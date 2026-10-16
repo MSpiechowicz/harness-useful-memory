@@ -14,8 +14,13 @@
 //! kept as written.
 //!
 //! [`TOKEN_VAR`] or `database_token` is the libSQL auth token. With a team database the whole
-//! store is remote: repository and global notes are shared by everyone using it, nothing is kept
-//! locally, and the move from Harness Desktop's folder does not run.
+//! store is remote by default: repository and global notes are shared by everyone using it,
+//! nothing is kept locally, and the move from Harness Desktop's folder does not run.
+//!
+//! [`Routing`] can keep one scope on this computer instead: `repository_notes` and `global_notes`
+//! in the config file (or [`REPOSITORY_NOTES_VAR`] and [`GLOBAL_NOTES_VAR`]) are `"remote"` (the
+//! default) or `"local"`. With one of each the server reads and writes through a
+//! [`crate::store::SplitStore`]; with both `"local"` the team database is not used at all.
 //!
 //! The URL and the token are secrets: errors show a [`redact_url`] form and pass through
 //! [`Secrets::scrub`]. On Unix a config file other users can change, or that another user owns, is
@@ -39,6 +44,14 @@ pub const TOKEN_VAR: &str = "HARNESS_MEMORY_DATABASE_TOKEN";
 /// `~` is fine).
 pub const CONFIG_VAR: &str = "HARNESS_MEMORY_CONFIG";
 
+/// Environment variable keeping repository notes in the team database (`remote`, the default) or
+/// on this computer (`local`). Wins over `repository_notes` in the config file; empty = unset.
+pub const REPOSITORY_NOTES_VAR: &str = "HARNESS_MEMORY_REPOSITORY_NOTES";
+
+/// Environment variable keeping global notes in the team database (`remote`, the default) or on
+/// this computer (`local`). Wins over `global_notes` in the config file; empty = unset.
+pub const GLOBAL_NOTES_VAR: &str = "HARNESS_MEMORY_GLOBAL_NOTES";
+
 /// The config file name inside `<config dir>/harness-memory/`.
 pub const CONFIG_FILE: &str = "config.toml";
 
@@ -52,6 +65,8 @@ const MASK: &str = "••••";
 struct ConfigFile {
     database_url: Option<String>,
     database_token: Option<String>,
+    repository_notes: Option<String>,
+    global_notes: Option<String>,
 }
 
 /// The selected store.
@@ -84,6 +99,15 @@ impl Backend {
         }
     }
 
+    /// The schema version this harness-memory brings the backend's database to.
+    pub fn schema_version(&self) -> i64 {
+        match self {
+            Self::Local | Self::Libsql { .. } => crate::store::sqlite::schema::SCHEMA_VERSION,
+            Self::Postgres { .. } => crate::store::postgres::schema::SCHEMA_VERSION,
+            Self::Mongo { .. } => crate::store::mongo::schema::SCHEMA_VERSION,
+        }
+    }
+
     /// The secrets of this backend, for scrubbing messages.
     pub fn secrets(&self) -> Secrets {
         match self {
@@ -94,10 +118,68 @@ impl Backend {
     }
 }
 
-/// The backend [`select`] picked, with warnings to print first.
+/// Where one scope's notes are kept when a team database is set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Place {
+    /// In the team database (`remote`).
+    #[default]
+    Remote,
+    /// In the local SQLite file of this computer (`local`).
+    Local,
+}
+
+impl Place {
+    /// `remote` or `local`, as the settings write it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Remote => "remote",
+            Self::Local => "local",
+        }
+    }
+
+    /// Where it is, in words: `team database` or `this computer`.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Remote => "team database",
+            Self::Local => "this computer",
+        }
+    }
+
+    /// Parses a setting (`remote` or `local`, any case, surrounding blanks ignored).
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "remote" => Some(Self::Remote),
+            "local" => Some(Self::Local),
+            _ => None,
+        }
+    }
+}
+
+/// Where repository notes and global notes go when a team database is set; both
+/// [`Place::Remote`] by default. Without a team database everything is local whatever it says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Routing {
+    pub repository: Place,
+    pub global: Place,
+}
+
+impl Routing {
+    /// True when one scope is in the team database and the other on this computer.
+    pub fn is_split(self) -> bool {
+        self.repository != self.global
+    }
+
+    /// True when both scopes stay on this computer, so the team database is not used.
+    pub fn is_all_local(self) -> bool {
+        self.repository == Place::Local && self.global == Place::Local
+    }
+}
+
+/// The backend [`select`] picked and the routing of the scopes, with warnings to print first.
 #[derive(Debug)]
 pub struct Selection {
     pub backend: Backend,
+    pub routing: Routing,
     pub warnings: Vec<String>,
 }
 
@@ -134,6 +216,8 @@ pub enum BackendError {
          instead"
     )]
     LibsqlUrlSecrets,
+    #[error("{0} must be \"remote\" or \"local\"")]
+    Routing(String),
 }
 
 /// The config folder: `$XDG_CONFIG_HOME` (or `~/.config`) on Linux, `~/Library/Application
@@ -183,11 +267,45 @@ pub fn select(env: &Env) -> Result<Selection, BackendError> {
 
     let url = env.var(URL_VAR).map(str::to_owned).or(config.database_url);
     let token = env.var(TOKEN_VAR).map(str::to_owned).or(config.database_token);
+    let backend = backend_for(url, token)?;
+
+    let routing = Routing {
+        repository: place(
+            env,
+            REPOSITORY_NOTES_VAR,
+            config.repository_notes.as_deref(),
+            "repository_notes",
+        )?,
+        global: place(env, GLOBAL_NOTES_VAR, config.global_notes.as_deref(), "global_notes")?,
+    };
+
+    if backend != Backend::Local && routing.is_all_local() {
+        warnings.push(format!(
+            "the team database ({}) is set, but repository_notes and global_notes are both \"local\": using the \
+             local database only",
+            backend.describe()
+        ));
+    }
 
     Ok(Selection {
-        backend: backend_for(url, token)?,
+        backend,
+        routing,
         warnings,
     })
+}
+
+/// The [`Place`] from the environment variable `var`, else from the config file's `key` (the
+/// default when neither is set); an error naming where the unknown value came from.
+fn place(env: &Env, var: &str, file: Option<&str>, key: &str) -> Result<Place, BackendError> {
+    let (raw, origin) = match env.var(var) {
+        Some(raw) => (Some(raw), var.to_owned()),
+        None => (file, format!("{key} in the config file")),
+    };
+
+    match raw {
+        None => Ok(Place::default()),
+        Some(raw) => Place::parse(raw).ok_or(BackendError::Routing(origin)),
+    }
 }
 
 /// Why [`read_config`] gave no text.
@@ -691,6 +809,99 @@ mod tests {
 
         let relative = Env::for_tests("/home/u").with_var(CONFIG_VAR, "config.toml");
         assert!(matches!(select(&relative), Err(BackendError::ConfigRelative)));
+    }
+
+    #[test]
+    fn both_scopes_go_to_the_team_database_by_default() {
+        let env = Env::for_tests("/home/u").with_var(URL_VAR, "postgres://db/m");
+        let selection = select(&env).expect("select");
+
+        assert_eq!(selection.routing, Routing::default());
+        assert_eq!(selection.routing.repository, Place::Remote);
+        assert_eq!(selection.routing.global, Place::Remote);
+        assert!(!selection.routing.is_split());
+        assert!(selection.warnings.is_empty());
+    }
+
+    #[test]
+    fn the_config_file_and_the_environment_route_the_scopes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "database_url = \"postgres://file/m\"\nrepository_notes = \"remote\"\nglobal_notes = \"Local\"\n",
+        )
+        .expect("write");
+
+        let env = Env::for_tests("/home/u").with_var(CONFIG_VAR, path.to_string_lossy());
+        let routing = select(&env).expect("file").routing;
+        assert_eq!(
+            routing,
+            Routing {
+                repository: Place::Remote,
+                global: Place::Local
+            }
+        );
+        assert!(routing.is_split());
+
+        let env = env
+            .with_var(REPOSITORY_NOTES_VAR, " local ")
+            .with_var(GLOBAL_NOTES_VAR, "remote");
+        assert_eq!(
+            select(&env).expect("env").routing,
+            Routing {
+                repository: Place::Local,
+                global: Place::Remote
+            }
+        );
+
+        let env = env.with_var(GLOBAL_NOTES_VAR, "");
+        assert_eq!(select(&env).expect("empty is unset").routing.global, Place::Local);
+    }
+
+    #[test]
+    fn unknown_routing_values_are_errors() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "repository_notes = \"team\"\n").expect("write");
+
+        let env = Env::for_tests("/home/u").with_var(CONFIG_VAR, path.to_string_lossy());
+        let error = select(&env).expect_err("unknown value").to_string();
+        assert_eq!(
+            error,
+            "repository_notes in the config file must be \"remote\" or \"local\""
+        );
+
+        let env = Env::for_tests("/home/u").with_var(GLOBAL_NOTES_VAR, "both");
+        let error = select(&env).expect_err("unknown value").to_string();
+        assert_eq!(error, "HARNESS_MEMORY_GLOBAL_NOTES must be \"remote\" or \"local\"");
+
+        std::fs::write(&path, "global_notes = 1\n").expect("write");
+        let env = Env::for_tests("/home/u").with_var(CONFIG_VAR, path.to_string_lossy());
+        assert!(matches!(select(&env), Err(BackendError::ConfigInvalid { .. })));
+    }
+
+    #[test]
+    fn both_scopes_local_leave_the_team_database_unused_with_a_warning() {
+        let env = Env::for_tests("/home/u")
+            .with_var(URL_VAR, "postgres://u:hunter2@db/m")
+            .with_var(REPOSITORY_NOTES_VAR, "local")
+            .with_var(GLOBAL_NOTES_VAR, "local");
+        let selection = select(&env).expect("select");
+
+        assert!(selection.routing.is_all_local());
+        assert_eq!(selection.warnings.len(), 1);
+        assert!(
+            selection.warnings[0].contains("both \"local\": using the local database only"),
+            "{:?}",
+            selection.warnings
+        );
+        assert!(!selection.warnings[0].contains("hunter2"));
+
+        let local = Env::for_tests("/home/u")
+            .with_var(REPOSITORY_NOTES_VAR, "local")
+            .with_var(GLOBAL_NOTES_VAR, "local");
+        assert!(select(&local).expect("no team database").warnings.is_empty());
     }
 
     #[test]

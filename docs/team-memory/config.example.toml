@@ -21,3 +21,8 @@ database_url = "postgres://harness_memory:CHANGE-ME@db.example.com:5432/harness_
 
 # MongoDB. The database is the URL path (harness_memory when there is none). Transactions need a replica set.
 # database_url = "mongodb+srv://harness_memory:CHANGE-ME@cluster.example.com/harness_memory?retryWrites=true"
+
+# Which notes go to the team database: "remote" (the default) or "local" to keep that kind on this computer.
+# HARNESS_MEMORY_REPOSITORY_NOTES and HARNESS_MEMORY_GLOBAL_NOTES override them.
+# repository_notes = "remote"
+# global_notes = "local"

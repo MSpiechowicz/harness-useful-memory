@@ -29,6 +29,9 @@ pub const CAPTURED_VARS: &[&str] = &[
     "HARNESS_MEMORY_DATABASE_URL",
     "HARNESS_MEMORY_DATABASE_TOKEN",
     "HARNESS_MEMORY_CONFIG",
+    // Which scopes stay on this computer with a team database (see `crate::backend::Routing`).
+    "HARNESS_MEMORY_REPOSITORY_NOTES",
+    "HARNESS_MEMORY_GLOBAL_NOTES",
     // The Windows config folder (roaming), which holds the config file.
     "APPDATA",
 ];

@@ -2,9 +2,9 @@
 //!
 //! The notes (repository and global) and relations of the local database are written to the team
 //! store through [`MemoryStore`], so any backend can receive it. [`Options`] can narrow that to one
-//! repository and leave the global scope out. A note whose title already exists in the same scope
-//! of the team store is replaced only when the local note was changed later and differs, else it
-//! is skipped, so pushing again adds nothing. Replacing it can overwrite a teammate's text: those
+//! repository and leave the global scope or every repository out. A note whose title already
+//! exists in the same scope of the team store is replaced only when the local note was changed
+//! later and differs, else it is skipped, so pushing again adds nothing. Replacing it can overwrite a teammate's text: those
 //! notes are listed in [`Summary::changes`]. A relation that already exists in the team store as
 //! it would be written is left alone.
 //!
@@ -34,6 +34,9 @@ pub struct Options {
     pub repo: Option<String>,
     /// Leave the global notes and relations out.
     pub skip_global: bool,
+    /// Leave every repository's notes and relations out (they stay on this computer, see
+    /// [`crate::backend::Routing`]).
+    pub skip_repositories: bool,
 }
 
 impl Options {
@@ -41,6 +44,7 @@ impl Options {
     fn takes(&self, target: &Target) -> bool {
         match target {
             Target::Global => !self.skip_global,
+            Target::Repo(_) if self.skip_repositories => false,
             Target::Repo(key) => self.repo.as_ref().is_none_or(|repo| *repo == key.key),
         }
     }

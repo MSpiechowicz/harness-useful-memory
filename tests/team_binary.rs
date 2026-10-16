@@ -1,6 +1,7 @@
 //! The executable with a team database: settings that stop it, two machines sharing one
-//! PostgreSQL memory, and `push` from the command line (those two need `postgres_support`'s
-//! server and are skipped without it).
+//! PostgreSQL memory, `push` and `check` from the command line, and one scope kept on each
+//! machine (the cases on a real database need `postgres_support`'s server and are skipped without
+//! it).
 
 mod common;
 mod postgres_support;
@@ -371,6 +372,237 @@ fn push_stops_before_a_newer_team_database() {
         .expect("count")
         .get(0);
     assert_eq!(notes, 0);
+}
+
+/// `binary` with the scopes routed: `(repository_notes, global_notes)` as the environment sets them.
+fn routed(machine: &Machine, args: &[&str], url: Option<&str>, routing: (&str, &str)) -> Command {
+    let mut command = binary(machine, args, url);
+    command
+        .env("HARNESS_MEMORY_REPOSITORY_NOTES", routing.0)
+        .env("HARNESS_MEMORY_GLOBAL_NOTES", routing.1);
+    command
+}
+
+#[test]
+fn check_without_a_team_database_reports_the_local_file() {
+    let machine = machine();
+    let file = machine.memory.join("memory.sqlite3");
+
+    let output = run(binary(&machine, &["check"], None));
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        format!("ok: local database at {} (not created yet)\n", file.display())
+    );
+    assert!(!file.exists(), "check does not create the database");
+
+    std::fs::create_dir_all(&machine.memory).expect("memory folder");
+    std::fs::write(&file, "").expect("a database file");
+    let output = run(binary(&machine, &["check"], None));
+    assert_eq!(stdout(&output), format!("ok: local database at {}\n", file.display()));
+}
+
+#[test]
+fn check_reports_an_unreachable_team_database_without_the_password() {
+    let machine = machine();
+    let url = "postgres://alice:hunter2secret@127.0.0.1:1/memory?connect_timeout=2";
+    let output = run(binary(&machine, &["check"], Some(url)));
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty(), "{}", stdout(&output));
+    let message = stderr(&output);
+    assert!(
+        message.starts_with(
+            "harness-memory: cannot open the team database (PostgreSQL at postgres://alice@127.0.0.1:1/memory?…): "
+        ),
+        "{message}"
+    );
+    assert_eq!(message.lines().count(), 1, "{message}");
+    assert!(!message.contains("hunter2secret"), "{message}");
+    assert!(!machine.memory.exists());
+}
+
+#[test]
+fn check_refuses_unknown_settings() {
+    let machine = machine();
+    let output = run(routed(
+        &machine,
+        &["check"],
+        Some("postgres://u:hunter2@db/m"),
+        ("team", "local"),
+    ));
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stderr(&output),
+        "harness-memory: HARNESS_MEMORY_REPOSITORY_NOTES must be \"remote\" or \"local\"\n"
+    );
+
+    let extra = run(binary(&machine, &["check", "--verbose"], None));
+    assert_eq!(extra.status.code(), Some(2));
+    assert!(stderr(&extra).contains("| check |"), "{}", stderr(&extra));
+}
+
+#[test]
+fn check_with_both_scopes_local_skips_the_team_database() {
+    let machine = machine();
+    let url = "postgres://alice:hunter2secret@127.0.0.1:1/memory";
+    let output = run(routed(&machine, &["check"], Some(url), ("local", "local")));
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).starts_with("ok: local database at "),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains("is set, but repository_notes and global_notes are both \"local\""),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!stderr(&output).contains("hunter2secret"));
+}
+
+#[test]
+fn check_opens_the_team_database() {
+    let Some(db) = database() else { return };
+    let machine = machine();
+
+    let output = run(binary(&machine, &["check"], Some(db.url())));
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let said = stdout(&output);
+    assert!(said.starts_with("ok: PostgreSQL at postgres://"), "{said}");
+    assert!(said.ends_with(" (schema 1)\n"), "{said}");
+    assert_eq!(said.lines().count(), 1, "{said}");
+    assert!(!said.contains(":test@"), "no password: {said}");
+
+    let split = run(routed(&machine, &["check"], Some(db.url()), ("remote", "local")));
+    assert_eq!(split.status.code(), Some(0), "{}", stderr(&split));
+    let file = machine.memory.join("memory.sqlite3");
+    assert!(
+        stdout(&split).ends_with(&format!(
+            " (schema 1); repository notes: team database, global notes: this computer; local database at {} (not \
+             created yet)\n",
+            file.display()
+        )),
+        "{}",
+        stdout(&split)
+    );
+
+    let mut admin = db.admin();
+    admin
+        .execute(
+            "UPDATE harness_memory_meta SET value = value + 1 WHERE key = 'schema_version'",
+            &[],
+        )
+        .expect("a newer version");
+
+    let newer = run(binary(&machine, &["check"], Some(db.url())));
+    assert_eq!(newer.status.code(), Some(0), "{}", stderr(&newer));
+    assert!(
+        stdout(&newer)
+            .ends_with(" (schema newer than 1); the team database is newer than this harness-memory; update it\n"),
+        "{}",
+        stdout(&newer)
+    );
+}
+
+#[test]
+fn push_refuses_when_routing_leaves_nothing_to_push() {
+    let machine = machine();
+    let url = Some("postgres://u:hunter2@127.0.0.1:1/m");
+
+    for (routing, args, reason) in [
+        (("local", "local"), &["push"][..], "both \"local\""),
+        (
+            ("local", "remote"),
+            &["push", "--repo", "."],
+            "--repo names a repository",
+        ),
+        (
+            ("local", "remote"),
+            &["push", "--no-global"],
+            "--no-global leaves the global ones out",
+        ),
+    ] {
+        let output = run(routed(&machine, args, url, routing));
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {}", stderr(&output));
+        assert!(
+            stderr(&output).contains("nothing to push") && stderr(&output).contains(reason),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert!(!stderr(&output).contains("hunter2"));
+    }
+}
+
+#[test]
+fn push_leaves_the_scope_kept_on_this_computer_out() {
+    let Some(db) = database() else { return };
+    let machine = machine();
+    let local = push_support::local_memory();
+    copy_into(&local.path, &machine.memory);
+
+    let pushed = run(routed(&machine, &["push"], Some(db.url()), ("remote", "local")));
+    assert!(pushed.status.success(), "{}", stderr(&pushed));
+    let said = stdout(&pushed);
+    assert!(
+        said.contains("notes 2 added, 0 updated, 0 overwritten, 0 skipped"),
+        "{said}"
+    );
+    assert!(said.contains("relations 1 added, 0 unchanged"), "{said}");
+    assert!(
+        said.contains("global notes stay on this computer (global_notes = \"local\") and were left out"),
+        "{said}"
+    );
+
+    let mut admin = db.admin();
+    let global: i64 = admin
+        .query_one("SELECT count(*) FROM notes WHERE project_id IS NULL", &[])
+        .expect("count")
+        .get(0);
+    assert_eq!(global, 0, "no global note reached the team database");
+}
+
+#[test]
+fn a_split_server_shares_one_scope_and_keeps_the_other() {
+    let Some(db) = database() else { return };
+    let (first, second) = (machine(), machine());
+    let start = |machine: &Machine| Client::start(routed(machine, &["mcp"], Some(db.url()), ("remote", "local")));
+
+    let mut alice = start(&first);
+    let shared = alice.call(
+        "memory_remember",
+        json!({ "title": "Uploader location", "body": "src/upload.rs holds the uploader", "kind": "location" }),
+    );
+    assert!(shared.starts_with("created note"), "{shared}");
+    let private = alice.call(
+        "memory_remember",
+        json!({ "title": "Uploader habits", "body": "Alice debugs the uploader with prints", "kind": "note", "scope": "global" }),
+    );
+    assert!(private.starts_with("created note 1000000001"), "{private}");
+
+    let found = alice.call("memory_search", json!({ "query": "uploader" }));
+    assert!(
+        found.contains("Uploader location") && found.contains("Uploader habits"),
+        "{found}"
+    );
+    let read = alice.call("memory_get", json!({ "ids": [1, 1000000001] }));
+    assert!(
+        read.contains("Uploader location") && read.contains("Uploader habits"),
+        "{read}"
+    );
+    assert!(alice.finish().success());
+    assert!(
+        first.memory.join("memory.sqlite3").exists(),
+        "global notes are kept locally"
+    );
+
+    let mut bob = start(&second);
+    let found = bob.call("memory_search", json!({ "query": "uploader" }));
+    assert!(found.contains("Uploader location"), "{found}");
+    assert!(!found.contains("Uploader habits"), "{found}");
+    assert!(bob.finish().success());
 }
 
 fn stdout(output: &Output) -> String {

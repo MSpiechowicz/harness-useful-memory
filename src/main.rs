@@ -1,19 +1,20 @@
 //! The `harness-memory` executable: `harness-memory [mcp]` serves MCP over stdio,
 //! `harness-memory push [--dry-run] [--repo <key|.>] [--no-global]` copies the local memory into
-//! the team database, `harness-memory --version` prints the version.
+//! the team database, `harness-memory check` opens the configured database and says which it is,
+//! `harness-memory --version` prints the version.
 
 use std::io::{BufReader, Write};
 use std::process::ExitCode;
 
-use harness_memory::backend::{self, Backend, CONFIG_VAR, URL_VAR};
+use harness_memory::backend::{self, Backend, CONFIG_VAR, Place, Routing, Selection, URL_VAR};
 use harness_memory::location::{DIR_VAR, Migration, legacy_database_path, migrate_legacy, override_is_relative};
 use harness_memory::project::{ProjectResolver, normalize_remote};
 use harness_memory::push::{Action, GLOBAL, Options, Summary, push};
-use harness_memory::store::{MemoryStore, SqliteStore};
+use harness_memory::store::{MemoryStore, Scope, SplitStore, SqliteStore};
 use harness_memory::support::Env;
 use harness_memory::{Server, database_path, serve};
 
-const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--repo <key|.>] [--no-global] | --version]";
+const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--repo <key|.>] [--no-global] | check | --version]";
 
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -28,6 +29,7 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        [Some("check")] => run_check(),
         [Some("--version")] => {
             println!("harness-memory {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -45,28 +47,12 @@ fn run() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let Some(backend) = select(&env) else {
+    let Some(selection) = select(&env) else {
         return ExitCode::FAILURE;
     };
 
-    // A team database that cannot be opened stops the server: an empty local database instead
-    // would look like the team's memory had gone.
-    let store: Box<dyn MemoryStore> = match backend::open(&backend) {
-        None => match open_local(&env) {
-            Some(store) => store,
-            None => return ExitCode::FAILURE,
-        },
-        Some(Ok(opened)) => {
-            if opened.newer {
-                eprintln!("harness-memory: the team database is newer than this server; tools will fail");
-            }
-
-            opened.store
-        }
-        Some(Err(message)) => {
-            eprintln!("harness-memory: {message}");
-            return ExitCode::FAILURE;
-        }
+    let Some(store) = open_store(&env, &selection) else {
+        return ExitCode::FAILURE;
     };
 
     let projects = ProjectResolver::new(env, std::env::current_dir().ok());
@@ -87,22 +73,150 @@ fn run() -> ExitCode {
     }
 }
 
-/// The backend from the environment and the config file, after printing its warnings; `None`
-/// (with the reason printed) when the settings are wrong.
-fn select(env: &Env) -> Option<Backend> {
+/// The backend and routing from the environment and the config file, after printing its
+/// warnings; `None` (with the reason printed) when the settings are wrong.
+fn select(env: &Env) -> Option<Selection> {
     match backend::select(env) {
         Ok(selection) => {
             for warning in &selection.warnings {
                 eprintln!("harness-memory: {warning}");
             }
 
-            Some(selection.backend)
+            Some(selection)
         }
         Err(error) => {
             eprintln!("harness-memory: {error}");
             None
         }
     }
+}
+
+/// The store the server uses: the local one, the team database, or both split by scope (see
+/// [`Routing`]); `None` (with the reason printed) when one cannot be opened.
+fn open_store(env: &Env, selection: &Selection) -> Option<Box<dyn MemoryStore>> {
+    let Selection { backend, routing, .. } = selection;
+
+    if *backend == Backend::Local || routing.is_all_local() {
+        return open_local(env);
+    }
+
+    let team = open_team(backend)?;
+
+    if !routing.is_split() {
+        return Some(team);
+    }
+
+    let local = open_local(env)?;
+    let local_scope = if routing.repository == Place::Local {
+        Scope::Repo
+    } else {
+        Scope::Global
+    };
+
+    Some(Box::new(SplitStore::new(team, local, local_scope)))
+}
+
+/// The team database; `None` (with the reason printed) when it cannot be opened. That stops the
+/// server: an empty local database instead would look like the team's memory had gone.
+fn open_team(backend: &Backend) -> Option<Box<dyn MemoryStore>> {
+    match backend::open(backend)? {
+        Ok(opened) => {
+            if opened.newer {
+                eprintln!("harness-memory: the team database is newer than this server; tools will fail");
+            }
+
+            Some(opened.store)
+        }
+        Err(message) => {
+            eprintln!("harness-memory: {message}");
+            None
+        }
+    }
+}
+
+/// `harness-memory check`: opens the configured database like the server does and prints one
+/// line saying which it is (exit 0), or the reason it cannot be opened on stderr (exit 1). The
+/// local database is only looked at, never created or migrated.
+fn run_check() -> ExitCode {
+    let Ok(env) = Env::from_process() else {
+        eprintln!("harness-memory: the home folder is unknown");
+        return ExitCode::FAILURE;
+    };
+
+    let Some(Selection { backend, routing, .. }) = select(&env) else {
+        return ExitCode::FAILURE;
+    };
+
+    if backend == Backend::Local || routing.is_all_local() {
+        let Some(local) = local_place(&env) else {
+            return ExitCode::FAILURE;
+        };
+
+        println!("ok: {local}");
+        return ExitCode::SUCCESS;
+    }
+
+    let opened = match backend::open(&backend) {
+        Some(Ok(opened)) => opened,
+        Some(Err(message)) => {
+            eprintln!("harness-memory: {message}");
+            return ExitCode::FAILURE;
+        }
+        None => return ExitCode::FAILURE,
+    };
+
+    let schema = backend.schema_version();
+    let mut line = if opened.newer {
+        format!("ok: {} (schema newer than {schema})", backend.describe())
+    } else {
+        format!("ok: {} (schema {schema})", backend.describe())
+    };
+
+    if routing.is_split() {
+        let Some(local) = local_place(&env) else {
+            return ExitCode::FAILURE;
+        };
+
+        line.push_str(&format!("; {}; {local}", routing_line(routing)));
+    }
+
+    if opened.newer {
+        line.push_str("; the team database is newer than this harness-memory; update it");
+    }
+
+    println!("{line}");
+    ExitCode::SUCCESS
+}
+
+/// `local database at <path>`, noting when the file does not exist yet (it is not created);
+/// `None` (with the reason printed) when the data folder is unknown.
+fn local_place(env: &Env) -> Option<String> {
+    let Some(path) = database_path(env) else {
+        eprintln!("harness-memory: the data folder is unknown");
+        return None;
+    };
+
+    if override_is_relative(env) {
+        eprintln!(
+            "harness-memory: {DIR_VAR} must be an absolute folder; using {}",
+            path.display()
+        );
+    }
+
+    if path.exists() {
+        Some(format!("local database at {}", path.display()))
+    } else {
+        Some(format!("local database at {} (not created yet)", path.display()))
+    }
+}
+
+/// `repository notes: team database, global notes: this computer`.
+fn routing_line(routing: Routing) -> String {
+    format!(
+        "repository notes: {}, global notes: {}",
+        routing.repository.describe(),
+        routing.global.describe()
+    )
 }
 
 /// The local SQLite store, after the one-time move from Harness Desktop's folder; `None` (with
@@ -235,7 +349,7 @@ fn run_push(args: &PushArgs) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let Some(backend) = select(&env) else {
+    let Some(Selection { backend, routing, .. }) = select(&env) else {
         return ExitCode::FAILURE;
     };
 
@@ -249,6 +363,11 @@ fn run_push(args: &PushArgs) -> ExitCode {
             "harness-memory: push copies the local memory into a team database, and none is set: \
              set {URL_VAR} or database_url in {config}"
         );
+        return ExitCode::from(2);
+    }
+
+    if let Some(reason) = nothing_to_push(routing, args) {
+        eprintln!("harness-memory: nothing to push: {reason}");
         return ExitCode::from(2);
     }
 
@@ -286,7 +405,8 @@ fn run_push(args: &PushArgs) -> ExitCode {
     let options = Options {
         dry_run: args.dry_run,
         repo,
-        skip_global: args.no_global,
+        skip_global: args.no_global || routing.global == Place::Local,
+        skip_repositories: routing.repository == Place::Local,
     };
 
     let secrets = backend.secrets();
@@ -300,6 +420,15 @@ fn run_push(args: &PushArgs) -> ExitCode {
 
     report_push(&options, &summary, &backend.describe(), &local);
 
+    if routing.is_split() {
+        let (kept, key) = if routing.repository == Place::Local {
+            ("repository notes", "repository_notes")
+        } else {
+            ("global notes", "global_notes")
+        };
+        println!("{kept} stay on this computer ({key} = \"local\") and were left out");
+    }
+
     for failure in &summary.failed {
         eprintln!("harness-memory: not pushed: {}", secrets.scrub(failure));
     }
@@ -309,6 +438,27 @@ fn run_push(args: &PushArgs) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Why `push` with `args` has nothing to send under `routing`, if so.
+fn nothing_to_push(routing: Routing, args: &PushArgs) -> Option<&'static str> {
+    if routing.is_all_local() {
+        return Some("repository_notes and global_notes are both \"local\", so nothing goes to the team database");
+    }
+
+    if routing.repository == Place::Local && args.repo.is_some() {
+        return Some(
+            "--repo names a repository, but repository notes stay on this computer (repository_notes = \"local\")",
+        );
+    }
+
+    if routing.repository == Place::Local && args.no_global {
+        return Some(
+            "repository notes stay on this computer (repository_notes = \"local\") and --no-global leaves the global ones out",
+        );
+    }
+
+    None
 }
 
 /// Prints what a push did: the totals, the notes whose team text was overwritten, and for a dry

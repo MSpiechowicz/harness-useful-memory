@@ -1,8 +1,9 @@
 //! The storage contract of the memory server.
 //!
-//! [`MemoryStore`] is what the MCP tools call; [`sqlite::SqliteStore`] is the local backend, and
-//! [`postgres::PostgresStore`] and [`libsql::LibsqlStore`] are shared team databases. Every
-//! implementation validates its input against [`crate::limits`] and masks secrets with
+//! [`MemoryStore`] is what the MCP tools call; [`sqlite::SqliteStore`] is the local backend,
+//! [`postgres::PostgresStore`], [`libsql::LibsqlStore`] and [`mongo::MongoStore`] are shared team
+//! databases, and [`split::SplitStore`] keeps one scope in a team database and the other locally.
+//! Every backend validates its input against [`crate::limits`] and masks secrets with
 //! `redact_text` before anything is stored (the helpers in [`clean`] do both), so callers may pass
 //! raw agent text.
 
@@ -10,6 +11,7 @@ pub mod clean;
 pub mod libsql;
 pub mod mongo;
 pub mod postgres;
+pub mod split;
 pub mod sqlite;
 
 use std::path::PathBuf;
@@ -17,6 +19,7 @@ use std::path::PathBuf;
 pub use libsql::LibsqlStore;
 pub use mongo::MongoStore;
 pub use postgres::PostgresStore;
+pub use split::SplitStore;
 pub use sqlite::SqliteStore;
 pub(crate) use sqlite::prepare_new_file;
 

@@ -4,8 +4,11 @@
 mod common;
 mod push_support;
 
-use harness_memory::push::push;
-use harness_memory::store::{SqliteStore, StoreError};
+use std::collections::BTreeSet;
+
+use common::{global_only, query, repo_only};
+use harness_memory::push::{Options, push};
+use harness_memory::store::{MemoryStore, SqliteStore, StoreError};
 use push_support::{all, counts, local_memory};
 use tempfile::TempDir;
 
@@ -23,6 +26,28 @@ fn a_push_can_take_one_repository_and_leave_global_out() {
     let mut remote = SqliteStore::open(&dir.path().join("team.sqlite3")).expect("team store");
 
     push_support::narrowed_scenario(&mut remote);
+}
+
+#[test]
+fn a_push_can_leave_every_repository_out() {
+    let dir = TempDir::new().expect("temp dir");
+    let mut remote = SqliteStore::open(&dir.path().join("team.sqlite3")).expect("team store");
+    let local = local_memory();
+
+    let without_repositories = Options {
+        skip_repositories: true,
+        ..all()
+    };
+    let pushed = push(&local.path, &mut remote, &without_repositories).expect("global only");
+    assert_eq!(counts(&pushed).notes, [1, 0, 0, 0]);
+    assert_eq!(counts(&pushed).links, [1, 0]);
+    assert_eq!(pushed.projects, BTreeSet::from(["global".to_owned()]));
+
+    let repository = remote
+        .search(&query("", repo_only(push_support::REPO)))
+        .expect("repository notes");
+    assert!(repository.is_empty(), "{repository:?}");
+    assert_eq!(remote.search(&query("", global_only())).expect("global").len(), 1);
 }
 
 #[test]

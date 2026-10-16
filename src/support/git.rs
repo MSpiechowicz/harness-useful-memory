@@ -20,9 +20,9 @@
 //! configuration is still read from the default locations under `HOME`/`XDG_CONFIG_HOME`, and the
 //! system configuration from its default location.
 //!
-//! The team database settings (`HARNESS_MEMORY_DATABASE_URL`, `HARNESS_MEMORY_DATABASE_TOKEN` and
-//! `HARNESS_MEMORY_CONFIG`) are dropped too: git has no use for them, and a hook or helper it runs
-//! must not see the credentials.
+//! The team database settings (`HARNESS_MEMORY_DATABASE_URL`, `HARNESS_MEMORY_DATABASE_TOKEN`,
+//! `HARNESS_MEMORY_CONFIG`, `HARNESS_MEMORY_REPOSITORY_NOTES` and `HARNESS_MEMORY_GLOBAL_NOTES`) are
+//! dropped too: git has no use for them, and a hook or helper it runs must not see the credentials.
 
 use std::ffi::OsStr;
 use std::io::Read;
@@ -68,10 +68,12 @@ const GIT_ENV: [(&str, &str); 3] = [
 ];
 
 /// The server's team database settings (see `crate::backend`), never passed on to git.
-const TEAM_VARS: [&str; 3] = [
+const TEAM_VARS: [&str; 5] = [
     "HARNESS_MEMORY_DATABASE_URL",
     "HARNESS_MEMORY_DATABASE_TOKEN",
     "HARNESS_MEMORY_CONFIG",
+    "HARNESS_MEMORY_REPOSITORY_NOTES",
+    "HARNESS_MEMORY_GLOBAL_NOTES",
 ];
 
 /// Pause between exit checks once git closed its output.

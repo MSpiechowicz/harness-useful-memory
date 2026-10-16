@@ -182,8 +182,9 @@ at one shared database instead, so the whole team fills one project memory: a fi
 the next teammate's agent in the same repository. Use it for a team that works on the same repositories. For one person,
 or several machines of one person, the local file is simpler and needs nothing.
 
-With a team database the whole store is shared, repository notes **and** global notes. There is no local copy: if the
-database cannot be reached the server reports an error and does not fall back to an empty local one.
+With a team database the whole store is shared by default, repository notes **and** global notes. There is no local
+copy: if the database cannot be reached the server reports an error and does not fall back to an empty local one. To
+keep one of the two on your own computer, see [Which notes are shared](#which-notes-are-shared).
 
 **Choosing a backend.** The server needs one shared database it can reach over the network. Pick what you already run.
 
@@ -299,10 +300,49 @@ In `~/.codex/config.toml` that is a `[mcp_servers.harness-memory.env]` table wit
 `"env": { "HARNESS_MEMORY_DATABASE_URL": "..." }` key next to `command` in `mcp.json`, and OpenCode an
 `"environment": { ... }` key in its `local` entry.
 
-To check it, start a new session and ask an agent to run `memory_search`. A wrong URL, a refused plain connection or an
-unreachable database stops the server at startup: it exits with the reason on stderr, so the harness shows
-`harness-memory` as failed to start (its MCP log or status view has the message). A connection lost later in a session
-comes back as a tool error. The credentials are never printed.
+To check it, run `harness-memory check`. It reads the settings the server would read, opens the database the same way
+and prints one line, without the credentials:
+
+```text
+ok: PostgreSQL at postgres://harness_memory@db.example.com:5432/harness_memory?… (schema 1)
+```
+
+It exits with 0 when the database opens (the line then ends with `update it` when the database was set up by a newer
+`harness-memory`), and with 1 and the reason on stderr when it does not. Without a team database it names the local file
+(`ok: local database at …`, with `(not created yet)` before the first note); that file is only looked at, never
+created. Run it with the same variables as the harness's entry when the settings live there.
+
+The server checks the same at startup: a wrong URL, a refused plain connection or an unreachable database stops it with
+the reason on stderr, so the harness shows `harness-memory` as failed to start (its MCP log or status view has the
+message). A connection lost later in a session comes back as a tool error. The credentials are never printed.
+
+### Which notes are shared
+
+By default both kinds of notes go to the team database. Two optional keys keep one kind on this computer, in the local
+SQLite file, while the other is shared:
+
+| Key | Environment variable | Values | Default |
+| --- | --- | --- | --- |
+| `repository_notes` | `HARNESS_MEMORY_REPOSITORY_NOTES` | `"remote"` (team database) or `"local"` (this computer) | `"remote"` |
+| `global_notes` | `HARNESS_MEMORY_GLOBAL_NOTES` | `"remote"` (team database) or `"local"` (this computer) | `"remote"` |
+
+```toml
+database_url = "postgres://..."
+global_notes = "local"   # share repository notes with the team, keep personal global notes here
+```
+
+The environment variable wins over the key, and any other value is an error that stops the server. With both set to
+`"local"` the team database is not used at all (the server says so on stderr). The keys only matter with a team
+database.
+
+With one kind kept locally, the tools still see both: a search lists the repository's notes first and fills up with
+global ones, and `memory_get`, `memory_update` and `memory_forget` find a note by its id in either place. Local notes
+are numbered from 1000000001 (local note 7 is note 1000000007), so their ids never clash with the team's, and team
+notes keep the ids teammates see. Relations stay in the scope they are linked in, so a relation's note must be in the
+same place, and similar notes are only looked for next to the note just saved. Notes left in the other place from
+before you changed the keys are not shown; `push` copies local notes of a shared kind into the team database.
+`harness-memory check` adds where each kind goes (`; repository notes: team database, global notes: this computer;
+local database at …`).
 
 ### Seed it from existing notes
 
@@ -317,7 +357,8 @@ harness-memory push --repo . --no-global   # only this checkout's repository, no
 ```
 
 It reads the local file (`HARNESS_MEMORY_DIR` applies) and writes to the database in your configuration. Each teammate can
-push their own notes. By default `push` takes everything: every repository's notes and the global ones.
+push their own notes. By default `push` takes everything: every repository's notes and the global ones. A kind kept on
+this computer (`repository_notes` or `global_notes` set to `"local"`) is left out, and `push` says so.
 
 - **Review first.** Everything you push becomes visible to the whole team. `--dry-run` lists, under each repository key
   (and `global`), the titles of the notes it would add or change. Repositories without a remote are keyed by their
