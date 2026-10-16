@@ -1,0 +1,48 @@
+[package]
+name = "harness_memory"
+description = "Project memory MCP server for any coding agent harness (embedded SQLite, full-text search)"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/MSpiechowicz/harness-useful-memory"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# The stdio MCP server the harnesses' `mcp.json` entries start (`harness-memory` or `harness-memory mcp`).
+[[bin]]
+name = "harness-memory"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+# SQLite compiled in (FTS5 included), so no system library is needed.
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+# `preserve_order`: tool schemas and replies keep their keys in source order.
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+thiserror = "2.0.21"
+regex = "1.13"
+# Canonical paths without the Windows `\\?\` prefix.
+dunce = "1.0.5"
+
+# Kills a timed-out git together with its process group (`killpg`).
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["signal", "process"] }
+
+[dev-dependencies]
+insta = { version = "1.49.0", features = ["json"] }
+pretty_assertions = "1.4"
+tempfile = "3.27.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = 3
+strip = true

@@ -1,0 +1,141 @@
+//! Injected process environment.
+//!
+//! Path logic takes an [`Env`] instead of reading `std::env` directly, so tests run against
+//! fixture homes and never touch the real `~` or data folder.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use super::Error;
+
+/// Environment variables captured by [`Env::from_process`]. Nothing else is read.
+pub const CAPTURED_VARS: &[&str] = &[
+    // Where `git` is looked up.
+    "PATH",
+    // The per-machine data folder (see `crate::location`).
+    "XDG_DATA_HOME",
+    "LOCALAPPDATA",
+    // The global git configuration git reads (passed on to it).
+    "XDG_CONFIG_HOME",
+    // The database folder override (see `crate::location::DIR_VAR`).
+    "HARNESS_MEMORY_DIR",
+];
+
+/// Operating-system family, used for platform-specific paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsKind {
+    /// Linux and other non-Apple Unix systems.
+    Linux,
+    /// macOS.
+    MacOs,
+    /// Windows.
+    Windows,
+}
+
+impl OsKind {
+    /// The OS this binary was built for.
+    pub fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Linux
+        }
+    }
+}
+
+/// Snapshot of the environment the server depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Env {
+    /// The user's home directory.
+    pub home: PathBuf,
+    /// Captured variables (only [`CAPTURED_VARS`] in production).
+    pub vars: BTreeMap<String, String>,
+    /// OS family.
+    pub os: OsKind,
+}
+
+impl Env {
+    /// Captures the real environment once at startup.
+    pub fn from_process() -> Result<Self, Error> {
+        let home = std::env::home_dir()
+            .filter(|home| !home.as_os_str().is_empty())
+            .ok_or(Error::HomeUnknown)?;
+
+        let vars = CAPTURED_VARS
+            .iter()
+            .filter_map(|name| std::env::var(name).ok().map(|value| ((*name).to_owned(), value)))
+            .collect();
+
+        Ok(Self {
+            home,
+            vars,
+            os: OsKind::current(),
+        })
+    }
+
+    /// An environment rooted at `home` with no variables and the current OS (for tests).
+    pub fn for_tests(home: impl Into<PathBuf>) -> Self {
+        Self {
+            home: home.into(),
+            vars: BTreeMap::new(),
+            os: OsKind::current(),
+        }
+    }
+
+    /// Returns a copy with `name` set to `value`.
+    pub fn with_var(mut self, name: &str, value: impl Into<String>) -> Self {
+        self.vars.insert(name.to_owned(), value.into());
+        self
+    }
+
+    /// Returns a copy that reports `os` (for platform-specific path tests).
+    pub fn with_os(mut self, os: OsKind) -> Self {
+        self.os = os;
+        self
+    }
+
+    /// A captured variable, or `None` when unset or empty.
+    pub fn var(&self, name: &str) -> Option<&str> {
+        self.vars
+            .get(name)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+    }
+
+    /// Expands a leading `~` (alone, or followed by `/` or `\`) to the home directory.
+    pub fn expand_home(&self, raw: &str) -> PathBuf {
+        if raw == "~" {
+            return self.home.clone();
+        }
+
+        match raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+            Some(rest) => self.home.join(rest),
+            None => PathBuf::from(raw),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_variables_count_as_unset() {
+        let env = Env::for_tests("/home/u").with_var("XDG_DATA_HOME", "");
+
+        assert_eq!(env.var("XDG_DATA_HOME"), None);
+        assert_eq!(env.with_var("PATH", "/bin").var("PATH"), Some("/bin"));
+    }
+
+    #[test]
+    fn a_leading_tilde_expands_to_home() {
+        let env = Env::for_tests("/home/u");
+
+        assert_eq!(env.expand_home("~"), PathBuf::from("/home/u"));
+        assert_eq!(env.expand_home("~/work"), PathBuf::from("/home/u").join("work"));
+        assert_eq!(env.expand_home("~user/work"), PathBuf::from("~user/work"));
+        assert_eq!(env.expand_home("/srv/~"), PathBuf::from("/srv/~"));
+    }
+}

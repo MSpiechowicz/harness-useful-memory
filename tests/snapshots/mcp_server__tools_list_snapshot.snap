@@ -1,0 +1,362 @@
+---
+source: memory/tests/mcp_server.rs
+expression: "replies[0][\"result\"]"
+---
+{
+  "tools": [
+    {
+      "name": "memory_remember",
+      "description": "Call before you finish: save what you learned for later sessions, after finishing work, fixing a non-obvious problem, finding where something lives, or an optimisation. Use repo-relative paths. A note with the same title in the scope is updated (a repository note written from another checkout, or reached through project_path, is reported instead: replace it with memory_update); similar notes are listed so you can update or forget outdated ones. Never store secrets.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "Short, specific title (1-120 characters)"
+          },
+          "body": {
+            "type": "string",
+            "description": "The knowledge itself, concise (1-4000 characters)"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "outcome",
+              "problem",
+              "fix",
+              "optimisation",
+              "location",
+              "decision",
+              "note"
+            ],
+            "description": "Note kind"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z0-9_-]+$",
+              "maxLength": 32
+            },
+            "maxItems": 8,
+            "description": "Lowercase tags"
+          },
+          "entities": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 80
+            },
+            "maxItems": 10,
+            "description": "Files, modules, components or concepts the note is about"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "repo",
+              "global"
+            ],
+            "default": "repo",
+            "description": "repo: this repository; global: shared by all repositories"
+          },
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository, when the server cannot tell it from its working directory"
+          }
+        },
+        "required": [
+          "title",
+          "body",
+          "kind"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "memory_update",
+      "description": "Correct or extend a note by id. Give only the fields to change; append adds text to the body.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Note id"
+          },
+          "title": {
+            "type": "string",
+            "description": "New title (1-120 characters)"
+          },
+          "body": {
+            "type": "string",
+            "description": "New body (1-4000 characters)"
+          },
+          "append": {
+            "type": "string",
+            "description": "Text added to the end of the body"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "outcome",
+              "problem",
+              "fix",
+              "optimisation",
+              "location",
+              "decision",
+              "note"
+            ],
+            "description": "Note kind"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z0-9_-]+$",
+              "maxLength": 32
+            },
+            "maxItems": 8,
+            "description": "Lowercase tags"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "repo",
+              "global",
+              "both"
+            ],
+            "default": "both",
+            "description": "repo: this repository; global: shared by all repositories"
+          },
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository, when the server cannot tell it from its working directory"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "memory_search",
+      "description": "Call FIRST at the start of every task: returns known fixes, decisions and file locations for this repository. Find notes by a few keywords; repository notes are listed before global ones, and without a query the most recent notes are listed. A message that starts with a `<harness-memory-recall>` block already carries the notes found for that message: search further only if needed.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "A few keywords (at most 256 characters)"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "repo",
+              "global",
+              "both"
+            ],
+            "default": "both",
+            "description": "repo: this repository; global: shared by all repositories"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "outcome",
+              "problem",
+              "fix",
+              "optimisation",
+              "location",
+              "decision",
+              "note"
+            ],
+            "description": "Note kind"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "description": "Rows (default 8)"
+          },
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository, when the server cannot tell it from its working directory"
+          },
+          "same_checkout": {
+            "type": "boolean",
+            "default": false,
+            "description": "Only repository notes last written from the current checkout, not through project_path"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "memory_get",
+      "description": "Read whole notes by id.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "ids": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "minItems": 1,
+            "maxItems": 5,
+            "description": "Note ids"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "repo",
+              "global",
+              "both"
+            ],
+            "default": "both",
+            "description": "repo: this repository; global: shared by all repositories"
+          },
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository, when the server cannot tell it from its working directory"
+          }
+        },
+        "required": [
+          "ids"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "memory_link",
+      "description": "Relate two entities: `from relation to`, for example `GitCli located_in business/src/git/cli.rs` or `retry-fix resolves flaky-test`. Missing entities are created.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "from": {
+            "type": "string",
+            "description": "Entity name (at most 80 characters)"
+          },
+          "relation": {
+            "type": "string",
+            "description": "Relation such as located_in, resolves, depends_on (at most 40 characters)"
+          },
+          "to": {
+            "type": "string",
+            "description": "Entity name (at most 80 characters)"
+          },
+          "note_id": {
+            "type": "integer",
+            "description": "A note explaining the relation"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "repo",
+              "global"
+            ],
+            "default": "repo",
+            "description": "repo: this repository; global: shared by all repositories"
+          },
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository, when the server cannot tell it from its working directory"
+          }
+        },
+        "required": [
+          "from",
+          "relation",
+          "to"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "memory_neighbors",
+      "description": "Show the relations around an entity and the notes linked to them.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "entity": {
+            "type": "string",
+            "description": "Entity name"
+          },
+          "depth": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2,
+            "description": "Hops (default 1)"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "description": "Relations (default 20)"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "repo",
+              "global",
+              "both"
+            ],
+            "default": "both",
+            "description": "repo: this repository; global: shared by all repositories"
+          },
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository, when the server cannot tell it from its working directory"
+          }
+        },
+        "required": [
+          "entity"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "memory_forget",
+      "description": "Delete an outdated or wrong note (id, looked up in this repository and the global scope unless scope is given), an entity with its relations (entity), or one relation (from, relation, to). Give exactly one of these forms.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Note id"
+          },
+          "entity": {
+            "type": "string",
+            "description": "Entity name"
+          },
+          "from": {
+            "type": "string",
+            "description": "Relation source entity"
+          },
+          "relation": {
+            "type": "string",
+            "description": "Relation"
+          },
+          "to": {
+            "type": "string",
+            "description": "Relation target entity"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "repo",
+              "global"
+            ],
+            "default": "repo",
+            "description": "repo: this repository; global: shared by all repositories"
+          },
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository, when the server cannot tell it from its working directory"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

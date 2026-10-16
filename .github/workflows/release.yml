@@ -1,0 +1,240 @@
+name: Release
+
+# After CI succeeds on main, semantic-release analyses the Conventional Commits since the last tag.
+# fix: -> patch, feat: -> minor, "BREAKING CHANGE:" footer or "feat!:" -> major, other types do not release.
+# On a release it bumps package.json/Cargo.toml/Cargo.lock, updates CHANGELOG.md, pushes the release commit and
+# the vX.Y.Z tag and creates a DRAFT GitHub release. The build jobs then compile harness-memory for every platform
+# from the release commit with read-only permissions (they run third-party build scripts, so they get no token that
+# can write) and hand the binaries over as workflow artifacts. Only the publish job can write: it runs no build code,
+# checks it received exactly the four expected binaries, writes checksums.txt from those files, attests them, uploads
+# them to the draft, re-checks the draft against checksums.txt and finally un-drafts the release.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+# Releases run one at a time and are never cancelled half-way (a cancelled run could leave a tag without binaries).
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  BUN_VERSION: 1.4.2
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    name: Version and draft release
+    # Only releases from main: CI must have passed for a push to main, or a manual run on main.
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main')
+      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the release commit + tag, create the draft release
+    outputs:
+      # Written by the exec plugin's successCmd (see .releaserc.json). Empty when nothing was released.
+      released: ${{ steps.semantic-release.outputs.released }}
+      version: ${{ steps.semantic-release.outputs.version }}
+      # The commit the release tag points at. Every later job builds exactly this commit.
+      sha: ${{ steps.release-sha.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The commit CI validated. If main has moved on since, semantic-release sees a stale
+          # branch and does nothing, the newer push gets its own run.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0 # semantic-release needs the full history and tags
+          persist-credentials: false # semantic-release authenticates with GITHUB_TOKEN itself
+      # semantic-release is a Node program (it needs Node >= 22.14), bunx runs it through `node`.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - name: semantic-release
+        id: semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bunx semantic-release
+      - name: Resolve the release commit
+        id: release-sha
+        if: ${{ steps.semantic-release.outputs.released == 'true' }}
+        env:
+          VERSION: ${{ steps.semantic-release.outputs.version }}
+        run: |
+          sha="$(git rev-parse --verify "refs/tags/v${VERSION}^{commit}")"
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.triple }})
+    needs: release
+    # An empty sha would make checkout fall back to github.sha, which is not the release commit.
+    if: ${{ needs.release.outputs.released == 'true' && needs.release.outputs.sha != '' }}
+    runs-on: ${{ matrix.os }}
+    # Third-party build.rs files and proc-macros run here: no write access to the repository or the release.
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # triple: the Rust target triple, also the suffix of the release asset harness-memory-<triple>.
+        # Both macOS builds run on the same arm64 runner. The Intel one is cross-compiled, so it is not run here.
+        # There is no Linux arm64 build.
+        include:
+          - os: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+            runnable: true
+          - os: macos-latest
+            triple: aarch64-apple-darwin
+            runnable: true
+          - os: macos-latest
+            triple: x86_64-apple-darwin
+            runnable: false
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            runnable: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release.outputs.sha }} # the release commit, it carries the bumped manifests
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Add Rust target
+        run: rustup target add "$TARGET"
+        env:
+          TARGET: ${{ matrix.triple }}
+      # No build cache here on purpose: a cache written by another workflow run could poison a release binary.
+      - run: cargo build --release --locked --target "$TRIPLE"
+        env:
+          TRIPLE: ${{ matrix.triple }}
+      - name: Smoke test and name the binary
+        env:
+          TRIPLE: ${{ matrix.triple }}
+          RUNNABLE: ${{ matrix.runnable }}
+        run: |
+          ext=""
+          if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
+          src="target/${TRIPLE}/release/harness-memory${ext}"
+          test -s "$src" || { echo "::error::$src is missing, the build did not produce it"; exit 1; }
+          if [ "$RUNNABLE" = "true" ]; then "$src" --version; fi
+          mkdir -p release-asset
+          cp "$src" "release-asset/harness-memory-${TRIPLE}${ext}"
+      - name: Hand the binary to the publish job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bin-${{ matrix.triple }}
+          path: release-asset/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish release
+    needs: [release, build]
+    runs-on: ubuntu-latest
+    # No third-party build code runs in this job, it only handles the finished binaries.
+    permissions:
+      contents: write # upload the assets to the draft and un-draft it
+      id-token: write # sign the build provenance attestations
+      attestations: write # store them, for `gh attestation verify`
+    steps:
+      # One folder per artifact (no merging): an extra artifact from a build job cannot overwrite another
+      # platform's binary unnoticed, it fails the check below.
+      - name: Download the binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bin-*
+          path: ${{ runner.temp }}/artifacts
+          merge-multiple: false
+      # Exactly bin-<triple>/harness-memory-<triple>[.exe] for the four triples, nothing else, every binary a
+      # non-empty regular file; then the binaries are copied into one flat folder for the steps below.
+      - name: Check the downloaded set
+        run: |
+          : > "$RUNNER_TEMP/expected.txt"
+          for name in \
+            harness-memory-aarch64-apple-darwin \
+            harness-memory-x86_64-apple-darwin \
+            harness-memory-x86_64-pc-windows-msvc.exe \
+            harness-memory-x86_64-unknown-linux-gnu; do
+            dir="bin-${name#harness-memory-}"
+            dir="${dir%.exe}"
+            printf '%s\n%s/%s\n' "$dir" "$dir" "$name" >> "$RUNNER_TEMP/expected.txt"
+          done
+          LC_ALL=C sort -o "$RUNNER_TEMP/expected.txt" "$RUNNER_TEMP/expected.txt"
+          cd "$RUNNER_TEMP/artifacts"
+          find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/found.txt"
+          if ! diff "$RUNNER_TEMP/expected.txt" "$RUNNER_TEMP/found.txt"; then
+            echo "::error::The build artifacts are not exactly the four expected binaries"
+            exit 1
+          fi
+          mkdir "$RUNNER_TEMP/assets"
+          grep / "$RUNNER_TEMP/expected.txt" > "$RUNNER_TEMP/binaries.txt"
+          while read -r f; do
+            if [ ! -f "$f" ] || [ -L "$f" ] || [ ! -s "$f" ]; then
+              echo "::error::$f is not a non-empty regular file"
+              exit 1
+            fi
+            cp -- "$f" "$RUNNER_TEMP/assets/"
+          done < "$RUNNER_TEMP/binaries.txt"
+      # install.sh / install.ps1 install nothing without a SHA-256 to compare against.
+      - name: Build checksums.txt
+        run: |
+          cd "$RUNNER_TEMP/assets"
+          sha256sum -- harness-memory-* > checksums.txt
+          cat checksums.txt
+      # Signed provenance for every asset: proof it was built here, from this commit.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: ${{ runner.temp }}/assets/*
+      - name: Upload the assets to the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          cd "$RUNNER_TEMP/assets"
+          gh release upload "v$VERSION" harness-memory-* checksums.txt --repo "$GITHUB_REPOSITORY" --clobber
+      # What is on the draft now must be exactly what was built here: nothing added, nothing swapped.
+      - name: Verify the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          check="$RUNNER_TEMP/draft"
+          { cat "$RUNNER_TEMP/expected.txt"; echo checksums.txt; } | LC_ALL=C sort > "$RUNNER_TEMP/expected-all.txt"
+          gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | LC_ALL=C sort > "$RUNNER_TEMP/draft-names.txt"
+          if ! diff "$RUNNER_TEMP/expected-all.txt" "$RUNNER_TEMP/draft-names.txt"; then
+            echo "::error::The draft release does not hold exactly the four binaries and checksums.txt"
+            exit 1
+          fi
+          gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" --dir "$check"
+          cd "$check"
+          find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/draft-files.txt"
+          if ! diff "$RUNNER_TEMP/expected-all.txt" "$RUNNER_TEMP/draft-files.txt"; then
+            echo "::error::The downloaded draft assets differ from the expected set"
+            exit 1
+          fi
+          # checksums.txt lines are "<64 hex>  <name>": the names must be exactly the four binaries.
+          cut -c67- checksums.txt | LC_ALL=C sort > "$RUNNER_TEMP/listed.txt"
+          if ! diff "$RUNNER_TEMP/expected.txt" "$RUNNER_TEMP/listed.txt"; then
+            echo "::error::checksums.txt does not list exactly the four binaries"
+            exit 1
+          fi
+          sha256sum --check --strict checksums.txt
+          cmp checksums.txt "$RUNNER_TEMP/assets/checksums.txt"
+      - name: Publish the draft release as latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false --latest
