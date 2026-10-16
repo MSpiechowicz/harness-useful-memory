@@ -67,6 +67,18 @@ fn binary(machine: &Machine, args: &[&str], url: Option<&str>) -> Command {
     command
 }
 
+/// The config file the executable reads on this OS for `machine` (macOS ignores `XDG_CONFIG_HOME`
+/// and `APPDATA` and uses `~/Library/Application Support`).
+fn config_file(machine: &Machine) -> PathBuf {
+    let dir = if cfg!(target_os = "macos") {
+        machine.home.join("Library").join("Application Support")
+    } else {
+        machine.config.clone()
+    };
+
+    dir.join("harness-memory").join("config.toml")
+}
+
 fn run(mut command: Command) -> Output {
     command.stdin(Stdio::null()).output().expect("run")
 }
@@ -117,7 +129,7 @@ fn bad_team_settings_stop_the_server() {
         stderr(&remote_plaintext)
     );
 
-    let file = machine.config.join("harness-memory").join("config.toml");
+    let file = config_file(&machine);
     std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
     std::fs::write(&file, "database_ulr = \"postgres://u:hunter2@db/m\"\n").expect("write");
     let typo = run(binary(&machine, &["mcp"], None));

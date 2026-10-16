@@ -556,6 +556,7 @@ pub fn permission_warning(path: &Path) -> Option<String> {
 }
 
 /// True when the group or everyone may read a file with Unix `mode`.
+#[cfg(unix)]
 fn readable_by_others(mode: u32) -> bool {
     mode & 0o044 != 0
 }
@@ -941,6 +942,7 @@ mod tests {
         assert_eq!(config_dir(&windows), Some(roaming));
     }
 
+    #[cfg(unix)]
     #[test]
     fn group_or_world_readable_modes_are_reported() {
         assert!(!readable_by_others(0o100600));
