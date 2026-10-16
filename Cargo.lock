@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "harness_memory"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "dunce",
  "insta",
