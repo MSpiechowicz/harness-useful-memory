@@ -233,6 +233,8 @@ mod tests {
             Ok(SslMode::Disable)
         );
         assert_eq!(mode("postgres://[::1]/m?sslmode=require"), Ok(SslMode::Require));
+        // A socket folder is local only where there are Unix sockets. Windows reads it as a host name.
+        #[cfg(unix)]
         assert_eq!(mode("postgres:///m?host=/run/postgresql"), Ok(SslMode::Prefer));
     }
 
