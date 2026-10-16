@@ -100,7 +100,7 @@ impl PostgresStore {
         self.ready()?;
 
         match operation(&mut self.client) {
-            Err(StoreError::Backend(_)) if self.client.is_closed() => {
+            Err(error) if self.client.is_closed() || ended(&error) => {
                 self.client = open(&self.settings)?;
                 operation(&mut self.client)
             }
@@ -117,7 +117,7 @@ impl PostgresStore {
         self.ready()?;
 
         let result = match transact(&mut self.client, &mut operation) {
-            Err(Failure::BeforeCommit(StoreError::Backend(_))) if self.client.is_closed() => {
+            Err(Failure::BeforeCommit(error)) if self.client.is_closed() || ended(&error) => {
                 self.client = open(&self.settings)?;
                 transact(&mut self.client, &mut operation)
             }
@@ -254,6 +254,14 @@ fn open(settings: &connect::Settings) -> Result<Client, StoreError> {
 /// fixed description (see [`described`]): the server's message, detail and hint can quote stored
 /// values or text a teammate raised, so none of them is kept. Any other error is the error and its
 /// causes, at most 200 characters.
+/// Whether `error` says the server ended this session (an administrator or a restart terminated
+/// it: SQLSTATE 57P01, 57P02, 57P03). The client may not have noticed the closed socket yet, so
+/// this counts as a lost connection like [`Client::is_closed`].
+fn ended(error: &StoreError) -> bool {
+    matches!(error, StoreError::Backend(message)
+        if ["57P01", "57P02", "57P03"].iter().any(|code| message.contains(&format!("SQLSTATE {code}"))))
+}
+
 fn backend(error: postgres::Error) -> StoreError {
     let message = match error.as_db_error() {
         Some(db) => described(db.code().code()),
