@@ -1,0 +1,19 @@
+{
+  "name": "harness-memory",
+  "version": "0.1.0",
+  "description": "Project memory for coding agents: a local stdio MCP server with notes and an entity graph in SQLite",
+  "license": "GPL-3.0-or-later",
+  "private": true,
+  "type": "module",
+  "repository": "https://github.com/MSpiechowicz/harness-useful-memory",
+  "scripts": {
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@semantic-release/changelog": "^7.0.0",
+    "@semantic-release/exec": "^7.1.0",
+    "@semantic-release/git": "^11.0.1",
+    "@types/bun": "^1.4.2",
+    "semantic-release": "^25.0.9"
+  }
+}
