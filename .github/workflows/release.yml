@@ -161,7 +161,7 @@ jobs:
       # non-empty regular file; then the binaries are copied into one flat folder for the steps below.
       - name: Check the downloaded set
         run: |
-          : > "$RUNNER_TEMP/expected.txt"
+          : > "$RUNNER_TEMP/artifacts.txt"
           for name in \
             harness-memory-aarch64-apple-darwin \
             harness-memory-x86_64-apple-darwin \
@@ -169,17 +169,19 @@ jobs:
             harness-memory-x86_64-unknown-linux-gnu; do
             dir="bin-${name#harness-memory-}"
             dir="${dir%.exe}"
-            printf '%s\n%s/%s\n' "$dir" "$dir" "$name" >> "$RUNNER_TEMP/expected.txt"
+            printf '%s\n%s/%s\n' "$dir" "$dir" "$name" >> "$RUNNER_TEMP/artifacts.txt"
           done
-          LC_ALL=C sort -o "$RUNNER_TEMP/expected.txt" "$RUNNER_TEMP/expected.txt"
+          LC_ALL=C sort -o "$RUNNER_TEMP/artifacts.txt" "$RUNNER_TEMP/artifacts.txt"
           cd "$RUNNER_TEMP/artifacts"
           find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/found.txt"
-          if ! diff "$RUNNER_TEMP/expected.txt" "$RUNNER_TEMP/found.txt"; then
+          if ! diff "$RUNNER_TEMP/artifacts.txt" "$RUNNER_TEMP/found.txt"; then
             echo "::error::The build artifacts are not exactly the four expected binaries"
             exit 1
           fi
           mkdir "$RUNNER_TEMP/assets"
-          grep / "$RUNNER_TEMP/expected.txt" > "$RUNNER_TEMP/binaries.txt"
+          grep / "$RUNNER_TEMP/artifacts.txt" > "$RUNNER_TEMP/binaries.txt"
+          # The bare file names, which the steps below compare the release against.
+          sed 's#.*/##' "$RUNNER_TEMP/binaries.txt" | LC_ALL=C sort > "$RUNNER_TEMP/expected.txt"
           while read -r f; do
             if [ ! -f "$f" ] || [ -L "$f" ] || [ ! -s "$f" ]; then
               echo "::error::$f is not a non-empty regular file"
