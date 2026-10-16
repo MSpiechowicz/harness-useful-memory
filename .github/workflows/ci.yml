@@ -45,6 +45,72 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
           "target/release/harness-memory${ext}" --version
 
+  # The team-memory stores against real PostgreSQL, libSQL (sqld) and MongoDB servers. The store tests skip themselves
+  # when their *_URL variable is unset, so the other jobs run without these servers. The images are pinned by digest
+  # (the comment names the tag it was taken from).
+  team-backends:
+    name: Team backends
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3 # postgres:17
+        env:
+          POSTGRES_PASSWORD: ci-postgres-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      libsql:
+        image: ghcr.io/tursodatabase/libsql-server@sha256:6dd3eb276d9d3604e4a48ac4a999a2e267814732d57d7e94c04ba71482333a67 # libsql-server:latest
+        env:
+          SQLD_NODE: primary
+          SQLD_HTTP_LISTEN_ADDR: 0.0.0.0:8080
+        ports:
+          - 8080:8080
+    env:
+      HARNESS_MEMORY_TEST_POSTGRES_URL: postgres://postgres:ci-postgres-password@localhost:5432/postgres?sslmode=disable
+      HARNESS_MEMORY_TEST_LIBSQL_URL: http://localhost:8080
+      HARNESS_MEMORY_TEST_MONGO_URL: mongodb://localhost:27017/?replicaSet=rs0&directConnection=true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # A service container cannot take command arguments, and transactions need a replica set.
+      - name: Start MongoDB as a single-node replica set
+        run: |
+          # mongo:8
+          docker run -d --name mongo -p 27017:27017 mongo@sha256:d0c8f51bb63fb1f992f4ff05293adb3f0967aaaae32c3e5fa567907800819b3b --replSet rs0 --bind_ip_all
+          for _ in $(seq 1 30); do
+            if docker exec mongo mongosh --quiet --eval 'db.hello().ok' >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          docker exec mongo mongosh --quiet --eval 'rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "localhost:27017" }] })'
+          for _ in $(seq 1 30); do
+            if docker exec mongo mongosh --quiet --eval 'quit(db.hello().isWritablePrimary ? 0 : 1)' >/dev/null 2>&1; then exit 0; fi
+            sleep 2
+          done
+          echo "MongoDB did not become primary" >&2
+          docker logs mongo
+          exit 1
+      - name: Wait for libSQL
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/health >/dev/null; then exit 0; fi
+            sleep 2
+          done
+          echo "libSQL did not become healthy" >&2
+          exit 1
+      # rust-toolchain.toml pins the version, install it when the runner lacks it.
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test --locked
+
   # Supply-chain policy for the Rust dependencies (see deny.toml).
   rust-deps:
     name: Rust dependency audit

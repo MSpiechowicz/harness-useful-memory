@@ -11,6 +11,14 @@ allow = [
   "Unicode-3.0",
   # foldhash (hashbrown).
   "Zlib",
+  # ring, rustls-webpki and untrusted (TLS for the team database).
+  "ISC",
+  # subtle (TLS for the team database).
+  "BSD-3-Clause",
+  # webpki-roots: the Mozilla root certificates the MongoDB driver's rustls TLS trusts.
+  "CDLA-Permissive-2.0",
+  # tiny-keccak, a build-time dependency of the MongoDB driver's macros.
+  "CC0-1.0",
   # This crate.
   "GPL-3.0-or-later",
 ]

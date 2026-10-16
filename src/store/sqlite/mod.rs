@@ -3,21 +3,31 @@
 //! Several servers (one per running agent) share the file: every write runs in an `IMMEDIATE`
 //! transaction and waits up to 5 s for the lock, so writers queue instead of failing with BUSY.
 //! Input is cleaned and checked before that transaction opens, so a rejected call never holds it.
+//!
+//! The statements themselves (`notes`, `search`, `graph`, the migrations in [`schema`]) run
+//! through [`sql::Sql`] and the operations through [`engine::Engine`], so the libSQL backend
+//! ([`crate::store::libsql`]) shares them: one SQL dialect, one behaviour.
 
+pub(crate) mod engine;
 mod graph;
+mod local;
 mod notes;
 pub mod schema;
 mod search;
+pub(crate) mod sql;
 
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, TransactionBehavior};
 
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, ProjectKey};
 use super::{Saved, SearchQuery, StoreError, Target, View};
+use engine::Engine;
+use local::Local;
 use schema::SchemaState;
+use sql::{Sql, args};
 
 /// How long a statement waits for another server's lock.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -79,67 +89,56 @@ impl SqliteStore {
 
         Ok(&mut self.conn)
     }
+}
 
-    fn write(&mut self) -> Result<Transaction<'_>, StoreError> {
-        let conn = self.conn()?;
-        Ok(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
+impl Engine for SqliteStore {
+    fn write<T>(&mut self, op: impl FnOnce(&mut dyn Sql) -> Result<T, StoreError>) -> Result<T, StoreError> {
+        let tx = self.conn()?.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let done = op(&mut Local(&tx))?;
+        tx.commit()?;
+        Ok(done)
+    }
+
+    fn read<T>(&mut self, op: impl FnOnce(&mut dyn Sql) -> Result<T, StoreError>) -> Result<T, StoreError> {
+        op(&mut Local(self.conn()?))
     }
 }
 
 impl MemoryStore for SqliteStore {
     fn remember(&mut self, target: &Target, draft: &NoteDraft) -> Result<Saved, StoreError> {
-        let draft = notes::prepare(draft)?;
-        let tx = self.write()?;
-        let saved = notes::remember(&tx, target, &draft)?;
-        tx.commit()?;
-        Ok(saved)
+        engine::remember(self, target, draft)
     }
 
     fn update(&mut self, view: &View, id: i64, patch: &NotePatch) -> Result<Saved, StoreError> {
-        let patch = notes::prepare_patch(patch)?;
-        let tx = self.write()?;
-        let saved = notes::update(&tx, view, id, &patch)?;
-        tx.commit()?;
-        Ok(saved)
+        engine::update(self, view, id, patch)
     }
 
     fn get(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
-        let tx = self.write()?;
-        let found = notes::get(&tx, view, ids)?;
-        tx.commit()?;
-        Ok(found)
+        engine::get(self, view, ids)
     }
 
     fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
-        search::search(self.conn()?, query)
+        engine::search(self, query)
     }
 
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {
-        search::similar(self.conn()?, view, id, limit)
+        engine::similar(self, view, id, limit)
     }
 
     fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {
-        let link = graph::prepare(link)?;
-        let tx = self.write()?;
-        let edge = graph::link(&tx, target, &link)?;
-        tx.commit()?;
-        Ok(edge)
+        engine::link(self, target, link)
     }
 
     fn neighbors(&mut self, view: &View, entity: &str, depth: u8, limit: usize) -> Result<Neighborhood, StoreError> {
-        graph::neighbors(self.conn()?, view, entity, depth, limit)
+        engine::neighbors(self, view, entity, depth, limit)
     }
 
     fn forget(&mut self, view: &View, target: &Target, what: &Forget) -> Result<usize, StoreError> {
-        let what = graph::prepare_forget(what)?;
-        let tx = self.write()?;
-        let deleted = match &what {
-            Forget::Note(id) => notes::forget(&tx, view, *id)?,
-            Forget::Entity(name) => graph::forget_entity(&tx, target, name)?,
-            Forget::Relation { from, relation, to } => graph::forget_relation(&tx, target, from, relation, to)?,
-        };
-        tx.commit()?;
-        Ok(deleted)
+        engine::forget(self, view, target, what)
+    }
+
+    fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
+        engine::find_by_title(self, target, title)
     }
 }
 
@@ -208,9 +207,9 @@ fn now() -> i64 {
 
 /// The SQL parameters of a view: the repository's project id (NULL when the repository has no
 /// rows yet or is not visible) and whether global rows are visible.
-fn view_params(conn: &Connection, view: &View) -> Result<(Option<i64>, bool), StoreError> {
+fn view_params(db: &mut dyn Sql, view: &View) -> Result<(Option<i64>, bool), StoreError> {
     let repo = match &view.repo {
-        Some(key) => project_id(conn, key)?,
+        Some(key) => project_id(db, key)?,
         None => None,
     };
 
@@ -218,26 +217,27 @@ fn view_params(conn: &Connection, view: &View) -> Result<(Option<i64>, bool), St
 }
 
 /// The project id of `key`, if it has rows.
-fn project_id(conn: &Connection, key: &ProjectKey) -> Result<Option<i64>, StoreError> {
-    let id = conn
-        .query_row("SELECT id FROM projects WHERE key = ?1", [&key.key], |row| row.get(0))
-        .optional()?;
-
-    Ok(id)
+fn project_id(db: &mut dyn Sql, key: &ProjectKey) -> Result<Option<i64>, StoreError> {
+    db.value("SELECT id FROM projects WHERE key = ?1", args![&key.key])
 }
 
 /// The project id a write to `target` uses (`None` for global), registering the repository.
-fn target_project(tx: &Transaction<'_>, target: &Target) -> Result<Option<i64>, StoreError> {
+fn target_project(db: &mut dyn Sql, target: &Target) -> Result<Option<i64>, StoreError> {
     let Target::Repo(key) = target else {
         return Ok(None);
     };
 
-    let id = tx.query_row(
+    let id = db.one(
         "INSERT INTO projects (key, root_path, remote, created_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?4)
          ON CONFLICT (key) DO UPDATE SET
              root_path = excluded.root_path, remote = excluded.remote, last_seen_at = excluded.last_seen_at
          RETURNING id",
-        params![key.key, key.root.to_string_lossy(), key.remote, now()],
+        args![
+            &key.key,
+            key.root.to_string_lossy().into_owned(),
+            key.remote.as_deref(),
+            now()
+        ],
         |row| row.get(0),
     )?;
 
@@ -246,9 +246,9 @@ fn target_project(tx: &Transaction<'_>, target: &Target) -> Result<Option<i64>, 
 
 /// The project id of an existing scope for reads and deletes (`Ok(None)` inside means global;
 /// the outer `None` means the repository has no rows).
-fn target_project_existing(conn: &Connection, target: &Target) -> Result<Option<Option<i64>>, StoreError> {
+fn target_project_existing(db: &mut dyn Sql, target: &Target) -> Result<Option<Option<i64>>, StoreError> {
     match target {
         Target::Global => Ok(Some(None)),
-        Target::Repo(key) => Ok(project_id(conn, key)?.map(Some)),
+        Target::Repo(key) => Ok(project_id(db, key)?.map(Some)),
     }
 }

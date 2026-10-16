@@ -8,7 +8,12 @@ use std::path::PathBuf;
 
 use super::Error;
 
-/// Environment variables captured by [`Env::from_process`]. Nothing else is read.
+/// Environment variables captured by [`Env::from_process`]: the only ones the server's own logic
+/// reads. Libraries and children read their own standard ones: the TLS setup of the team database
+/// drivers may read `SSL_CERT_FILE` and `SSL_CERT_DIR` for the trusted CA certificates, the
+/// libSQL client ignores proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`), and
+/// `git` gets the process environment without `GIT_*` and the team database settings (see
+/// [`super::git`]).
 pub const CAPTURED_VARS: &[&str] = &[
     // Where `git` is looked up.
     "PATH",
@@ -19,7 +24,17 @@ pub const CAPTURED_VARS: &[&str] = &[
     "XDG_CONFIG_HOME",
     // The database folder override (see `crate::location::DIR_VAR`).
     "HARNESS_MEMORY_DIR",
+    // The team database and its config file (see `crate::backend`). The URL and the token are
+    // secrets: `Env`'s `Debug` hides them.
+    "HARNESS_MEMORY_DATABASE_URL",
+    "HARNESS_MEMORY_DATABASE_TOKEN",
+    "HARNESS_MEMORY_CONFIG",
+    // The Windows config folder (roaming), which holds the config file.
+    "APPDATA",
 ];
+
+/// Captured variables whose values [`Env`]'s `Debug` shows as `••••`.
+const SECRET_VARS: &[&str] = &["HARNESS_MEMORY_DATABASE_URL", "HARNESS_MEMORY_DATABASE_TOKEN"];
 
 /// Operating-system family, used for platform-specific paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +61,7 @@ impl OsKind {
 }
 
 /// Snapshot of the environment the server depends on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Env {
     /// The user's home directory.
     pub home: PathBuf,
@@ -54,6 +69,29 @@ pub struct Env {
     pub vars: BTreeMap<String, String>,
     /// OS family.
     pub os: OsKind,
+}
+
+impl std::fmt::Debug for Env {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let vars: BTreeMap<&str, &str> = self
+            .vars
+            .iter()
+            .map(|(name, value)| {
+                let shown = if SECRET_VARS.contains(&name.as_str()) {
+                    "••••"
+                } else {
+                    value.as_str()
+                };
+                (name.as_str(), shown)
+            })
+            .collect();
+
+        f.debug_struct("Env")
+            .field("home", &self.home)
+            .field("vars", &vars)
+            .field("os", &self.os)
+            .finish()
+    }
 }
 
 impl Env {
@@ -127,6 +165,18 @@ mod tests {
 
         assert_eq!(env.var("XDG_DATA_HOME"), None);
         assert_eq!(env.with_var("PATH", "/bin").var("PATH"), Some("/bin"));
+    }
+
+    #[test]
+    fn debug_output_hides_the_database_secrets() {
+        let env = Env::for_tests("/home/u")
+            .with_var("HARNESS_MEMORY_DATABASE_URL", "postgres://u:hunter2@db/m")
+            .with_var("HARNESS_MEMORY_DATABASE_TOKEN", "tok-secret")
+            .with_var("PATH", "/bin");
+        let shown = format!("{env:?}");
+
+        assert!(!shown.contains("hunter2") && !shown.contains("tok-secret"), "{shown}");
+        assert!(shown.contains("/bin"), "{shown}");
     }
 
     #[test]

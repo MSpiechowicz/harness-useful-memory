@@ -1,15 +1,22 @@
 //! The storage contract of the memory server.
 //!
-//! [`MemoryStore`] is what the MCP tools call; [`sqlite::SqliteStore`] is the local backend. A
-//! remote backend can implement the same trait later. Every implementation validates its input
-//! against [`crate::limits`] and masks secrets with `redact_text` before anything is stored (the
-//! helpers in [`clean`] do both), so callers may pass raw agent text.
+//! [`MemoryStore`] is what the MCP tools call; [`sqlite::SqliteStore`] is the local backend, and
+//! [`postgres::PostgresStore`] and [`libsql::LibsqlStore`] are shared team databases. Every
+//! implementation validates its input against [`crate::limits`] and masks secrets with
+//! `redact_text` before anything is stored (the helpers in [`clean`] do both), so callers may pass
+//! raw agent text.
 
 pub mod clean;
+pub mod libsql;
+pub mod mongo;
+pub mod postgres;
 pub mod sqlite;
 
 use std::path::PathBuf;
 
+pub use libsql::LibsqlStore;
+pub use mongo::MongoStore;
+pub use postgres::PostgresStore;
 pub use sqlite::SqliteStore;
 pub(crate) use sqlite::prepare_new_file;
 
@@ -334,4 +341,43 @@ pub trait MemoryStore: Send {
     /// Deletes a note (visible in `view`), or an entity or relation in the scope `target`.
     /// Returns the number of deleted rows (relations included for an entity).
     fn forget(&mut self, view: &View, target: &Target, what: &Forget) -> Result<usize, StoreError>;
+
+    /// The note in the scope `target` (not the global scope too) whose title compares equal to
+    /// `title` the way [`MemoryStore::remember`] compares titles. `harness-memory push` uses it to
+    /// decide between adding, updating and skipping a note.
+    ///
+    /// The default searches for the title and reads the best exact match, which counts a hit and
+    /// can miss when more than [`crate::limits::SEARCH_LIMIT_MAX`] notes outrank it; backends
+    /// override it with an exact lookup that counts no hit.
+    fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
+        let wanted = clean::normalize(&clean::title(title)?);
+        let view = match target {
+            Target::Repo(key) => View {
+                repo: Some(key.clone()),
+                global: false,
+            },
+            Target::Global => View {
+                repo: None,
+                global: true,
+            },
+        };
+
+        let query = SearchQuery {
+            text: title.chars().take(crate::limits::QUERY_MAX).collect(),
+            view: view.clone(),
+            kind: None,
+            limit: crate::limits::SEARCH_LIMIT_MAX,
+            checkout: None,
+        };
+
+        let found = self
+            .search(&query)?
+            .into_iter()
+            .find(|hit| clean::normalize(&hit.title) == wanted);
+
+        match found {
+            Some(hit) => Ok(self.get(&view, &[hit.id])?.into_iter().next()),
+            None => Ok(None),
+        }
+    }
 }

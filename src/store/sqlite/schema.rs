@@ -1,6 +1,10 @@
-//! The database schema and its version (`PRAGMA user_version`).
+//! The database schema and its version (`PRAGMA user_version`), shared by the local file and the
+//! libSQL backend.
 
 use rusqlite::{Connection, TransactionBehavior};
+
+use super::sql::{Sql, args};
+use crate::store::StoreError;
 
 /// The schema version this server writes.
 pub const SCHEMA_VERSION: i64 = 2;
@@ -103,6 +107,9 @@ UPDATE notes SET writer_root = (SELECT p.root_path FROM projects p WHERE p.id = 
     WHERE project_id IS NOT NULL;
 ";
 
+/// The migrations in order, each with the version it brings the database to.
+const STEPS: [(i64, &str); 2] = [(1, V1), (2, V2)];
+
 /// Brings the database to [`SCHEMA_VERSION`]; a newer database is reported, not changed.
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<SchemaState> {
     match user_version(conn)? {
@@ -119,12 +126,10 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<SchemaState> {
         return Ok(SchemaState::Newer);
     }
 
-    if version < 1 {
-        tx.execute_batch(V1)?;
-    }
-
-    if version < 2 {
-        tx.execute_batch(V2)?;
+    for (step, sql) in STEPS {
+        if version < step {
+            tx.execute_batch(sql)?;
+        }
     }
 
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -136,4 +141,21 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<SchemaState> {
 /// `PRAGMA user_version`.
 pub fn user_version(conn: &Connection) -> rusqlite::Result<i64> {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
+}
+
+/// `PRAGMA user_version` through [`Sql`].
+pub(crate) fn version_of(db: &mut dyn Sql) -> Result<i64, StoreError> {
+    db.one("PRAGMA user_version", args![], |row| row.get(0))
+}
+
+/// Runs the migrations a database at `version` lacks and records [`SCHEMA_VERSION`], inside the
+/// caller's write transaction (the statements [`migrate`] runs on a local file).
+pub(crate) fn upgrade(db: &mut dyn Sql, version: i64) -> Result<(), StoreError> {
+    for (step, sql) in STEPS {
+        if version < step {
+            db.batch(sql)?;
+        }
+    }
+
+    db.batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
 }

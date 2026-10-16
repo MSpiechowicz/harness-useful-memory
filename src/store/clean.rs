@@ -12,13 +12,152 @@
 
 use std::collections::HashSet;
 
-use super::StoreError;
+use super::{Forget, Link, NoteDraft, NoteKind, NotePatch, Provenance, StoreError};
 use crate::limits::{BODY_MAX, ENTITIES_PER_NOTE, ENTITY_MAX, RELATION_MAX, TAG_MAX, TAGS_MAX, TITLE_MAX};
 use crate::support::redact::redact_text;
 use crate::support::text::display_safe;
 
 /// What `redact_text` puts in place of a secret.
 const MASK: &str = "••••";
+
+/// A [`NoteDraft`] cleaned and checked, ready to store. Backends clean before they open a write
+/// transaction, so nothing slow runs while other writers wait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanDraft {
+    pub title: String,
+    /// The comparison form of the title ([`normalize`]): unique per scope.
+    pub title_norm: String,
+    pub body: String,
+    pub kind: NoteKind,
+    /// The tags joined by single spaces.
+    pub tags: String,
+    pub entities: Vec<String>,
+    pub writer: Writer,
+}
+
+/// A [`NotePatch`] cleaned and checked; `body` and `append` are not masked yet (see
+/// [`patched_body`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanPatch {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub append: Option<String>,
+    pub kind: Option<NoteKind>,
+    pub tags: Option<Vec<String>>,
+    pub writer: Writer,
+}
+
+/// A [`Provenance`] as stored. An unknown writer is stored as such (no root and no source), so a
+/// note never keeps the name of an earlier writer for a write it did not make.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Writer {
+    pub root: Option<String>,
+    pub source: Option<String>,
+    pub via_override: bool,
+}
+
+impl Writer {
+    pub fn new(provenance: &Provenance) -> Self {
+        Self {
+            root: provenance.root.as_ref().map(|root| root.to_string_lossy().into_owned()),
+            source: source(provenance.source.as_deref()),
+            via_override: provenance.via_override,
+        }
+    }
+}
+
+/// `draft` cleaned and checked.
+pub fn draft(draft: &NoteDraft) -> Result<CleanDraft, StoreError> {
+    let title = title(&draft.title)?;
+
+    Ok(CleanDraft {
+        title_norm: normalize(&title),
+        title,
+        body: body(&draft.body)?,
+        kind: draft.kind,
+        tags: tags(&draft.tags)?.join(" "),
+        entities: entities(&draft.entities)?,
+        writer: Writer::new(&draft.provenance),
+    })
+}
+
+/// `patch` cleaned and checked; fails when it changes nothing.
+pub fn patch(patch: &NotePatch) -> Result<CleanPatch, StoreError> {
+    let empty = patch.title.is_none()
+        && patch.body.is_none()
+        && patch.append.is_none()
+        && patch.kind.is_none()
+        && patch.tags.is_none();
+
+    if empty {
+        return Err(StoreError::Invalid(
+            "nothing to change: give title, body, append, kind or tags".to_owned(),
+        ));
+    }
+
+    Ok(CleanPatch {
+        title: patch.title.as_deref().map(title).transpose()?,
+        body: patch.body.as_deref().map(body_unmasked).transpose()?,
+        append: patch.append.as_deref().map(body_unmasked).transpose()?,
+        kind: patch.kind,
+        tags: patch.tags.as_deref().map(tags).transpose()?,
+        writer: Writer::new(&patch.provenance),
+    })
+}
+
+/// The body a [`CleanPatch`] leaves on a note whose body is `current`: the patch body (or the
+/// current one) with `append` joined, masked after the join so a secret split across the two is
+/// masked as a whole (see [`join_masked`]), and at most [`BODY_MAX`] characters.
+pub fn patched_body(current: &str, patch: &CleanPatch) -> Result<String, StoreError> {
+    let body = patch.body.as_deref().unwrap_or(current);
+    let body = match &patch.append {
+        Some(append) => join_masked(body, append),
+        None => redact_text(body),
+    };
+
+    let length = body.chars().count();
+    if length > BODY_MAX {
+        return Err(StoreError::Invalid(format!(
+            "body would be {length} characters (most {BODY_MAX}); shorten it with body instead of append"
+        )));
+    }
+
+    Ok(body)
+}
+
+/// `link` with its names and label cleaned and checked.
+pub fn link(link: &Link) -> Result<Link, StoreError> {
+    let from = entity(&link.from)?;
+    let to = entity(&link.to)?;
+
+    if normalize(&from) == normalize(&to) {
+        return Err(StoreError::Invalid("an entity cannot be linked to itself".to_owned()));
+    }
+
+    Ok(Link {
+        from,
+        relation: relation(&link.relation)?,
+        to,
+        note_id: link.note_id,
+    })
+}
+
+/// `what` with its names and label cleaned and checked.
+pub fn forget(what: &Forget) -> Result<Forget, StoreError> {
+    Ok(match what {
+        Forget::Note(id) => Forget::Note(*id),
+        Forget::Entity(name) => Forget::Entity(entity(name)?),
+        Forget::Relation {
+            from,
+            relation: label,
+            to,
+        } => Forget::Relation {
+            from: entity(from)?,
+            relation: relation(label)?,
+            to: entity(to)?,
+        },
+    })
+}
 
 /// A note title (1 to [`TITLE_MAX`] characters, one line).
 pub fn title(raw: &str) -> Result<String, StoreError> {

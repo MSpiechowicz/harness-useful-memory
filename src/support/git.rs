@@ -19,6 +19,10 @@
 //! `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM` and `GIT_CEILING_DIRECTORIES`: the user's global
 //! configuration is still read from the default locations under `HOME`/`XDG_CONFIG_HOME`, and the
 //! system configuration from its default location.
+//!
+//! The team database settings (`HARNESS_MEMORY_DATABASE_URL`, `HARNESS_MEMORY_DATABASE_TOKEN` and
+//! `HARNESS_MEMORY_CONFIG`) are dropped too: git has no use for them, and a hook or helper it runs
+//! must not see the credentials.
 
 use std::ffi::OsStr;
 use std::io::Read;
@@ -61,6 +65,13 @@ const GIT_ENV: [(&str, &str); 3] = [
     ("GIT_TERMINAL_PROMPT", "0"),
     ("GIT_OPTIONAL_LOCKS", "0"),
     ("LC_ALL", "C"),
+];
+
+/// The server's team database settings (see `crate::backend`), never passed on to git.
+const TEAM_VARS: [&str; 3] = [
+    "HARNESS_MEMORY_DATABASE_URL",
+    "HARNESS_MEMORY_DATABASE_TOKEN",
+    "HARNESS_MEMORY_CONFIG",
 ];
 
 /// Pause between exit checks once git closed its output.
@@ -132,6 +143,10 @@ impl Git {
             if is_git_var(&name) {
                 command.env_remove(name);
             }
+        }
+
+        for name in TEAM_VARS {
+            command.env_remove(name);
         }
 
         command

@@ -1,0 +1,23 @@
+# Harness Memory team-memory configuration.
+#
+# Copy this file to the config folder and keep it private, it holds the database credentials:
+#   Linux    $XDG_CONFIG_HOME/harness-memory/config.toml (default ~/.config/harness-memory/config.toml)
+#   macOS    ~/Library/Application Support/harness-memory/config.toml
+#   Windows  %APPDATA%\harness-memory\config.toml
+#   any OS   the path in HARNESS_MEMORY_CONFIG
+#   chmod 600 ~/.config/harness-memory/config.toml
+#
+# HARNESS_MEMORY_DATABASE_URL and HARNESS_MEMORY_DATABASE_TOKEN override the values below. Without a database_url the
+# server uses its local SQLite file.
+
+# Pick one URL.
+
+# PostgreSQL. TLS is required for every host but localhost.
+database_url = "postgres://harness_memory:CHANGE-ME@db.example.com:5432/harness_memory?sslmode=require"
+
+# libSQL: a self-hosted sqld (libsql:// or https://, http:// only for localhost) or Turso.
+# database_url = "libsql://your-database.turso.io"
+# database_token = "CHANGE-ME"
+
+# MongoDB. The database is the URL path (harness_memory when there is none). Transactions need a replica set.
+# database_url = "mongodb+srv://harness_memory:CHANGE-ME@cluster.example.com/harness_memory?retryWrites=true"

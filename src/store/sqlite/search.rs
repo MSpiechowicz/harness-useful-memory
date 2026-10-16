@@ -7,9 +7,8 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use rusqlite::{Connection, params};
-
-use super::notes::{VISIBLE, entities_of, kind_from_sql, scope_of};
+use super::notes::{VISIBLE, kind_from_sql, scope_of};
+use super::sql::{Sql, Value, args};
 use super::view_params;
 use crate::limits::{QUERY_MAX, QUERY_TOKENS_MAX, SEARCH_LIMIT_MAX, SNIPPET_MAX, SNIPPET_TOKENS};
 use crate::store::{Hit, NoteKind, Provenance, SearchQuery, StoreError, View};
@@ -42,7 +41,7 @@ struct Candidate {
     body: String,
 }
 
-pub(super) fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
+pub(super) fn search(db: &mut dyn Sql, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
     let text = query.text.trim();
     let length = text.chars().count();
 
@@ -52,7 +51,7 @@ pub(super) fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<Hit>,
         )));
     }
 
-    let (repo, global) = view_params(conn, &query.view)?;
+    let (repo, global) = view_params(db, &query.view)?;
     let limit = query.limit.clamp(1, SEARCH_LIMIT_MAX);
     let kind = query.kind.map(NoteKind::as_str);
     let words = words(text, QUERY_TOKENS_MAX);
@@ -64,20 +63,18 @@ pub(super) fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<Hit>,
     };
 
     let rows = if words.is_empty() {
-        recent(conn, (repo, global), &filter, limit)?
+        recent(db, (repo, global), &filter, limit)?
     } else {
-        matching(conn, &fts_query(&words, true), (repo, global), &filter, limit, None)?
+        matching(db, &fts_query(&words, true), (repo, global), &filter, limit, None)?
     };
 
-    finish(conn, rows.into_iter().map(|row| row.hit).collect())
+    finish(db, rows.into_iter().map(|row| row.hit).collect())
 }
 
-pub(super) fn similar(conn: &Connection, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {
-    let text: Option<(String, String)> = rusqlite::OptionalExtension::optional(conn.query_row(
-        "SELECT title, body FROM notes WHERE id = ?1",
-        [id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ))?;
+pub(super) fn similar(db: &mut dyn Sql, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {
+    let text: Option<(String, String)> = db.row("SELECT title, body FROM notes WHERE id = ?1", args![id], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?;
 
     let Some((title, body)) = text else {
         return Ok(Vec::new());
@@ -105,9 +102,9 @@ pub(super) fn similar(conn: &Connection, view: &View, id: i64, limit: usize) -> 
         return Ok(Vec::new());
     }
 
-    let params = view_params(conn, view)?;
+    let params = view_params(db, view)?;
     let candidates = matching(
-        conn,
+        db,
         &fts_query(&keys, false),
         params,
         &Filter::default(),
@@ -128,7 +125,7 @@ pub(super) fn similar(conn: &Connection, view: &View, id: i64, limit: usize) -> 
         .map(|candidate| candidate.hit)
         .collect();
 
-    finish(conn, similar)
+    finish(db, similar)
 }
 
 /// Lowercased alphanumeric words of `text`, at most `max`.
@@ -153,7 +150,7 @@ fn fts_query(words: &[String], prefix: bool) -> String {
 }
 
 fn matching(
-    conn: &Connection,
+    db: &mut dyn Sql,
     fts: &str,
     (repo, global): (Option<i64>, bool),
     filter: &Filter<'_>,
@@ -170,9 +167,9 @@ fn matching(
     );
 
     collect(
-        conn,
+        db,
         &sql,
-        params![
+        args![
             fts,
             repo,
             global,
@@ -185,7 +182,7 @@ fn matching(
 }
 
 fn recent(
-    conn: &Connection,
+    db: &mut dyn Sql,
     (repo, global): (Option<i64>, bool),
     filter: &Filter<'_>,
     limit: usize,
@@ -200,9 +197,9 @@ fn recent(
     );
 
     collect(
-        conn,
+        db,
         &sql,
-        params![
+        args![
             None::<String>,
             repo,
             global,
@@ -214,9 +211,9 @@ fn recent(
     )
 }
 
-fn collect(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Candidate>, StoreError> {
-    let mut statement = conn.prepare(sql)?;
-    let rows = statement.query_map(params, |row| {
+fn collect(db: &mut dyn Sql, sql: &str, args: &[Value]) -> Result<Vec<Candidate>, StoreError> {
+    let rows = db.query(sql, args)?;
+    let candidates = rows.iter().map(|row| {
         let kind: String = row.get(1)?;
         let snippet: String = row.get(4)?;
         let root: Option<String> = row.get(8)?;
@@ -238,15 +235,31 @@ fn collect(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Resul
             },
             body: row.get(6)?,
         })
-    })?;
+    });
 
-    Ok(rows.collect::<Result<_, _>>()?)
+    candidates.collect()
 }
 
-/// Attaches each hit's entities.
-fn finish(conn: &Connection, mut hits: Vec<Hit>) -> Result<Vec<Hit>, StoreError> {
-    for hit in &mut hits {
-        hit.entities = entities_of(conn, hit.id)?;
+/// Attaches each hit's entities, alphabetically, in one query for all hits (one round trip to a
+/// remote server, not one per hit).
+fn finish(db: &mut dyn Sql, mut hits: Vec<Hit>) -> Result<Vec<Hit>, StoreError> {
+    if hits.is_empty() {
+        return Ok(hits);
+    }
+
+    let ids: Vec<String> = hits.iter().map(|hit| hit.id.to_string()).collect();
+    let rows = db.query(
+        "SELECT ne.note_id, e.name FROM note_entities ne JOIN entities e ON e.id = ne.entity_id
+         WHERE ne.note_id IN (SELECT value FROM json_each(?1)) ORDER BY e.name_norm",
+        args![format!("[{}]", ids.join(","))],
+    )?;
+
+    for row in &rows {
+        let id: i64 = row.get(0)?;
+
+        if let Some(hit) = hits.iter_mut().find(|hit| hit.id == id) {
+            hit.entities.push(row.get(1)?);
+        }
     }
 
     Ok(hits)

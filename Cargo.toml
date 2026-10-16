@@ -27,10 +27,26 @@ thiserror = "2.0.21"
 regex = "1.13"
 # Canonical paths without the Windows `\\?\` prefix.
 dunce = "1.0.5"
+# The team database config file (`<config dir>/harness-memory/config.toml`).
+toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
+# The PostgreSQL team backend: the synchronous client, TLS through rustls with the ring provider
+# (no OpenSSL), and the platform's trusted roots.
+postgres = "0.19.14"
+tokio-postgres-rustls = { version = "0.14.0", features = ["ring"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8.5"
+# Accent folding for the PostgreSQL full-text index (SQLite's FTS5 does it itself).
+unicode-normalization = "0.1.25"
+# The MongoDB team backend: the official driver's blocking API, TLS through rustls with ring (no
+# OpenSSL), DNS for `mongodb+srv://` seed lists.
+mongodb = { version = "3.9.1", default-features = false, features = ["compat-3-0-0", "rustls-tls", "dns-resolver", "sync"] }
+# The libSQL team backend (sqld, Turso): a blocking HTTP client for the Hrana pipeline API, TLS
+# through the rustls (ring) and platform roots above, no gzip.
+ureq = { version = "3.4.2", default-features = false, features = ["rustls-no-provider"] }
 
 # Kills a timed-out git together with its process group (`killpg`).
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", default-features = false, features = ["signal", "process"] }
+nix = { version = "0.31.3", default-features = false, features = ["signal", "process", "user"] }
 
 [dev-dependencies]
 insta = { version = "1.49.0", features = ["json"] }

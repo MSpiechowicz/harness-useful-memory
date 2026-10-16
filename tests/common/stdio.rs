@@ -20,6 +20,34 @@ pub fn command(memory_dir: &Path, cwd: &Path) -> Command {
     command
 }
 
+/// Keeps `command` on the local database unless the test chose otherwise: the team database
+/// variables are removed and the config folders point at a folder that does not exist, except
+/// those the test set on `command` itself.
+pub fn without_team_settings(command: &mut Command) {
+    let chosen: Vec<String> = command
+        .get_envs()
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .collect();
+    let unchosen = |name: &str| !chosen.iter().any(|set| set == name);
+
+    for name in [
+        "HARNESS_MEMORY_DATABASE_URL",
+        "HARNESS_MEMORY_DATABASE_TOKEN",
+        "HARNESS_MEMORY_CONFIG",
+    ] {
+        if unchosen(name) {
+            command.env_remove(name);
+        }
+    }
+
+    let nowhere = std::env::temp_dir().join("harness-memory-tests-no-config");
+    for name in ["XDG_CONFIG_HOME", "APPDATA"] {
+        if unchosen(name) {
+            command.env(name, &nowhere);
+        }
+    }
+}
+
 /// A running server after the `initialize` handshake.
 pub struct Client {
     child: Child,
@@ -31,8 +59,11 @@ pub struct Client {
 }
 
 impl Client {
-    /// Starts `command` with piped stdio and completes the handshake.
+    /// Starts `command` with piped stdio and completes the handshake. The team database settings
+    /// of the developer's environment are not passed on (see [`without_team_settings`]).
     pub fn start(mut command: Command) -> Self {
+        without_team_settings(&mut command);
+
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
