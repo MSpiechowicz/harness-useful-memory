@@ -304,7 +304,9 @@ fn a_request_shows_where_the_script_runs_and_its_standard_input() {
     ));
     let (request, _, _) = desktop.join().expect("desktop");
 
-    assert_eq!(request["cwd"], json!(fixture.work().to_string_lossy()));
+    // The server reports the folder resolved, e.g. `/private/var/...` for macOS's `/var/...` temp folder.
+    let work = fixture.work().canonicalize().expect("work folder");
+    assert_eq!(request["cwd"], json!(work.to_string_lossy()));
     assert_eq!(request["stdin"]["bytes"], stdin.len());
     let preview = request["stdin"]["preview"].as_str().expect("preview");
     assert!(preview.starts_with("first line\nhidden\nxxx"), "{preview}");
