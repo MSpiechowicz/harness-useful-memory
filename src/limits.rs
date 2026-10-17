@@ -34,6 +34,12 @@ pub const SEARCH_LIMIT_DEFAULT: usize = 8;
 /// Most search rows.
 pub const SEARCH_LIMIT_MAX: usize = 20;
 
+/// Rows of one page of `notes list` and `scripts list` when none is asked for.
+pub const LIST_PAGE_DEFAULT: usize = 50;
+
+/// Most rows of one page of `notes list` and `scripts list`.
+pub const LIST_PAGE_MAX: usize = 200;
+
 /// Tokens in a search snippet (FTS5 `snippet()`).
 pub const SNIPPET_TOKENS: usize = 24;
 
@@ -66,3 +72,33 @@ pub const LIST_REPLY_MAX: usize = 4 * 1024;
 
 /// Reply size of `memory_get`, in bytes.
 pub const GET_REPLY_MAX: usize = 16 * 1024;
+
+/// Script name length, in characters (`[a-z0-9][a-z0-9_-]*`).
+pub const SCRIPT_NAME_MAX: usize = 64;
+
+/// Script description length, in characters.
+pub const SCRIPT_DESCRIPTION_MAX: usize = 500;
+
+/// Script body size, in bytes.
+pub const SCRIPT_BODY_MAX: usize = 64 * 1024;
+
+/// Arguments per `script_run`.
+pub const SCRIPT_ARGS_MAX: usize = 32;
+
+/// Length of one `script_run` argument, in bytes.
+pub const SCRIPT_ARG_MAX: usize = 4096;
+
+/// Standard input of one `script_run`, in bytes.
+pub const SCRIPT_STDIN_MAX: usize = 64 * 1024;
+
+/// Seconds a script may run when it names no timeout.
+pub const SCRIPT_TIMEOUT_DEFAULT: u64 = 60;
+
+/// Longest script timeout, in seconds.
+pub const SCRIPT_TIMEOUT_MAX: u64 = 600;
+
+/// Script standard output kept in the reply, in bytes.
+pub const SCRIPT_STDOUT_MAX: usize = 32 * 1024;
+
+/// Script standard error kept in the reply, in bytes.
+pub const SCRIPT_STDERR_MAX: usize = 8 * 1024;

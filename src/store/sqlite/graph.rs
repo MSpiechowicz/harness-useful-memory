@@ -55,6 +55,19 @@ pub(super) fn prune_entity(db: &mut dyn Sql, id: i64) -> Result<(), StoreError> 
     Ok(())
 }
 
+/// Deletes the entities of the repository `repo` (when given) and of the global scope (when
+/// `global`) that no note and no relation uses.
+pub(super) fn prune_entities(db: &mut dyn Sql, repo: Option<i64>, global: bool) -> Result<(), StoreError> {
+    db.execute(
+        "DELETE FROM entities WHERE (project_id = ?1 OR (?2 AND project_id IS NULL))
+           AND NOT EXISTS (SELECT 1 FROM note_entities WHERE entity_id = entities.id)
+           AND NOT EXISTS (SELECT 1 FROM relations WHERE src = entities.id OR dst = entities.id)",
+        args![repo, global],
+    )?;
+
+    Ok(())
+}
+
 /// Records a link cleaned by [`clean::link`].
 pub(super) fn link(db: &mut dyn Sql, target: &Target, link: &Link) -> Result<Edge, StoreError> {
     let Link {

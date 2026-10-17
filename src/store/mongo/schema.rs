@@ -3,6 +3,8 @@
 //! A migration runs under a lock document in `meta` (`migration_lock`, a lease of
 //! [`LOCK_LEASE`] seconds, taken over once expired or invalid), so two servers starting at once do
 //! not both migrate; the one that waits sees the version the other wrote.
+//!
+//! Versions: 1 the notes, entities and relations; 2 adds the scripts.
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,11 +14,11 @@ use mongodb::bson::{Document, doc, oid::ObjectId};
 use mongodb::options::IndexOptions;
 use mongodb::sync::Database;
 
-use super::{ENTITIES, META, NOTES, RELATIONS, connection, error_code, int, now, number};
+use super::{ENTITIES, META, NOTES, RELATIONS, SCRIPTS, connection, error_code, int, now, number};
 use crate::store::StoreError;
 
 /// The schema version this server writes (independent of the SQLite schema version).
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// The `_id` of the schema document in `meta`; its `version` field holds the version.
 pub const SCHEMA_ID: &str = "schema";
@@ -156,6 +158,10 @@ fn apply(db: &Database) -> mongodb::error::Result<SchemaState> {
         create_v1(db)?;
     }
 
+    if current < 2 {
+        create_v2(db)?;
+    }
+
     db.collection::<Document>(META)
         .update_one(
             doc! { "_id": SCHEMA_ID },
@@ -202,6 +208,17 @@ fn create_v1(db: &Database) -> mongodb::error::Result<()> {
             index(doc! { "project": 1, "dst": 1 }, "relations_dst", false),
             index(doc! { "note_id": 1 }, "relations_note", false),
         ])
+        .run()?;
+
+    Ok(())
+}
+
+/// Version 2: the scripts. `null` is a value of its own in a MongoDB index, so the unique
+/// `(project, name)` index also keeps global script names unique (every script stores `project`,
+/// `null` for global ones). Creating an existing index again is a no-op.
+fn create_v2(db: &Database) -> mongodb::error::Result<()> {
+    db.collection::<Document>(SCRIPTS)
+        .create_index(index(doc! { "project": 1, "name": 1 }, "scripts_name", true))
         .run()?;
 
     Ok(())

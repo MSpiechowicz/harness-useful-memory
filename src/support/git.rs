@@ -68,7 +68,7 @@ const GIT_ENV: [(&str, &str); 3] = [
 ];
 
 /// The server's team database settings (see `crate::backend`), never passed on to git.
-const TEAM_VARS: [&str; 5] = [
+pub(super) const TEAM_VARS: [&str; 5] = [
     "HARNESS_MEMORY_DATABASE_URL",
     "HARNESS_MEMORY_DATABASE_TOKEN",
     "HARNESS_MEMORY_CONFIG",
@@ -236,7 +236,7 @@ fn kill_tree(child: &mut Child) {
 /// Sends SIGKILL to the process group led by `pid` (the child was spawned with `process_group(0)`).
 /// Called only while the child is not reaped yet, so its pid and group id are still its own.
 #[cfg(unix)]
-fn kill_group(pid: u32) {
+pub(super) fn kill_group(pid: u32) {
     use nix::sys::signal::{Signal, killpg};
     use nix::unistd::Pid;
 
@@ -277,7 +277,7 @@ fn find_git(env: &Env) -> Option<PathBuf> {
 
 /// The absolute entries of `PATH`, then the usual system folders: a client may start the server
 /// with a minimal `PATH` (apps started from the macOS Finder lack the login shell's).
-fn search_dirs(env: &Env) -> Vec<PathBuf> {
+pub(super) fn search_dirs(env: &Env) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = env
         .var("PATH")
         .map(|path| std::env::split_paths(path).filter(|dir| dir.is_absolute()).collect())
@@ -294,14 +294,14 @@ fn search_dirs(env: &Env) -> Vec<PathBuf> {
 }
 
 #[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
+pub(super) fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
     std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
+pub(super) fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 

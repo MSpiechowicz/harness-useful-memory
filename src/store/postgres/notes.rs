@@ -9,18 +9,27 @@ use super::{KIND_MAX, PATH_MAX, SOURCE_MAX, backend, column, cut, graph, now, ta
 use super::{target_project_existing, view_params};
 use crate::limits::{BODY_MAX, ENTITY_MAX, GET_IDS_MAX, TAG_MAX, TAGS_MAX, TITLE_MAX};
 use crate::store::clean::{self, CleanDraft, CleanPatch};
-use crate::store::{Note, NoteKind, Provenance, Saved, Scope, StoreError, Target, View};
+use crate::store::{Forgotten, Note, NoteKind, Provenance, Saved, Scope, StoreError, Target, View};
 
 /// The columns [`note_from_row`] reads, from `notes n LEFT JOIN projects p`, with the text cut to
 /// the limits (see [`cut`]).
 fn note_columns() -> String {
+    columns(&cut("n.body", BODY_MAX))
+}
+
+/// [`note_columns`] with an empty body, for lists.
+pub(super) fn row_columns() -> String {
+    columns("''")
+}
+
+/// The columns of a note with `body` as its body.
+fn columns(body: &str) -> String {
     format!(
         "n.id, n.project_id, {key}, {kind}, {title}, {body}, {tags}, {source}, \
          n.created_at, n.updated_at, n.revision, n.hits, {root}, n.via_override",
         key = cut("p.key", PATH_MAX),
         kind = cut("n.kind", KIND_MAX),
         title = cut("n.title", TITLE_MAX),
-        body = cut("n.body", BODY_MAX),
         tags = cut("n.tags", TAGS_MAX * (TAG_MAX + 1)),
         source = cut("n.source", SOURCE_MAX),
         root = cut("n.writer_root", PATH_MAX),
@@ -161,7 +170,13 @@ pub(super) fn update(tx: &mut Transaction<'_>, view: &View, id: i64, patch: &Cle
     saved(tx, id, false)
 }
 
-pub(super) fn get(tx: &mut Transaction<'_>, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
+/// The visible notes among `ids`, each read as it was before this read's hit (when `count`).
+pub(super) fn get(
+    client: &mut impl GenericClient,
+    view: &View,
+    ids: &[i64],
+    count: bool,
+) -> Result<Vec<Note>, StoreError> {
     if ids.is_empty() || ids.len() > GET_IDS_MAX {
         return Err(StoreError::Invalid(format!("ids must list 1-{GET_IDS_MAX} note ids")));
     }
@@ -173,11 +188,17 @@ pub(super) fn get(tx: &mut Transaction<'_>, view: &View, ids: &[i64]) -> Result<
             continue;
         }
 
-        if let Some(note) = load(tx, view, id)? {
-            tx.execute("UPDATE notes SET hits = hits + 1 WHERE id = $1", &[&id])
+        let Some(note) = load(client, view, id)? else {
+            continue;
+        };
+
+        if count {
+            client
+                .execute("UPDATE notes SET hits = hits + 1 WHERE id = $1", &[&id])
                 .map_err(backend)?;
-            found.push(note);
         }
+
+        found.push(note);
     }
 
     Ok(found)
@@ -202,6 +223,38 @@ pub(super) fn forget(tx: &mut Transaction<'_>, view: &View, id: i64) -> Result<u
     }
 
     Ok(1)
+}
+
+/// Deletes every note visible in `view`, then the entities of those scopes that no note or
+/// relation uses (a deleted note's relations stay, their `note_id` cleared by the schema).
+pub(super) fn forget_all(tx: &mut Transaction<'_>, view: &View) -> Result<Forgotten, StoreError> {
+    let (repo, global) = view_params(tx, view)?;
+    let mut forgotten = Forgotten::default();
+
+    let deleted = tx
+        .query(
+            "WITH gone AS (
+                 DELETE FROM notes WHERE project_id = $1::bigint OR ($2::boolean AND project_id IS NULL)
+                 RETURNING project_id IS NULL AS is_global
+             )
+             SELECT is_global, count(*) FROM gone GROUP BY is_global",
+            &[&repo, &global],
+        )
+        .map_err(backend)?;
+
+    for row in &deleted {
+        let is_global: bool = column(row, 0)?;
+        let count = usize::try_from(column::<i64>(row, 1)?).unwrap_or(0);
+
+        if is_global {
+            forgotten.global = count;
+        } else {
+            forgotten.repo = count;
+        }
+    }
+
+    graph::prune_entities(tx, repo, global)?;
+    Ok(forgotten)
 }
 
 /// The note titled like `title` (a [`clean::title`]) in the scope `target`, without counting a
@@ -280,7 +333,7 @@ pub(super) fn scope_of(project_id: Option<i64>) -> Scope {
 }
 
 /// A row of [`note_columns`], without its entities.
-fn note_from_row(row: &Row) -> Result<Note, StoreError> {
+pub(super) fn note_from_row(row: &Row) -> Result<Note, StoreError> {
     let tags: String = column(row, 6)?;
     let kind: String = column(row, 3)?;
     let root: Option<String> = column(row, 12)?;

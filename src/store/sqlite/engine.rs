@@ -4,9 +4,9 @@
 //! first, so a rejected call never opens a write transaction, then run the shared statements.
 
 use super::sql::Sql;
-use super::{graph, notes, search};
+use super::{graph, listing, notes, search};
 use crate::store::{Edge, Forget, Hit, Link, Neighborhood, Note, NoteDraft, NotePatch, Saved, SearchQuery, clean};
-use crate::store::{StoreError, Target, View};
+use crate::store::{Forgotten, NoteListQuery, NotePage, StoreError, Target, View};
 
 /// The transactions of one SQLite-dialect store.
 pub(crate) trait Engine {
@@ -30,7 +30,16 @@ pub(crate) fn update(engine: &mut impl Engine, view: &View, id: i64, patch: &Not
 
 /// A write: reading counts a hit on each note.
 pub(crate) fn get(engine: &mut impl Engine, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
-    engine.write(|db| notes::get(db, view, ids))
+    engine.write(|db| notes::get(db, view, ids, true))
+}
+
+/// A read: counts no hit.
+pub(crate) fn peek(engine: &mut impl Engine, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
+    engine.read(|db| notes::get(db, view, ids, false))
+}
+
+pub(crate) fn list_notes(engine: &mut impl Engine, query: &NoteListQuery) -> Result<NotePage, StoreError> {
+    engine.read(|db| listing::list(db, query))
 }
 
 pub(crate) fn search(engine: &mut impl Engine, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
@@ -69,6 +78,10 @@ pub(crate) fn forget(
         Forget::Entity(name) => graph::forget_entity(db, target, name),
         Forget::Relation { from, relation, to } => graph::forget_relation(db, target, from, relation, to),
     })
+}
+
+pub(crate) fn forget_notes(engine: &mut impl Engine, view: &View) -> Result<Forgotten, StoreError> {
+    engine.write(|db| notes::forget_all(db, view))
 }
 
 /// The note titled like `title` in the scope `target`, read exactly and without counting a hit.

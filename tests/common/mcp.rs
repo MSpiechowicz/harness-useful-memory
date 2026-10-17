@@ -30,11 +30,14 @@ pub fn env(home: &Path) -> Env {
     Env::for_tests(home).with_var("PATH", std::env::var("PATH").unwrap_or_default())
 }
 
-/// A server on `dir/memory.sqlite3` whose working directory is `cwd` and whose home is `home`.
+/// A server on `dir/memory.sqlite3` (notes, scripts and script trust) whose working directory is
+/// `cwd` and whose home is `home`.
 pub fn server(dir: &TempDir, home: &Path, cwd: &Path) -> Server {
-    let store = SqliteStore::open(&dir.path().join("memory.sqlite3")).expect("store");
+    let open = || SqliteStore::open(&dir.path().join("memory.sqlite3")).expect("store");
     Server::new(
-        Box::new(store),
+        Box::new(open()),
+        Box::new(open()),
+        Box::new(open()),
         ProjectResolver::new(env(home), Some(cwd.to_path_buf())),
     )
 }

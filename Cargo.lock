@@ -656,6 +656,7 @@ name = "harness_memory"
 version = "1.1.0"
 dependencies = [
  "dunce",
+ "getrandom 0.4.3",
  "insta",
  "mongodb",
  "nix",
@@ -667,6 +668,7 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio-postgres-rustls",

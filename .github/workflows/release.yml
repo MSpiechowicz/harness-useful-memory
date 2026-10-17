@@ -119,6 +119,7 @@ jobs:
       - run: cargo build --release --locked --target "$TRIPLE"
         env:
           TRIPLE: ${{ matrix.triple }}
+          HARNESS_MEMORY_RELEASE: "1" # released binaries report the plain version, other builds report `-dev`
       - name: Smoke test and name the binary
         env:
           TRIPLE: ${{ matrix.triple }}

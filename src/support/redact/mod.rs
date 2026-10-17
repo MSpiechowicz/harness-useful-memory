@@ -11,10 +11,13 @@
 //!    values are masked.
 //! 4. **Entropy**: whitespace-separated words that look random (see `rules::is_high_entropy`).
 //!    UUIDs, paths, URLs and word-like identifiers are exempt.
+//!
+//! [`has_credentials`] only asks whether text holds a credential format or a URL with a literal
+//! password or secret query value, for script bodies that are stored as written.
 
 mod rules;
 
-use rules::{MASK, is_high_entropy, mask_tokens};
+use rules::{MASK, has_token, has_url_credentials, is_high_entropy, mask_tokens};
 
 /// Masks secrets in free text (note titles, bodies, tags): credential formats, `NAME=value`
 /// assignments with secret-looking names, URL userinfo and secret query values, and
@@ -42,6 +45,20 @@ pub fn redact_text(text: &str) -> String {
 
     out.push_str(rest);
     out
+}
+
+/// Masks script output: credential formats, secret assignments and URL secrets, as
+/// [`redact_text`] does, but not the entropy rule, which would mask compact JSON words.
+pub fn redact_output(text: &str) -> String {
+    mask_tokens(text)
+}
+
+/// True when `text` holds a credential format (as [`redact_text`] masks them; a PEM block only
+/// when it is a private key) or a URL with a literal password or secret query value. Variable
+/// references (`$GH_TOKEN`, `https://u:${PASS}@host`), `NAME=value` assignments and random-looking
+/// words do not count: a script reads its secrets from the environment.
+pub fn has_credentials(text: &str) -> bool {
+    has_token(text) || has_url_credentials(text)
 }
 
 #[cfg(test)]
@@ -93,7 +110,7 @@ mod tests {
     #[test]
     fn high_entropy_words_are_masked() {
         for sample in [
-            "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5bC7d",
+            concat!("aB3dE5fG7hJ9kL1mN3pQ5", "rS7tU9vW1xY3zA5bC7d"),
             "Xk9#mP2$vL8@nQ4!wR6^tY0&uI3*oE5(",
         ] {
             assert_eq!(redact_text(sample), MASK, "{sample}");
@@ -121,10 +138,13 @@ mod tests {
 
     #[test]
     fn redact_text_masks_tokens_assignments_userinfo_and_random_words() {
-        let input = "token sk-ant-abcdefghijklmnopqrstuv used\n\
+        let input = concat!(
+            "token sk-ant-abcdefghijklmnopqrstuv used\n\
                      GITHUB_TOKEN=abc123 password: hunter2\n\
                      clone https://me:pw@host/x.git id 7218123d-0746-47cd-b886-473b29bc5f49\n\
-                     blob aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5bC7d end";
+                     blob aB3dE5fG7hJ9kL1mN3pQ5",
+            "rS7tU9vW1xY3zA5bC7d end"
+        );
 
         let expected = "token •••• used\n\
                         GITHUB_TOKEN=•••• password: ••••\n\
@@ -139,5 +159,59 @@ mod tests {
         let input = "Compiling harness_memory v0.1.0\n  Finished in 1.2s";
 
         assert_eq!(redact_text(input), input);
+    }
+
+    #[test]
+    fn credentials_in_script_bodies_are_found() {
+        let found = [
+            format!(
+                "curl -H 'Authorization: token {}' https://api.github.com",
+                "ghp_".to_owned() + &"a".repeat(36)
+            ),
+            concat!("export KEY=AKIA", "ABCDEFGHIJKLMNOP").to_owned(),
+            "curl -H \"Authorization: Bearer abcdefgh12345678\" $URL".to_owned(),
+            "git clone https://me:pa55word@example.com/x.git".to_owned(),
+            "fetch('https://api.example.com/v1?api_key=abc123&page=2')".to_owned(),
+            "curl \"https://hooks.example.com/run?sig=deadbeef\"".to_owned(),
+            "cat <<KEY\n-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\nKEY".to_owned(),
+        ];
+
+        for text in found {
+            assert!(has_credentials(&text), "{text}");
+        }
+    }
+
+    #[test]
+    fn variable_references_and_plain_scripts_are_not_credentials() {
+        let clean = [
+            "#!/usr/bin/env bash\nset -euo pipefail\ngh pr list --json number,title",
+            "curl -H \"Authorization: Bearer $GH_TOKEN\" https://api.github.com/user",
+            "git clone https://x-access-token:${GH_TOKEN}@github.com/o/r.git",
+            "git clone https://user:$PASSWORD@example.com/x.git",
+            "git clone ssh://git@github.com/o/r.git",
+            "curl \"https://api.example.com/v1?api_key=$API_KEY&page=2\"",
+            "GH_TOKEN=$(gh auth token) gh api /user",
+            "password = os.environ['DB_PASSWORD']",
+            concat!("echo aB3dE5fG7hJ9kL1mN3pQ5", "rS7tU9vW1xY3zA5bC7d"),
+            "openssl x509 -in cert.pem | grep -q -- '-----BEGIN CERTIFICATE-----'",
+        ];
+
+        for text in clean {
+            assert!(!has_credentials(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn script_output_keeps_compact_json_and_masks_credentials() {
+        let json = r#"[{"number":18,"title":"feat(extensions): update plugins"},{"number":6,"title":"docs:"}]"#;
+        assert_eq!(redact_output(json), json);
+        assert_ne!(
+            redact_text(json),
+            json,
+            "the entropy rule is what redact_output leaves out"
+        );
+
+        let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4).get(..36).expect("36"));
+        assert!(!redact_output(&format!("token {token}")).contains(&token));
     }
 }

@@ -114,6 +114,51 @@ pub(super) fn mask_urls(text: &str) -> String {
         .into_owned()
 }
 
+/// A URL anywhere in free text, up to whitespace, a quote or a bracket.
+static URL_IN_TEXT: LazyLock<Regex> = LazyLock::new(|| compile(r#"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s"'<>()\[\]{}`]+"#));
+
+/// True when `value` is a shell or template reference (`$NAME`, `${NAME}`, `"$NAME"`), not a
+/// literal.
+fn is_reference(value: &str) -> bool {
+    value.trim_start_matches(['"', '\'']).starts_with('$')
+}
+
+/// True when `text` holds a credential format (as [`TOKEN`] matches it). A PEM block only counts
+/// when it is a private key, so a script may look for `-----BEGIN CERTIFICATE-----`.
+pub(super) fn has_token(text: &str) -> bool {
+    TOKEN.find_iter(text).any(|found| {
+        let found = found.as_str();
+        !found.starts_with("-----BEGIN ") || found.contains("PRIVATE KEY")
+    })
+}
+
+/// True when a URL in `text` carries a literal password (`scheme://user:password@`) or a literal
+/// value in a secret-looking query parameter. Values that reference a variable (`$TOKEN`) and a
+/// user without a password (`ssh://git@host`) do not count.
+pub(super) fn has_url_credentials(text: &str) -> bool {
+    URL_IN_TEXT.find_iter(text).any(|url| {
+        let url = url.as_str();
+
+        let password = URL_USERINFO
+            .captures(url)
+            .and_then(|captures| captures.get(2))
+            .and_then(|userinfo| userinfo.as_str().split_once(':'))
+            .is_some_and(|(_, password)| !password.is_empty() && !is_reference(password));
+
+        if password {
+            return true;
+        }
+
+        QUERY_PARAM.captures_iter(url).any(|captures| {
+            let name = &captures[2];
+            let value = &captures[3];
+            let secret = is_secret_key(name) || SECRET_QUERY_PARAMS.contains(&normalize_key(name).as_str());
+
+            secret && !value.is_empty() && !is_reference(value)
+        })
+    })
+}
+
 /// Masks credential formats, secret assignments and URL secrets in free text.
 pub(super) fn mask_tokens(text: &str) -> String {
     let text = TOKEN.replace_all(text, MASK);

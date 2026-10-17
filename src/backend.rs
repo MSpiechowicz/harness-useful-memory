@@ -20,7 +20,10 @@
 //! [`Routing`] can keep one scope on this computer instead: `repository_notes` and `global_notes`
 //! in the config file (or [`REPOSITORY_NOTES_VAR`] and [`GLOBAL_NOTES_VAR`]) are `"remote"` (the
 //! default) or `"local"`. With one of each the server reads and writes through a
-//! [`crate::store::SplitStore`]; with both `"local"` the team database is not used at all.
+//! [`crate::store::SplitStore`]; with both `"local"` the team database is not used for notes.
+//! Scripts follow `scripts` (or [`SCRIPTS_VAR`]) the same way, `"remote"` by default.
+//! `trust_team_scripts = true` (or [`TRUST_TEAM_SCRIPTS_VAR`] `1`) lets every script read from the
+//! team database run without a person approving it on this computer first.
 //!
 //! The URL and the token are secrets: errors show a [`redact_url`] form and pass through
 //! [`Secrets::scrub`]. On Unix a config file other users can change, or that another user owns, is
@@ -30,7 +33,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::store::{LibsqlStore, MemoryStore, MongoStore, PostgresStore, StoreError};
+use crate::store::{LibsqlStore, MemoryStore, MongoStore, PostgresStore, ScriptStore, StoreError};
 use crate::support::redact::redact_text;
 use crate::support::{Env, OsKind};
 
@@ -52,6 +55,14 @@ pub const REPOSITORY_NOTES_VAR: &str = "HARNESS_MEMORY_REPOSITORY_NOTES";
 /// this computer (`local`). Wins over `global_notes` in the config file; empty = unset.
 pub const GLOBAL_NOTES_VAR: &str = "HARNESS_MEMORY_GLOBAL_NOTES";
 
+/// Environment variable keeping scripts in the team database (`remote`, the default) or on this
+/// computer (`local`). Wins over `scripts` in the config file; empty = unset.
+pub const SCRIPTS_VAR: &str = "HARNESS_MEMORY_SCRIPTS";
+
+/// Environment variable trusting every script read from the team database (`1`) or not (`0`, the
+/// default). Wins over `trust_team_scripts` in the config file; empty = unset.
+pub const TRUST_TEAM_SCRIPTS_VAR: &str = "HARNESS_MEMORY_TRUST_TEAM_SCRIPTS";
+
 /// The config file name inside `<config dir>/harness-memory/`.
 pub const CONFIG_FILE: &str = "config.toml";
 
@@ -67,6 +78,8 @@ struct ConfigFile {
     database_token: Option<String>,
     repository_notes: Option<String>,
     global_notes: Option<String>,
+    scripts: Option<String>,
+    trust_team_scripts: Option<bool>,
 }
 
 /// The selected store.
@@ -155,12 +168,13 @@ impl Place {
     }
 }
 
-/// Where repository notes and global notes go when a team database is set; both
+/// Where repository notes, global notes and scripts go when a team database is set; all
 /// [`Place::Remote`] by default. Without a team database everything is local whatever it says.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Routing {
     pub repository: Place,
     pub global: Place,
+    pub scripts: Place,
 }
 
 impl Routing {
@@ -169,7 +183,8 @@ impl Routing {
         self.repository != self.global
     }
 
-    /// True when both scopes stay on this computer, so the team database is not used.
+    /// True when both note scopes stay on this computer, so the team database is not used for
+    /// notes (scripts follow [`Routing::scripts`]).
     pub fn is_all_local(self) -> bool {
         self.repository == Place::Local && self.global == Place::Local
     }
@@ -180,7 +195,106 @@ impl Routing {
 pub struct Selection {
     pub backend: Backend,
     pub routing: Routing,
+    /// Whether every script read from the team database counts as approved here.
+    pub trust_team_scripts: bool,
     pub warnings: Vec<String>,
+}
+
+impl Selection {
+    /// Where scripts are kept: [`Routing::scripts`] with a team database, else this computer.
+    pub fn scripts_place(&self) -> Place {
+        match self.backend {
+            Backend::Local => Place::Local,
+            _ => self.routing.scripts,
+        }
+    }
+
+    /// The name this machine's script trust gives the place scripts are kept: `local`, or
+    /// `team:` and [`Backend::team_key`], so two team databases never share an approval.
+    pub fn scripts_key(&self) -> String {
+        match self.scripts_place() {
+            Place::Local => LOCAL_KEY.to_owned(),
+            Place::Remote => self.backend.team_key(),
+        }
+    }
+
+    /// True when the scripts come from the team database and `trust_team_scripts` is on.
+    pub fn team_scripts_trusted(&self) -> bool {
+        self.trust_team_scripts && self.scripts_place() == Place::Remote
+    }
+}
+
+/// The trust name of the scripts on this computer (see [`Selection::scripts_key`]).
+pub const LOCAL_KEY: &str = "local";
+
+impl Backend {
+    /// `team:` and the first 16 hex digits of the SHA-256 of [`Backend::team_identity`]; `local`
+    /// for the local database.
+    pub fn team_key(&self) -> String {
+        use sha2::{Digest, Sha256};
+
+        let Some(identity) = self.team_identity() else {
+            return LOCAL_KEY.to_owned();
+        };
+
+        let digest = Sha256::digest(identity.as_bytes());
+        let hex: String = digest.iter().take(8).map(|byte| format!("{byte:02x}")).collect();
+        format!("team:{hex}")
+    }
+
+    /// The team database without credentials: its kind, hosts and database name
+    /// (`postgres://db.example.com/memory`). The hosts are in lowercase, without the scheme's
+    /// default port (PostgreSQL 5432, MongoDB 27017, libSQL over HTTPS 443, over HTTP 80) and,
+    /// for MongoDB, sorted. The user, password, query and token are left out, so changing them,
+    /// or writing the same database another way, keeps the approvals.
+    pub fn team_identity(&self) -> Option<String> {
+        let (kind, url) = match self {
+            Self::Local => return None,
+            Self::Postgres { url } => ("postgres", url),
+            Self::Libsql { url, .. } => ("libsql", url),
+            Self::Mongo { url } if url.starts_with("mongodb+srv://") => ("mongodb+srv", url),
+            Self::Mongo { url } => ("mongodb", url),
+        };
+
+        let (scheme, rest) = url.trim().split_once("://").unwrap_or(("", url.trim()));
+        let rest = &rest[..rest.find(['?', '#']).unwrap_or(rest.len())];
+        let location = rest.rfind('@').map_or(rest, |at| &rest[at + 1..]);
+        let (hosts, database) = location.split_once('/').unwrap_or((location, ""));
+        let database = database.trim_end_matches('/');
+
+        let database = match (self, database) {
+            (Self::Mongo { .. }, "") => crate::store::mongo::DEFAULT_DATABASE,
+            _ => database,
+        };
+
+        let default_port = match scheme.to_ascii_lowercase().as_str() {
+            "postgres" | "postgresql" => Some("5432"),
+            "mongodb" => Some("27017"),
+            "libsql" | "https" => Some("443"),
+            "http" => Some("80"),
+            _ => None,
+        };
+
+        let mut hosts: Vec<String> = hosts
+            .split(',')
+            .filter(|host| !host.is_empty())
+            .map(|host| without_port(&host.to_ascii_lowercase(), default_port))
+            .collect();
+
+        if matches!(self, Self::Mongo { .. }) {
+            hosts.sort();
+        }
+
+        Some(format!("{kind}://{}/{database}", hosts.join(",")))
+    }
+}
+
+/// `host` without `:<port>` when it is `default` (`[::1]:5432` keeps its brackets).
+fn without_port(host: &str, default: Option<&str>) -> String {
+    match (host.rsplit_once(':'), default) {
+        (Some((name, port)), Some(default)) if port == default && !name.is_empty() => name.to_owned(),
+        _ => host.to_owned(),
+    }
 }
 
 /// Why no backend could be selected. Messages never hold the URL or the token.
@@ -218,6 +332,8 @@ pub enum BackendError {
     LibsqlUrlSecrets,
     #[error("{0} must be \"remote\" or \"local\"")]
     Routing(String),
+    #[error("{0} must be 1 or 0")]
+    Flag(String),
 }
 
 /// The config folder: `$XDG_CONFIG_HOME` (or `~/.config`) on Linux, `~/Library/Application
@@ -277,21 +393,43 @@ pub fn select(env: &Env) -> Result<Selection, BackendError> {
             "repository_notes",
         )?,
         global: place(env, GLOBAL_NOTES_VAR, config.global_notes.as_deref(), "global_notes")?,
+        scripts: place(env, SCRIPTS_VAR, config.scripts.as_deref(), "scripts")?,
     };
 
     if backend != Backend::Local && routing.is_all_local() {
+        let used = match routing.scripts {
+            Place::Local => "using the local database only",
+            Place::Remote => "notes use the local database, scripts the team database",
+        };
+
         warnings.push(format!(
-            "the team database ({}) is set, but repository_notes and global_notes are both \"local\": using the \
-             local database only",
+            "the team database ({}) is set, but repository_notes and global_notes are both \"local\": {used}",
             backend.describe()
         ));
     }
 
+    let trust_team_scripts = flag(env, TRUST_TEAM_SCRIPTS_VAR, config.trust_team_scripts)?;
+
     Ok(Selection {
         backend,
         routing,
+        trust_team_scripts,
         warnings,
     })
+}
+
+/// The switch from the environment variable `var` (`1`, `true`, `0` or `false`, any case), else
+/// from the config file (off when neither is set); an error naming `var` for another value.
+fn flag(env: &Env, var: &str, file: Option<bool>) -> Result<bool, BackendError> {
+    let Some(raw) = env.var(var) else {
+        return Ok(file.unwrap_or(false));
+    };
+
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err(BackendError::Flag(var.to_owned())),
+    }
 }
 
 /// The [`Place`] from the environment variable `var`, else from the config file's `key` (the
@@ -429,10 +567,27 @@ pub fn open(backend: &Backend) -> Option<Result<Opened, String>> {
         Backend::Mongo { url } => open_mongo(url),
     };
 
-    Some(opened.map_err(|error| {
-        let reason = backend.secrets().scrub(&error.to_string());
-        format!("cannot open the team database ({}): {reason}", backend.describe())
-    }))
+    Some(opened.map_err(|error| open_failed(backend, &error)))
+}
+
+/// Connects to a team backend for scripts, like [`open`].
+pub fn open_scripts(backend: &Backend) -> Option<Result<Box<dyn ScriptStore>, String>> {
+    let opened: Result<Box<dyn ScriptStore>, StoreError> = match backend {
+        Backend::Local => return None,
+        Backend::Postgres { url } => PostgresStore::connect(url).map(|store| Box::new(store) as Box<dyn ScriptStore>),
+        Backend::Libsql { url, token } => {
+            LibsqlStore::connect(url, token.as_deref()).map(|store| Box::new(store) as Box<dyn ScriptStore>)
+        }
+        Backend::Mongo { url } => MongoStore::connect(url).map(|store| Box::new(store) as Box<dyn ScriptStore>),
+    };
+
+    Some(opened.map_err(|error| open_failed(backend, &error)))
+}
+
+/// `cannot open the team database (<backend>): <reason>`, scrubbed of the backend's secrets.
+fn open_failed(backend: &Backend, error: &StoreError) -> String {
+    let reason = backend.secrets().scrub(&error.to_string());
+    format!("cannot open the team database ({}): {reason}", backend.describe())
 }
 
 fn open_libsql(url: &str, token: Option<&str>) -> Result<Opened, StoreError> {
@@ -639,6 +794,88 @@ fn percent_decode_lossy(raw: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn team_keys_name_the_database_without_its_credentials() {
+        let identity = |url: &str| pick(url).expect("backend").team_identity();
+
+        assert_eq!(
+            identity("postgres://alice:s3cret@DB.example.com:5432/memory?sslmode=require").as_deref(),
+            Some("postgres://db.example.com/memory")
+        );
+        assert_eq!(
+            identity("postgresql://bob@db.example.com:5432/memory/").as_deref(),
+            Some("postgres://db.example.com/memory")
+        );
+        assert_eq!(
+            identity("postgres://db.example.com:6543/memory").as_deref(),
+            Some("postgres://db.example.com:6543/memory")
+        );
+        assert_eq!(
+            identity("libsql://team-acme.turso.io").as_deref(),
+            Some("libsql://team-acme.turso.io/")
+        );
+        assert_eq!(
+            identity("mongodb://u:p@m1:27017,m2:27017/?replicaSet=rs0").as_deref(),
+            Some("mongodb://m1,m2/harness_memory")
+        );
+        assert_eq!(
+            identity("mongodb+srv://u:p@cluster.example.net/notes").as_deref(),
+            Some("mongodb+srv://cluster.example.net/notes")
+        );
+        assert_eq!(Backend::Local.team_identity(), None);
+
+        let key = |url: &str| pick(url).expect("backend").team_key();
+        let same = key("postgres://alice:one@db.example.com:5432/memory");
+        assert_eq!(
+            same,
+            key("postgres://carol:two@db.example.com:5432/memory?sslmode=require")
+        );
+        assert_ne!(same, key("postgres://alice:one@db.example.com:5432/other"));
+        assert_ne!(same, key("postgres://alice:one@db.example.com:6543/memory"));
+        assert_ne!(same, key("postgres://alice:one@db2.example.com:5432/memory"));
+        assert!(same.starts_with("team:") && same.len() == 21, "{same}");
+        assert!(
+            same[5..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        assert_eq!(Backend::Local.team_key(), "local");
+    }
+
+    #[test]
+    fn team_keys_are_the_same_for_every_way_of_writing_one_database() {
+        let key = |url: &str| pick(url).expect("backend").team_key();
+
+        for equivalents in [
+            &[
+                "postgres://db.example.com/memory",
+                "postgresql://alice@DB.example.com:5432/memory/",
+                "postgres://db.example.com:5432/memory?options=-c%20user=x@evil.example",
+                "postgres://bob:p@ss@db.example.com/memory#x@elsewhere",
+            ][..],
+            &[
+                "mongodb://m1,m2/notes",
+                "mongodb://u:p@m2:27017,M1:27017/notes?replicaSet=rs0",
+                "mongodb://m2,m1:27017/notes?authSource=admin@other",
+            ],
+            &[
+                "libsql://team.turso.io",
+                "libsql://team.turso.io:443",
+                "https://TEAM.turso.io:443/",
+            ],
+            &["http://127.0.0.1:80", "http://127.0.0.1"],
+        ] {
+            let first = key(equivalents[0]);
+            for url in &equivalents[1..] {
+                assert_eq!(key(url), first, "{url} and {}", equivalents[0]);
+            }
+        }
+
+        assert_ne!(key("http://127.0.0.1:8080"), key("http://127.0.0.1"));
+        assert_ne!(key("mongodb://m1,m2/notes"), key("mongodb://m1,m3/notes"));
+        assert_ne!(key("mongodb://m1:27018/notes"), key("mongodb://m1/notes"));
+    }
+
     fn pick(url: &str) -> Result<Backend, BackendError> {
         backend_for(Some(url.to_owned()), None)
     }
@@ -840,7 +1077,8 @@ mod tests {
             routing,
             Routing {
                 repository: Place::Remote,
-                global: Place::Local
+                global: Place::Local,
+                scripts: Place::Remote,
             }
         );
         assert!(routing.is_split());
@@ -852,12 +1090,81 @@ mod tests {
             select(&env).expect("env").routing,
             Routing {
                 repository: Place::Local,
-                global: Place::Remote
+                global: Place::Remote,
+                scripts: Place::Remote,
             }
         );
 
         let env = env.with_var(GLOBAL_NOTES_VAR, "");
         assert_eq!(select(&env).expect("empty is unset").routing.global, Place::Local);
+    }
+
+    #[test]
+    fn team_scripts_are_trusted_only_when_the_settings_say_so() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("config.toml");
+        let env = Env::for_tests("/home/u").with_var(CONFIG_VAR, path.to_string_lossy());
+
+        std::fs::write(&path, "database_url = \"postgres://file/m\"\n").expect("write");
+        assert!(!select(&env).expect("default").trust_team_scripts);
+
+        std::fs::write(
+            &path,
+            "database_url = \"postgres://file/m\"\ntrust_team_scripts = true\n",
+        )
+        .expect("write");
+        assert!(select(&env).expect("file").trust_team_scripts);
+
+        let env = env.with_var(TRUST_TEAM_SCRIPTS_VAR, "0");
+        assert!(!select(&env).expect("env wins").trust_team_scripts);
+        let env = env.with_var(TRUST_TEAM_SCRIPTS_VAR, " TRUE ");
+        assert!(select(&env).expect("any case").trust_team_scripts);
+
+        let error = select(&env.with_var(TRUST_TEAM_SCRIPTS_VAR, "yes"))
+            .expect_err("bad value")
+            .to_string();
+        assert_eq!(error, "HARNESS_MEMORY_TRUST_TEAM_SCRIPTS must be 1 or 0");
+
+        std::fs::write(&path, "trust_team_scripts = \"yes\"\n").expect("write");
+        let env = Env::for_tests("/home/u").with_var(CONFIG_VAR, path.to_string_lossy());
+        assert!(select(&env).is_err(), "a string is not a switch");
+    }
+
+    #[test]
+    fn scripts_go_to_the_team_database_unless_the_settings_keep_them_local() {
+        let team = Env::for_tests("/home/u").with_var(URL_VAR, "postgres://db/m");
+        let selection = select(&team).expect("default");
+        assert_eq!(selection.routing.scripts, Place::Remote);
+        assert_eq!(selection.scripts_place(), Place::Remote);
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "database_url = \"postgres://file/m\"\nscripts = \" Local \"\n").expect("write");
+
+        let env = Env::for_tests("/home/u").with_var(CONFIG_VAR, path.to_string_lossy());
+        let selection = select(&env).expect("file");
+        assert_eq!(selection.routing.scripts, Place::Local);
+        assert_eq!(selection.routing.repository, Place::Remote);
+        assert!(!selection.routing.is_all_local());
+
+        let env = env.with_var(SCRIPTS_VAR, "remote");
+        assert_eq!(select(&env).expect("env wins").routing.scripts, Place::Remote);
+
+        let env = env.with_var(SCRIPTS_VAR, "");
+        assert_eq!(select(&env).expect("empty is unset").routing.scripts, Place::Local);
+
+        let error = select(&env.with_var(SCRIPTS_VAR, "team"))
+            .expect_err("unknown value")
+            .to_string();
+        assert_eq!(error, "HARNESS_MEMORY_SCRIPTS must be \"remote\" or \"local\"");
+
+        std::fs::write(&path, "scripts = \"both\"\n").expect("write");
+        let env = Env::for_tests("/home/u").with_var(CONFIG_VAR, path.to_string_lossy());
+        let error = select(&env).expect_err("unknown value").to_string();
+        assert_eq!(error, "scripts in the config file must be \"remote\" or \"local\"");
+
+        let local = Env::for_tests("/home/u").with_var(SCRIPTS_VAR, "remote");
+        assert_eq!(select(&local).expect("no team database").scripts_place(), Place::Local);
     }
 
     #[test]
@@ -887,7 +1194,8 @@ mod tests {
         let env = Env::for_tests("/home/u")
             .with_var(URL_VAR, "postgres://u:hunter2@db/m")
             .with_var(REPOSITORY_NOTES_VAR, "local")
-            .with_var(GLOBAL_NOTES_VAR, "local");
+            .with_var(GLOBAL_NOTES_VAR, "local")
+            .with_var(SCRIPTS_VAR, "local");
         let selection = select(&env).expect("select");
 
         assert!(selection.routing.is_all_local());
@@ -898,6 +1206,16 @@ mod tests {
             selection.warnings
         );
         assert!(!selection.warnings[0].contains("hunter2"));
+
+        let scripts_shared = env.with_var(SCRIPTS_VAR, "remote");
+        let warnings = select(&scripts_shared).expect("select").warnings;
+        assert_eq!(
+            warnings,
+            [
+                "the team database (PostgreSQL at postgres://u@db/m) is set, but repository_notes and global_notes \
+              are both \"local\": notes use the local database, scripts the team database"
+            ]
+        );
 
         let local = Env::for_tests("/home/u")
             .with_var(REPOSITORY_NOTES_VAR, "local")

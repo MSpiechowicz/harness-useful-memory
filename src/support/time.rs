@@ -19,6 +19,19 @@ pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
+/// Unix seconds as an RFC 3339 UTC timestamp, `YYYY-MM-DDTHH:MM:SSZ`.
+pub fn rfc3339(seconds: i64) -> String {
+    let (year, month, day) = civil_from_days(seconds.div_euclid(86_400));
+    let of_day = seconds.rem_euclid(86_400);
+
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        of_day / 3600,
+        of_day % 3600 / 60,
+        of_day % 60
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -30,5 +43,12 @@ mod tests {
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
         assert_eq!(civil_from_days(11_017), (2000, 3, 1));
         assert_eq!(civil_from_days(20_742), (2026, 10, 16));
+    }
+
+    #[test]
+    fn timestamps_are_rfc3339_utc() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339(-1), "1969-12-31T23:59:59Z");
+        assert_eq!(rfc3339(1_792_190_096), "2026-10-16T22:34:56Z");
     }
 }

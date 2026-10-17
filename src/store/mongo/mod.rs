@@ -3,7 +3,7 @@
 //! # Layout
 //!
 //! The database is the one in the URL path (`harness_memory` when the URL names none) and holds
-//! four collections:
+//! five collections:
 //!
 //! - `notes`: one document per note, `_id` the note id (an `i64` from the `note_ids` counter in
 //!   `meta`), `project` the repository key (`null` for global notes), the linked entity names
@@ -14,7 +14,10 @@
 //! - `entities`: unique `(project, name_norm)`; the first spelling is kept in `name`.
 //! - `relations`: unique `(project, src, rel, dst)` over normalized entity names, with the
 //!   entities' spellings copied in, plus `(project, dst)` and `note_id` indexes.
-//! - `meta`: the schema version (`_id: "schema"`), the note id counter and the migration lock.
+//! - `scripts` (schema 2): one document per script, `_id` from the `script_ids` counter in `meta`,
+//!   `project` as for notes; unique `(project, name)`.
+//! - `meta`: the schema version (`_id: "schema"`), the note and script id counters and the
+//!   migration lock.
 //!
 //! # Writes
 //!
@@ -62,8 +65,10 @@
 
 mod connection;
 mod graph;
+mod listing;
 mod notes;
 pub mod schema;
+mod scripts;
 mod search;
 
 use std::thread;
@@ -77,7 +82,7 @@ use mongodb::options::{ClientOptions, ReadConcern, ReturnDocument, WriteConcern}
 use mongodb::sync::{Client, ClientSession, Collection, Database};
 
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, Saved, SearchQuery};
-use super::{Scope, StoreError, Target, View};
+use super::{Forgotten, NoteListQuery, NotePage, Scope, StoreError, Target, View};
 use crate::limits::{BODY_MAX, ENTITY_MAX, TAG_MAX, TAGS_MAX, TITLE_MAX};
 use schema::SchemaState;
 
@@ -87,6 +92,7 @@ pub const DEFAULT_DATABASE: &str = "harness_memory";
 const NOTES: &str = "notes";
 const ENTITIES: &str = "entities";
 const RELATIONS: &str = "relations";
+const SCRIPTS: &str = "scripts";
 const META: &str = "meta";
 
 /// How long the driver looks for a usable server when the URL does not say.
@@ -270,7 +276,16 @@ impl MemoryStore for MongoStore {
         self.check_version()?;
 
         // Each hit is one atomic increment, so reads need no transaction.
-        notes::get(&mut Ctx::new(&self.db, None), view, ids).map_err(Fail::into_store)
+        notes::get(&mut Ctx::new(&self.db, None), view, ids, true).map_err(Fail::into_store)
+    }
+
+    fn peek(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
+        notes::check_ids(ids)?;
+        notes::get(&mut self.reader()?, view, ids, false).map_err(Fail::into_store)
+    }
+
+    fn list_notes(&mut self, query: &NoteListQuery) -> Result<NotePage, StoreError> {
+        listing::list(&mut self.reader()?, query).map_err(Fail::into_store)
     }
 
     fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
@@ -298,6 +313,10 @@ impl MemoryStore for MongoStore {
             Forget::Entity(name) => graph::forget_entity(ctx, target, name),
             Forget::Relation { from, relation, to } => graph::forget_relation(ctx, target, from, relation, to),
         })
+    }
+
+    fn forget_notes(&mut self, view: &View) -> Result<Forgotten, StoreError> {
+        self.write(|ctx| notes::forget_all(ctx, view))
     }
 
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {

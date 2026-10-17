@@ -110,6 +110,16 @@ impl ProjectResolver {
         dir.starts_with(&top).then_some(top)
     }
 
+    /// The environment the server runs with.
+    pub fn env(&self) -> &Env {
+        &self.env
+    }
+
+    /// The server's working directory, when known.
+    pub fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_deref()
+    }
+
     /// The home folder, canonical when it exists.
     pub fn home(&self) -> PathBuf {
         validate_project_dir(&self.env, &self.env.home).unwrap_or_else(|_| self.env.home.clone())

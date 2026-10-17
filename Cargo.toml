@@ -24,6 +24,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 # `preserve_order`: tool schemas and replies keep their keys in source order.
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 thiserror = "2.0.21"
+# The SHA-256 of a script body, which names the version a machine trusts.
+sha2 = "0.11.1"
 regex = "1.13"
 # Canonical paths without the Windows `\\?\` prefix.
 dunce = "1.0.5"
@@ -43,6 +45,11 @@ mongodb = { version = "3.9.1", default-features = false, features = ["compat-3-0
 # The libSQL team backend (sqld, Turso): a blocking HTTP client for the Hrana pipeline API, TLS
 # through the rustls (ring) and platform roots above, no gzip.
 ureq = { version = "3.4.2", default-features = false, features = ["rustls-no-provider"] }
+# The private folder a script body is written to for its run.
+tempfile = "3.27.0"
+# The id of a script run request, from the operating system's random source (the version the
+# MongoDB driver's DNS resolver already pulls in).
+getrandom = "0.4.3"
 
 # Kills a timed-out git together with its process group (`killpg`).
 [target.'cfg(unix)'.dependencies]
@@ -52,6 +59,10 @@ nix = { version = "0.31.3", default-features = false, features = ["signal", "pro
 insta = { version = "1.49.0", features = ["json"] }
 pretty_assertions = "1.4"
 tempfile = "3.27.0"
+
+# A terminal for `harness-memory trust <id>` in the tests (it refuses to run without one).
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["term"] }
 
 [lints.rust]
 unsafe_code = "forbid"

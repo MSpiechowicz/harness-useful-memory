@@ -1,0 +1,574 @@
+//! `MemoryStore::list_notes` (with `MemoryStore::peek`, the other read that counts no hit, and
+//! `MemoryStore::forget_notes`, which deletes what a list shows) cases every backend (and
+//! `SplitStore`) must pass. Each case takes an
+//! empty store and panics on a mismatch. The ids and the times of the latest write differ between
+//! backends (and a split store shows local ids above the offset), so the cases check the order of
+//! updated-time sorts against the rows' own times and ids, and exact orders for title sorts.
+
+use harness_memory::store::{
+    Forgotten, Link, MemoryStore, NoteDraft, NoteKind, NoteListQuery, NotePage, NoteRow, NoteSort, Scope, StoreError,
+    Target, View,
+};
+use pretty_assertions::assert_eq;
+
+use super::{both, draft, global_only, repo, repo_only};
+
+pub const REPO: &str = "github.com/acme/widget";
+pub const OTHER: &str = "github.com/acme/gadget";
+
+/// A case: an empty store in, panics out.
+pub type Case = fn(&mut dyn MemoryStore);
+
+/// Every case, by name.
+pub const CASES: [(&str, Case); 9] = [
+    ("lists_visible_notes_newest_first", lists_visible_notes_newest_first),
+    ("pages_cover_the_list_once", pages_cover_the_list_once),
+    ("text_and_kind_filter_and_count", text_and_kind_filter_and_count),
+    ("titles_sort_both_ways", titles_sort_both_ways),
+    ("entities_filter_and_fill_rows", entities_filter_and_fill_rows),
+    ("views_decide_what_is_listed", views_decide_what_is_listed),
+    ("peek_reads_without_counting", peek_reads_without_counting),
+    (
+        "forget_notes_deletes_every_listed_note",
+        forget_notes_deletes_every_listed_note,
+    ),
+    (
+        "kinds_scopes_and_places_sort_and_page",
+        kinds_scopes_and_places_sort_and_page,
+    ),
+];
+
+/// The first page (of up to 200) of `view`, newest first.
+pub fn listing(view: View) -> NoteListQuery {
+    NoteListQuery {
+        view,
+        text: String::new(),
+        kind: None,
+        entity: None,
+        sort: NoteSort::Updated,
+        descending: true,
+        offset: 0,
+        limit: 200,
+    }
+}
+
+fn list(store: &mut dyn MemoryStore, query: &NoteListQuery) -> NotePage {
+    store.list_notes(query).expect("list")
+}
+
+fn titles(rows: &[NoteRow]) -> Vec<&str> {
+    rows.iter().map(|row| row.title.as_str()).collect()
+}
+
+fn count(page: &NotePage, kind: NoteKind) -> usize {
+    page.kinds
+        .iter()
+        .find(|(listed, _)| *listed == kind)
+        .map(|(_, count)| *count)
+        .expect("every kind is counted")
+}
+
+fn save(store: &mut dyn MemoryStore, target: &Target, note: &NoteDraft) -> i64 {
+    store.remember(target, note).expect("remember").id
+}
+
+fn tagged(title: &str, body: &str, kind: NoteKind, tags: &[&str], entities: &[&str]) -> NoteDraft {
+    NoteDraft {
+        tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+        entities: entities.iter().map(|entity| (*entity).to_owned()).collect(),
+        ..draft(title, body, kind)
+    }
+}
+
+/// Asserts `rows` are ordered by the latest write, then by id, newest first.
+fn assert_newest_first(rows: &[NoteRow]) {
+    for pair in rows.windows(2) {
+        let earlier = (pair[0].updated_at, pair[0].id);
+        let later = (pair[1].updated_at, pair[1].id);
+        assert!(earlier > later, "{earlier:?} before {later:?}");
+    }
+}
+
+pub fn lists_visible_notes_newest_first(store: &mut dyn MemoryStore) {
+    save(store, &repo(REPO), &draft("Flaky test", "Times out", NoteKind::Problem));
+    save(
+        store,
+        &repo(REPO),
+        &draft("Raise the timeout", "To 30 s", NoteKind::Fix),
+    );
+    save(store, &repo(OTHER), &draft("Gadget only", "Not here", NoteKind::Note));
+    save(
+        store,
+        &Target::Global,
+        &draft("Editor tabs", "Four wide", NoteKind::Decision),
+    );
+
+    let page = list(store, &listing(both(REPO)));
+
+    assert_eq!(page.total, 3);
+    assert_newest_first(&page.rows);
+
+    let mut listed = titles(&page.rows);
+    listed.sort_unstable();
+    assert_eq!(listed, ["Editor tabs", "Flaky test", "Raise the timeout"]);
+
+    let kinds: Vec<NoteKind> = page.kinds.iter().map(|(kind, _)| *kind).collect();
+    assert_eq!(kinds, NoteKind::ALL);
+    assert_eq!(
+        (
+            count(&page, NoteKind::Problem),
+            count(&page, NoteKind::Fix),
+            count(&page, NoteKind::Decision)
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        count(&page, NoteKind::Note),
+        0,
+        "another repository's note is not counted"
+    );
+
+    let oldest_first = list(
+        store,
+        &NoteListQuery {
+            descending: false,
+            ..listing(both(REPO))
+        },
+    );
+    let mut reversed = oldest_first.rows.clone();
+    reversed.reverse();
+    assert_eq!(reversed, page.rows);
+
+    let row = page.rows.iter().find(|row| row.title == "Flaky test").expect("listed");
+    assert_eq!(row.project.as_deref(), Some("git:github.com/acme/widget"));
+    assert_eq!(row.provenance.source.as_deref(), Some("tests"));
+    assert_eq!((row.revision, row.hits), (1, 0));
+
+    let notes = store.get(&both(REPO), &[row.id]).expect("get");
+    assert_eq!(notes[0].hits, 0, "listing counts no hit");
+}
+
+pub fn pages_cover_the_list_once(store: &mut dyn MemoryStore) {
+    for index in 0..7 {
+        let target = if index % 2 == 0 { repo(REPO) } else { Target::Global };
+        save(store, &target, &draft(&format!("Note {index}"), "Body", NoteKind::Note));
+    }
+
+    let all = list(store, &listing(both(REPO)));
+    assert_eq!(all.total, 7);
+
+    let mut paged: Vec<NoteRow> = Vec::new();
+
+    for (offset, size) in [(0, 3), (3, 3), (6, 1), (9, 0)] {
+        let page = list(
+            store,
+            &NoteListQuery {
+                offset,
+                limit: 3,
+                ..listing(both(REPO))
+            },
+        );
+
+        assert_eq!(page.total, 7, "the total is the same on every page");
+        assert_eq!(page.rows.len(), size, "offset {offset}");
+        paged.extend(page.rows);
+    }
+
+    assert_eq!(paged, all.rows);
+
+    let clamped = list(
+        store,
+        &NoteListQuery {
+            limit: 0,
+            ..listing(both(REPO))
+        },
+    );
+    assert_eq!(clamped.rows.len(), 1, "a limit below 1 lists one row");
+}
+
+pub fn text_and_kind_filter_and_count(store: &mut dyn MemoryStore) {
+    let note = |title: &str, body: &str, kind: NoteKind, tags: &[&str]| tagged(title, body, kind, tags, &[]);
+
+    save(
+        store,
+        &repo(REPO),
+        &note("Build CACHE", "Lives in target/", NoteKind::Location, &[]),
+    );
+    save(
+        store,
+        &repo(REPO),
+        &note("Linker", "The cache of objects", NoteKind::Fix, &[]),
+    );
+    save(
+        store,
+        &Target::Global,
+        &note("Tabs", "Four wide", NoteKind::Decision, &["cache-policy"]),
+    );
+    save(
+        store,
+        &Target::Global,
+        &note("Coverage", "Stays at 50% or more", NoteKind::Decision, &[]),
+    );
+    save(
+        store,
+        &Target::Global,
+        &note("Snake", "Names use a_b", NoteKind::Note, &[]),
+    );
+
+    let cached = list(
+        store,
+        &NoteListQuery {
+            text: " cache ".to_owned(),
+            ..listing(both(REPO))
+        },
+    );
+    let mut found = titles(&cached.rows);
+    found.sort_unstable();
+    assert_eq!(
+        found,
+        ["Build CACHE", "Linker", "Tabs"],
+        "title, body and tags, ignoring case"
+    );
+    assert_eq!(cached.total, 3);
+    assert_eq!(
+        (
+            count(&cached, NoteKind::Location),
+            count(&cached, NoteKind::Fix),
+            count(&cached, NoteKind::Decision)
+        ),
+        (1, 1, 1)
+    );
+
+    let fixes = list(
+        store,
+        &NoteListQuery {
+            text: "cache".to_owned(),
+            kind: Some(NoteKind::Fix),
+            ..listing(both(REPO))
+        },
+    );
+    assert_eq!(titles(&fixes.rows), ["Linker"]);
+    assert_eq!(fixes.total, 1, "the total follows the kind");
+    assert_eq!(count(&fixes, NoteKind::Decision), 1, "the counts ignore the kind");
+
+    for (text, expected) in [("50%", "Coverage"), ("a_b", "Snake")] {
+        let literal = list(
+            store,
+            &NoteListQuery {
+                text: text.to_owned(),
+                ..listing(both(REPO))
+            },
+        );
+        assert_eq!(titles(&literal.rows), [expected], "{text} is matched literally");
+    }
+
+    let nothing = list(
+        store,
+        &NoteListQuery {
+            text: "nowhere".to_owned(),
+            ..listing(both(REPO))
+        },
+    );
+    assert_eq!((nothing.total, nothing.rows.len()), (0, 0));
+
+    let long = NoteListQuery {
+        text: "x".repeat(257),
+        ..listing(both(REPO))
+    };
+    assert!(matches!(store.list_notes(&long), Err(StoreError::Invalid(_))));
+}
+
+pub fn titles_sort_both_ways(store: &mut dyn MemoryStore) {
+    save(store, &repo(REPO), &draft("beta", "Body", NoteKind::Note));
+    save(store, &Target::Global, &draft("Alpha", "Body", NoteKind::Note));
+    save(store, &repo(REPO), &draft("gamma", "Body", NoteKind::Note));
+    save(store, &Target::Global, &draft("Delta", "Body", NoteKind::Note));
+
+    let by_title = NoteListQuery {
+        sort: NoteSort::Title,
+        descending: false,
+        ..listing(both(REPO))
+    };
+
+    assert_eq!(
+        titles(&list(store, &by_title).rows),
+        ["Alpha", "beta", "Delta", "gamma"]
+    );
+    assert_eq!(
+        titles(
+            &list(
+                store,
+                &NoteListQuery {
+                    descending: true,
+                    ..by_title.clone()
+                }
+            )
+            .rows
+        ),
+        ["gamma", "Delta", "beta", "Alpha"]
+    );
+
+    let second = NoteListQuery {
+        offset: 1,
+        limit: 2,
+        ..by_title
+    };
+    assert_eq!(titles(&list(store, &second).rows), ["beta", "Delta"]);
+}
+
+pub fn entities_filter_and_fill_rows(store: &mut dyn MemoryStore) {
+    save(
+        store,
+        &repo(REPO),
+        &tagged("Auth flow", "Body", NoteKind::Note, &["auth"], &["Zeta", "auth.rs"]),
+    );
+    save(
+        store,
+        &repo(REPO),
+        &tagged("Unrelated", "Body", NoteKind::Note, &[], &["db.rs"]),
+    );
+    save(
+        store,
+        &Target::Global,
+        &tagged("Global auth", "Body", NoteKind::Note, &[], &["AUTH.rs"]),
+    );
+
+    let all = list(store, &listing(both(REPO)));
+    let auth = all.rows.iter().find(|row| row.title == "Auth flow").expect("listed");
+    assert_eq!(auth.entities, ["auth.rs", "Zeta"], "alphabetically, ignoring case");
+    assert_eq!(auth.tags, ["auth"]);
+
+    let linked = list(
+        store,
+        &NoteListQuery {
+            entity: Some("Auth.RS".to_owned()),
+            sort: NoteSort::Title,
+            descending: false,
+            ..listing(both(REPO))
+        },
+    );
+    assert_eq!(titles(&linked.rows), ["Auth flow", "Global auth"]);
+    assert_eq!(linked.total, 2);
+
+    let repo_side = list(
+        store,
+        &NoteListQuery {
+            entity: Some("auth.rs".to_owned()),
+            ..listing(repo_only(REPO))
+        },
+    );
+    assert_eq!(titles(&repo_side.rows), ["Auth flow"]);
+}
+
+pub fn views_decide_what_is_listed(store: &mut dyn MemoryStore) {
+    save(store, &repo(REPO), &draft("Mine", "Body", NoteKind::Note));
+    save(store, &repo(OTHER), &draft("Theirs", "Body", NoteKind::Note));
+    save(store, &Target::Global, &draft("Shared", "Body", NoteKind::Note));
+
+    let listed = |store: &mut dyn MemoryStore, view: View| {
+        let mut found: Vec<String> = list(store, &listing(view))
+            .rows
+            .into_iter()
+            .map(|row| row.title)
+            .collect();
+        found.sort_unstable();
+        found
+    };
+
+    assert_eq!(listed(store, repo_only(REPO)), ["Mine"]);
+    assert_eq!(listed(store, global_only()), ["Shared"]);
+    assert_eq!(listed(store, both(OTHER)), ["Shared", "Theirs"]);
+    assert_eq!(listed(store, both("github.com/acme/never-written")), ["Shared"]);
+
+    let none = View {
+        repo: None,
+        global: false,
+    };
+    let page = list(store, &listing(none));
+    assert_eq!((page.total, page.rows.len()), (0, 0));
+}
+
+pub fn peek_reads_without_counting(store: &mut dyn MemoryStore) {
+    let mine = save(
+        store,
+        &repo(REPO),
+        &tagged("Mine", "Body", NoteKind::Note, &["ci"], &["auth.rs"]),
+    );
+    let theirs = save(store, &repo(OTHER), &draft("Theirs", "Body", NoteKind::Note));
+    let shared = save(store, &Target::Global, &draft("Shared", "Body", NoteKind::Note));
+
+    let hits = |store: &mut dyn MemoryStore| -> Vec<(String, i64)> {
+        store
+            .peek(&both(REPO), &[shared, mine, theirs, mine])
+            .expect("peek")
+            .into_iter()
+            .map(|note| (note.title, note.hits))
+            .collect()
+    };
+
+    let peeked = store.peek(&both(REPO), &[mine]).expect("peek");
+    assert_eq!(peeked[0].entities, ["auth.rs"]);
+    assert_eq!(peeked[0].tags, ["ci"]);
+
+    let none = [("Shared".to_owned(), 0), ("Mine".to_owned(), 0)];
+    assert_eq!(
+        hits(store),
+        none,
+        "in the order asked, each once, the other repository's left out"
+    );
+    assert_eq!(hits(store), none, "peeking twice counts no hit");
+
+    store.get(&both(REPO), &[mine]).expect("get");
+    assert_eq!(
+        hits(store),
+        [("Shared".to_owned(), 0), ("Mine".to_owned(), 1)],
+        "get counts one"
+    );
+
+    assert!(matches!(store.peek(&both(REPO), &[]), Err(StoreError::Invalid(_))));
+}
+
+/// More global notes than one list page holds, so deleting covers every page.
+const FILLERS: usize = 201;
+
+pub fn forget_notes_deletes_every_listed_note(store: &mut dyn MemoryStore) {
+    let mine = save(
+        store,
+        &repo(REPO),
+        &tagged("Mine", "Body", NoteKind::Note, &[], &["auth.rs", "db.rs"]),
+    );
+    save(
+        store,
+        &repo(REPO),
+        &tagged("Second", "Body", NoteKind::Fix, &[], &["cache.rs"]),
+    );
+    save(
+        store,
+        &repo(OTHER),
+        &tagged("Theirs", "Body", NoteKind::Note, &[], &["auth.rs"]),
+    );
+
+    for index in 0..FILLERS {
+        let title = format!("Shared {index}");
+        save(
+            store,
+            &Target::Global,
+            &tagged(&title, "Body", NoteKind::Note, &[], &["tabs.md"]),
+        );
+    }
+
+    store
+        .link(
+            &repo(REPO),
+            &Link {
+                from: "auth.rs".to_owned(),
+                relation: "depends_on".to_owned(),
+                to: "db.rs".to_owned(),
+                note_id: Some(mine),
+            },
+        )
+        .expect("link");
+
+    let forgotten = store.forget_notes(&both(REPO)).expect("forget notes");
+    assert_eq!(
+        forgotten,
+        Forgotten {
+            repo: 2,
+            global: FILLERS
+        }
+    );
+
+    assert_eq!(list(store, &listing(both(REPO))).total, 0);
+    assert_eq!(
+        titles(&list(store, &listing(both(OTHER))).rows),
+        ["Theirs"],
+        "another repository's notes stay"
+    );
+
+    let around = store
+        .neighbors(&repo_only(REPO), "auth.rs", 1, 10)
+        .expect("a related entity stays");
+    assert_eq!(around.edges.len(), 1);
+    assert_eq!(around.edges[0].note_id, None, "the relation lost its note");
+
+    for (view, entity) in [(repo_only(REPO), "cache.rs"), (global_only(), "tabs.md")] {
+        assert!(
+            matches!(store.neighbors(&view, entity, 1, 10), Err(StoreError::NotFound(_))),
+            "{entity} is used by nothing any more"
+        );
+    }
+
+    assert!(
+        store.neighbors(&repo_only(OTHER), "auth.rs", 1, 10).is_ok(),
+        "another repository's entity stays"
+    );
+
+    assert_eq!(store.forget_notes(&both(REPO)).expect("again"), Forgotten::default());
+}
+
+/// The notes of `view` in `sort` order (`descending` when asked), read one row per page, so the
+/// pages are checked to follow the order too.
+fn paged(store: &mut dyn MemoryStore, sort: NoteSort, descending: bool) -> Vec<NoteRow> {
+    let query = NoteListQuery {
+        sort,
+        descending,
+        ..listing(both(REPO))
+    };
+    let whole = list(store, &query).rows;
+
+    let pages: Vec<NoteRow> = (0..whole.len() + 1)
+        .flat_map(|offset| {
+            list(
+                store,
+                &NoteListQuery {
+                    offset,
+                    limit: 1,
+                    ..query.clone()
+                },
+            )
+            .rows
+        })
+        .collect();
+
+    assert_eq!(pages, whole, "{sort:?} pages one row at a time");
+    whole
+}
+
+/// Asserts `rows` reversed are `reversed`.
+fn assert_reversed(rows: &[NoteRow], reversed: &[NoteRow]) {
+    let mut turned = rows.to_vec();
+    turned.reverse();
+    assert_eq!(turned, reversed);
+}
+
+/// Sorts by kind name and by scope (global first) break ties by id; a sort by place (one place
+/// per store, so by id there) keeps every note once; each turns round with the order.
+pub fn kinds_scopes_and_places_sort_and_page(store: &mut dyn MemoryStore) {
+    save(store, &repo(REPO), &draft("Repo fix", "Body", NoteKind::Fix));
+    save(
+        store,
+        &Target::Global,
+        &draft("Global decision", "Body", NoteKind::Decision),
+    );
+    save(store, &repo(REPO), &draft("Repo decision", "Body", NoteKind::Decision));
+    save(store, &Target::Global, &draft("Global note", "Body", NoteKind::Note));
+    save(store, &repo(OTHER), &draft("Hidden", "Body", NoteKind::Location));
+
+    let by_kind = paged(store, NoteSort::Kind, false);
+    let kinds: Vec<&str> = by_kind.iter().map(|row| row.kind.as_str()).collect();
+    assert_eq!(kinds, ["decision", "decision", "fix", "note"]);
+    assert!(by_kind[0].id < by_kind[1].id, "a tie goes by id");
+    assert_reversed(&by_kind, &paged(store, NoteSort::Kind, true));
+
+    let by_scope = paged(store, NoteSort::Scope, false);
+    let scopes: Vec<Scope> = by_scope.iter().map(|row| row.scope).collect();
+    assert_eq!(scopes, [Scope::Global, Scope::Global, Scope::Repo, Scope::Repo]);
+    assert!(by_scope[0].id < by_scope[1].id && by_scope[2].id < by_scope[3].id);
+    assert_reversed(&by_scope, &paged(store, NoteSort::Scope, true));
+
+    let by_place = paged(store, NoteSort::Place, false);
+    let mut placed = titles(&by_place);
+    placed.sort_unstable();
+    assert_eq!(placed, ["Global decision", "Global note", "Repo decision", "Repo fix"]);
+    assert_reversed(&by_place, &paged(store, NoteSort::Place, true));
+}

@@ -6,19 +6,32 @@
 //! Every backend validates its input against [`crate::limits`] and masks secrets with
 //! `redact_text` before anything is stored (the helpers in [`clean`] do both), so callers may pass
 //! raw agent text.
+//!
+//! [`ScriptStore`] and [`TrustStore`] (in [`scripts`]) are the script contract; [`Lazy`] opens a
+//! store on first use. [`listing`] holds the types of [`MemoryStore::list_notes`].
 
 pub mod clean;
+pub mod lazy;
 pub mod libsql;
+pub mod listing;
 pub mod mongo;
 pub mod postgres;
+pub mod scripts;
 pub mod split;
 pub mod sqlite;
 
 use std::path::PathBuf;
 
+pub use lazy::Lazy;
 pub use libsql::LibsqlStore;
+pub use listing::{NoteListQuery, NotePage, NoteRow, NoteSort};
 pub use mongo::MongoStore;
 pub use postgres::PostgresStore;
+pub use scripts::{
+    Language, PreviousVersion, SavedScript, Script, ScriptDraft, ScriptRef, ScriptStore, ScriptSummary, TrustOrigin,
+    TrustRecord, TrustStore, TrustedVersion, checked_draft, declares_encoding, foreign_encoding,
+    foreign_encoding_error, hidden_character, hidden_character_error, is_valid_name, script_sha256, visible_body,
+};
 pub use split::SplitStore;
 pub use sqlite::SqliteStore;
 pub(crate) use sqlite::prepare_new_file;
@@ -280,6 +293,39 @@ pub enum Forget {
     Relation { from: String, relation: String, to: String },
 }
 
+/// How many notes [`MemoryStore::forget_notes`] deleted, by scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Forgotten {
+    pub repo: usize,
+    pub global: usize,
+}
+
+impl Forgotten {
+    /// The notes of both scopes.
+    pub fn total(self) -> usize {
+        self.repo + self.global
+    }
+
+    /// The notes of `scope`.
+    pub fn of(self, scope: Scope) -> usize {
+        match scope {
+            Scope::Repo => self.repo,
+            Scope::Global => self.global,
+        }
+    }
+}
+
+impl std::ops::Add for Forgotten {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            repo: self.repo + other.repo,
+            global: self.global + other.global,
+        }
+    }
+}
+
 /// Store failures; every message is safe to show to the agent.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -329,6 +375,14 @@ pub trait MemoryStore: Send {
     /// The notes among `ids` visible in `view` (in the order asked); counts a hit on each.
     fn get(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError>;
 
+    /// The notes [`MemoryStore::get`] reads, without counting a hit (for showing a note, not
+    /// recalling it).
+    fn peek(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError>;
+
+    /// One page of the notes `query` keeps, with their total and the counts per kind; counts no
+    /// hit (see [`listing`]).
+    fn list_notes(&mut self, query: &NoteListQuery) -> Result<NotePage, StoreError>;
+
     /// Ranked notes: the repository first, then relevance, then the most recently updated.
     fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError>;
 
@@ -344,6 +398,11 @@ pub trait MemoryStore: Send {
     /// Deletes a note (visible in `view`), or an entity or relation in the scope `target`.
     /// Returns the number of deleted rows (relations included for an entity).
     fn forget(&mut self, view: &View, target: &Target, what: &Forget) -> Result<usize, StoreError>;
+
+    /// Deletes every note visible in `view` in one write, as [`MemoryStore::forget`] deletes one:
+    /// the relations stay (without their note), and an entity of those scopes that no relation
+    /// uses any more goes.
+    fn forget_notes(&mut self, view: &View) -> Result<Forgotten, StoreError>;
 
     /// The note in the scope `target` (not the global scope too) whose title compares equal to
     /// `title` the way [`MemoryStore::remember`] compares titles. `harness-memory push` uses it to

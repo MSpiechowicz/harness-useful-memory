@@ -13,7 +13,7 @@ use crate::limits::{
 use crate::store::{Forget, Link, NoteDraft, NoteKind, NotePatch, Provenance, SearchQuery, Target, View, clean};
 
 /// Sent when a repository-scope call has no repository.
-const NO_PROJECT: &str = "cannot tell which repository this is (the server runs outside one, or in the home folder \
+pub(super) const NO_PROJECT: &str = "cannot tell which repository this is (the server runs outside one, or in the home folder \
                           or a filesystem root): pass project_path with the absolute repository path, or use \
                           scope \"global\"";
 
@@ -24,6 +24,8 @@ const NO_CHECKOUT: &str = "same_checkout needs the server to run inside a reposi
 pub(super) struct Reply {
     pub text: String,
     pub is_error: bool,
+    /// Sent as `structuredContent` next to the text, when set.
+    pub structured: Option<Value>,
 }
 
 /// Runs tool `name`; `None` when there is no such tool.
@@ -36,12 +38,20 @@ pub(super) fn call(server: &mut Server, name: &str, arguments: Value) -> Option<
         "memory_link" => parse(arguments).and_then(|args| link(server, args)),
         "memory_neighbors" => parse(arguments).and_then(|args| neighbors(server, args)),
         "memory_forget" => parse(arguments).and_then(|args| forget(server, args)),
-        _ => return None,
+        _ => return super::calls_scripts::call(server, name, arguments),
     };
 
     Some(match result {
-        Ok(text) => Reply { text, is_error: false },
-        Err(text) => Reply { text, is_error: true },
+        Ok(text) => Reply {
+            text,
+            is_error: false,
+            structured: None,
+        },
+        Err(text) => Reply {
+            text,
+            is_error: true,
+            structured: None,
+        },
     })
 }
 
@@ -192,8 +202,12 @@ fn search(server: &mut Server, args: SearchArgs) -> Result<String, String> {
     };
 
     let hits = server.store.search(&query).map_err(|error| error.to_string())?;
+    let scripts = super::search_scripts::block(server, &query.view, &query.text);
     let home = server.projects.home();
-    let mut reply = Capped::new(LIST_REPLY_MAX);
+
+    // The saved scripts always fit: the notes get the room they leave.
+    let room = scripts.as_ref().map_or(0, |block| block.len() + 1);
+    let mut reply = Capped::new(LIST_REPLY_MAX.saturating_sub(room));
 
     if !hits.is_empty() {
         reply.push(FRAME);
@@ -211,7 +225,14 @@ fn search(server: &mut Server, args: SearchArgs) -> Result<String, String> {
         reply.push(&hit_block(hit, &home));
     }
 
-    Ok(reply.finish())
+    let mut text = reply.finish();
+
+    if let Some(block) = scripts {
+        text.push('\n');
+        text.push_str(&block);
+    }
+
+    Ok(text)
 }
 
 fn get(server: &mut Server, args: GetArgs) -> Result<String, String> {
@@ -372,7 +393,7 @@ fn forget_with(server: &mut Server, view: &View, target: &Target, what: &Forget)
 }
 
 /// Parses tool arguments; serde's message names the offending field.
-fn parse<T: DeserializeOwned>(arguments: Value) -> Result<T, String> {
+pub(super) fn parse<T: DeserializeOwned>(arguments: Value) -> Result<T, String> {
     serde_json::from_value(arguments).map_err(|error| format!("invalid arguments: {error}"))
 }
 
@@ -392,7 +413,7 @@ fn scope_arg<'a>(raw: Option<&'a str>, default: &'a str) -> Result<&'a str, Stri
 }
 
 /// The scope a write goes to (default: this repository).
-fn target(server: &mut Server, scope: Option<&str>, project_path: Option<&str>) -> Result<Target, String> {
+pub(super) fn target(server: &mut Server, scope: Option<&str>, project_path: Option<&str>) -> Result<Target, String> {
     match scope_arg(scope, "repo")? {
         "global" => Ok(Target::Global),
         "repo" => match server.projects.resolve(project_path)? {
@@ -436,7 +457,7 @@ fn own_root(server: &mut Server) -> Result<std::path::PathBuf, String> {
 /// and whether `project_path` named another repository than that one. The root is always the
 /// writer's own, never the checkout `project_path` named, so a note does not claim to come from a
 /// checkout that did not write it.
-fn provenance(server: &mut Server, project_path: Option<&str>) -> Provenance {
+pub(super) fn provenance(server: &mut Server, project_path: Option<&str>) -> Provenance {
     let named = server.projects.resolve(project_path).ok().flatten().map(|key| key.root);
     let given = project_path.is_some_and(|raw| !raw.trim().is_empty());
 

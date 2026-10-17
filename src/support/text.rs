@@ -48,7 +48,9 @@ const FORMAT_CHARACTERS: &[(char, char)] = &[
     ('\u{E0100}', '\u{E01EF}'),
 ];
 
-fn is_format_character(character: char) -> bool {
+/// True for a character of [`FORMAT_CHARACTERS`]: invisible, or changing how the text around it
+/// is shown.
+pub fn is_format_character(character: char) -> bool {
     FORMAT_CHARACTERS
         .iter()
         .any(|(first, last)| (*first..=*last).contains(&character))

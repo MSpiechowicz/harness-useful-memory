@@ -11,6 +11,10 @@
 //! - [`push`]: copies the local memory into a team database.
 //! - [`mcp`]: the stdio JSON-RPC server and its tools.
 //! - [`limits`]: per-call limits (the amount of memory itself is never capped).
+//! - [`open`]: the script and trust stores the server opens on first use.
+//! - [`cli_trust`]: the `scripts list` and `trust` commands, where a person approves scripts.
+//! - [`cli_notes`]: the `notes list`, `notes get` and `notes delete` commands, where a person
+//!   browses and deletes notes.
 //! - [`location`]: where the database lives, and the one-time move from Harness Desktop's folder.
 //! - [`support`]: the environment, git runner, secret masking and text checks the rest uses.
 //!
@@ -18,9 +22,13 @@
 //! a repository; everything stored passes through [`support::redact::redact_text`] first.
 
 pub mod backend;
+mod cli;
+pub mod cli_notes;
+pub mod cli_trust;
 pub mod limits;
 pub mod location;
 pub mod mcp;
+pub mod open;
 pub mod project;
 pub mod push;
 pub mod store;

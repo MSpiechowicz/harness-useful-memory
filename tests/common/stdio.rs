@@ -36,6 +36,9 @@ pub fn without_team_settings(command: &mut Command) {
         "HARNESS_MEMORY_CONFIG",
         "HARNESS_MEMORY_REPOSITORY_NOTES",
         "HARNESS_MEMORY_GLOBAL_NOTES",
+        "HARNESS_MEMORY_SCRIPTS",
+        "HARNESS_MEMORY_TRUST_TEAM_SCRIPTS",
+        "HARNESS_MEMORY_APPROVAL_WAIT_MS",
     ] {
         if unchosen(name) {
             command.env_remove(name);

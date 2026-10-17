@@ -104,7 +104,7 @@ fn scope_label(scope: Scope, project: Option<&str>) -> String {
 }
 
 /// `text`, every non-empty line indented.
-fn indent(text: &str) -> String {
+pub(super) fn indent(text: &str) -> String {
     text.lines()
         .map(|line| {
             if line.is_empty() {
@@ -128,7 +128,7 @@ fn one_line_list(items: &[String]) -> String {
 
 /// Appends `, from "<root>" via "<client>"` (either part when only one is known, `, via unknown`
 /// when neither is) and `, override` when the agent named the repository with `project_path`.
-fn push_provenance(header: &mut String, provenance: &Provenance, home: &Path) {
+pub(super) fn push_provenance(header: &mut String, provenance: &Provenance, home: &Path) {
     let root = provenance.root.as_deref().map(|root| quoted(&shown_path(root, home)));
     let source = provenance.source.as_deref().map(quoted);
 
@@ -169,7 +169,7 @@ fn plain(text: &str) -> String {
 /// inside it stays part of the one field, and every non-ASCII character escaped as `\uXXXX` (a
 /// surrogate pair beyond the basic plane), so no look-alike quote, bracket or comma can pass for a
 /// delimiter.
-fn quoted(text: &str) -> String {
+pub(super) fn quoted(text: &str) -> String {
     let json = serde_json::Value::String(plain(text)).to_string();
     let mut ascii = String::with_capacity(json.len());
 

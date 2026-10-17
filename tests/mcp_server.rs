@@ -47,13 +47,17 @@ fn initialize_negotiates_the_version_and_sends_instructions() {
     assert_eq!(replies[2]["result"], json!({}));
 
     let instructions = replies[0]["result"]["instructions"].as_str().expect("instructions");
-    assert!(instructions.chars().count() <= 1200);
+    assert!(instructions.chars().count() <= 1600);
     for tool in [
         "memory_search",
         "memory_remember",
         "memory_update",
         "memory_forget",
         "project_path",
+        "script_save",
+        "script_run",
+        "script_list",
+        "script_delete",
     ] {
         assert!(instructions.contains(tool), "{tool}");
     }

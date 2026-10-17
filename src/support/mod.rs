@@ -5,12 +5,14 @@
 //! - [`git`]: a hardened, shell-free `git` runner with a timeout and an output cap.
 //! - [`redact`]: masks secrets in free text before it is stored.
 //! - [`text`]: display safety checks and the search stopword list.
-//! - [`time`]: calendar dates from Unix days.
+//! - [`runner`]: runs a saved script with a timeout and output caps.
+//! - [`time`]: calendar dates and timestamps from Unix time.
 
 pub mod env;
 pub mod git;
 pub mod paths;
 pub mod redact;
+pub mod runner;
 pub mod text;
 pub mod time;
 

@@ -1,5 +1,5 @@
 ---
-source: memory/tests/mcp_server.rs
+source: tests/mcp_server.rs
 expression: "replies[0][\"result\"]"
 ---
 {
@@ -140,7 +140,7 @@ expression: "replies[0][\"result\"]"
     },
     {
       "name": "memory_search",
-      "description": "Call FIRST at the start of every task: returns known fixes, decisions and file locations for this repository. Find notes by a few keywords; repository notes are listed before global ones, and without a query the most recent notes are listed. A message that starts with a `<harness-memory-recall>` block already carries the notes found for that message: search further only if needed.",
+      "description": "Call FIRST at the start of every task: returns known fixes, decisions and file locations for this repository. Find notes by a few keywords; repository notes are listed before global ones, and without a query the most recent notes are listed. A message that starts with a `<harness-memory-recall>` block already carries the notes found for that message: search further only if needed. Saved scripts whose name or description match the keywords are listed after the notes: prefer script_run to retyping them.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -356,6 +356,223 @@ expression: "replies[0][\"result\"]"
         },
         "required": [],
         "additionalProperties": false
+      }
+    },
+    {
+      "name": "script_save",
+      "description": "Save a deterministic action you repeat (a curl or gh fetch, a report, a lookup) as a script, so later sessions run it with script_run instead of working it out again. A script with the same name in the scope is replaced. Scripts run with the user's environment: read secrets from environment variables (for example $GH_TOKEN), never write them into the body (a body holding a credential is refused). Arguments arrive as $1, $2 (sys.argv, process.argv), never through a shell. What you save runs here without approval, since you wrote it: never save the code of a script that waits for approval, edited or not, to run it (an unedited copy waits for approval too).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": [
+              "repo",
+              "global"
+            ],
+            "default": "repo",
+            "description": "repo: this repository; global: shared by all repositories"
+          },
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]*$",
+            "maxLength": 64,
+            "description": "Short name, unique in the scope, for example open-prs"
+          },
+          "description": {
+            "type": "string",
+            "description": "What the script does and its arguments (at most 500 characters)"
+          },
+          "language": {
+            "type": "string",
+            "enum": [
+              "sh",
+              "bash",
+              "python",
+              "node",
+              "bun"
+            ],
+            "description": "The interpreter (python: python3, else python)"
+          },
+          "body": {
+            "type": "string",
+            "description": "The script source (at most 65536 bytes)"
+          },
+          "timeout_secs": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 600,
+            "default": 60,
+            "description": "Seconds a run may take before it is killed"
+          },
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository, when the server cannot tell it from its working directory"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "language",
+          "body"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "script_list",
+      "description": "List saved scripts, repository scripts first: check here before working out a repeated action again. Without a query every visible script is listed.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": [
+              "repo",
+              "global",
+              "all"
+            ],
+            "default": "all",
+            "description": "repo: this repository; global: shared by all repositories; all: both"
+          },
+          "query": {
+            "type": "string",
+            "description": "Keeps scripts whose name or description contains it (at most 256 characters)"
+          },
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository, when the server cannot tell it from its working directory"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "script_get",
+      "description": "Read a script with its body, by id or name (a name is looked up in this repository first, then in the global scope). `approval` says why this machine runs it (local: saved here, approved: approved by the user here, team: every team script is trusted) or that the user must approve it first (needed).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Script id (give id or name)"
+          },
+          "name": {
+            "type": "string",
+            "description": "Script name (give id or name)"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "repo",
+              "global",
+              "all"
+            ],
+            "default": "all",
+            "description": "repo: this repository; global: shared by all repositories; all: both"
+          },
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository, when the server cannot tell it from its working directory"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "script_run",
+      "description": "Run a saved script by id or name and get its exit code, stdout and stderr (capped, secrets masked). Prefer it over repeating the steps by hand. A script saved on another machine, or changed, renamed or moved since this machine approved it, runs only after the user approves it: when Harness Desktop runs, the call waits up to 45 s for the user's answer there (when your client stops waiting sooner, call script_run again once the user approved). You cannot approve a script: when the run is refused, ask the user to approve it in Harness Desktop → Memory (the user can also run `harness-memory trust` in a terminal), then call script_run again.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Script id (give id or name)"
+          },
+          "name": {
+            "type": "string",
+            "description": "Script name (give id or name)"
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 4096
+            },
+            "maxItems": 32,
+            "description": "Arguments, passed as they are (no shell)"
+          },
+          "stdin": {
+            "type": "string",
+            "description": "Standard input (at most 65536 bytes)"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "repo",
+              "global",
+              "all"
+            ],
+            "default": "all",
+            "description": "repo: this repository; global: shared by all repositories; all: both"
+          },
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository, when the server cannot tell it from its working directory"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "script_delete",
+      "description": "Delete a stale or wrong script by id or name.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Script id (give id or name)"
+          },
+          "name": {
+            "type": "string",
+            "description": "Script name (give id or name)"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "repo",
+              "global",
+              "all"
+            ],
+            "default": "all",
+            "description": "repo: this repository; global: shared by all repositories; all: both"
+          },
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository, when the server cannot tell it from its working directory"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
       }
     }
   ]

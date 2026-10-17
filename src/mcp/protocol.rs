@@ -106,7 +106,7 @@ pub fn initialize_result(params: &Value) -> Value {
     json!({
         "protocolVersion": version,
         "capabilities": { "tools": { "listChanged": false } },
-        "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") },
+        "serverInfo": { "name": SERVER_NAME, "version": env!("HARNESS_MEMORY_VERSION") },
         "instructions": INSTRUCTIONS,
     })
 }

@@ -1,0 +1,94 @@
+//! A page of notes ([`crate::store::listing`]) in PostgreSQL: the counts per kind and the page,
+//! then the entity names of the page's notes. `strpos`, not `LIKE`, so `%` and `_` in the text
+//! are plain characters; titles sort by code point (`COLLATE "C"`), like SQLite.
+
+use postgres::GenericClient;
+
+use super::notes::{VISIBLE, kind_from_sql, note_from_row, row_columns};
+use super::{KIND_MAX, backend, column, cut, view_params};
+use crate::limits::ENTITY_MAX;
+use crate::store::listing::{
+    NoteListQuery, NotePage, NoteRow, NoteSort, direction, page_limit, query_entity, query_text,
+};
+use crate::store::{NoteKind, StoreError};
+
+/// The notes the text (`$1`) and the normalized entity name (`$4`) keep (`NULL` for any).
+const KEPT: &str = "($1::text IS NULL OR strpos(lower(n.title), lower($1::text)) > 0
+                     OR strpos(lower(n.body), lower($1::text)) > 0 OR strpos(lower(n.tags), lower($1::text)) > 0)
+                    AND ($4::text IS NULL OR EXISTS (SELECT 1 FROM note_entities ne JOIN entities e ON e.id = ne.entity_id
+                                                     WHERE ne.note_id = n.id AND e.name_norm = $4::text))";
+
+pub(super) fn list(client: &mut impl GenericClient, query: &NoteListQuery) -> Result<NotePage, StoreError> {
+    let text = query_text(query)?;
+    let entity = query_entity(query);
+    let (repo, global) = view_params(client, &query.view)?;
+
+    let counts_sql = format!(
+        "SELECT {}, count(*) FROM notes n WHERE {VISIBLE} AND {KEPT} GROUP BY n.kind",
+        cut("n.kind", KIND_MAX)
+    );
+    let counted: Vec<(NoteKind, usize)> = client
+        .query(&counts_sql, &[&text, &repo, &global, &entity])
+        .map_err(backend)?
+        .iter()
+        .map(|row| {
+            let kind: String = column(row, 0)?;
+            let count: i64 = column(row, 1)?;
+            Ok((kind_from_sql(&kind), usize::try_from(count).unwrap_or(0)))
+        })
+        .collect::<Result<_, StoreError>>()?;
+
+    let dir = direction(query);
+    let order = match query.sort {
+        NoteSort::Updated => format!("n.updated_at {dir}, n.id {dir}"),
+        NoteSort::Title => format!("n.title_norm COLLATE \"C\" {dir}, n.id {dir}"),
+        NoteSort::Kind => format!("n.kind COLLATE \"C\" {dir}, n.id {dir}"),
+        NoteSort::Scope => format!("(n.project_id IS NOT NULL) {dir}, n.id {dir}"),
+        NoteSort::Place => format!("n.id {dir}"),
+    };
+    let sql = format!(
+        "SELECT {} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
+         WHERE {VISIBLE} AND {KEPT} AND ($5::text IS NULL OR n.kind = $5::text)
+         ORDER BY {order} LIMIT $6 OFFSET $7",
+        row_columns()
+    );
+
+    let limit = i64::try_from(page_limit(query)).unwrap_or(1);
+    let offset = i64::try_from(query.offset).unwrap_or(i64::MAX);
+    let kind = query.kind.map(NoteKind::as_str);
+
+    let mut rows: Vec<NoteRow> = client
+        .query(&sql, &[&text, &repo, &global, &entity, &kind, &limit, &offset])
+        .map_err(backend)?
+        .iter()
+        .map(|row| note_from_row(row).map(NoteRow::from))
+        .collect::<Result<_, StoreError>>()?;
+
+    fill_entities(client, &mut rows)?;
+    Ok(NotePage::new(counted, query.kind, rows))
+}
+
+/// Sets the entity names of `rows` (alphabetically, as a note's), in one statement.
+fn fill_entities(client: &mut impl GenericClient, rows: &mut [NoteRow]) -> Result<(), StoreError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+    let sql = format!(
+        "SELECT ne.note_id, {} FROM note_entities ne JOIN entities e ON e.id = ne.entity_id
+         WHERE ne.note_id = ANY($1) ORDER BY e.name_norm COLLATE \"C\"",
+        cut("e.name", ENTITY_MAX)
+    );
+
+    for linked in client.query(&sql, &[&ids]).map_err(backend)? {
+        let id: i64 = column(&linked, 0)?;
+        let name: String = column(&linked, 1)?;
+
+        if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
+            row.entities.push(name);
+        }
+    }
+
+    Ok(())
+}

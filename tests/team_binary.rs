@@ -404,14 +404,20 @@ fn check_without_a_team_database_reports_the_local_file() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(
         stdout(&output),
-        format!("ok: local database at {} (not created yet)\n", file.display())
+        format!(
+            "ok: local database at {} (not created yet)\nscripts: this computer\n",
+            file.display()
+        )
     );
     assert!(!file.exists(), "check does not create the database");
 
     std::fs::create_dir_all(&machine.memory).expect("memory folder");
     std::fs::write(&file, "").expect("a database file");
     let output = run(binary(&machine, &["check"], None));
-    assert_eq!(stdout(&output), format!("ok: local database at {}\n", file.display()));
+    assert_eq!(
+        stdout(&output),
+        format!("ok: local database at {}\nscripts: this computer\n", file.display())
+    );
 }
 
 #[test]
@@ -459,7 +465,9 @@ fn check_refuses_unknown_settings() {
 fn check_with_both_scopes_local_skips_the_team_database() {
     let machine = machine();
     let url = "postgres://alice:hunter2secret@127.0.0.1:1/memory";
-    let output = run(routed(&machine, &["check"], Some(url), ("local", "local")));
+    let mut command = routed(&machine, &["check"], Some(url), ("local", "local"));
+    command.env("HARNESS_MEMORY_SCRIPTS", "local");
+    let output = run(command);
 
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(
@@ -476,6 +484,51 @@ fn check_with_both_scopes_local_skips_the_team_database() {
 }
 
 #[test]
+fn check_with_both_note_scopes_local_still_opens_the_team_database_for_scripts() {
+    let machine = machine();
+    let url = "postgres://alice:hunter2secret@127.0.0.1:1/memory?connect_timeout=2";
+    let output = run(routed(&machine, &["check"], Some(url), ("local", "local")));
+
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    assert!(output.stdout.is_empty(), "{}", stdout(&output));
+    let message = stderr(&output);
+    assert!(
+        message.contains(
+            "harness-memory: cannot open the team database (PostgreSQL at postgres://alice@127.0.0.1:1/memory?…): "
+        ),
+        "{message}"
+    );
+    assert!(!message.contains("hunter2secret"), "{message}");
+
+    let Some(db) = database() else { return };
+    let output = run(routed(&machine, &["check"], Some(db.url()), ("local", "local")));
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let file = machine.memory.join("memory.sqlite3");
+    assert_eq!(
+        stdout(&output),
+        format!(
+            "ok: local database at {} (not created yet)\nscripts: team database\n",
+            file.display()
+        )
+    );
+
+    db.admin()
+        .execute(
+            "UPDATE harness_memory_meta SET value = value + 1 WHERE key = 'schema_version'",
+            &[],
+        )
+        .expect("a newer version");
+    let newer = run(routed(&machine, &["check"], Some(db.url()), ("local", "local")));
+    assert_eq!(newer.status.code(), Some(0), "{}", stderr(&newer));
+    assert!(
+        stdout(&newer)
+            .ends_with("\nscripts: team database; the team database is newer than this harness-memory; update it\n"),
+        "{}",
+        stdout(&newer)
+    );
+}
+
+#[test]
 fn check_opens_the_team_database() {
     let Some(db) = database() else { return };
     let machine = machine();
@@ -484,8 +537,8 @@ fn check_opens_the_team_database() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let said = stdout(&output);
     assert!(said.starts_with("ok: PostgreSQL at postgres://"), "{said}");
-    assert!(said.ends_with(" (schema 1)\n"), "{said}");
-    assert_eq!(said.lines().count(), 1, "{said}");
+    assert!(said.ends_with(" (schema 2)\nscripts: team database\n"), "{said}");
+    assert_eq!(said.lines().count(), 2, "{said}");
     assert!(!said.contains(":test@"), "no password: {said}");
 
     let split = run(routed(&machine, &["check"], Some(db.url()), ("remote", "local")));
@@ -493,8 +546,8 @@ fn check_opens_the_team_database() {
     let file = machine.memory.join("memory.sqlite3");
     assert!(
         stdout(&split).ends_with(&format!(
-            " (schema 1); repository notes: team database, global notes: this computer; local database at {} (not \
-             created yet)\n",
+            " (schema 2); repository notes: team database, global notes: this computer; local database at {} (not \
+             created yet)\nscripts: team database\n",
             file.display()
         )),
         "{}",
@@ -512,8 +565,10 @@ fn check_opens_the_team_database() {
     let newer = run(binary(&machine, &["check"], Some(db.url())));
     assert_eq!(newer.status.code(), Some(0), "{}", stderr(&newer));
     assert!(
-        stdout(&newer)
-            .ends_with(" (schema newer than 1); the team database is newer than this harness-memory; update it\n"),
+        stdout(&newer).ends_with(
+            " (schema newer than 2); the team database is newer than this harness-memory; update it\nscripts: \
+                 team database\n"
+        ),
         "{}",
         stdout(&newer)
     );

@@ -23,6 +23,9 @@ pub const TOKEN_VAR: &str = "HARNESS_MEMORY_TEST_LIBSQL_TOKEN";
 /// tables and the triggers with it).
 const RESET: &str = "
 PRAGMA foreign_keys = OFF;
+DROP TABLE IF EXISTS script_trust;
+DROP TABLE IF EXISTS script_seen_unapproved;
+DROP TABLE IF EXISTS scripts;
 DROP TABLE IF EXISTS notes_fts;
 DROP TABLE IF EXISTS note_entities;
 DROP TABLE IF EXISTS relations;

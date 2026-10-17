@@ -32,6 +32,12 @@ pub const CAPTURED_VARS: &[&str] = &[
     // Which scopes stay on this computer with a team database (see `crate::backend::Routing`).
     "HARNESS_MEMORY_REPOSITORY_NOTES",
     "HARNESS_MEMORY_GLOBAL_NOTES",
+    // Whether scripts stay on this computer with a team database (see `crate::backend::Routing`).
+    "HARNESS_MEMORY_SCRIPTS",
+    // Whether team scripts run without approval here (see `crate::backend::TRUST_TEAM_SCRIPTS_VAR`).
+    "HARNESS_MEMORY_TRUST_TEAM_SCRIPTS",
+    // How long `script_run` waits for Harness Desktop's answer, in milliseconds (for tests).
+    "HARNESS_MEMORY_APPROVAL_WAIT_MS",
     // The Windows config folder (roaming), which holds the config file.
     "APPDATA",
 ];

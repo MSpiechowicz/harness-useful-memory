@@ -22,8 +22,10 @@
 
 mod connect;
 mod graph;
+mod listing;
 mod notes;
 pub mod schema;
+mod scripts;
 mod search;
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,7 +35,7 @@ use postgres::types::FromSql;
 use postgres::{Client, GenericClient, NoTls, Row, Transaction};
 
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, ProjectKey};
-use super::{Saved, SearchQuery, StoreError, Target, View, clean};
+use super::{Forgotten, NoteListQuery, NotePage, Saved, SearchQuery, StoreError, Target, View, clean};
 pub use connect::UrlError;
 use schema::SchemaState;
 
@@ -199,7 +201,15 @@ impl MemoryStore for PostgresStore {
     }
 
     fn get(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
-        self.write(|tx| notes::get(tx, view, ids))
+        self.write(|tx| notes::get(tx, view, ids, true))
+    }
+
+    fn peek(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
+        self.read(|client| notes::get(client, view, ids, false))
+    }
+
+    fn list_notes(&mut self, query: &NoteListQuery) -> Result<NotePage, StoreError> {
+        self.read(|client| listing::list(client, query))
     }
 
     fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
@@ -226,6 +236,10 @@ impl MemoryStore for PostgresStore {
             Forget::Entity(name) => graph::forget_entity(tx, target, name),
             Forget::Relation { from, relation, to } => graph::forget_relation(tx, target, from, relation, to),
         })
+    }
+
+    fn forget_notes(&mut self, view: &View) -> Result<Forgotten, StoreError> {
+        self.write(|tx| notes::forget_all(tx, view))
     }
 
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {

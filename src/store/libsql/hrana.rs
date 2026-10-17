@@ -68,7 +68,7 @@ impl Client {
             .http_status_as_error(false)
             .max_redirects(0)
             .proxy(None)
-            .user_agent(concat!("harness-memory/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("harness-memory/", env!("HARNESS_MEMORY_VERSION")))
             .build()
             .new_agent();
 

@@ -61,6 +61,20 @@ pub(super) fn prune_entity(tx: &mut Transaction<'_>, id: i64) -> Result<(), Stor
     Ok(())
 }
 
+/// Deletes the entities of the repository `repo` (when given) and of the global scope (when
+/// `global`) that no note and no relation uses.
+pub(super) fn prune_entities(tx: &mut Transaction<'_>, repo: Option<i64>, global: bool) -> Result<(), StoreError> {
+    tx.execute(
+        "DELETE FROM entities e WHERE (e.project_id = $1::bigint OR ($2::boolean AND e.project_id IS NULL))
+           AND NOT EXISTS (SELECT 1 FROM note_entities ne WHERE ne.entity_id = e.id)
+           AND NOT EXISTS (SELECT 1 FROM relations r WHERE r.src = e.id OR r.dst = e.id)",
+        &[&repo, &global],
+    )
+    .map_err(backend)?;
+
+    Ok(())
+}
+
 /// Records a link cleaned by [`clean::link`].
 pub(super) fn link(tx: &mut Transaction<'_>, target: &Target, link: &Link) -> Result<Edge, StoreError> {
     let project = target_project(tx, target)?;

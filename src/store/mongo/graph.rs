@@ -64,6 +64,29 @@ pub(super) fn prune_entity(ctx: &mut Ctx<'_>, project: Option<&str>, norm: &str)
     Ok(())
 }
 
+/// Deletes the entities of the scope `project` that no relation uses, once its notes are gone.
+pub(super) fn prune_scope(ctx: &mut Ctx<'_>, project: Option<&str>) -> Result<(), Fail> {
+    let scope = scope_value(project);
+    let relations = ctx.find(
+        RELATIONS,
+        doc! { "project": scope.clone() },
+        doc! {},
+        0,
+        doc! { "src": cut("$src", ENTITY_NORM_MAX), "dst": cut("$dst", ENTITY_NORM_MAX) },
+    )?;
+
+    let mut used: Vec<String> = relations
+        .iter()
+        .flat_map(|relation| [text(relation, "src"), text(relation, "dst")])
+        .flatten()
+        .collect();
+    used.sort_unstable();
+    used.dedup();
+
+    ctx.delete_many(ENTITIES, doc! { "project": scope, "name_norm": { "$nin": used } })?;
+    Ok(())
+}
+
 /// `link` with its names and label cleaned and checked (before any request).
 pub(super) fn prepare(link: &Link) -> Result<Link, StoreError> {
     let from = clean::entity(&link.from)?;

@@ -1,20 +1,30 @@
 //! The `harness-memory` executable: `harness-memory [mcp]` serves MCP over stdio,
 //! `harness-memory push [--dry-run] [--repo <key|.>] [--no-global]` copies the local memory into
-//! the team database, `harness-memory check` opens the configured database and says which it is,
-//! `harness-memory --version` prints the version.
+//! the team database, `harness-memory check` opens the configured database and says which it is
+//! and where scripts are, `harness-memory scripts list|delete` and `harness-memory trust` list,
+//! delete and approve scripts ([`harness_memory::cli_trust`]), `harness-memory notes list|get|delete` browse and
+//! delete notes ([`harness_memory::cli_notes`]), `harness-memory --version` prints the version.
 
 use std::io::{BufReader, Write};
 use std::process::ExitCode;
 
 use harness_memory::backend::{self, Backend, CONFIG_VAR, Place, Routing, Selection, URL_VAR};
-use harness_memory::location::{DIR_VAR, Migration, legacy_database_path, migrate_legacy, override_is_relative};
+use harness_memory::location::{DIR_VAR, override_is_relative};
+use harness_memory::open::{open_notes, open_other_scripts, open_scripts, open_trust};
 use harness_memory::project::{ProjectResolver, normalize_remote};
 use harness_memory::push::{Action, GLOBAL, Options, Summary, push};
-use harness_memory::store::{MemoryStore, Scope, SplitStore, SqliteStore};
 use harness_memory::support::Env;
 use harness_memory::{Server, database_path, serve};
+use harness_memory::{cli_notes, cli_trust};
 
-const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--repo <key|.>] [--no-global] | check | --version]";
+const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--repo <key|.>] [--no-global] | check | scripts list \
+                     --json [--project PATH] [--group needsReview|repo|global] [--query TEXT] [--sort \
+                     name|language|scope|place|runs|lastRun|updated] \
+                     [--order asc|desc] [--offset N] [--limit N] | scripts delete <id> [--project PATH] | scripts \
+                     delete --all --yes [--project PATH] [--json] | trust <id>[=<sha256>]... | --all [--project PATH] \
+                     | notes list --json [--project PATH] [--kind KIND] [--query TEXT] [--sort updated|title|kind|scope|place] [--order \
+                     asc|desc] [--offset N] [--limit N] | notes get <id> --json [--project PATH] | notes delete <id> \
+                     [--project PATH] | notes delete --all --yes [--project PATH] [--json] | --version]";
 
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -30,8 +40,11 @@ fn main() -> ExitCode {
             }
         },
         [Some("check")] => run_check(),
+        [Some("scripts"), rest @ ..] => cli_trust::scripts(rest),
+        [Some("trust"), rest @ ..] => cli_trust::trust(rest),
+        [Some("notes"), rest @ ..] => cli_notes::notes(rest),
         [Some("--version")] => {
-            println!("harness-memory {}", env!("CARGO_PKG_VERSION"));
+            println!("harness-memory {}", env!("HARNESS_MEMORY_VERSION"));
             ExitCode::SUCCESS
         }
         _ => {
@@ -51,12 +64,22 @@ fn run() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let Some(store) = open_store(&env, &selection) else {
+    let Some(store) = open_notes(&env, &selection) else {
         return ExitCode::FAILURE;
     };
 
+    let scripts = open_scripts(&env, &selection);
+    let other_scripts = open_other_scripts(&env, &selection);
+    let trust = open_trust(&env);
     let projects = ProjectResolver::new(env, std::env::current_dir().ok());
-    let mut server = Server::new(store, projects);
+    let mut server = Server::new(store, scripts, trust, projects)
+        .with_scripts_place(selection.scripts_place())
+        .with_team_key(selection.backend.team_key())
+        .with_trust_team_scripts(selection.trust_team_scripts);
+
+    if let Some(other) = other_scripts {
+        server = server.with_other_scripts(other);
+    }
 
     let stdin = BufReader::new(std::io::stdin().lock());
     let mut stdout = std::io::stdout().lock();
@@ -91,68 +114,45 @@ fn select(env: &Env) -> Option<Selection> {
     }
 }
 
-/// The store the server uses: the local one, the team database, or both split by scope (see
-/// [`Routing`]); `None` (with the reason printed) when one cannot be opened.
-fn open_store(env: &Env, selection: &Selection) -> Option<Box<dyn MemoryStore>> {
-    let Selection { backend, routing, .. } = selection;
-
-    if *backend == Backend::Local || routing.is_all_local() {
-        return open_local(env);
-    }
-
-    let team = open_team(backend)?;
-
-    if !routing.is_split() {
-        return Some(team);
-    }
-
-    let local = open_local(env)?;
-    let local_scope = if routing.repository == Place::Local {
-        Scope::Repo
-    } else {
-        Scope::Global
-    };
-
-    Some(Box::new(SplitStore::new(team, local, local_scope)))
-}
-
-/// The team database; `None` (with the reason printed) when it cannot be opened. That stops the
-/// server: an empty local database instead would look like the team's memory had gone.
-fn open_team(backend: &Backend) -> Option<Box<dyn MemoryStore>> {
-    match backend::open(backend)? {
-        Ok(opened) => {
-            if opened.newer {
-                eprintln!("harness-memory: the team database is newer than this server; tools will fail");
-            }
-
-            Some(opened.store)
-        }
-        Err(message) => {
-            eprintln!("harness-memory: {message}");
-            None
-        }
-    }
-}
-
-/// `harness-memory check`: opens the configured database like the server does and prints one
-/// line saying which it is (exit 0), or the reason it cannot be opened on stderr (exit 1). The
-/// local database is only looked at, never created or migrated.
+/// `harness-memory check`: opens the configured database like the server does and prints a line
+/// saying which it is, then `scripts: team database` or `scripts: this computer` (exit 0), or the
+/// reason it cannot be opened on stderr (exit 1). The local database is only looked at, never
+/// created or migrated. With every note scope kept on this computer, the team database is opened
+/// for the scripts when they go there.
 fn run_check() -> ExitCode {
     let Ok(env) = Env::from_process() else {
         eprintln!("harness-memory: the home folder is unknown");
         return ExitCode::FAILURE;
     };
 
-    let Some(Selection { backend, routing, .. }) = select(&env) else {
+    let Some(selection) = select(&env) else {
         return ExitCode::FAILURE;
     };
+
+    let selection_scripts = selection.scripts_place();
+    let team = cli_trust::check_line(&selection)
+        .map(|line| format!("\n{line}"))
+        .unwrap_or_default();
+    let scripts = format!("scripts: {}", selection_scripts.describe());
+    let Selection { backend, routing, .. } = selection;
 
     if backend == Backend::Local || routing.is_all_local() {
         let Some(local) = local_place(&env) else {
             return ExitCode::FAILURE;
         };
 
+        if selection_scripts == Place::Local {
+            println!("ok: {local}");
+            println!("{scripts}{team}");
+            return ExitCode::SUCCESS;
+        }
+
+        let Some(newer) = check_team(&backend) else {
+            return ExitCode::FAILURE;
+        };
+
         println!("ok: {local}");
+        println!("{scripts}{}{team}", newer_note(newer));
         return ExitCode::SUCCESS;
     }
 
@@ -185,7 +185,29 @@ fn run_check() -> ExitCode {
     }
 
     println!("{line}");
+    println!("{scripts}{team}");
     ExitCode::SUCCESS
+}
+
+/// Opens the team database `backend` for the scripts: whether it was written by a newer server,
+/// or `None` with the reason printed.
+fn check_team(backend: &Backend) -> Option<bool> {
+    match backend::open(backend)? {
+        Ok(opened) => Some(opened.newer),
+        Err(message) => {
+            eprintln!("harness-memory: {message}");
+            None
+        }
+    }
+}
+
+/// What the scripts line adds when the team database is newer than this server.
+fn newer_note(newer: bool) -> &'static str {
+    if newer {
+        "; the team database is newer than this harness-memory; update it"
+    } else {
+        ""
+    }
 }
 
 /// `local database at <path>`, noting when the file does not exist yet (it is not created);
@@ -217,48 +239,6 @@ fn routing_line(routing: Routing) -> String {
         routing.repository.describe(),
         routing.global.describe()
     )
-}
-
-/// The local SQLite store, after the one-time move from Harness Desktop's folder; `None` (with
-/// the reason printed) when it cannot be opened.
-fn open_local(env: &Env) -> Option<Box<dyn MemoryStore>> {
-    let Some(path) = database_path(env) else {
-        eprintln!("harness-memory: the data folder is unknown");
-        return None;
-    };
-
-    if override_is_relative(env) {
-        eprintln!(
-            "harness-memory: {DIR_VAR} must be an absolute folder; using {}",
-            path.display()
-        );
-    }
-
-    // A failed move is not fatal: the server starts on an empty database and the legacy one stays.
-    if let Migration::Failed(reason) = migrate_legacy(env, &path) {
-        eprintln!(
-            "harness-memory: could not copy the Harness Desktop memory database ({reason}); starting empty. \
-             The old notes are still in {}; to retry, stop every harness-memory server and delete {}",
-            legacy_database_path(env)
-                .map(|legacy| legacy.display().to_string())
-                .unwrap_or_default(),
-            path.display()
-        );
-    }
-
-    let store = match SqliteStore::open(&path) {
-        Ok(store) => store,
-        Err(error) => {
-            eprintln!("harness-memory: {error}");
-            return None;
-        }
-    };
-
-    if store.is_newer() {
-        eprintln!("harness-memory: memory database is newer than this server; tools will fail");
-    }
-
-    Some(Box::new(store))
 }
 
 /// The options of `harness-memory push`.

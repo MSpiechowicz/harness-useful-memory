@@ -11,7 +11,9 @@ use super::search::terms;
 use super::{Ctx, ENTITIES, Fail, NOTES, RELATIONS, graph, int, now, project_of, scope_of, scope_value, strings};
 use super::{PATH_MAX, cut, flag, id_only, note_fields, number, text, visible};
 use crate::limits::{BODY_MAX, ENTITY_MAX, GET_IDS_MAX};
-use crate::store::{Note, NoteDraft, NoteKind, NotePatch, Provenance, Saved, StoreError, Target, View, clean};
+use crate::store::{
+    Forgotten, Note, NoteDraft, NoteKind, NotePatch, Provenance, Saved, StoreError, Target, View, clean,
+};
 use crate::support::redact::redact_text;
 
 /// A [`NoteDraft`] cleaned and checked.
@@ -265,8 +267,8 @@ pub(super) fn update(ctx: &mut Ctx<'_>, view: &View, id: i64, patch: &CleanPatch
     })
 }
 
-/// The visible notes among `ids`, each read as it was before this read's hit was counted.
-pub(super) fn get(ctx: &mut Ctx<'_>, view: &View, ids: &[i64]) -> Result<Vec<Note>, Fail> {
+/// The visible notes among `ids`, each read as it was before this read's hit (when `count`).
+pub(super) fn get(ctx: &mut Ctx<'_>, view: &View, ids: &[i64], count: bool) -> Result<Vec<Note>, Fail> {
     let mut seen: HashSet<i64> = HashSet::new();
     let mut found: Vec<Note> = Vec::new();
 
@@ -275,20 +277,25 @@ pub(super) fn get(ctx: &mut Ctx<'_>, view: &View, ids: &[i64]) -> Result<Vec<Not
             continue;
         }
 
-        let mut filter = visible(view);
-        filter.insert("_id", id);
+        let read = if count {
+            let mut filter = visible(view);
+            filter.insert("_id", id);
 
-        let counted = ctx.find_one_and_update(
-            NOTES,
-            filter,
-            doc! { "$inc": { "hits": 1_i64 } },
-            false,
-            false,
-            note_fields(),
-        )?;
+            ctx.find_one_and_update(
+                NOTES,
+                filter,
+                doc! { "$inc": { "hits": 1_i64 } },
+                false,
+                false,
+                note_fields(),
+            )?
+            .as_ref()
+            .map(stored)
+        } else {
+            load(ctx, view, id)?
+        };
 
-        if let Some(document) = counted {
-            let Stored { mut note, norms } = stored(&document);
+        if let Some(Stored { mut note, norms }) = read {
             note.entities = entities_of(ctx, note.project.as_deref(), &norms)?;
             found.push(note);
         }
@@ -314,6 +321,37 @@ pub(super) fn forget(ctx: &mut Ctx<'_>, view: &View, id: i64) -> Result<usize, F
     }
 
     Ok(1)
+}
+
+/// Deletes every note visible in `view`, one scope at a time: the notes, the note of their
+/// relations (the relations stay), then the entities of the scope that no relation uses.
+pub(super) fn forget_all(ctx: &mut Ctx<'_>, view: &View) -> Result<Forgotten, Fail> {
+    let mut forgotten = Forgotten::default();
+
+    if let Some(repo) = &view.repo {
+        forgotten.repo = forget_scope(ctx, Some(&repo.key))?;
+    }
+
+    if view.global {
+        forgotten.global = forget_scope(ctx, None)?;
+    }
+
+    Ok(forgotten)
+}
+
+/// Deletes the notes of the scope `project` (see [`forget_all`]); how many went.
+fn forget_scope(ctx: &mut Ctx<'_>, project: Option<&str>) -> Result<usize, Fail> {
+    let scope = scope_value(project);
+    let deleted = ctx.delete_many(NOTES, doc! { "project": scope.clone() })?;
+
+    ctx.update_many(
+        RELATIONS,
+        doc! { "project": scope.clone(), "note_id": { "$ne": Bson::Null } },
+        doc! { "$set": { "note_id": Bson::Null } },
+    )?;
+    graph::prune_scope(ctx, project)?;
+
+    Ok(usize::try_from(deleted).unwrap_or(usize::MAX))
 }
 
 /// The note of the scope `target` whose title (a cleaned one) compares equal to `title`, read
@@ -374,7 +412,7 @@ pub(super) fn provenance_of(document: &Document) -> Provenance {
     }
 }
 
-fn stored(document: &Document) -> Stored {
+pub(super) fn stored(document: &Document) -> Stored {
     let project = text(document, "project");
 
     let note = Note {

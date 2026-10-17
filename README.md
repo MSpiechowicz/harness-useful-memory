@@ -134,13 +134,18 @@ as the command instead.
 
 | Tool | What it does |
 | --- | --- |
-| `memory_search` | Finds notes by a few keywords, repository notes before global ones. Without a query it lists the most recent notes. Agents call it first, at the start of a task |
+| `memory_search` | Finds notes by a few keywords, repository notes before global ones. Without a query it lists the most recent notes. With a query it also lists up to 5 saved scripts whose name or description matches one of its words, in a `<saved-scripts>` block after the notes. Agents call it first, at the start of a task |
 | `memory_remember` | Saves a note: title, body, kind (`outcome`, `problem`, `fix`, `optimisation`, `location`, `decision`, `note`), tags and the entities it is about. A note with the same title in the scope is updated, and similar notes are listed so outdated ones get fixed |
 | `memory_update` | Changes a note by id: any of title, body, kind and tags, or appends text to the body |
 | `memory_get` | Reads whole notes by id (up to 5) |
 | `memory_link` | Relates two entities, `from relation to`, for example `ConfigLoader located_in src/config.rs`. Missing entities are created |
 | `memory_neighbors` | Shows the relations around an entity (one or two hops) and the notes linked to them |
 | `memory_forget` | Deletes a note by id, an entity with its relations, or one relation |
+| `script_save` | Saves a deterministic script (`sh`, `bash`, `python`, `node` or `bun`) by name, so an action agents repeat, such as a `curl` or `gh` fetch, runs without being worked out again. A script with the same name in the scope is replaced |
+| `script_list` | Lists the saved scripts, repository scripts first, optionally filtered by a word of the name or description |
+| `script_get` | Reads a script with its body, by id or name |
+| `script_run` | Runs a script by id or name with arguments and standard input, and returns its exit code, stdout and stderr. A script from a teammate runs only after you approve it |
+| `script_delete` | Deletes a script by id or name |
 
 Every tool takes an optional `scope` (`repo` or `global`, and `both` for reads) and a `project_path`, the absolute path
 of the repository, for when the server cannot tell it from its working directory. The server also sends instructions that
@@ -148,6 +153,186 @@ tell agents when to search, when to save, and to update a note rather than add a
 
 Per-call limits keep the notes short: a title is at most 120 characters, a body 4000, a note has at most 8 tags and 10
 entities, and search and read replies are capped at a few KiB. The number of notes is not capped.
+
+The script tools also return `structuredContent`: `script_save` `{"script", "created"}`, `script_list` `{"scripts"}`,
+`script_get` `{"script"}` (with `body`), `script_delete` `{"deleted", "id"}` and `script_run` `{"id", "sha256",
+"exitCode", "timedOut", "durationMs", "stdout", "stderr", "stdoutTruncated", "stderrTruncated"}`. A script object has
+`id`, `name`, `description`, `language`, `scope`, `repo` (`host/owner/repo`, or `null` for a global script), `sha256`,
+`timeoutSecs`, `place` (`team` or `local`), `author` (`source`, `root`: on one line without control or invisible
+characters, at most 64 and 512 characters), `createdAt`, `updatedAt`, `runCount`,
+`lastRunAt`, `lastExitCode` (RFC 3339 UTC times), `trusted` and `approval` (`local`: saved on this computer,
+`approved`: approved by you here, `team`: a team script with `trust_team_scripts` on, `needed`: waits for your approval,
+see [Approving scripts](#approving-scripts)). A refused run returns `{"untrusted": true, "id", "name", "pending"}`,
+where `pending` is `false` (not asked), `"declined"` or `"timeout"`.
+
+### Scripts
+
+A script is a file the server writes to a private temporary folder and runs with its interpreter, found by name on
+`PATH` (`python3`, then `python`, for Python), as `<interpreter> <file> <args…>`: arguments are passed as they are,
+never through a shell. The folder (`0700`, removed after the run) is in `run` next to the local database
+(`<data folder>/harness-memory/run`, or `run` in `HARNESS_MEMORY_DIR`), never in the shared system temporary folder,
+because Node and Bun look for modules and settings in every parent folder of a script. It runs in the repository root
+(the server's working directory outside one) with the user's environment, so `gh` and `curl` see `GH_TOKEN` and the
+rest, but not the team database settings (`HARNESS_MEMORY_DATABASE_URL`, `HARNESS_MEMORY_DATABASE_TOKEN`,
+`HARNESS_MEMORY_CONFIG` and the routing variables).
+
+Since the file is not in the repository, imports relative to the script do not find repository files: `import helper`
+in Python and `require('./helper')` or `import './helper.ts'` in Node and Bun look next to the temporary file. Use
+paths relative to the working directory instead (`path.resolve('helper.js')`, `sys.path.insert(0, os.getcwd())`), absolute
+paths, or run the repository's own tools from the working directory (`./scripts/release.sh`, `npx eslint`).
+
+A run ends when the script exits. Processes it left in the background that still hold its output get 1 s, then they
+are killed (Linux and macOS). A run is killed after the script's timeout (60 s unless it names one, at most 600 s),
+with everything it started on Linux and macOS; on Windows only the interpreter is killed. The reply keeps 32 KiB of
+stdout and 8 KiB of stderr, masked before the cut so a secret crossing it is masked whole: credential formats, secret
+assignments and URL secrets (random-looking words are kept, so JSON output stays intact).
+
+A body holding a credential is refused: scripts read secrets from environment variables. So is a body with control
+characters (other than newlines, tabs and a carriage return right before a newline) or invisible format characters
+such as bidirectional overrides, zero-width spaces and variation selectors, which could make a reviewed body run
+differently from how it reads (a lone carriage return hides the rest of a line, and `ok` with a variation selector is
+another JavaScript name than `ok`). A Python body that declares an encoding other than UTF-8 on its first two lines
+(`# -*- coding: utf-7 -*-`, PEP 263; `utf-8`, `utf8` and `utf_8` are fine) is refused too, since Python would run
+other code than the text you read, and a Python body without a declaration is written after a UTF-8 byte-order mark,
+so Python reads it as UTF-8 whatever it says. A script with one of these in the team database is not run or approved
+either. Emoji
+keep what they need: the emoji joiner (U+200D) next to an emoji, and U+FE0E or U+FE0F right after an emoji symbol
+(U+FE0F also after a keycap digit, `#` or `*`). A body is at most 64 KiB, a run takes at most 32 arguments of 4 KiB
+and 64 KiB of standard input.
+
+#### Approving scripts
+
+An agent cannot approve a script through the MCP tools. A machine runs only the script versions it trusts: the ones
+saved on it with `script_save`, and the ones you approved there. Trust belongs to one script, where it is kept (this
+computer, or the team database, named by a hash of its kind, hosts and database name without credentials, the
+scheme's default port and the order of MongoDB hosts left out, so every way of writing one database URL names the
+same database) and its id there, and to one version of it, named by its `sha256`: the SHA-256 of its language and body
+(`harness-memory-script-v1`, a NUL byte, the language, a NUL byte, the body), so the same body run by another
+interpreter is another version. Approving a script never approves another script with the same code. A version is
+trusted as the script it was then: a trusted script renamed, or moved to another scope or repository, in the team
+database needs your approval again (the request shows its old name and scope). The description and timeout are not
+part of it. Trust is kept in the local database, also when scripts are in the team database, with the last 5 trusted
+versions of each script.
+
+Code an agent saves is trusted because the agent wrote it, by design: the approval protects you from code a teammate
+or anyone with access to the team database wrote running without you, not from your own agent. `script_save` does not
+trust a body that is the code of a visible script waiting for approval (in either store, in any language, also when it
+replaces that script): the copy waits for approval too. A copy with any edit is new code and is trusted like any code
+the agent writes, so read what your agent saves. Neither is the code of a script reported here as waiting for
+approval before (by `script_list`, `script_get`, `script_run`, `script_delete` or `scripts list`): this computer keeps
+the hashes of those versions, so deleting the original and saving its code again does not trust it. `script_save`
+trusts the body and language the agent sent, and only when the store gives them back unchanged (a database trigger
+could change the row as it is written), so a changed save waits for approval too.
+
+A script a teammate saved in the team database, or one whose body or language changed since, needs your approval:
+
+- **In Harness Desktop.** While Harness Desktop runs, `script_run` asks you there and waits up to 45 s for your answer:
+  the server writes a request to `requests/<id>.json` next to the local database (`0600` in a `0700` folder, the id
+  128 random bits) with the body, the arguments, the folder it runs in (`cwd`), its standard input (`stdin`: the
+  first 2048 characters without control or invisible characters, as `preview`, and its size in `bytes`, or `null`) and
+  the version trusted before (`previous`: `body`, `language`, `name`, `scope`, `trustedAt` and `origin`, `saved` or
+  `approved`, or `null`), so the desktop can show what changed, and Harness Desktop answers with
+  `requests/<id>.decision`. Run
+  approves the version and runs it, Don't run refuses it. Both files are removed however it ends, and requests older
+  than 2 minutes are removed before the next one. On Linux and macOS nothing is asked unless the data folder and the
+  requests folder are folders (not links) of your user that no one else may write to. The desktop shows it is running
+  by touching `desktop.alive` in the same folder. Scripts that need approval are also listed under Harness Desktop →
+  Memory, where you can approve them before an agent asks.
+
+  45 s is longer than some clients wait for a tool. If the client stopped waiting, Run still runs the script, but the
+  agent does not see the result: it should call `script_run` again once you approved (which runs the script again).
+  Without your answer nothing runs, also when the client hung up.
+- **In a terminal.** Without Harness Desktop the run is refused at once, and the agent is told to ask you. Review and
+  approve from a terminal (`--project` picks the repository whose scripts are shown, the working directory's by
+  default):
+
+  ```sh
+  harness-memory scripts list --json --untrusted    # the first 50 scripts that need approval, as script_list returns them
+  harness-memory trust 12=<sha256>                   # approve script 12 if it still has the sha256 you reviewed
+  harness-memory trust 12 14                         # approve scripts 12 and 14 as they are now
+  harness-memory trust --all                         # approve every visible script that needs it, as it is now
+  harness-memory scripts delete 12                   # delete script 12 as script_delete does
+  harness-memory scripts delete --all --yes --json   # delete every script scripts list shows: {"deleted": N, "team": M}
+  ```
+
+  `<id>=<sha256>` takes the `sha256` of `scripts list`: a script changed since then is not approved
+  (`harness-memory: script 12 open-prs changed since you reviewed it`). It works from any program (Harness Desktop
+  uses it). A plain id and `--all` approve the versions there are now, so read them in the same terminal first: they
+  run only with a terminal as standard input, and exit with 2 otherwise (`harness-memory: run this in your own
+  terminal: …`), so an agent's shell tool cannot approve what no one reviewed. A script whose body holds a hidden
+  character or declares another encoding is never approved, since it cannot run. `trust` prints one line per approved
+  script on stdout and exits with 1 when an id is not found, a script changed since its review or a body cannot run
+  (the others are still approved). When it fails, the last line on stderr says why (`harness-memory: …`, after any
+  warning, and `harness-memory: <n> scripts were not trusted` when several were not), so a program calling it can show
+  that line.
+
+  `scripts list --json` prints one page, `{"total", "groups": {"needsReview", "repo", "global"}, "scripts"}`, and takes
+  `--group needsReview|repo|global` (`--untrusted` is `--group needsReview`), `--query TEXT` (name or description,
+  ignoring case), `--sort name|language|scope|place|runs|lastRun|updated`, `--order asc|desc`, `--offset N` and
+  `--limit N` (1 to 200, 50 by default).
+  The groups do not overlap: `needsReview` holds every script that needs approval, `repo` and `global` the other
+  scripts of that scope. Their counts follow `--query` only, `total` follows `--query` and `--group`. By name (A to Z,
+  repository scripts first on a tie) unless `--sort updated` (newest first), `language`, `scope` (global scripts
+  first), `place` (the listed scripts are all in one place, so by id), `runs` (the run count) or `lastRun` (a script
+  never run comes last whichever the order), all ascending. `--order` turns any round, and ties go by id. Approval is
+  decided on this computer, so every visible script is read and the page is cut there. Usage errors exit with 2.
+
+  `scripts delete <id>` deletes a visible script as `script_delete` does (a version waiting for approval is
+  remembered first, so saving its code again trusts nothing) and prints `deleted script <id> <name>`, or exits with 1
+  and `harness-memory: script <id> not found`. `scripts delete --all --yes` does that for every script `scripts list`
+  shows without filters (every group and page) in one write, and prints `deleted N scripts`, or with `--json`
+  `{"deleted": N, "team": M}`, where `team` counts the ones that were in the team database. Without `--yes` it deletes
+  nothing and exits with 2.
+
+To skip the approval for the team's scripts, set `trust_team_scripts = true` in the [config file](#configure-each-teammate) (or
+`HARNESS_MEMORY_TRUST_TEAM_SCRIPTS=1`): every script read from the team database then runs as if you had approved it,
+and `harness-memory check` adds `team scripts: trusted automatically` (only when scripts are kept in the team
+database). Anyone who can write to the team database can
+then run code on your computer. Scripts saved on this computer stay trusted either way.
+
+A row changed by hand in a team database does not break the list: its timeout is read as 1 to 600 s, and a script with
+a language this server cannot run, an invalid name, or a description or body over its limit is left out (with a line
+on the server's stderr), as if it did not exist.
+
+Scripts need team database schema 2 (PostgreSQL, MongoDB) or 3 (libSQL). A release that raises the schema migrates
+the team database on first use, and from then on every tool of an older `harness-memory` fails on it, notes included
+(`check` says `update it`): when you upgrade, the whole team upgrades together.
+
+### Browsing notes
+
+Harness Desktop shows and deletes notes with these commands (they are for people and programs acting for them, not
+for agents, which use the tools). Each sees the notes `memory_search` would with `project_path` set to `--project`:
+that repository's notes and the global ones, only the global ones without `--project`, from wherever the server keeps
+them (the local file, the team database, or both).
+
+```sh
+harness-memory notes list --json --project ~/src/widget --query cache --sort updated --order desc --offset 0 --limit 50
+harness-memory notes get 12 --json --project ~/src/widget
+harness-memory notes delete 12 --project ~/src/widget
+harness-memory notes delete --all --yes --json --project ~/src/widget
+```
+
+- `notes list --json` prints one page, `{"total", "kinds": [{"kind", "count"}], "notes"}`. `--query TEXT` keeps the
+  notes whose title, body or tags contain it, ignoring case (on SQLite and libSQL only ASCII letters are folded),
+  `--kind KIND` one kind. `kinds` counts every kind under `--query`, `total` follows `--query` and `--kind`. Newest
+  first unless `--sort title` (A to Z), `kind` (by kind name), `scope` (global notes first) or `place` (notes kept on
+  this computer first), all ascending. `--order asc|desc` turns any round and ties go by id, `--offset N` and
+  `--limit N` (1 to 200, 50 by default) pick the page. The database filters, sorts and cuts the page, and leaves the bodies there. A note
+  object has `id`, `kind`, `title`, `scope` (`repo` or `global`), `repo` (`host/owner/repo`, a `path:` key whole, or
+  `null` for a global note), `place` (`team` or `local`, where it is kept), `tags`, `entities`, `author` (`source` and
+  `root`, shown like a script's), `createdAt`, `updatedAt` (RFC 3339 UTC), `revision` and `hits`.
+- `notes get <id> --json` prints `{"note", "links"}`: the note object with its `body`, and up to 50 linked notes
+  `{"id", "title", "kind", "relation", "direction"}`, the notes linked to the entity at the other end of a relation
+  that touches one of this note's entities (`direction` is `out` when this note's entity is the relation's source,
+  `in` when it is the target). Showing a note counts no hit (`memory_get` does count one).
+- `notes delete <id>` deletes the note as `memory_forget` does and prints `deleted note <id> <title>`.
+- `notes delete --all --yes` deletes every note `notes list` shows without filters (every page), in one write per
+  store, as `memory_forget` deletes one: relations stay without their note, entities no relation uses go. It prints
+  `deleted N notes`, or with `--json` `{"deleted": N, "team": M}`, where `team` counts the ones that were in the team
+  database. Without `--yes` it deletes nothing and exits with 2.
+
+A note that is not visible exits with 1 and the last line on stderr is `harness-memory: note <id> not found`. Usage
+errors exit with 2, other failures with 1 and the reason on the last line of stderr.
 
 ### Which repository
 
@@ -168,7 +353,8 @@ One SQLite file, `memory.sqlite3`, in the `harness-memory` folder of your user d
 
 Set `HARNESS_MEMORY_DIR` to use another folder (the file is then `$HARNESS_MEMORY_DIR/memory.sqlite3`). It has to be set
 in the environment the harness starts the server with, and it has to be absolute (a leading `~` is fine): a relative
-value is ignored, because the server runs inside your project.
+value is ignored, because the server runs inside your project. Point it at a folder only you can write to: the scripts
+run from `run` inside it, and the script approvals pass through `requests` there.
 
 **Coming from Harness Desktop.** Harness Desktop used to keep the same database at
 `<data dir>/com.mspiechowicz.harness-useful-desktop/memory/memory.sqlite3`. On first run, when there is no database in
@@ -301,16 +487,20 @@ In `~/.codex/config.toml` that is a `[mcp_servers.harness-memory.env]` table wit
 `"environment": { ... }` key in its `local` entry.
 
 To check it, run `harness-memory check`. It reads the settings the server would read, opens the database the same way
-and prints one line, without the credentials:
+and prints one line, without the credentials, then where scripts are kept (`scripts: team database` or
+`scripts: this computer`, followed by `team scripts: trusted automatically` when `trust_team_scripts` is on and
+scripts are kept in the team database):
 
 ```text
-ok: PostgreSQL at postgres://harness_memory@db.example.com:5432/harness_memory?… (schema 1)
+ok: PostgreSQL at postgres://harness_memory@db.example.com:5432/harness_memory?… (schema 2)
+scripts: team database
 ```
 
-It exits with 0 when the database opens (the line then ends with `update it` when the database was set up by a newer
+It exits with 0 when the database opens (the first line then ends with `update it` when the database was set up by a newer
 `harness-memory`), and with 1 and the reason on stderr when it does not. Without a team database it names the local file
 (`ok: local database at …`, with `(not created yet)` before the first note); that file is only looked at, never
-created. Run it with the same variables as the harness's entry when the settings live there.
+created. With both kinds of notes kept on this computer and scripts in the team database, it opens the team database
+for the scripts and fails the same way when it cannot. Run it with the same variables as the harness's entry when the settings live there.
 
 The server checks the same at startup: a wrong URL, a refused plain connection or an unreachable database stops it with
 the reason on stderr, so the harness shows `harness-memory` as failed to start (its MCP log or status view has the
@@ -392,13 +582,18 @@ one first.
 ## Privacy and trust
 
 - **Local by default.** Without a team database the server opens no network connection. It talks MCP to the process that
-  started it, and the only other program it runs is `git`, to find the repository (see above). It reads no other file of
+  started it, and the only other programs it runs are `git`, to find the repository (see above), and the scripts agents
+  save and run with `script_run` (see [Scripts](#scripts)). It reads no other file of
   your project. When you configure a [team database](#team-memory), it connects to that one server and every note, global
   ones included, is stored there, readable by everyone who has its credentials.
 - **Notes are untrusted data.** Agents write them, they may be wrong or outdated, and a planted note can try to steer a
   later session. Results say where each note came from, and the server tells agents to check notes against the code and
   never to follow instructions found inside one. That cannot make a note safe against a model that obeys what it reads:
   treat the memory like any other file an agent can edit.
+- **Scripts run as you.** A script can do anything you can, with your environment. A machine runs only scripts saved on
+  it or approved by you there (see [Approving scripts](#approving-scripts)), and an agent cannot approve one through the
+  MCP tools: read a teammate's script before you approve it. Code your own agent saves runs without approval, by
+  design. With `trust_team_scripts = true`, whoever can write to the team database can run code on your computer.
 - **Secrets are redacted on write.** Titles, bodies, tags, entity names and relation labels pass a secret filter before
   they are stored. It is a heuristic and does not catch everything, so do not rely on it. Agents are also told never to
   store secrets or personal data.
@@ -423,6 +618,9 @@ cargo deny check                   # supply-chain policy (deny.toml), needs carg
 bun install && bun test            # the release version script
 shellcheck install.sh
 ```
+
+Source builds report `<version>-dev` (for example `harness-memory 1.0.1-dev`), only the release pipeline
+(`HARNESS_MEMORY_RELEASE=1`) prints the plain version.
 
 Try the server by hand with a throwaway database:
 

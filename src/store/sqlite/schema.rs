@@ -7,7 +7,7 @@ use super::sql::{Sql, args};
 use crate::store::StoreError;
 
 /// The schema version this server writes.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// The state of a database after [`migrate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,16 +99,67 @@ CREATE INDEX note_entities_entity ON note_entities (entity_id);
 ";
 
 /// Version 2: where the latest write to each note came from (the client stays in `source`). Existing
-/// repository notes take their repository's last seen root, the best guess there is.
-const V2: &str = "
+/// repository notes take their repository's last seen root, the best guess there is. Public so tests
+/// can build a version 2 database and check the migration.
+pub const V2: &str = "
 ALTER TABLE notes ADD COLUMN writer_root TEXT;
 ALTER TABLE notes ADD COLUMN via_override INTEGER NOT NULL DEFAULT 0;
 UPDATE notes SET writer_root = (SELECT p.root_path FROM projects p WHERE p.id = notes.project_id)
     WHERE project_id IS NOT NULL;
 ";
 
+/// Version 3: scripts, unique by name per scope like note titles (`ifnull(project_id, 0)`), with
+/// the provenance columns of notes and their run statistics; the script versions this machine
+/// trusts, by script (where it is kept and its id there) and hash, with the name, scope and
+/// repository key it was trusted as, its body (for the next review's diff) and whether it was
+/// saved or approved here; and the hashes of the versions reported here as waiting for approval
+/// (both used in the local file only; a libSQL team database gets the tables but never fills
+/// them).
+const V3: &str = "
+CREATE TABLE scripts (
+    id INTEGER PRIMARY KEY,
+    project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL CHECK (language IN ('sh', 'bash', 'python', 'node', 'bun')),
+    body TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    timeout_secs INTEGER NOT NULL,
+    source TEXT,
+    writer_root TEXT,
+    via_override INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    run_count INTEGER NOT NULL DEFAULT 0,
+    last_run_at INTEGER,
+    last_exit_code INTEGER
+);
+CREATE UNIQUE INDEX scripts_name ON scripts (ifnull(project_id, 0), name);
+
+CREATE TABLE script_trust (
+    place TEXT NOT NULL,
+    script_id INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    trusted_at TEXT NOT NULL,
+    name TEXT NOT NULL,
+    scope TEXT NOT NULL CHECK (scope IN ('repo', 'global')),
+    project TEXT,
+    language TEXT NOT NULL,
+    body TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK (origin IN ('saved', 'approved')),
+    PRIMARY KEY (place, script_id, sha256)
+);
+CREATE INDEX script_trust_script ON script_trust (place, script_id, trusted_at);
+
+CREATE TABLE script_seen_unapproved (
+    sha256 TEXT PRIMARY KEY,
+    seen_at INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX script_seen_unapproved_age ON script_seen_unapproved (seen_at);
+";
+
 /// The migrations in order, each with the version it brings the database to.
-const STEPS: [(i64, &str); 2] = [(1, V1), (2, V2)];
+const STEPS: [(i64, &str); 3] = [(1, V1), (2, V2), (3, V3)];
 
 /// Brings the database to [`SCHEMA_VERSION`]; a newer database is reported, not changed.
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<SchemaState> {

@@ -10,9 +10,11 @@
 
 pub(crate) mod engine;
 mod graph;
+mod listing;
 mod local;
 mod notes;
 pub mod schema;
+pub(crate) mod scripts;
 mod search;
 pub(crate) mod sql;
 
@@ -23,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, TransactionBehavior};
 
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, ProjectKey};
-use super::{Saved, SearchQuery, StoreError, Target, View};
+use super::{Forgotten, NoteListQuery, NotePage, Saved, SearchQuery, StoreError, Target, View};
 use engine::Engine;
 use local::Local;
 use schema::SchemaState;
@@ -117,6 +119,14 @@ impl MemoryStore for SqliteStore {
         engine::get(self, view, ids)
     }
 
+    fn peek(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
+        engine::peek(self, view, ids)
+    }
+
+    fn list_notes(&mut self, query: &NoteListQuery) -> Result<NotePage, StoreError> {
+        engine::list_notes(self, query)
+    }
+
     fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
         engine::search(self, query)
     }
@@ -135,6 +145,10 @@ impl MemoryStore for SqliteStore {
 
     fn forget(&mut self, view: &View, target: &Target, what: &Forget) -> Result<usize, StoreError> {
         engine::forget(self, view, target, what)
+    }
+
+    fn forget_notes(&mut self, view: &View) -> Result<Forgotten, StoreError> {
+        engine::forget_notes(self, view)
     }
 
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {

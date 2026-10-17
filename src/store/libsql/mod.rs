@@ -18,6 +18,7 @@
 
 mod endpoint;
 mod hrana;
+mod scripts;
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,7 +27,7 @@ use super::sqlite::engine::{self, Engine};
 use super::sqlite::schema::{self, SCHEMA_VERSION, SchemaState};
 use super::sqlite::sql::Sql;
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, Saved, SearchQuery};
-use super::{StoreError, Target, View};
+use super::{Forgotten, NoteListQuery, NotePage, StoreError, Target, View};
 use hrana::{Client, Outcome, Stream, execute};
 
 /// How long a write keeps asking for a lock the server reports busy.
@@ -157,6 +158,14 @@ impl MemoryStore for LibsqlStore {
         engine::get(self, view, ids)
     }
 
+    fn peek(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
+        engine::peek(self, view, ids)
+    }
+
+    fn list_notes(&mut self, query: &NoteListQuery) -> Result<NotePage, StoreError> {
+        engine::list_notes(self, query)
+    }
+
     fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
         engine::search(self, query)
     }
@@ -175,6 +184,10 @@ impl MemoryStore for LibsqlStore {
 
     fn forget(&mut self, view: &View, target: &Target, what: &Forget) -> Result<usize, StoreError> {
         engine::forget(self, view, target, what)
+    }
+
+    fn forget_notes(&mut self, view: &View) -> Result<Forgotten, StoreError> {
+        engine::forget_notes(self, view)
     }
 
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {

@@ -69,12 +69,12 @@ fn notes_persist_across_processes_in_the_memory_folder() {
 
     let tools = first.request("tools/list", json!({}));
     let tools = tools["result"]["tools"].as_array().expect("tools");
-    assert_eq!(tools.len(), 7);
-    assert!(
-        tools
-            .iter()
-            .all(|tool| tool["name"].as_str().is_some_and(|name| name.starts_with("memory_")))
-    );
+    assert_eq!(tools.len(), 12);
+    assert!(tools.iter().all(|tool| {
+        tool["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("memory_") || name.starts_with("script_"))
+    }));
 
     let created = first.call(
         "memory_remember",
@@ -154,7 +154,7 @@ fn the_command_line_accepts_only_mcp_and_version() {
     assert!(version.status.success());
     assert_eq!(
         String::from_utf8_lossy(&version.stdout).trim(),
-        format!("harness-memory {}", env!("CARGO_PKG_VERSION"))
+        format!("harness-memory {}", env!("HARNESS_MEMORY_VERSION"))
     );
 
     let wrong = Command::new(BINARY).args(["--db", "/tmp/x"]).output().expect("run");
