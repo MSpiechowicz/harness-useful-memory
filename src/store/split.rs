@@ -334,11 +334,11 @@ impl MemoryStore for SplitStore {
             cursors.push(Cursor::new(first, NOTHING));
         }
 
-        let mut page = NotePage::new([], query.kind, Vec::new());
+        let mut page = NotePage::new([], query, Vec::new());
 
         for cursor in &mut cursors {
             let part = cursor.fetch(self.store(cursor.side), query)?;
-            page = NotePage::new(page.kinds.into_iter().chain(part.kinds), query.kind, Vec::new());
+            page = NotePage::new(page.counted.into_iter().chain(part.counted), query, Vec::new());
         }
 
         let limit = page_limit(query);

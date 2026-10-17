@@ -266,12 +266,16 @@ A script a teammate saved in the team database, or one whose body or language ch
   warning, and `harness-memory: <n> scripts were not trusted` when several were not), so a program calling it can show
   that line.
 
-  `scripts list --json` prints one page, `{"total", "groups": {"needsReview", "repo", "global"}, "scripts"}`, and takes
-  `--group needsReview|repo|global` (`--untrusted` is `--group needsReview`), `--query TEXT` (name or description,
+  `scripts list --json` prints one page, `{"total", "groups": {"needsReview", "repo", "global"}, "scopes": {"repo",
+  "global"}, "review": {"needed", "trusted"}, "scripts"}`, and takes `--group needsReview|repo|global` (`--untrusted`
+  is `--group needsReview`), `--scope repo|global`, `--review needed|trusted`, `--query TEXT` (name or description,
   ignoring case), `--sort name|language|scope|place|runs|lastRun|updated`, `--order asc|desc`, `--offset N` and
   `--limit N` (1 to 200, 50 by default).
   The groups do not overlap: `needsReview` holds every script that needs approval, `repo` and `global` the other
-  scripts of that scope. Their counts follow `--query` only, `total` follows `--query` and `--group`. By name (A to Z,
+  scripts of that scope. `--scope` keeps the scripts of one scope, `--review needed` the ones that need approval (the
+  `needsReview` group) and `--review trusted` every other one. `--scope` and `--review` combine with each other but not
+  with `--group` (that is a usage error). The group counts follow `--query`, the `scopes` counts follow `--query` and
+  `--review`, the `review` counts follow `--query` and `--scope`, and `total` follows every filter. By name (A to Z,
   repository scripts first on a tie) unless `--sort updated` (newest first), `language`, `scope` (global scripts
   first), `place` (the listed scripts are all in one place, so by id), `runs` (the run count) or `lastRun` (a script
   never run comes last whichever the order), all ascending. `--order` turns any round, and ties go by id. Approval is
@@ -312,9 +316,11 @@ harness-memory notes delete 12 --project ~/src/widget
 harness-memory notes delete --all --yes --json --project ~/src/widget
 ```
 
-- `notes list --json` prints one page, `{"total", "kinds": [{"kind", "count"}], "notes"}`. `--query TEXT` keeps the
-  notes whose title, body or tags contain it, ignoring case (on SQLite and libSQL only ASCII letters are folded),
-  `--kind KIND` one kind. `kinds` counts every kind under `--query`, `total` follows `--query` and `--kind`. Newest
+- `notes list --json` prints one page, `{"total", "kinds": [{"kind", "count"}], "scopes": {"repo", "global"},
+  "notes"}`. `--query TEXT` keeps the notes whose title, body or tags contain it, ignoring case (on SQLite and libSQL
+  only ASCII letters are folded), `--kind KIND` one kind, `--scope repo|global` one scope, and they combine. `kinds`
+  counts every kind under `--query` and `--scope`, `scopes` counts both scopes under `--query` and `--kind`, and
+  `total` follows all three. Newest
   first unless `--sort title` (A to Z), `kind` (by kind name), `scope` (global notes first) or `place` (notes kept on
   this computer first), all ascending. `--order asc|desc` turns any round and ties go by id, `--offset N` and
   `--limit N` (1 to 200, 50 by default) pick the page. The database filters, sorts and cuts the page, and leaves the bodies there. A note

@@ -1,8 +1,11 @@
 //! Notes page by page, for a person browsing them ([`MemoryStore::list_notes`]): filtered by a
-//! substring, a kind and a linked entity, sorted by the time of the latest write, title, kind,
-//! scope or place ([`NoteSort`]), counted per kind.
+//! substring, a kind, a scope and a linked entity, sorted by the time of the latest write, title,
+//! kind, scope or place ([`NoteSort`]), counted per kind and per scope.
 //!
 //! The backends filter, sort, count and cut the page in the database and leave the bodies there.
+//! They count the notes the text and the entity keep per kind and scope ([`NotePage::new`] makes
+//! the counts of the page from those), and list the page of the view narrowed to the scope asked
+//! for ([`scoped`]).
 //! The text matches the title, the body or the tags as a substring, ignoring case as the database
 //! folds it: the SQLite-dialect stores fold ASCII letters only (SQLite's `lower()`), PostgreSQL
 //! and MongoDB fold every letter. A sort by title compares the normalized titles
@@ -24,6 +27,8 @@ pub struct NoteListQuery {
     /// note. At most [`QUERY_MAX`] characters.
     pub text: String,
     pub kind: Option<NoteKind>,
+    /// Keeps the notes of this scope (of those the view shows); `None` keeps both.
+    pub scope: Option<Scope>,
     /// Keeps the notes linked to the entity of this name (compared like entity names are).
     pub entity: Option<String>,
     pub sort: NoteSort,
@@ -93,37 +98,76 @@ impl From<Note> for NoteRow {
 /// One page of notes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NotePage {
-    /// The notes the text and the kind keep, on every page.
+    /// The notes the text, the kind and the scope keep, on every page.
     pub total: usize,
-    /// The notes the text keeps, per kind (every kind, in [`NoteKind::ALL`] order), whatever the
-    /// kind asked for.
+    /// The notes the text and the scope keep, per kind (every kind, in [`NoteKind::ALL`] order),
+    /// whatever the kind asked for.
     pub kinds: Vec<(NoteKind, usize)>,
+    /// The notes the text and the kind keep, per scope (repository, then global), whatever the
+    /// scope asked for.
+    pub scopes: Vec<(Scope, usize)>,
     pub rows: Vec<NoteRow>,
+    /// The notes the text keeps, per kind and scope: what the counts above come from (a
+    /// [`crate::store::SplitStore`] adds those of its two stores).
+    pub(crate) counted: Vec<(NoteKind, Scope, usize)>,
 }
 
 impl NotePage {
-    /// A page of `rows` with the per-kind counts `counted` (a kind may come more than once, an
-    /// unknown name counts as a plain note); the total follows from them and `kind`.
+    /// A page of `rows` of `query` with the counts per kind and scope `counted` (a pair may come
+    /// more than once, an unknown kind name counts as a plain note); the counts and the total
+    /// follow from them and the kind and the scope of `query`.
     pub(crate) fn new(
-        counted: impl IntoIterator<Item = (NoteKind, usize)>,
-        kind: Option<NoteKind>,
+        counted: impl IntoIterator<Item = (NoteKind, Scope, usize)>,
+        query: &NoteListQuery,
         rows: Vec<NoteRow>,
     ) -> Self {
-        let mut kinds: Vec<(NoteKind, usize)> = NoteKind::ALL.iter().map(|kind| (*kind, 0)).collect();
+        let mut cells: Vec<(NoteKind, Scope, usize)> = Vec::new();
 
-        for (counted_kind, count) in counted {
-            if let Some(entry) = kinds.iter_mut().find(|(known, _)| *known == counted_kind) {
-                entry.1 += count;
+        for (kind, scope, count) in counted {
+            match cells.iter_mut().find(|(known, at, _)| *known == kind && *at == scope) {
+                Some(cell) => cell.2 += count,
+                None => cells.push((kind, scope, count)),
             }
         }
 
-        let total = kinds
-            .iter()
-            .filter(|(listed, _)| kind.is_none_or(|kind| kind == *listed))
-            .map(|(_, count)| count)
-            .sum();
+        let kind_kept = |kind: NoteKind| query.kind.is_none_or(|asked| asked == kind);
+        let scope_kept = |scope: Scope| query.scope.is_none_or(|asked| asked == scope);
 
-        Self { total, kinds, rows }
+        let count = |keeps: &dyn Fn(NoteKind, Scope) -> bool| -> usize {
+            cells
+                .iter()
+                .filter(|(kind, scope, _)| keeps(*kind, *scope))
+                .map(|(_, _, count)| count)
+                .sum()
+        };
+
+        let kinds = NoteKind::ALL
+            .iter()
+            .map(|listed| (*listed, count(&|kind, scope| kind == *listed && scope_kept(scope))))
+            .collect();
+        let scopes = [Scope::Repo, Scope::Global]
+            .into_iter()
+            .map(|listed| (listed, count(&|kind, scope| scope == listed && kind_kept(kind))))
+            .collect();
+        let total = count(&|kind, scope| kind_kept(kind) && scope_kept(scope));
+
+        Self {
+            total,
+            kinds,
+            scopes,
+            rows,
+            counted: cells,
+        }
+    }
+}
+
+/// The view parameters `repo` and `global` (the repository and whether global notes are shown)
+/// narrowed to the scope of `query`: what its page lists. The counts take the whole view.
+pub(crate) fn scoped<T>(query: &NoteListQuery, repo: Option<T>, global: bool) -> (Option<T>, bool) {
+    match query.scope {
+        None => (repo, global),
+        Some(Scope::Repo) => (repo, false),
+        Some(Scope::Global) => (None, global),
     }
 }
 

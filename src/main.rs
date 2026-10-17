@@ -18,13 +18,14 @@ use harness_memory::{Server, database_path, serve};
 use harness_memory::{cli_notes, cli_trust};
 
 const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--repo <key|.>] [--no-global] | check | scripts list \
-                     --json [--project PATH] [--group needsReview|repo|global] [--query TEXT] [--sort \
-                     name|language|scope|place|runs|lastRun|updated] \
+                     --json [--project PATH] [--group needsReview|repo|global] [--scope repo|global] [--review \
+                     needed|trusted] [--query TEXT] [--sort name|language|scope|place|runs|lastRun|updated] \
                      [--order asc|desc] [--offset N] [--limit N] | scripts delete <id> [--project PATH] | scripts \
                      delete --all --yes [--project PATH] [--json] | trust <id>[=<sha256>]... | --all [--project PATH] \
-                     | notes list --json [--project PATH] [--kind KIND] [--query TEXT] [--sort updated|title|kind|scope|place] [--order \
-                     asc|desc] [--offset N] [--limit N] | notes get <id> --json [--project PATH] | notes delete <id> \
-                     [--project PATH] | notes delete --all --yes [--project PATH] [--json] | --version]";
+                     | notes list --json [--project PATH] [--kind KIND] [--scope repo|global] [--query TEXT] [--sort \
+                     updated|title|kind|scope|place] [--order asc|desc] [--offset N] [--limit N] | notes get <id> \
+                     --json [--project PATH] | notes delete <id> [--project PATH] | notes delete --all --yes \
+                     [--project PATH] [--json] | --version]";
 
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();

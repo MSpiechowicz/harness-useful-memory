@@ -379,8 +379,8 @@ pub trait MemoryStore: Send {
     /// recalling it).
     fn peek(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError>;
 
-    /// One page of the notes `query` keeps, with their total and the counts per kind; counts no
-    /// hit (see [`listing`]).
+    /// One page of the notes `query` keeps, with their total and the counts per kind and per
+    /// scope; counts no hit (see [`listing`]).
     fn list_notes(&mut self, query: &NoteListQuery) -> Result<NotePage, StoreError>;
 
     /// Ranked notes: the repository first, then relevance, then the most recently updated.

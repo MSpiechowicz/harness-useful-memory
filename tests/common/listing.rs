@@ -20,7 +20,7 @@ pub const OTHER: &str = "github.com/acme/gadget";
 pub type Case = fn(&mut dyn MemoryStore);
 
 /// Every case, by name.
-pub const CASES: [(&str, Case); 9] = [
+pub const CASES: [(&str, Case); 10] = [
     ("lists_visible_notes_newest_first", lists_visible_notes_newest_first),
     ("pages_cover_the_list_once", pages_cover_the_list_once),
     ("text_and_kind_filter_and_count", text_and_kind_filter_and_count),
@@ -36,6 +36,10 @@ pub const CASES: [(&str, Case); 9] = [
         "kinds_scopes_and_places_sort_and_page",
         kinds_scopes_and_places_sort_and_page,
     ),
+    (
+        "scope_text_and_kind_filter_together_and_count",
+        scope_text_and_kind_filter_together_and_count,
+    ),
 ];
 
 /// The first page (of up to 200) of `view`, newest first.
@@ -44,6 +48,7 @@ pub fn listing(view: View) -> NoteListQuery {
         view,
         text: String::new(),
         kind: None,
+        scope: None,
         entity: None,
         sort: NoteSort::Updated,
         descending: true,
@@ -66,6 +71,14 @@ fn count(page: &NotePage, kind: NoteKind) -> usize {
         .find(|(listed, _)| *listed == kind)
         .map(|(_, count)| *count)
         .expect("every kind is counted")
+}
+
+fn scope_count(page: &NotePage, scope: Scope) -> usize {
+    page.scopes
+        .iter()
+        .find(|(listed, _)| *listed == scope)
+        .map(|(_, count)| *count)
+        .expect("both scopes are counted")
 }
 
 fn save(store: &mut dyn MemoryStore, target: &Target, note: &NoteDraft) -> i64 {
@@ -571,4 +584,142 @@ pub fn kinds_scopes_and_places_sort_and_page(store: &mut dyn MemoryStore) {
     placed.sort_unstable();
     assert_eq!(placed, ["Global decision", "Global note", "Repo decision", "Repo fix"]);
     assert_reversed(&by_place, &paged(store, NoteSort::Place, true));
+}
+
+/// The scope keeps the notes of one scope and combines with the text and the kind: the counts per
+/// kind follow the text and the scope, the counts per scope the text and the kind, the total all
+/// three; without a scope the counts per scope still come, under the text and the kind.
+pub fn scope_text_and_kind_filter_together_and_count(store: &mut dyn MemoryStore) {
+    save(store, &repo(REPO), &draft("Repo cache fix", "Clear it", NoteKind::Fix));
+    save(store, &repo(REPO), &draft("Repo decision", "Tabs", NoteKind::Decision));
+    save(store, &repo(REPO), &draft("Repo note", "The cache", NoteKind::Note));
+    save(store, &repo(OTHER), &draft("Other cache fix", "Hidden", NoteKind::Fix));
+    save(
+        store,
+        &Target::Global,
+        &draft("Global cache fix", "Clear it", NoteKind::Fix),
+    );
+    save(
+        store,
+        &Target::Global,
+        &draft("Global decision", "Spaces", NoteKind::Decision),
+    );
+
+    let scoped = |scope: Scope| NoteListQuery {
+        scope: Some(scope),
+        sort: NoteSort::Title,
+        descending: false,
+        ..listing(both(REPO))
+    };
+
+    let all = list(store, &listing(both(REPO)));
+    assert_eq!(all.total, 5);
+    assert_eq!(all.scopes, [(Scope::Repo, 3), (Scope::Global, 2)], "repository first");
+
+    let repo_side = list(store, &scoped(Scope::Repo));
+    assert_eq!(
+        titles(&repo_side.rows),
+        ["Repo cache fix", "Repo decision", "Repo note"]
+    );
+    assert_eq!(repo_side.total, 3, "the total follows the scope");
+    assert_eq!(repo_side.scopes, all.scopes, "the counts per scope ignore the scope");
+    assert_eq!(
+        (
+            count(&repo_side, NoteKind::Fix),
+            count(&repo_side, NoteKind::Decision),
+            count(&repo_side, NoteKind::Note)
+        ),
+        (1, 1, 1),
+        "the counts per kind follow the scope"
+    );
+
+    let global_fixes = list(
+        store,
+        &NoteListQuery {
+            kind: Some(NoteKind::Fix),
+            ..scoped(Scope::Global)
+        },
+    );
+    assert_eq!(titles(&global_fixes.rows), ["Global cache fix"]);
+    assert_eq!(global_fixes.total, 1);
+    assert_eq!(
+        global_fixes.scopes,
+        [(Scope::Repo, 1), (Scope::Global, 1)],
+        "the counts per scope follow the kind"
+    );
+    assert_eq!(
+        (
+            count(&global_fixes, NoteKind::Fix),
+            count(&global_fixes, NoteKind::Decision),
+            count(&global_fixes, NoteKind::Note)
+        ),
+        (1, 1, 0)
+    );
+
+    let cached = list(
+        store,
+        &NoteListQuery {
+            text: "CACHE".to_owned(),
+            ..scoped(Scope::Repo)
+        },
+    );
+    assert_eq!(titles(&cached.rows), ["Repo cache fix", "Repo note"]);
+    assert_eq!(cached.total, 2);
+    assert_eq!(cached.scopes, [(Scope::Repo, 2), (Scope::Global, 1)], "under the text");
+    assert_eq!((count(&cached, NoteKind::Fix), count(&cached, NoteKind::Note)), (1, 1));
+
+    let cached_fixes = list(
+        store,
+        &NoteListQuery {
+            text: "cache".to_owned(),
+            kind: Some(NoteKind::Fix),
+            ..scoped(Scope::Repo)
+        },
+    );
+    assert_eq!(titles(&cached_fixes.rows), ["Repo cache fix"]);
+    assert_eq!(cached_fixes.total, 1);
+    assert_eq!(cached_fixes.scopes, [(Scope::Repo, 1), (Scope::Global, 1)]);
+    assert_eq!(count(&cached_fixes, NoteKind::Note), 1);
+
+    let unscoped_fixes = list(
+        store,
+        &NoteListQuery {
+            kind: Some(NoteKind::Fix),
+            ..listing(both(REPO))
+        },
+    );
+    assert_eq!(unscoped_fixes.total, 2);
+    assert_eq!(unscoped_fixes.scopes, [(Scope::Repo, 1), (Scope::Global, 1)]);
+    assert_eq!(count(&unscoped_fixes, NoteKind::Decision), 2, "every scope");
+
+    let second = list(
+        store,
+        &NoteListQuery {
+            offset: 1,
+            limit: 1,
+            ..scoped(Scope::Repo)
+        },
+    );
+    assert_eq!(titles(&second.rows), ["Repo decision"], "pages follow the scope");
+    assert_eq!(second.total, 3);
+
+    let outside = list(
+        store,
+        &NoteListQuery {
+            view: repo_only(REPO),
+            ..scoped(Scope::Global)
+        },
+    );
+    assert_eq!((outside.total, outside.rows.len()), (0, 0), "the view still decides");
+    assert_eq!(outside.scopes, [(Scope::Repo, 3), (Scope::Global, 0)]);
+
+    let global_view = list(
+        store,
+        &NoteListQuery {
+            view: global_only(),
+            ..scoped(Scope::Repo)
+        },
+    );
+    assert_eq!((global_view.total, global_view.rows.len()), (0, 0));
+    assert_eq!(scope_count(&global_view, Scope::Global), 2);
 }

@@ -178,9 +178,12 @@ fn lists_gets_and_deletes(folders: &Folders, repo_place: &str, global_place: &st
         "without --project only the global notes"
     );
 
+    assert_eq!(global["scopes"], json!({ "repo": 0, "global": 1 }));
+
     let listing = folders.widget_list(&["--sort", "title"]);
     let keys: Vec<&String> = listing.as_object().expect("object").keys().collect();
-    assert_eq!(keys, ["total", "kinds", "notes"]);
+    assert_eq!(keys, ["total", "kinds", "scopes", "notes"]);
+    assert_eq!(listing["scopes"], json!({ "repo": 2, "global": 1 }));
     assert_eq!(listing["total"], 3);
     assert_eq!(
         titles(&listing),
@@ -264,6 +267,9 @@ fn lists_gets_and_deletes(folders: &Folders, repo_place: &str, global_place: &st
     let fixes = folders.widget_list(&["--kind", "fix", "--query", "TIMEOUT"]);
     assert_eq!(titles(&fixes), ["Raise the timeout"]);
     assert_eq!(fixes["total"], 1);
+    assert_eq!(fixes["scopes"], json!({ "repo": 1, "global": 0 }));
+
+    filters_combine(folders);
 
     let project = folders.widget_project();
     let shown = folders.json(&["notes", "get", &fix.to_string(), "--json", "--project", &project]);
@@ -305,6 +311,70 @@ fn lists_gets_and_deletes(folders: &Folders, repo_place: &str, global_place: &st
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output), format!("deleted note {flaky} Flaky test\n"));
     assert_eq!(folders.widget_list(&[])["total"], 2);
+}
+
+/// The count of `kind` in the `kinds` of `listing`.
+fn kind_count(listing: &Value, kind: &str) -> u64 {
+    listing["kinds"]
+        .as_array()
+        .expect("kinds")
+        .iter()
+        .find(|entry| entry["kind"] == kind)
+        .and_then(|entry| entry["count"].as_u64())
+        .expect("every kind is counted")
+}
+
+/// Checks `--scope` with `--kind` and `--query` on the widget notes [`seed`] wrote: the counts per
+/// kind follow the query and the scope, the counts per scope the query and the kind, the total
+/// every filter.
+fn filters_combine(folders: &Folders) {
+    let repo_side = folders.widget_list(&["--scope", "repo", "--sort", "title"]);
+    assert_eq!(titles(&repo_side), ["Flaky test", "Raise the timeout"]);
+    assert_eq!(repo_side["total"], 2);
+    assert_eq!(
+        repo_side["scopes"],
+        json!({ "repo": 2, "global": 1 }),
+        "the scope counts ignore the scope"
+    );
+    assert_eq!(
+        (
+            kind_count(&repo_side, "problem"),
+            kind_count(&repo_side, "fix"),
+            kind_count(&repo_side, "decision")
+        ),
+        (1, 1, 0),
+        "the kind counts follow the scope"
+    );
+
+    let global_decisions = folders.widget_list(&["--scope=global", "--kind", "decision"]);
+    assert_eq!(titles(&global_decisions), ["Editor tabs"]);
+    assert_eq!(global_decisions["total"], 1);
+    assert_eq!(global_decisions["scopes"], json!({ "repo": 0, "global": 1 }));
+    assert_eq!(kind_count(&global_decisions, "decision"), 1);
+    assert_eq!(kind_count(&global_decisions, "fix"), 0);
+
+    let none = folders.widget_list(&["--scope", "global", "--kind", "fix"]);
+    assert_eq!((none["total"].clone(), titles(&none).len()), (json!(0), 0));
+    assert_eq!(none["scopes"], json!({ "repo": 1, "global": 0 }));
+    assert_eq!(kind_count(&none, "decision"), 1);
+
+    let timeout = folders.widget_list(&["--scope", "repo", "--kind", "fix", "--query", "timeout"]);
+    assert_eq!(titles(&timeout), ["Raise the timeout"]);
+    assert_eq!(timeout["total"], 1);
+    assert_eq!(timeout["scopes"], json!({ "repo": 1, "global": 0 }));
+    assert_eq!(
+        (kind_count(&timeout, "fix"), kind_count(&timeout, "problem")),
+        (1, 0),
+        "the kind counts follow the query"
+    );
+
+    let paged = folders.widget_list(&["--scope", "repo", "--sort", "title", "--offset", "1", "--limit", "1"]);
+    assert_eq!(titles(&paged), ["Raise the timeout"]);
+    assert_eq!(paged["total"], 2);
+
+    let global = folders.json(&["notes", "list", "--json", "--scope", "repo"]);
+    assert_eq!(global["total"], 0, "without --project no repository notes");
+    assert_eq!(global["scopes"], json!({ "repo": 0, "global": 1 }));
 }
 
 /// Checks `notes delete --all` on notes [`seed`] wrote; `repo_team` and `global_team` say whether
@@ -555,6 +625,11 @@ fn bad_usage_exits_2() {
         &["notes", "list", "--json", "--sort", "hits"],
         &["notes", "list", "--json", "--sort", "Kind"],
         &["notes", "list", "--json", "--order", "up"],
+        &["notes", "list", "--json", "--scope", "team"],
+        &["notes", "list", "--json", "--scope", "Repo"],
+        &["notes", "list", "--json", "--scope", ""],
+        &["notes", "list", "--json", "--scope"],
+        &["notes", "list", "--json", "--scope", "repo", "--scope", "global"],
         &["notes", "get", "1"],
         &["notes", "get", "x", "--json"],
         &["notes", "delete"],

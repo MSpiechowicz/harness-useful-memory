@@ -1,6 +1,6 @@
 //! A page of notes ([`crate::store::listing`]) in MongoDB: two aggregations, the counts per kind
-//! and the page (sorted, skipped and cut on the server, the bodies left there), then the entity
-//! names of the page's notes, one query per scope on the page.
+//! and scope and the page (sorted, skipped and cut on the server, the bodies left there), then
+//! the entity names of the page's notes, one query per scope on the page.
 
 use mongodb::bson::{Bson, Document, doc};
 
@@ -8,12 +8,12 @@ use super::notes::{Stored, stored};
 use super::scripts::literal_pattern;
 use super::{Ctx, ENTITIES, ENTITY_NORM_MAX, Fail, NOTES, cut, int, note_fields, scope_value, text, visible};
 use crate::limits::ENTITY_MAX;
-use crate::store::NoteKind;
-use crate::store::listing::{NoteListQuery, NotePage, NoteRow, NoteSort, page_limit, query_entity, query_text};
+use crate::store::listing::{NoteListQuery, NotePage, NoteRow, NoteSort, page_limit, query_entity, query_text, scoped};
+use crate::store::{NoteKind, Scope, View};
 
 pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage, Fail> {
     let text = query_text(query)?;
-    let mut kept = visible(&query.view);
+    let mut kept = Document::new();
 
     if let Some(text) = text {
         let pattern = literal_pattern(text);
@@ -33,26 +33,40 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage,
         kept.insert("entities", entity);
     }
 
-    let counted: Vec<(NoteKind, usize)> = ctx
+    let mut counts_filter = visible(&query.view);
+    counts_filter.extend(kept.clone());
+
+    // A view shows one repository at most, so a group's project tells its scope: a key, or
+    // `null` (or no project at all) for a global note.
+    let counted: Vec<(NoteKind, Scope, usize)> = ctx
         .aggregate(
             NOTES,
             vec![
-                doc! { "$match": kept.clone() },
-                doc! { "$group": { "_id": "$kind", "count": { "$sum": 1_i64 } } },
+                doc! { "$match": counts_filter },
+                doc! { "$group": {
+                    "_id": { "kind": "$kind", "project": "$project" },
+                    "count": { "$sum": 1_i64 },
+                } },
             ],
         )?
         .iter()
         .map(|group| {
-            let kind = group
-                .get_str("_id")
-                .ok()
+            let id = group.get_document("_id").ok();
+            let kind = id
+                .and_then(|id| id.get_str("kind").ok())
                 .and_then(NoteKind::parse)
                 .unwrap_or(NoteKind::Note);
-            (kind, usize::try_from(int(group, "count")).unwrap_or(0))
+            let scope = match id.and_then(|id| id.get_str("project").ok()) {
+                Some(_) => Scope::Repo,
+                None => Scope::Global,
+            };
+            (kind, scope, usize::try_from(int(group, "count")).unwrap_or(0))
         })
         .collect();
 
-    let mut page_filter = kept;
+    let (repo, global) = scoped(query, query.view.repo.clone(), query.view.global);
+    let mut page_filter = visible(&View { repo, global });
+    page_filter.extend(kept);
 
     if let Some(kind) = query.kind {
         page_filter.insert("kind", kind.as_str());
@@ -84,7 +98,7 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage,
 
     let stored: Vec<Stored> = found.iter().map(stored).collect();
     let rows = with_entities(ctx, stored)?;
-    Ok(NotePage::new(counted, query.kind, rows))
+    Ok(NotePage::new(counted, query, rows))
 }
 
 /// The rows of `stored` with their entity names (alphabetically by normalized name, as a

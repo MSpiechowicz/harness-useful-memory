@@ -1,14 +1,14 @@
 //! A page of notes ([`crate::store::listing`]) in the SQLite dialect: two statements, the counts
-//! per kind and the page, then the entity names of the page's notes. `instr`, not `LIKE`, so `%`
-//! and `_` in the text are plain characters.
+//! per kind and scope and the page, then the entity names of the page's notes. `instr`, not
+//! `LIKE`, so `%` and `_` in the text are plain characters.
 
 use super::notes::{ROW_COLUMNS, VISIBLE, kind_from_sql, note_from_row};
 use super::sql::{Sql, Value, args};
 use super::view_params;
 use crate::store::listing::{
-    NoteListQuery, NotePage, NoteRow, NoteSort, direction, page_limit, query_entity, query_text,
+    NoteListQuery, NotePage, NoteRow, NoteSort, direction, page_limit, query_entity, query_text, scoped,
 };
-use crate::store::{NoteKind, StoreError};
+use crate::store::{NoteKind, Scope, StoreError};
 
 /// The notes the text (`?1`) and the normalized entity name (`?4`) keep (`NULL` for any).
 const KEPT: &str = "(?1 IS NULL OR instr(lower(n.title), lower(?1)) > 0 OR instr(lower(n.body), lower(?1)) > 0
@@ -21,16 +21,21 @@ pub(super) fn list(db: &mut dyn Sql, query: &NoteListQuery) -> Result<NotePage, 
     let entity = query_entity(query);
     let (repo, global) = view_params(db, &query.view)?;
 
-    let counted: Vec<(NoteKind, usize)> = db
+    let counted: Vec<(NoteKind, Scope, usize)> = db
         .query(
-            &format!("SELECT n.kind, count(*) FROM notes n WHERE {VISIBLE} AND {KEPT} GROUP BY n.kind"),
+            &format!(
+                "SELECT n.kind, n.project_id IS NULL, count(*) FROM notes n WHERE {VISIBLE} AND {KEPT}
+                 GROUP BY n.kind, n.project_id IS NULL"
+            ),
             args![text, repo, global, entity.as_deref()],
         )?
         .iter()
         .map(|row| {
             let kind: String = row.get(0)?;
-            let count: i64 = row.get(1)?;
-            Ok((kind_from_sql(&kind), usize::try_from(count).unwrap_or(0)))
+            let is_global: i64 = row.get(1)?;
+            let count: i64 = row.get(2)?;
+            let scope = if is_global == 0 { Scope::Repo } else { Scope::Global };
+            Ok((kind_from_sql(&kind), scope, usize::try_from(count).unwrap_or(0)))
         })
         .collect::<Result<_, StoreError>>()?;
 
@@ -51,6 +56,7 @@ pub(super) fn list(db: &mut dyn Sql, query: &NoteListQuery) -> Result<NotePage, 
     let limit = i64::try_from(page_limit(query)).unwrap_or(1);
     let offset = i64::try_from(query.offset).unwrap_or(i64::MAX);
     let kind = query.kind.map(NoteKind::as_str);
+    let (repo, global) = scoped(query, repo, global);
 
     let mut rows: Vec<NoteRow> = db
         .query(&sql, args![text, repo, global, entity.as_deref(), kind, limit, offset])?
@@ -59,7 +65,7 @@ pub(super) fn list(db: &mut dyn Sql, query: &NoteListQuery) -> Result<NotePage, 
         .collect::<Result<_, StoreError>>()?;
 
     fill_entities(db, &mut rows)?;
-    Ok(NotePage::new(counted, query.kind, rows))
+    Ok(NotePage::new(counted, query, rows))
 }
 
 /// Sets the entity names of `rows` (alphabetically, as a note's), in one statement.

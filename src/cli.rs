@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use crate::backend::{self, Selection};
 use crate::limits::{LIST_PAGE_DEFAULT, LIST_PAGE_MAX};
 use crate::project::ProjectResolver;
-use crate::store::ProjectKey;
+use crate::store::{ProjectKey, Scope};
 use crate::support::Env;
 
 /// The options of the lists' paging: `--offset N`, `--limit N`, `--query TEXT`, `--order asc|desc`.
@@ -83,6 +83,16 @@ impl<'a> Args<'a> {
         match self.value("--project") {
             Some(path) if path.trim().is_empty() => Err(()),
             Some(path) => Ok(Some(path.to_owned())),
+            None => Ok(None),
+        }
+    }
+
+    /// The scope of `--scope` (`repo` or `global`); `Err` for any other value.
+    pub(crate) fn scope(&self) -> Result<Option<Scope>, ()> {
+        match self.value("--scope") {
+            Some("repo") => Ok(Some(Scope::Repo)),
+            Some("global") => Ok(Some(Scope::Global)),
+            Some(_) => Err(()),
             None => Ok(None),
         }
     }

@@ -2,20 +2,25 @@
 //! Harness Desktop on their behalf), never for an agent's MCP calls:
 //!
 //! - `harness-memory scripts list --json [--project PATH] [--group needsReview|repo|global]
-//!   [--query TEXT] [--sort name|language|scope|place|runs|lastRun|updated] [--order asc|desc]
-//!   [--offset N] [--limit N]` prints
-//!   `{"total": N, "groups": {"needsReview": N, "repo": N, "global": N}, "scripts": [...]}`: one
-//!   page of the visible scripts (the repository of `--project`, else of the working directory,
-//!   and the global scope) as the objects `script_list` returns. The groups do not overlap:
-//!   `needsReview` holds every script that needs approval, `repo` and `global` the others of
-//!   their scope. `--query` keeps the scripts whose name or description contains it, ignoring
-//!   case (as `script_list` does); the group counts follow it, the total follows it and
-//!   `--group`. By name (ties: repository scripts first) ascending unless `--sort updated`
+//!   [--scope repo|global] [--review needed|trusted] [--query TEXT]
+//!   [--sort name|language|scope|place|runs|lastRun|updated] [--order asc|desc] [--offset N]
+//!   [--limit N]` prints `{"total": N, "groups": {"needsReview": N, "repo": N, "global": N},
+//!   "scopes": {"repo": N, "global": N}, "review": {"needed": N, "trusted": N}, "scripts": [...]}`:
+//!   one page of the visible scripts (the repository of `--project`, else of the working
+//!   directory, and the global scope) as the objects `script_list` returns. The groups do not
+//!   overlap: `needsReview` holds every script that needs approval, `repo` and `global` the others
+//!   of their scope. `--scope` keeps the scripts of one scope, `--review needed` those that need
+//!   approval (the `needsReview` group), `--review trusted` every other one; the two combine,
+//!   and neither combines with `--group`. `--query` keeps the scripts whose name or description
+//!   contains it, ignoring case (as `script_list` does). The group counts follow `--query`, the
+//!   scope counts `--query` and `--review`, the review counts `--query` and `--scope`, the total
+//!   every filter. By name (ties: repository scripts first) ascending unless `--sort updated`
 //!   (newest first), `language`, `scope` (global scripts first), `place` (every listed script is
 //!   in one place, so by id), `runs` (the run count) or `lastRun` (the latest run; a script never
-//!   run comes last either way), all ascending; `--order` turns any round, ties go by id. `--limit` is 1 to 200, 50 when
-//!   not given; `--untrusted` is `--group needsReview`. Approval is decided on this machine, so
-//!   every visible script is read and the page is cut here, not in the database.
+//!   run comes last either way), all ascending; `--order` turns any round, ties go by id.
+//!   `--limit` is 1 to 200, 50 when not given; `--untrusted` is `--group needsReview`. Approval
+//!   is decided on this machine, so every visible script is read and the page is cut here, not
+//!   in the database.
 //! - `harness-memory scripts delete <id> [--project PATH]` deletes a visible script as
 //!   `script_delete` does (a version that needs approval is remembered first, so saving its code
 //!   again trusts nothing) and prints `deleted script <id> <name>`; a script that is not visible
@@ -54,8 +59,8 @@ use crate::store::{
 use crate::store::{foreign_encoding, foreign_encoding_error, hidden_character, hidden_character_error};
 
 /// The usage of these commands, for the executable's usage line.
-pub const USAGE: &str = "scripts list --json [--project PATH] [--group needsReview|repo|global] [--query TEXT] \
-                         [--sort name|language|scope|place|runs|lastRun|updated] [--order asc|desc] [--offset N] [--limit N] | scripts delete <id> \
+pub const USAGE: &str = "scripts list --json [--project PATH] [--group needsReview|repo|global] [--scope \
+                         repo|global] [--review needed|trusted] [--query TEXT] [--sort name|language|scope|place|runs|lastRun|updated] [--order asc|desc] [--offset N] [--limit N] | scripts delete <id> \
                          [--project PATH] | scripts delete --all --yes [--project PATH] [--json] | trust \
                          <id>[=<sha256>]... | --all [--project PATH]";
 
@@ -145,19 +150,32 @@ fn list(args: &[Option<&str>]) -> ExitCode {
         Err(message) => return opened.failed(&message),
     };
 
-    let count = |group: Group| {
+    let count = |keeps: &dyn Fn(&ScriptSummary, Approval) -> bool| {
         listed
             .iter()
-            .filter(|(summary, approval)| Group::of(summary, *approval) == group)
+            .filter(|(summary, approval)| keeps(summary, *approval))
             .count()
     };
+    let in_group = |group: Group| count(&|summary, approval| Group::of(summary, approval) == group);
+    let in_scope = |scope: Scope| count(&|summary, approval| summary.scope == scope && options.review_keeps(approval));
+    let in_review =
+        |review: Review| count(&|summary, approval| Review::of(approval) == review && options.scope_keeps(summary));
+
     let groups = json!({
-        "needsReview": count(Group::NeedsReview),
-        "repo": count(Group::Repo),
-        "global": count(Group::Global),
+        "needsReview": in_group(Group::NeedsReview),
+        "repo": in_group(Group::Repo),
+        "global": in_group(Group::Global),
+    });
+    let scopes = json!({
+        "repo": in_scope(Scope::Repo),
+        "global": in_scope(Scope::Global),
+    });
+    let review = json!({
+        "needed": in_review(Review::Needed),
+        "trusted": in_review(Review::Trusted),
     });
 
-    listed.retain(|(summary, approval)| options.group.is_none_or(|group| Group::of(summary, *approval) == group));
+    listed.retain(|(summary, approval)| options.keeps(summary, *approval));
     listed.sort_by(|(a, _), (b, _)| options.compare(a, b));
 
     let objects: Vec<Value> = listed
@@ -169,7 +187,13 @@ fn list(args: &[Option<&str>]) -> ExitCode {
 
     println!(
         "{}",
-        json!({ "total": listed.len(), "groups": groups, "scripts": objects })
+        json!({
+            "total": listed.len(),
+            "groups": groups,
+            "scopes": scopes,
+            "review": review,
+            "scripts": objects,
+        })
     );
     ExitCode::SUCCESS
 }
@@ -243,6 +267,10 @@ pub fn trust(args: &[Option<&str>]) -> ExitCode {
 #[derive(Debug)]
 struct ListOptions {
     group: Option<Group>,
+    /// `--scope`; never given with [`Self::group`].
+    scope: Option<Scope>,
+    /// `--review`; never given with [`Self::group`].
+    review: Option<Review>,
     project: Option<String>,
     sort: ScriptSort,
     descending: bool,
@@ -250,6 +278,23 @@ struct ListOptions {
 }
 
 impl ListOptions {
+    /// True when the group, the scope and the review asked for keep the script.
+    fn keeps(&self, summary: &ScriptSummary, approval: Approval) -> bool {
+        let in_group = self.group.is_none_or(|group| Group::of(summary, approval) == group);
+
+        in_group && self.scope_keeps(summary) && self.review_keeps(approval)
+    }
+
+    /// True when the scope asked for (if any) keeps the script.
+    fn scope_keeps(&self, summary: &ScriptSummary) -> bool {
+        self.scope.is_none_or(|scope| summary.scope == scope)
+    }
+
+    /// True when the review asked for (if any) keeps a script with `approval`.
+    fn review_keeps(&self, approval: Approval) -> bool {
+        self.review.is_none_or(|review| Review::of(approval) == review)
+    }
+
     /// The order of the list: by [`Self::sort`], then by id, turned round when descending; a
     /// script never run comes after the others by `lastRun` either way.
     fn compare(&self, a: &ScriptSummary, b: &ScriptSummary) -> Ordering {
@@ -336,6 +381,31 @@ impl Group {
     }
 }
 
+/// Whether a listed script needs approval (the [`Group::NeedsReview`] scripts) or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Review {
+    Needed,
+    Trusted,
+}
+
+impl Review {
+    fn of(approval: Approval) -> Self {
+        if approval.is_trusted() {
+            Self::Trusted
+        } else {
+            Self::Needed
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "needed" => Some(Self::Needed),
+            "trusted" => Some(Self::Trusted),
+            _ => None,
+        }
+    }
+}
+
 /// The options of `trust`: the scripts, or `None` for `--all`.
 #[derive(Debug, Default)]
 struct TrustOptions {
@@ -388,9 +458,14 @@ enum Approved {
 }
 
 /// The options after `scripts`; `None` for anything but `list --json` with known, unrepeated
-/// options and valid values.
+/// options and valid values, and for a group (`--group`, `--untrusted`) with `--scope` or
+/// `--review`.
 fn parse_list(args: &[Option<&str>]) -> Option<ListOptions> {
-    let valued = [&PAGE_OPTIONS[..], &["--project", "--group", "--sort"]].concat();
+    let valued = [
+        &PAGE_OPTIONS[..],
+        &["--project", "--group", "--scope", "--review", "--sort"],
+    ]
+    .concat();
     let parsed = Args::parse(args, &["--json", "--untrusted"], &valued)?;
 
     if parsed.positional != ["list"] || !parsed.flag("--json") {
@@ -404,6 +479,16 @@ fn parse_list(args: &[Option<&str>]) -> Option<ListOptions> {
         (false, None) => None,
     };
 
+    let scope = parsed.scope().ok()?;
+    let review = match parsed.value("--review") {
+        Some(raw) => Some(Review::parse(raw)?),
+        None => None,
+    };
+
+    if group.is_some() && (scope.is_some() || review.is_some()) {
+        return None;
+    }
+
     let sort = match parsed.value("--sort") {
         Some(raw) => ScriptSort::parse(raw)?,
         None => ScriptSort::Name,
@@ -413,6 +498,8 @@ fn parse_list(args: &[Option<&str>]) -> Option<ListOptions> {
 
     Some(ListOptions {
         group,
+        scope,
+        review,
         project: parsed.project().ok()?,
         sort,
         descending: page.descending.unwrap_or(sort == ScriptSort::Updated),
@@ -646,6 +733,13 @@ mod tests {
             assert_eq!((parsed.sort, parsed.descending), (sort, false), "{raw}");
         }
 
+        let filtered =
+            parse_list(&args(&["list", "--json", "--scope", "global", "--review", "needed"])).expect("valid");
+        assert_eq!(
+            (filtered.group, filtered.scope, filtered.review),
+            (None, Some(Scope::Global), Some(Review::Needed))
+        );
+
         let updated = parse_list(&args(&["list", "--json", "--group", "repo", "--sort", "updated"])).expect("valid");
         assert_eq!(
             (updated.group, updated.sort, updated.descending),
@@ -668,6 +762,10 @@ mod tests {
             &["list", "--json", "--project", "/a", "--project", "/b"],
             &["list", "--json", "--yaml"],
             &["list", "--json", "--untrusted", "--group", "repo"],
+            &["list", "--json", "--untrusted", "--scope", "repo"],
+            &["list", "--json", "--group", "repo", "--review", "trusted"],
+            &["list", "--json", "--scope", "both"],
+            &["list", "--json", "--review", "pending"],
             &["list", "--json", "--group", "trusted"],
             &["list", "--json", "--sort", "size"],
             &["list", "--json", "--limit", "500"],

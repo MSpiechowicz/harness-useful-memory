@@ -107,7 +107,7 @@ fn listing(data: &Path, cwd: &Path, extra: &[&str]) -> Value {
 
     let parsed: Value = serde_json::from_str(&stdout(&output)).expect("JSON");
     let keys: Vec<&String> = parsed.as_object().expect("object").keys().collect();
-    assert_eq!(keys, ["total", "groups", "scripts"]);
+    assert_eq!(keys, ["total", "groups", "scopes", "review", "scripts"]);
     parsed
 }
 
@@ -261,6 +261,23 @@ fn bad_usage_exits_2() {
         &["scripts"],
         &["scripts", "list"],
         &["scripts", "list", "--json", "--all"],
+        &["scripts", "list", "--json", "--scope", "team"],
+        &["scripts", "list", "--json", "--scope", "Global"],
+        &["scripts", "list", "--json", "--review", "pending"],
+        &["scripts", "list", "--json", "--review", "Needed"],
+        &["scripts", "list", "--json", "--review"],
+        &["scripts", "list", "--json", "--group", "repo", "--scope", "repo"],
+        &[
+            "scripts",
+            "list",
+            "--json",
+            "--group",
+            "needsReview",
+            "--review",
+            "needed",
+        ],
+        &["scripts", "list", "--json", "--untrusted", "--scope", "global"],
+        &["scripts", "list", "--json", "--untrusted", "--review", "needed"],
         &["scripts", "delete"],
         &["scripts", "delete", "x"],
         &["scripts", "delete", "3", "--json"],
@@ -614,6 +631,108 @@ fn scripts_list_pages_groups_and_sorts() {
     let output = cli(&data, &work, &["scripts", "list", "--json", "--query", &long]);
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).ends_with("harness-memory: query is longer than 256 characters\n"));
+}
+
+#[test]
+fn scripts_list_filters_by_scope_and_review_together() {
+    let (dir, data, work) = folders();
+    let root = repo_with_remote(dir.path(), "widget", "https://github.com/acme/widget.git");
+    let project = root.to_string_lossy().into_owned();
+    let at = |extra: &[&str]| -> Value {
+        let mut args = vec!["--project", project.as_str()];
+        args.extend(extra);
+        listing(&data, &work, &args)
+    };
+
+    for name in ["delta", "alpha", "echo"] {
+        save_elsewhere(&data, &Target::Global, name);
+    }
+
+    for name in ["bravo", "charlie"] {
+        save_elsewhere(&data, &repo("github.com/acme/widget"), name);
+    }
+
+    let shas = reviewed(&data, &work, &["--project", &project]);
+    let args = trust_args(&["--project", &project], shas[..2].to_vec());
+    assert!(
+        cli(&data, &work, &strs(&args)).status.success(),
+        "alpha (global) and bravo (repository) trusted"
+    );
+
+    let all = at(&[]);
+    assert_eq!(all["total"], 5);
+    assert_eq!(all["groups"], json!({ "needsReview": 3, "repo": 1, "global": 1 }));
+    assert_eq!(all["scopes"], json!({ "repo": 2, "global": 3 }));
+    assert_eq!(all["review"], json!({ "needed": 3, "trusted": 2 }));
+
+    let global = at(&["--scope", "global"]);
+    assert_eq!(
+        names(global["scripts"].as_array().expect("scripts")),
+        ["alpha", "delta", "echo"]
+    );
+    assert_eq!(global["total"], 3, "the total follows the scope");
+    assert_eq!(global["scopes"], all["scopes"], "the scope counts ignore the scope");
+    assert_eq!(
+        global["review"],
+        json!({ "needed": 2, "trusted": 1 }),
+        "the review counts follow the scope"
+    );
+    assert_eq!(global["groups"], all["groups"], "the groups stay as they were");
+
+    let needed = at(&["--review", "needed"]);
+    assert_eq!(
+        names(needed["scripts"].as_array().expect("scripts")),
+        ["charlie", "delta", "echo"]
+    );
+    assert_eq!(needed["total"], 3);
+    assert_eq!(
+        needed["scopes"],
+        json!({ "repo": 1, "global": 2 }),
+        "the scope counts follow the review"
+    );
+    assert_eq!(needed["review"], all["review"], "the review counts ignore the review");
+
+    let trusted_repo = at(&["--scope", "repo", "--review", "trusted"]);
+    assert_eq!(names(trusted_repo["scripts"].as_array().expect("scripts")), ["bravo"]);
+    assert_eq!(trusted_repo["total"], 1);
+    assert_eq!(trusted_repo["scopes"], json!({ "repo": 1, "global": 1 }));
+    assert_eq!(trusted_repo["review"], json!({ "needed": 1, "trusted": 1 }));
+
+    let queried = at(&["--scope", "global", "--review", "needed", "--query", "LTA"]);
+    assert_eq!(names(queried["scripts"].as_array().expect("scripts")), ["delta"]);
+    assert_eq!(queried["total"], 1);
+    assert_eq!(queried["scopes"], json!({ "repo": 0, "global": 1 }));
+    assert_eq!(queried["review"], json!({ "needed": 1, "trusted": 0 }));
+    assert_eq!(queried["groups"], json!({ "needsReview": 1, "repo": 0, "global": 0 }));
+
+    let paged = at(&[
+        "--review", "needed", "--sort", "name", "--order", "desc", "--offset", "1", "--limit", "1",
+    ]);
+    assert_eq!(names(paged["scripts"].as_array().expect("scripts")), ["delta"]);
+    assert_eq!(paged["total"], 3);
+
+    let grouped = at(&["--group", "repo"]);
+    assert_eq!(names(grouped["scripts"].as_array().expect("scripts")), ["bravo"]);
+    assert_eq!(grouped["total"], 1, "--group works as before");
+    assert_eq!(grouped["scopes"], all["scopes"]);
+    assert_eq!(grouped["review"], all["review"]);
+
+    for bad in [
+        &["--group", "global", "--scope", "global"][..],
+        &["--group", "needsReview", "--review", "needed"],
+        &["--untrusted", "--review", "needed"],
+        &["--scope", "everywhere"],
+        &["--review", "approved"],
+    ] {
+        let args: Vec<&str> = ["scripts", "list", "--json"].iter().chain(bad).copied().collect();
+        let output = cli(&data, &work, &args);
+        assert_eq!(output.status.code(), Some(2), "{bad:?}");
+        assert!(
+            stderr(&output).starts_with("usage: harness-memory"),
+            "{}",
+            stderr(&output)
+        );
+    }
 }
 
 #[test]

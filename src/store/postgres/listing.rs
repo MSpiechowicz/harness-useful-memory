@@ -1,6 +1,6 @@
-//! A page of notes ([`crate::store::listing`]) in PostgreSQL: the counts per kind and the page,
-//! then the entity names of the page's notes. `strpos`, not `LIKE`, so `%` and `_` in the text
-//! are plain characters; titles sort by code point (`COLLATE "C"`), like SQLite.
+//! A page of notes ([`crate::store::listing`]) in PostgreSQL: the counts per kind and scope and
+//! the page, then the entity names of the page's notes. `strpos`, not `LIKE`, so `%` and `_` in
+//! the text are plain characters; titles sort by code point (`COLLATE "C"`), like SQLite.
 
 use postgres::GenericClient;
 
@@ -8,9 +8,9 @@ use super::notes::{VISIBLE, kind_from_sql, note_from_row, row_columns};
 use super::{KIND_MAX, backend, column, cut, view_params};
 use crate::limits::ENTITY_MAX;
 use crate::store::listing::{
-    NoteListQuery, NotePage, NoteRow, NoteSort, direction, page_limit, query_entity, query_text,
+    NoteListQuery, NotePage, NoteRow, NoteSort, direction, page_limit, query_entity, query_text, scoped,
 };
-use crate::store::{NoteKind, StoreError};
+use crate::store::{NoteKind, Scope, StoreError};
 
 /// The notes the text (`$1`) and the normalized entity name (`$4`) keep (`NULL` for any).
 const KEPT: &str = "($1::text IS NULL OR strpos(lower(n.title), lower($1::text)) > 0
@@ -24,17 +24,20 @@ pub(super) fn list(client: &mut impl GenericClient, query: &NoteListQuery) -> Re
     let (repo, global) = view_params(client, &query.view)?;
 
     let counts_sql = format!(
-        "SELECT {}, count(*) FROM notes n WHERE {VISIBLE} AND {KEPT} GROUP BY n.kind",
+        "SELECT {}, n.project_id IS NULL, count(*) FROM notes n WHERE {VISIBLE} AND {KEPT}
+         GROUP BY n.kind, n.project_id IS NULL",
         cut("n.kind", KIND_MAX)
     );
-    let counted: Vec<(NoteKind, usize)> = client
+    let counted: Vec<(NoteKind, Scope, usize)> = client
         .query(&counts_sql, &[&text, &repo, &global, &entity])
         .map_err(backend)?
         .iter()
         .map(|row| {
             let kind: String = column(row, 0)?;
-            let count: i64 = column(row, 1)?;
-            Ok((kind_from_sql(&kind), usize::try_from(count).unwrap_or(0)))
+            let is_global: bool = column(row, 1)?;
+            let count: i64 = column(row, 2)?;
+            let scope = if is_global { Scope::Global } else { Scope::Repo };
+            Ok((kind_from_sql(&kind), scope, usize::try_from(count).unwrap_or(0)))
         })
         .collect::<Result<_, StoreError>>()?;
 
@@ -56,6 +59,7 @@ pub(super) fn list(client: &mut impl GenericClient, query: &NoteListQuery) -> Re
     let limit = i64::try_from(page_limit(query)).unwrap_or(1);
     let offset = i64::try_from(query.offset).unwrap_or(i64::MAX);
     let kind = query.kind.map(NoteKind::as_str);
+    let (repo, global) = scoped(query, repo, global);
 
     let mut rows: Vec<NoteRow> = client
         .query(&sql, &[&text, &repo, &global, &entity, &kind, &limit, &offset])
@@ -65,7 +69,7 @@ pub(super) fn list(client: &mut impl GenericClient, query: &NoteListQuery) -> Re
         .collect::<Result<_, StoreError>>()?;
 
     fill_entities(client, &mut rows)?;
-    Ok(NotePage::new(counted, query.kind, rows))
+    Ok(NotePage::new(counted, query, rows))
 }
 
 /// Sets the entity names of `rows` (alphabetically, as a note's), in one statement.
