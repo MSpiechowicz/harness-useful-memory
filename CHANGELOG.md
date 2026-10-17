@@ -1,3 +1,16 @@
+# [1.2.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v1.1.0...v1.2.0) (2026-10-17)
+
+
+### Bug Fixes
+
+* **ci:** compare the run request folder resolved on macOS ([6237fdb](https://github.com/MSpiechowicz/harness-useful-memory/commit/6237fdb872ad265f9cea72a043c41589b165a511))
+* **ci:** pass the macOS runner test and Windows clippy ([cb559df](https://github.com/MSpiechowicz/harness-useful-memory/commit/cb559dfc8fdfea7f87de2e8b8fc7f6838cb2169e))
+
+
+### Features
+
+* **scripts:** save, approve and run deterministic scripts ([01b8009](https://github.com/MSpiechowicz/harness-useful-memory/commit/01b80094e307b964e14586188d8e164b7c8c0dfc))
+
 # [1.1.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v1.0.1...v1.1.0) (2026-10-16)
 
 
