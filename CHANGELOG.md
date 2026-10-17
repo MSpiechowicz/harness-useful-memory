@@ -1,3 +1,10 @@
+# [1.3.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v1.2.0...v1.3.0) (2026-10-17)
+
+
+### Features
+
+* **cli:** filter notes and scripts by scope and review status together ([e7fad03](https://github.com/MSpiechowicz/harness-useful-memory/commit/e7fad0304370888f7baab62e55d78dd190fa8fd0))
+
 # [1.2.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v1.1.0...v1.2.0) (2026-10-17)
 
 
