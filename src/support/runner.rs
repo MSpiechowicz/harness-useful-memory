@@ -471,7 +471,9 @@ mod tests {
 
         let finished = run(&env, &request).expect("sh runs");
         let (mode, file) = finished.stdout.text.split_once('\n').expect("two lines");
-        let run_folder = home.path().join(".local/share/harness-memory/run");
+        let run_folder = crate::location::data_dir(&env)
+            .expect("data dir")
+            .join("harness-memory/run");
 
         assert_eq!(mode, "drwx------");
         assert_eq!(

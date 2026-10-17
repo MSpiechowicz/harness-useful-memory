@@ -3,6 +3,9 @@
 //! to the database; without it the run is refused at once, never naming the trust hash; and
 //! `trust_team_scripts` runs every team script. Also the characters a body may hold.
 
+// Most of these tests run only on Unix, so on Windows their helpers and imports are unused.
+#![cfg_attr(not(unix), allow(unused))]
+
 mod common;
 
 use std::time::{Duration, Instant};

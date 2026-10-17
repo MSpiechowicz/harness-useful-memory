@@ -5,6 +5,9 @@
 //! bad usage or no terminal, the reason on the last line of stderr), and `check` reports
 //! `trust_team_scripts`.
 
+// Most of these tests run only on Unix, so on Windows their helpers and imports are unused.
+#![cfg_attr(not(unix), allow(unused))]
+
 mod common;
 
 use std::path::{Path, PathBuf};

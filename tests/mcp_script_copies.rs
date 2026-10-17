@@ -4,6 +4,9 @@
 //! Approvals stay with the team database they were given for, run requests show only cleaned
 //! client and writer names, and a client that hangs up while the user is asked runs nothing.
 
+// Most of these tests run only on Unix, so on Windows their helpers and imports are unused.
+#![cfg_attr(not(unix), allow(unused))]
+
 mod common;
 
 use std::io::{BufRead, BufReader, Write};

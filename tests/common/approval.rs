@@ -1,6 +1,9 @@
 //! A data folder for the approval tests, a server on it, and Harness Desktop played by a thread
 //! that answers the run requests.
 
+// Most of these tests run only on Unix, so on Windows their helpers and imports are unused.
+#![cfg_attr(not(unix), allow(unused))]
+
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};

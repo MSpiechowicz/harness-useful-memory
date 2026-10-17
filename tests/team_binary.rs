@@ -3,6 +3,9 @@
 //! machine (the cases on a real database need `postgres_support`'s server and are skipped without
 //! it).
 
+// Most of these tests run only on Unix, so on Windows their helpers and imports are unused.
+#![cfg_attr(not(unix), allow(unused))]
+
 mod common;
 mod postgres_support;
 mod push_support;

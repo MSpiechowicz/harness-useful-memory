@@ -2,6 +2,9 @@
 //! `structuredContent`, refused bodies, shell-free arguments, timeouts, output caps and masking, the
 //! trust check before a run, and (through the real executable) the environment a script sees.
 
+// Most of these tests run only on Unix, so on Windows their helpers and imports are unused.
+#![cfg_attr(not(unix), allow(unused))]
+
 mod common;
 
 use std::path::{Path, PathBuf};

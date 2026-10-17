@@ -4,6 +4,9 @@
 //! team database. Also what a run request shows besides the script: where it runs and its
 //! standard input.
 
+// Most of these tests run only on Unix, so on Windows their helpers and imports are unused.
+#![cfg_attr(not(unix), allow(unused))]
+
 mod common;
 
 use std::path::{Path, PathBuf};
