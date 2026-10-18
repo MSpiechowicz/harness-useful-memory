@@ -1,7 +1,7 @@
 [package]
 name = "harness_memory"
 description = "Project memory MCP server for any coding agent harness (embedded SQLite, full-text search)"
-version = "1.4.0"
+version = "2.0.0"
 edition = "2024"
 rust-version = "1.98"
 license = "GPL-3.0-or-later"

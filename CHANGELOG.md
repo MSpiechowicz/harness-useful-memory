@@ -1,3 +1,16 @@
+# [2.0.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v1.4.0...v2.0.0) (2026-10-18)
+
+
+* feat(mcp)!: name the note tools after notes and entities ([1a80df5](https://github.com/MSpiechowicz/harness-useful-memory/commit/1a80df56f0a2629734b4b2483b59e49f1c488912))
+
+
+### BREAKING CHANGES
+
+* the old memory_* tool names are gone. Agents and allow-lists
+that call them must use the new names.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
 # [1.4.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v1.3.0...v1.4.0) (2026-10-18)
 
 
