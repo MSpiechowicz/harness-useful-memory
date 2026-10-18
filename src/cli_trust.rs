@@ -700,6 +700,8 @@ mod tests {
                 ..Routing::default()
             },
             trust_team_scripts,
+            hooks: Place::Local,
+            trust_team_hooks: false,
             warnings: Vec::new(),
         };
         let team = || Backend::Postgres {

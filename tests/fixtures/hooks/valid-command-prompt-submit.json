@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "id": "1a2b3c4d5e6f70818293a4b5c6d70007",
+  "name": "Print date",
+  "description": null,
+  "scope": "global",
+  "project": null,
+  "event": "promptSubmit",
+  "matcher": null,
+  "action": {
+    "type": "command",
+    "command": "date -u +%F",
+    "timeoutSecs": 5
+  },
+  "enabled": true,
+  "createdAt": "2026-10-17T10:00:00Z",
+  "createdBy": "desktop",
+  "updatedAt": "2026-10-17T10:00:00Z",
+  "updatedBy": "desktop"
+}

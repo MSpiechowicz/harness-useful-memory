@@ -22,6 +22,7 @@
 
 mod connect;
 mod graph;
+mod hooks;
 mod listing;
 mod notes;
 pub mod schema;

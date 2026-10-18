@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "id": "1a2b3c4d5e6f70818293a4b5c6d70032",
+  "name": "Example hook",
+  "description": null,
+  "scope": "global",
+  "project": null,
+  "event": "sessionStart",
+  "matcher": null,
+  "action": {
+    "type": "addContext",
+    "text": "Mind the project conventions."
+  },
+  "enabled": true,
+  "createdAt": "2026-10-17 10:00:00",
+  "createdBy": "desktop",
+  "updatedAt": "2026-10-17T10:00:00Z",
+  "updatedBy": "desktop"
+}

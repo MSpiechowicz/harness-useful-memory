@@ -7,7 +7,7 @@ use super::sql::{Sql, args};
 use crate::store::StoreError;
 
 /// The schema version this server writes.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// The state of a database after [`migrate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,8 +114,8 @@ UPDATE notes SET writer_root = (SELECT p.root_path FROM projects p WHERE p.id = 
 /// repository key it was trusted as, its body (for the next review's diff) and whether it was
 /// saved or approved here; and the hashes of the versions reported here as waiting for approval
 /// (both used in the local file only; a libSQL team database gets the tables but never fills
-/// them).
-const V3: &str = "
+/// them). Public so tests can build a version 3 database and check the migration.
+pub const V3: &str = "
 CREATE TABLE scripts (
     id INTEGER PRIMARY KEY,
     project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
@@ -158,8 +158,26 @@ CREATE TABLE script_seen_unapproved (
 CREATE INDEX script_seen_unapproved_age ON script_seen_unapproved (seen_at);
 ";
 
+/// Version 4: the hooks a team shares (see [`crate::store::hooks`]), unique by id, with the
+/// repository key they apply to (`NULL` for global hooks; a key, not a `projects` row, so no
+/// local path goes with it), listed per scope by `created_at` (used in a libSQL team database
+/// only; the local file gets the table but never fills it). Only adds a table, so the rows of
+/// version 3 are untouched.
+const V4: &str = "
+CREATE TABLE hooks (
+    id TEXT PRIMARY KEY,
+    repo TEXT,
+    body TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    author TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX hooks_repo ON hooks (repo, created_at, id);
+";
+
 /// The migrations in order, each with the version it brings the database to.
-const STEPS: [(i64, &str); 3] = [(1, V1), (2, V2), (3, V3)];
+const STEPS: [(i64, &str); 4] = [(1, V1), (2, V2), (3, V3), (4, V4)];
 
 /// Brings the database to [`SCHEMA_VERSION`]; a newer database is reported, not changed.
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<SchemaState> {

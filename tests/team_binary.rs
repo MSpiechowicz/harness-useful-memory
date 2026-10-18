@@ -540,7 +540,7 @@ fn check_opens_the_team_database() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let said = stdout(&output);
     assert!(said.starts_with("ok: PostgreSQL at postgres://"), "{said}");
-    assert!(said.ends_with(" (schema 2)\nscripts: team database\n"), "{said}");
+    assert!(said.ends_with(" (schema 3)\nscripts: team database\n"), "{said}");
     assert_eq!(said.lines().count(), 2, "{said}");
     assert!(!said.contains(":test@"), "no password: {said}");
 
@@ -549,7 +549,7 @@ fn check_opens_the_team_database() {
     let file = machine.memory.join("memory.sqlite3");
     assert!(
         stdout(&split).ends_with(&format!(
-            " (schema 2); repository notes: team database, global notes: this computer; local database at {} (not \
+            " (schema 3); repository notes: team database, global notes: this computer; local database at {} (not \
              created yet)\nscripts: team database\n",
             file.display()
         )),

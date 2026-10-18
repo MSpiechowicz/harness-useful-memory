@@ -7,10 +7,12 @@
 //! `redact_text` before anything is stored (the helpers in [`clean`] do both), so callers may pass
 //! raw agent text.
 //!
-//! [`ScriptStore`] and [`TrustStore`] (in [`scripts`]) are the script contract; [`Lazy`] opens a
-//! store on first use. [`listing`] holds the types of [`MemoryStore::list_notes`].
+//! [`ScriptStore`] and [`TrustStore`] (in [`scripts`]) are the script contract, [`HookStore`] (in
+//! [`hooks`]) the team hook contract; [`Lazy`] opens a store on first use. [`listing`] holds the
+//! types of [`MemoryStore::list_notes`].
 
 pub mod clean;
+pub mod hooks;
 pub mod lazy;
 pub mod libsql;
 pub mod listing;
@@ -22,6 +24,7 @@ pub mod sqlite;
 
 use std::path::PathBuf;
 
+pub use hooks::{HookDelete, HookDraft, HookPage, HookPut, HookStore, TeamHook, checked_hook, hook_sha256};
 pub use lazy::Lazy;
 pub use libsql::LibsqlStore;
 pub use listing::{NoteListQuery, NotePage, NoteRow, NoteSort};

@@ -298,8 +298,9 @@ A row changed by hand in a team database does not break the list: its timeout is
 a language this server cannot run, an invalid name, or a description or body over its limit is left out (with a line
 on the server's stderr), as if it did not exist.
 
-Scripts need team database schema 2 (PostgreSQL, MongoDB) or 3 (libSQL). A release that raises the schema migrates
-the team database on first use, and from then on every tool of an older `harness-memory` fails on it, notes included
+Scripts need team database schema 2 (PostgreSQL, MongoDB) or 3 (libSQL), [team hooks](#sharing-hooks) schema 3
+(PostgreSQL, MongoDB) or 4 (libSQL). A release that raises the schema migrates the team database on first use (it only
+adds tables and collections), and from then on every tool of an older `harness-memory` fails on it, notes included
 (`check` says `update it`): when you upgrade, the whole team upgrades together.
 
 ### Browsing notes
@@ -498,7 +499,7 @@ and prints one line, without the credentials, then where scripts are kept (`scri
 scripts are kept in the team database):
 
 ```text
-ok: PostgreSQL at postgres://harness_memory@db.example.com:5432/harness_memory?… (schema 2)
+ok: PostgreSQL at postgres://harness_memory@db.example.com:5432/harness_memory?… (schema 3)
 scripts: team database
 ```
 
@@ -539,6 +540,78 @@ same place, and similar notes are only looked for next to the note just saved. N
 before you changed the keys are not shown; `push` copies local notes of a shared kind into the team database.
 `harness-memory check` adds where each kind goes (`; repository notes: team database, global notes: this computer;
 local database at …`).
+
+### Sharing hooks
+
+[Harness Desktop](https://github.com/MSpiechowicz/harness-useful-desktop) hooks (small JSON files that add context to a
+prompt, send a follow-up or run a command in a desktop chat) can be shared through the team database. Harness Desktop
+does it for you: its Settings turn sharing on, its Hooks view shares a hook and shows the team's. It reads and writes
+them with the commands below, never by connecting to the database itself. This server never runs a hook.
+
+There is no MCP tool for hooks, but the commands below are not limited to Harness Desktop: any process running as you,
+an agent with a shell tool included, can run `harness-memory hooks put` and share a hook with everyone on the team
+database.
+
+| Key | Environment variable | Values | Default |
+| --- | --- | --- | --- |
+| `hooks` | `HARNESS_MEMORY_HOOKS` | `"remote"` (share through the team database) or `"local"` (share none) | `"local"` |
+| `trust_team_hooks` | `HARNESS_MEMORY_TRUST_TEAM_HOOKS` | `true` (`1`) or `false` (`0`) | `false` |
+
+```toml
+database_url = "postgres://..."
+hooks = "remote"
+# trust_team_hooks = true   # team hooks run without your approval in Harness Desktop
+```
+
+`hooks = "remote"` only counts with a team database (without one it is ignored, like `scripts = "remote"`).
+`trust_team_hooks` is only passed on to Harness Desktop (and only while hooks are shared): with it on, a team hook runs
+there without your approval, otherwise it waits until you approve that exact version. With it on, anyone who can write
+to the team database, and any agent of a teammate that can run `harness-memory`, can run commands on your computer.
+Leave it off unless you trust everyone with access to the team database.
+
+The team database keeps one row per hook in `hooks` (a collection in MongoDB): its `id` (the 32 hex id of the desktop
+file it was shared from, unique), `repo` (the repository key `git:host/owner/repo` of a project hook, at most 512 bytes, `null` for a
+global one), `body` (the hook file bytes as written, at most 16384), `sha256` (of the body), `author` (a free-text label, at most
+80 characters), `created_at` and `updated_at`. A scope (the global one, and each repository) holds at most 64 hooks.
+The body is a version 1 hook file of Harness Desktop (`docs/hooks-format.md` there) with two team rules: no `seed`
+(Harness family hooks are never shared, every computer adds its own), and a project hook's `project` holds the
+repository key instead of a local path. So only the repository identity leaves your computer: a project hook in a
+repository without an `origin` remote (a `path:` key) cannot be shared. A body that holds a credential is refused too.
+
+```sh
+harness-memory hooks config --json
+harness-memory hooks list --json --project ~/src/widget --offset 0 --limit 50
+harness-memory hooks get 1a2b3c4d5e6f70818293a4b5c6d7000b --json
+harness-memory hooks put --json --project ~/src/widget < hook.json
+harness-memory hooks put --json --project ~/src/widget --expect-sha <sha256> --author "Ada" < hook.json
+harness-memory hooks delete 1a2b3c4d5e6f70818293a4b5c6d7000b --expect-sha <sha256> --json
+```
+
+- `hooks config --json` prints `{"hooks": "remote"|"local", "trustTeamHooks": bool}` whenever the settings load
+  (`"local"` without a team database; `trustTeamHooks` is `false` unless hooks are shared), so Harness Desktop can tell
+  whether this `harness-memory` has these commands.
+- `hooks list --json` prints one page, `{"total", "nextOffset", "project", "hooks"}`: the global hooks and those of
+  `--project`'s repository, global first, then by `createdAt`, then by id. `project` is `{"key", "shareable"}`, the
+  repository key of `--project` and whether it may be shared (a `git:` key; a `path:` key is never sent to the
+  database), `null` without `--project`. `--offset N` and `--limit N` (1 to 200, 50 by default) pick the page.
+  `nextOffset` is the `--offset` of the next page, `null` after the last one: page with it rather than by counting the
+  hooks, since rows left out (see below) make a page shorter but still move the offset. Without sharing it lists none.
+- `hooks get <id> --json` prints one hook.
+- `hooks put --json` reads a hook file from standard input. Without `--expect-sha` it adds a new hook (an id that is
+  taken is a `conflict`), with it it replaces the hook with that id while its `sha256` is still the one given (a missing
+  id is `notFound`, another `sha256` a `conflict`). A project hook needs `--project`, whose repository key must equal
+  the file's `project`. The author is `--author`, else your user name (`USER`, `USERNAME`). It prints the stored hook.
+- `hooks delete <id> --json` prints `{"deleted": bool}` (`false` when no hook has the id); with `--expect-sha` only
+  while the hook's `sha256` is still the one given.
+
+A hook is `{"id", "repo", "sha256", "author", "createdAt", "updatedAt", "body"}` (RFC 3339 UTC times). A refusal exits
+with 1 and prints `{"error", "message"}`, the message also the last line of stderr: `conflict`, `notFound`, `invalid`
+(the body breaks the hook file format, or a bad author), `refused` (a Harness family hook, a repository without an
+`origin` remote, a `project` that is not the repository of `--project`), `limit` (the scope holds 64 hooks) or `local`
+(hooks are not shared). Other failures (the settings, the database) exit with 1 and only the stderr line, usage errors
+with 2. A row changed by hand that this server never writes is left out of the list and of `get`, with a line on stderr:
+one `put` would refuse (an id that is no hook id, a repository that is no `git:` key, a bad author, a body that breaks
+the rules above or names another id or scope than its row). `total` still counts it.
 
 ### Seed it from existing notes
 
@@ -600,6 +673,11 @@ one first.
   it or approved by you there (see [Approving scripts](#approving-scripts)), and an agent cannot approve one through the
   MCP tools: read a teammate's script before you approve it. Code your own agent saves runs without approval, by
   design. With `trust_team_scripts = true`, whoever can write to the team database can run code on your computer.
+- **Team hooks are remote code.** With `hooks = "remote"`, Harness Desktop runs the hooks teammates shared only after you
+  approve each version, or straight away with `trust_team_hooks = true`: whoever can write to the team database can
+  then run commands on your computer. No MCP tool shares a hook, but an agent with a shell can run `harness-memory hooks
+  put`, so keep `trust_team_hooks` off unless you trust everyone with access to the team database. A shared hook
+  carries the repository key, never a local path.
 - **Secrets are redacted on write.** Titles, bodies, tags, entity names and relation labels pass a secret filter before
   they are stored. It is a heuristic and does not catch everything, so do not rely on it. Agents are also told never to
   store secrets or personal data.

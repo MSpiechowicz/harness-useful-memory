@@ -105,7 +105,7 @@ fn a_version_2_database_is_migrated_and_keeps_its_notes() {
 
     let conn = rusqlite::Connection::open(&path).expect("raw");
     assert_eq!(user_version(&conn).expect("version"), SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 3);
+    assert_eq!(SCHEMA_VERSION, 4);
 }
 
 #[test]

@@ -4,7 +4,7 @@
 //! [`LOCK_LEASE`] seconds, taken over once expired or invalid), so two servers starting at once do
 //! not both migrate; the one that waits sees the version the other wrote.
 //!
-//! Versions: 1 the notes, entities and relations; 2 adds the scripts.
+//! Versions: 1 the notes, entities and relations; 2 adds the scripts; 3 the team hooks.
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,11 +14,11 @@ use mongodb::bson::{Document, doc, oid::ObjectId};
 use mongodb::options::IndexOptions;
 use mongodb::sync::Database;
 
-use super::{ENTITIES, META, NOTES, RELATIONS, SCRIPTS, connection, error_code, int, now, number};
+use super::{ENTITIES, HOOKS, META, NOTES, RELATIONS, SCRIPTS, connection, error_code, int, now, number};
 use crate::store::StoreError;
 
 /// The schema version this server writes (independent of the SQLite schema version).
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// The `_id` of the schema document in `meta`; its `version` field holds the version.
 pub const SCHEMA_ID: &str = "schema";
@@ -162,6 +162,10 @@ fn apply(db: &Database) -> mongodb::error::Result<SchemaState> {
         create_v2(db)?;
     }
 
+    if current < 3 {
+        create_v3(db)?;
+    }
+
     db.collection::<Document>(META)
         .update_one(
             doc! { "_id": SCHEMA_ID },
@@ -219,6 +223,21 @@ fn create_v1(db: &Database) -> mongodb::error::Result<()> {
 fn create_v2(db: &Database) -> mongodb::error::Result<()> {
     db.collection::<Document>(SCRIPTS)
         .create_index(index(doc! { "project": 1, "name": 1 }, "scripts_name", true))
+        .run()?;
+
+    Ok(())
+}
+
+/// Version 3: the team hooks, `_id` the hook id (so it is unique), listed per scope (`repo`,
+/// `null` for global hooks) by `created_at`. Only adds a collection, so the documents of version
+/// 2 are untouched.
+fn create_v3(db: &Database) -> mongodb::error::Result<()> {
+    db.collection::<Document>(HOOKS)
+        .create_index(index(
+            doc! { "repo": 1, "created_at": 1, "_id": 1 },
+            "hooks_repo",
+            false,
+        ))
         .run()?;
 
     Ok(())

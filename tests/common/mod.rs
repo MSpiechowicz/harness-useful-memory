@@ -1,11 +1,12 @@
 //! Helpers shared by the test crates: temporary stores, project keys, drafts, an in-process server
-//! (`mcp`), a client for the real executable (`stdio`), and the script store and note list cases
-//! every backend passes (`scripts`, `listing`).
+//! (`mcp`), a client for the real executable (`stdio`), and the script store, team hook store and
+//! note list cases every backend passes (`scripts`, `hooks`, `listing`).
 //!
 //! Each test crate uses a different subset, hence the `dead_code` allowance.
 #![allow(dead_code)]
 
 pub mod approval;
+pub mod hooks;
 pub mod listing;
 pub mod mcp;
 pub mod scripts;

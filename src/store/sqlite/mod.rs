@@ -10,6 +10,7 @@
 
 pub(crate) mod engine;
 mod graph;
+pub(crate) mod hooks;
 mod listing;
 mod local;
 mod notes;

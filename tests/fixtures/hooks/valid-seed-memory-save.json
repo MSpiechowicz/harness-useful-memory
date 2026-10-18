@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "id": "1a2b3c4d5e6f70818293a4b5c6d70010",
+  "name": "Save what you learned",
+  "description": "Seeded default. Asks the agent to keep lessons and repeatable commands after a turn.",
+  "scope": "global",
+  "project": null,
+  "event": "turnEnd",
+  "matcher": null,
+  "action": {
+    "type": "followUp",
+    "text": "If this turn taught you something worth keeping, save it to Harness Memory (memory_remember or memory_update). Save any command sequence you would run again as a script (script_save). Reply briefly, or say nothing needs saving."
+  },
+  "enabled": true,
+  "createdAt": "2026-10-17T10:00:00Z",
+  "createdBy": "desktop",
+  "updatedAt": "2026-10-17T10:00:00Z",
+  "updatedBy": "desktop",
+  "requires": [
+    "harness-memory"
+  ],
+  "seed": "memory-save"
+}

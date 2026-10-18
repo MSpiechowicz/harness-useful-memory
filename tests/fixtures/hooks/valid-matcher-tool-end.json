@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "id": "1a2b3c4d5e6f70818293a4b5c6d70005",
+  "name": "After file writes",
+  "description": null,
+  "scope": "global",
+  "project": null,
+  "event": "toolEnd",
+  "matcher": "Edit|write|mcp__srv.tool:v-2",
+  "action": {
+    "type": "followUp",
+    "text": "Check that the formatter still passes."
+  },
+  "enabled": true,
+  "createdAt": "2026-10-17T10:00:00Z",
+  "createdBy": "desktop",
+  "updatedAt": "2026-10-17T10:00:00Z",
+  "updatedBy": "desktop"
+}

@@ -25,6 +25,11 @@
 //! `trust_team_scripts = true` (or [`TRUST_TEAM_SCRIPTS_VAR`] `1`) lets every script read from the
 //! team database run without a person approving it on this computer first.
 //!
+//! Team hooks follow `hooks` (or [`HOOKS_VAR`]), `"local"` by default: only `"remote"` with a team
+//! database shares them through it, otherwise `harness-memory hooks` lists none.
+//! `trust_team_hooks` (or [`TRUST_TEAM_HOOKS_VAR`]) is only passed on to Harness Desktop, which
+//! decides whether a team hook runs without approval (this server never runs a hook).
+//!
 //! The URL and the token are secrets: errors show a [`redact_url`] form and pass through
 //! [`Secrets::scrub`]. On Unix a config file other users can change, or that another user owns, is
 //! refused, and one other users can read is reported (see [`permission_warning`]).
@@ -33,7 +38,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::store::{LibsqlStore, MemoryStore, MongoStore, PostgresStore, ScriptStore, StoreError};
+use crate::store::{HookStore, LibsqlStore, MemoryStore, MongoStore, PostgresStore, ScriptStore, StoreError};
 use crate::support::redact::redact_text;
 use crate::support::{Env, OsKind};
 
@@ -63,6 +68,14 @@ pub const SCRIPTS_VAR: &str = "HARNESS_MEMORY_SCRIPTS";
 /// default). Wins over `trust_team_scripts` in the config file; empty = unset.
 pub const TRUST_TEAM_SCRIPTS_VAR: &str = "HARNESS_MEMORY_TRUST_TEAM_SCRIPTS";
 
+/// Environment variable sharing team hooks through the team database (`remote`) or not (`local`,
+/// the default). Wins over `hooks` in the config file; empty = unset.
+pub const HOOKS_VAR: &str = "HARNESS_MEMORY_HOOKS";
+
+/// Environment variable telling Harness Desktop to run team hooks without approval (`1`) or not
+/// (`0`, the default). Wins over `trust_team_hooks` in the config file; empty = unset.
+pub const TRUST_TEAM_HOOKS_VAR: &str = "HARNESS_MEMORY_TRUST_TEAM_HOOKS";
+
 /// The config file name inside `<config dir>/harness-memory/`.
 pub const CONFIG_FILE: &str = "config.toml";
 
@@ -80,6 +93,8 @@ struct ConfigFile {
     global_notes: Option<String>,
     scripts: Option<String>,
     trust_team_scripts: Option<bool>,
+    hooks: Option<String>,
+    trust_team_hooks: Option<bool>,
 }
 
 /// The selected store.
@@ -197,6 +212,10 @@ pub struct Selection {
     pub routing: Routing,
     /// Whether every script read from the team database counts as approved here.
     pub trust_team_scripts: bool,
+    /// Where team hooks go: [`Place::Local`] (the default) shares none.
+    pub hooks: Place,
+    /// Whether Harness Desktop runs team hooks without approval (`trust_team_hooks`).
+    pub trust_team_hooks: bool,
     pub warnings: Vec<String>,
 }
 
@@ -221,6 +240,20 @@ impl Selection {
     /// True when the scripts come from the team database and `trust_team_scripts` is on.
     pub fn team_scripts_trusted(&self) -> bool {
         self.trust_team_scripts && self.scripts_place() == Place::Remote
+    }
+
+    /// True when team hooks are shared through the team database and `trust_team_hooks` is on.
+    pub fn team_hooks_trusted(&self) -> bool {
+        self.trust_team_hooks && self.hooks_place() == Place::Remote
+    }
+
+    /// Where team hooks are shared: [`Selection::hooks`] with a team database, else this computer
+    /// (where there are none).
+    pub fn hooks_place(&self) -> Place {
+        match self.backend {
+            Backend::Local => Place::Local,
+            _ => self.hooks,
+        }
     }
 }
 
@@ -391,9 +424,16 @@ pub fn select(env: &Env) -> Result<Selection, BackendError> {
             REPOSITORY_NOTES_VAR,
             config.repository_notes.as_deref(),
             "repository_notes",
+            Place::Remote,
         )?,
-        global: place(env, GLOBAL_NOTES_VAR, config.global_notes.as_deref(), "global_notes")?,
-        scripts: place(env, SCRIPTS_VAR, config.scripts.as_deref(), "scripts")?,
+        global: place(
+            env,
+            GLOBAL_NOTES_VAR,
+            config.global_notes.as_deref(),
+            "global_notes",
+            Place::Remote,
+        )?,
+        scripts: place(env, SCRIPTS_VAR, config.scripts.as_deref(), "scripts", Place::Remote)?,
     };
 
     if backend != Backend::Local && routing.is_all_local() {
@@ -409,11 +449,15 @@ pub fn select(env: &Env) -> Result<Selection, BackendError> {
     }
 
     let trust_team_scripts = flag(env, TRUST_TEAM_SCRIPTS_VAR, config.trust_team_scripts)?;
+    let hooks = place(env, HOOKS_VAR, config.hooks.as_deref(), "hooks", Place::Local)?;
+    let trust_team_hooks = flag(env, TRUST_TEAM_HOOKS_VAR, config.trust_team_hooks)?;
 
     Ok(Selection {
         backend,
         routing,
         trust_team_scripts,
+        hooks,
+        trust_team_hooks,
         warnings,
     })
 }
@@ -432,16 +476,16 @@ fn flag(env: &Env, var: &str, file: Option<bool>) -> Result<bool, BackendError> 
     }
 }
 
-/// The [`Place`] from the environment variable `var`, else from the config file's `key` (the
-/// default when neither is set); an error naming where the unknown value came from.
-fn place(env: &Env, var: &str, file: Option<&str>, key: &str) -> Result<Place, BackendError> {
+/// The [`Place`] from the environment variable `var`, else from the config file's `key` (`default`
+/// when neither is set); an error naming where the unknown value came from.
+fn place(env: &Env, var: &str, file: Option<&str>, key: &str, default: Place) -> Result<Place, BackendError> {
     let (raw, origin) = match env.var(var) {
         Some(raw) => (Some(raw), var.to_owned()),
         None => (file, format!("{key} in the config file")),
     };
 
     match raw {
-        None => Ok(Place::default()),
+        None => Ok(default),
         Some(raw) => Place::parse(raw).ok_or(BackendError::Routing(origin)),
     }
 }
@@ -579,6 +623,20 @@ pub fn open_scripts(backend: &Backend) -> Option<Result<Box<dyn ScriptStore>, St
             LibsqlStore::connect(url, token.as_deref()).map(|store| Box::new(store) as Box<dyn ScriptStore>)
         }
         Backend::Mongo { url } => MongoStore::connect(url).map(|store| Box::new(store) as Box<dyn ScriptStore>),
+    };
+
+    Some(opened.map_err(|error| open_failed(backend, &error)))
+}
+
+/// Connects to a team backend for team hooks, like [`open`].
+pub fn open_hooks(backend: &Backend) -> Option<Result<Box<dyn HookStore>, String>> {
+    let opened: Result<Box<dyn HookStore>, StoreError> = match backend {
+        Backend::Local => return None,
+        Backend::Postgres { url } => PostgresStore::connect(url).map(|store| Box::new(store) as Box<dyn HookStore>),
+        Backend::Libsql { url, token } => {
+            LibsqlStore::connect(url, token.as_deref()).map(|store| Box::new(store) as Box<dyn HookStore>)
+        }
+        Backend::Mongo { url } => MongoStore::connect(url).map(|store| Box::new(store) as Box<dyn HookStore>),
     };
 
     Some(opened.map_err(|error| open_failed(backend, &error)))
@@ -1165,6 +1223,53 @@ mod tests {
 
         let local = Env::for_tests("/home/u").with_var(SCRIPTS_VAR, "remote");
         assert_eq!(select(&local).expect("no team database").scripts_place(), Place::Local);
+    }
+
+    #[test]
+    fn hooks_are_shared_only_when_the_settings_say_so_with_a_team_database() {
+        let team = Env::for_tests("/home/u").with_var(URL_VAR, "postgres://db/m");
+        let selection = select(&team).expect("default");
+        assert_eq!((selection.hooks, selection.hooks_place()), (Place::Local, Place::Local));
+        assert!(!selection.trust_team_hooks);
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "database_url = \"postgres://file/m\"\nhooks = \"remote\"\ntrust_team_hooks = true\n",
+        )
+        .expect("write");
+
+        let env = Env::for_tests("/home/u").with_var(CONFIG_VAR, path.to_string_lossy());
+        let selection = select(&env).expect("file");
+        assert_eq!(selection.hooks_place(), Place::Remote);
+        assert!(selection.team_hooks_trusted());
+        assert_eq!(
+            selection.routing,
+            Routing::default(),
+            "hooks leave the notes and scripts alone"
+        );
+
+        let env = env.with_var(HOOKS_VAR, "local").with_var(TRUST_TEAM_HOOKS_VAR, "0");
+        let selection = select(&env).expect("env wins");
+        assert_eq!(selection.hooks_place(), Place::Local);
+        assert!(!selection.trust_team_hooks);
+
+        let error = select(&env.with_var(HOOKS_VAR, "team"))
+            .expect_err("unknown value")
+            .to_string();
+        assert_eq!(error, "HARNESS_MEMORY_HOOKS must be \"remote\" or \"local\"");
+
+        let no_team = Env::for_tests("/home/u")
+            .with_var(HOOKS_VAR, "remote")
+            .with_var(TRUST_TEAM_HOOKS_VAR, "1");
+        let selection = select(&no_team).expect("no team database");
+        assert!(selection.trust_team_hooks && !selection.team_hooks_trusted());
+        assert_eq!(
+            (selection.hooks, selection.hooks_place()),
+            (Place::Remote, Place::Local)
+        );
+        assert!(selection.warnings.is_empty());
     }
 
     #[test]

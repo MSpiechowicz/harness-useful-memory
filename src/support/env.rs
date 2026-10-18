@@ -36,6 +36,13 @@ pub const CAPTURED_VARS: &[&str] = &[
     "HARNESS_MEMORY_SCRIPTS",
     // Whether team scripts run without approval here (see `crate::backend::TRUST_TEAM_SCRIPTS_VAR`).
     "HARNESS_MEMORY_TRUST_TEAM_SCRIPTS",
+    // Whether team hooks are shared, and whether Harness Desktop runs them without approval (see
+    // `crate::backend::HOOKS_VAR`).
+    "HARNESS_MEMORY_HOOKS",
+    "HARNESS_MEMORY_TRUST_TEAM_HOOKS",
+    // The user name, the default author of a team hook (`hooks put`).
+    "USER",
+    "USERNAME",
     // How long `script_run` waits for Harness Desktop's answer, in milliseconds (for tests).
     "HARNESS_MEMORY_APPROVAL_WAIT_MS",
     // The Windows config folder (roaming), which holds the config file.

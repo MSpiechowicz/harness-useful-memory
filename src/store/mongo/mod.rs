@@ -3,7 +3,7 @@
 //! # Layout
 //!
 //! The database is the one in the URL path (`harness_memory` when the URL names none) and holds
-//! five collections:
+//! six collections:
 //!
 //! - `notes`: one document per note, `_id` the note id (an `i64` from the `note_ids` counter in
 //!   `meta`), `project` the repository key (`null` for global notes), the linked entity names
@@ -16,6 +16,8 @@
 //!   entities' spellings copied in, plus `(project, dst)` and `note_id` indexes.
 //! - `scripts` (schema 2): one document per script, `_id` from the `script_ids` counter in `meta`,
 //!   `project` as for notes; unique `(project, name)`.
+//! - `hooks` (schema 3): one document per team hook, `_id` the hook id, `repo` the repository
+//!   key (`null` for global hooks), the file bytes in `body`; index `(repo, created_at, _id)`.
 //! - `meta`: the schema version (`_id: "schema"`), the note and script id counters and the
 //!   migration lock.
 //!
@@ -65,6 +67,7 @@
 
 mod connection;
 mod graph;
+mod hooks;
 mod listing;
 mod notes;
 pub mod schema;
@@ -93,6 +96,7 @@ const NOTES: &str = "notes";
 const ENTITIES: &str = "entities";
 const RELATIONS: &str = "relations";
 const SCRIPTS: &str = "scripts";
+const HOOKS: &str = "hooks";
 const META: &str = "meta";
 
 /// How long the driver looks for a usable server when the URL does not say.
@@ -226,7 +230,7 @@ impl MongoStore {
         }
 
         Err(StoreError::Backend(
-            "too many concurrent changes to the same notes; try again".to_owned(),
+            "too many concurrent changes to the same data; try again".to_owned(),
         ))
     }
 
@@ -502,6 +506,22 @@ impl<'a> Ctx<'a> {
         Ok(result.matched_count)
     }
 
+    /// Updates the first match, inserting a document when none matches.
+    pub(super) fn update_one_upsert(
+        &mut self,
+        collection: &str,
+        filter: Document,
+        update: Document,
+    ) -> Result<(), Fail> {
+        self.collection(collection)
+            .update_one(filter, update)
+            .upsert(true)
+            .optional(self.session.as_deref_mut(), |action, session| action.session(session))
+            .run()?;
+
+        Ok(())
+    }
+
     pub(super) fn update_many(&mut self, collection: &str, filter: Document, update: Document) -> Result<u64, Fail> {
         let result = self
             .collection(collection)
@@ -530,6 +550,17 @@ impl<'a> Ctx<'a> {
             .run()?;
 
         Ok(result.deleted_count)
+    }
+
+    /// How many documents match `filter`.
+    pub(super) fn count(&mut self, collection: &str, filter: Document) -> Result<u64, Fail> {
+        let count = self
+            .collection(collection)
+            .count_documents(filter)
+            .optional(self.session.as_deref_mut(), |action, session| action.session(session))
+            .run()?;
+
+        Ok(count)
     }
 
     /// True when a document matches `filter`.

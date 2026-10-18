@@ -85,7 +85,7 @@ fn postgres_scripts_deleting_many_takes_only_visible_ids() {
 }
 
 #[test]
-fn a_schema_1_database_migrates_to_schema_2_and_keeps_its_notes() {
+fn a_schema_1_database_migrates_to_the_current_schema_and_keeps_its_notes() {
     let Some(db) = database() else { return };
     let mut store = db.open();
     let note = store
@@ -96,9 +96,12 @@ fn a_schema_1_database_migrates_to_schema_2_and_keeps_its_notes() {
         .expect("note");
     drop(store);
 
-    // Back to schema 1: the same tables without `scripts`.
+    // Back to schema 1: the same tables without `scripts` (and the `hooks` of schema 3).
     db.admin()
-        .batch_execute("DROP TABLE scripts; UPDATE harness_memory_meta SET value = 1 WHERE key = 'schema_version'")
+        .batch_execute(
+            "DROP TABLE hooks; DROP TABLE scripts; UPDATE harness_memory_meta SET value = 1 WHERE key = \
+             'schema_version'",
+        )
         .expect("downgrade");
 
     let mut store = db.open();
@@ -112,7 +115,7 @@ fn a_schema_1_database_migrates_to_schema_2_and_keeps_its_notes() {
         )
         .expect("version")
         .get(0);
-    assert_eq!((version, SCHEMA_VERSION), (2, 2));
+    assert_eq!((version, SCHEMA_VERSION), (3, 3));
 
     let notes = store.get(&both(REPO), &[note.id]).expect("get");
     assert_eq!(notes.len(), 1);

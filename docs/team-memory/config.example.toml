@@ -26,3 +26,11 @@ database_url = "postgres://harness_memory:CHANGE-ME@db.example.com:5432/harness_
 # HARNESS_MEMORY_REPOSITORY_NOTES and HARNESS_MEMORY_GLOBAL_NOTES override them.
 # repository_notes = "remote"
 # global_notes = "local"
+
+# Whether Harness Desktop hooks are shared through the team database: "remote", or "local" (the default) to share none.
+# trust_team_hooks = true lets Harness Desktop run team hooks without your approval: whoever can write to the team
+# database (any process running as a teammate can run `harness-memory hooks put`) can then run commands on your
+# computer, so leave it off unless you trust everyone with access to the team database.
+# HARNESS_MEMORY_HOOKS and HARNESS_MEMORY_TRUST_TEAM_HOOKS override them.
+# hooks = "remote"
+# trust_team_hooks = false

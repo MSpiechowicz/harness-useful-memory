@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "id": "1a2b3c4d5e6f70818293a4b5c6d7000a",
+  "name": "Clean up",
+  "description": null,
+  "scope": "global",
+  "project": null,
+  "event": "sessionEnd",
+  "matcher": null,
+  "action": {
+    "type": "command",
+    "command": "rm -f .harness-scratch"
+  },
+  "enabled": true,
+  "createdAt": "2026-10-17T10:00:00Z",
+  "createdBy": "desktop",
+  "updatedAt": "2026-10-17T10:00:00Z",
+  "updatedBy": "desktop"
+}

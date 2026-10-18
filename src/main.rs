@@ -3,7 +3,9 @@
 //! the team database, `harness-memory check` opens the configured database and says which it is
 //! and where scripts are, `harness-memory scripts list|delete` and `harness-memory trust` list,
 //! delete and approve scripts ([`harness_memory::cli_trust`]), `harness-memory notes list|get|delete` browse and
-//! delete notes ([`harness_memory::cli_notes`]), `harness-memory --version` prints the version.
+//! delete notes ([`harness_memory::cli_notes`]), `harness-memory hooks config|list|get|put|delete` share
+//! Harness Desktop hooks with the team ([`harness_memory::cli_hooks`]), `harness-memory --version` prints the
+//! version.
 
 use std::io::{BufReader, Write};
 use std::process::ExitCode;
@@ -15,7 +17,7 @@ use harness_memory::project::{ProjectResolver, normalize_remote};
 use harness_memory::push::{Action, GLOBAL, Options, Summary, push};
 use harness_memory::support::Env;
 use harness_memory::{Server, database_path, serve};
-use harness_memory::{cli_notes, cli_trust};
+use harness_memory::{cli_hooks, cli_notes, cli_trust};
 
 const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--repo <key|.>] [--no-global] | check | scripts list \
                      --json [--project PATH] [--group needsReview|repo|global] [--scope repo|global] [--review \
@@ -25,7 +27,10 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--repo <key|
                      | notes list --json [--project PATH] [--kind KIND] [--scope repo|global] [--query TEXT] [--sort \
                      updated|title|kind|scope|place] [--order asc|desc] [--offset N] [--limit N] | notes get <id> \
                      --json [--project PATH] | notes delete <id> [--project PATH] | notes delete --all --yes \
-                     [--project PATH] [--json] | --version]";
+                     [--project PATH] [--json] | hooks config --json | hooks list --json [--project PATH] \
+                     [--offset N] [--limit N] | hooks get <id> --json | hooks put --json [--project PATH] \
+                     [--expect-sha SHA256] [--author NAME] < hook.json | hooks delete <id> [--expect-sha SHA256] \
+                     --json | --version]";
 
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -44,6 +49,7 @@ fn main() -> ExitCode {
         [Some("scripts"), rest @ ..] => cli_trust::scripts(rest),
         [Some("trust"), rest @ ..] => cli_trust::trust(rest),
         [Some("notes"), rest @ ..] => cli_notes::notes(rest),
+        [Some("hooks"), rest @ ..] => cli_hooks::hooks(rest),
         [Some("--version")] => {
             println!("harness-memory {}", env!("HARNESS_MEMORY_VERSION"));
             ExitCode::SUCCESS
