@@ -1,3 +1,15 @@
+# [1.4.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v1.3.0...v1.4.0) (2026-10-18)
+
+
+### Bug Fixes
+
+* **test:** expect the PostgreSQL schema 3 in the newer-database check ([5557f03](https://github.com/MSpiechowicz/harness-useful-memory/commit/5557f03ec7d7d0fb59f682b47b07a6c23926274b))
+
+
+### Features
+
+* **hooks:** share hooks with the team through the team database ([8047481](https://github.com/MSpiechowicz/harness-useful-memory/commit/8047481fc93fc15157372102b9c5597922456e04)), closes [MSpiechowicz/harness-useful-desktop#26](https://github.com/MSpiechowicz/harness-useful-desktop/issues/26)
+
 # [1.3.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v1.2.0...v1.3.0) (2026-10-17)
 
 
