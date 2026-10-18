@@ -569,7 +569,7 @@ fn check_opens_the_team_database() {
     assert_eq!(newer.status.code(), Some(0), "{}", stderr(&newer));
     assert!(
         stdout(&newer).ends_with(
-            " (schema newer than 2); the team database is newer than this harness-memory; update it\nscripts: \
+            " (schema newer than 3); the team database is newer than this harness-memory; update it\nscripts: \
                  team database\n"
         ),
         "{}",
