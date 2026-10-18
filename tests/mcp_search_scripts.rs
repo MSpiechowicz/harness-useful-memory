@@ -1,4 +1,4 @@
-//! `memory_search` lists the saved scripts whose name or description match its words after the
+//! `note_search` lists the saved scripts whose name or description match its words after the
 //! notes: at most five, ranked by matched words, runs and the latest write, from the store scripts
 //! are routed to, never with hidden characters, and never failing the search.
 
@@ -44,7 +44,7 @@ fn save(server: &mut Server, scope: &str, name: &str, description: &str) {
 }
 
 fn search(server: &mut Server, query: &str) -> String {
-    ok(server, "memory_search", json!({ "query": query }))
+    ok(server, "note_search", json!({ "query": query }))
 }
 
 /// The lines between `<saved-scripts>` and `</saved-scripts>`; empty when the reply has no block.
@@ -82,7 +82,7 @@ fn scripts_matching_the_search_words_follow_the_notes() {
 
     ok(
         &mut server,
-        "memory_remember",
+        "note_save",
         json!({ "title": "Pull requests go through gh", "body": "Use gh to review pull requests", "kind": "fix" }),
     );
     save(&mut server, "repo", "open-prs", "List open PRs with gh");
@@ -222,11 +222,7 @@ fn scripts_outside_the_search_view_are_not_listed() {
     save(&mut server, "global", "global-deploy", "Deploy");
 
     let scoped = |server: &mut Server, scope: &str| {
-        names(&ok(
-            server,
-            "memory_search",
-            json!({ "query": "deploy", "scope": scope }),
-        ))
+        names(&ok(server, "note_search", json!({ "query": "deploy", "scope": scope })))
     };
     assert_eq!(scoped(&mut server, "repo"), ["repo-deploy"]);
     assert_eq!(scoped(&mut server, "global"), ["global-deploy"]);
@@ -335,7 +331,7 @@ fn a_failing_script_store_never_breaks_the_search() {
 
     ok(
         &mut server,
-        "memory_remember",
+        "note_save",
         json!({ "title": "Deploy with make", "body": "Run make deploy", "kind": "fix", "scope": "global" }),
     );
 
@@ -352,14 +348,14 @@ fn the_scripts_block_fits_however_many_notes_match() {
     for index in 0..20 {
         ok(
             &mut server,
-            "memory_remember",
+            "note_save",
             json!({ "title": format!("Deploy step {index}"), "body": format!("deploy {}", "word ".repeat(200)),
                     "kind": "note" }),
         );
     }
     save(&mut server, "global", "deploy", "Deploy the app");
 
-    let reply = ok(&mut server, "memory_search", json!({ "query": "deploy", "limit": 20 }));
+    let reply = ok(&mut server, "note_search", json!({ "query": "deploy", "limit": 20 }));
     assert!(reply.len() <= harness_memory::limits::LIST_REPLY_MAX, "{}", reply.len());
     assert!(reply.contains("more)\n"), "notes were cut: {reply}");
     assert_eq!(names(&reply), ["deploy"]);

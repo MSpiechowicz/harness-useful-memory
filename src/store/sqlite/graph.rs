@@ -139,7 +139,7 @@ pub(super) fn neighbors(
 
     if start.is_none() {
         return Err(StoreError::NotFound(format!(
-            "entity \"{name}\" not found; memory_search may find related notes"
+            "entity \"{name}\" not found (note_search may find related notes)"
         )));
     }
 

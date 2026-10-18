@@ -376,7 +376,7 @@ fn ensure_title_free(tx: &mut Transaction<'_>, note: &Note, title_norm: &str) ->
 
     let id: i64 = column(&row, 0)?;
     Err(StoreError::Invalid(format!(
-        "note {id} already has this title; update that note or forget one of them"
+        "note {id} already has this title: update that note or delete one of them"
     )))
 }
 

@@ -9,7 +9,7 @@
   "matcher": null,
   "action": {
     "type": "addContext",
-    "text": "Before you start, search Harness Memory for notes about this task (memory_search) and check the saved scripts (script_list). Reuse what fits."
+    "text": "Before you start, search Harness Memory for notes about this task (note_search) and check the saved scripts (script_list). Reuse what fits."
   },
   "enabled": true,
   "createdAt": "2026-10-17T10:00:00Z",

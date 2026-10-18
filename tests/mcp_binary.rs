@@ -69,15 +69,28 @@ fn notes_persist_across_processes_in_the_memory_folder() {
 
     let tools = first.request("tools/list", json!({}));
     let tools = tools["result"]["tools"].as_array().expect("tools");
-    assert_eq!(tools.len(), 12);
-    assert!(tools.iter().all(|tool| {
-        tool["name"]
-            .as_str()
-            .is_some_and(|name| name.starts_with("memory_") || name.starts_with("script_"))
-    }));
+    let names: Vec<&str> = tools.iter().filter_map(|tool| tool["name"].as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "note_save",
+            "note_update",
+            "note_search",
+            "note_get",
+            "note_delete",
+            "entity_link",
+            "entity_neighbors",
+            "entity_delete",
+            "script_save",
+            "script_list",
+            "script_get",
+            "script_run",
+            "script_delete",
+        ]
+    );
 
     let created = first.call(
-        "memory_remember",
+        "note_save",
         json!({ "title": "Uploader location", "body": "src/upload.rs holds the uploader", "kind": "location" }),
     );
     assert_eq!(
@@ -85,7 +98,7 @@ fn notes_persist_across_processes_in_the_memory_folder() {
         r#"created note 1 (repo "git:github.com/acme/widget", revision 1)"#
     );
 
-    let found = first.call("memory_search", json!({ "query": "uploader" }));
+    let found = first.call("note_search", json!({ "query": "uploader" }));
     assert!(found.contains("Uploader location"), "{found}");
     assert!(first.finish().success());
 
@@ -95,14 +108,11 @@ fn notes_persist_across_processes_in_the_memory_folder() {
 
     // A second server outside the repository finds the note when told which repository it is.
     let mut second = Client::start(isolated(command(&machine.memory, &machine.plain), &machine));
-    let unrelated = second.call("memory_search", json!({ "query": "uploader" }));
+    let unrelated = second.call("note_search", json!({ "query": "uploader" }));
     assert_eq!(unrelated, "no matching notes");
 
     let repo_path = machine.repo.to_str().expect("utf-8");
-    let shared = second.call(
-        "memory_search",
-        json!({ "query": "uploader", "project_path": repo_path }),
-    );
+    let shared = second.call("note_search", json!({ "query": "uploader", "project_path": repo_path }));
     assert!(shared.contains("#1 [location, repo,"), "{shared}");
     assert!(second.finish().success());
 }
@@ -137,7 +147,7 @@ fn the_default_database_takes_over_the_harness_desktop_one() {
     start.current_dir(&machine.plain).env_remove("HARNESS_MEMORY_DIR");
 
     let mut client = Client::start(start);
-    let found = client.call("memory_search", json!({ "query": "desktop decision" }));
+    let found = client.call("note_search", json!({ "query": "desktop decision" }));
     assert!(found.contains("Desktop decision"), "{found}");
     assert!(client.finish().success());
 

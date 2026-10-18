@@ -1,4 +1,4 @@
-//! The saved scripts a `memory_search` reply lists after its notes, so an agent finds a script
+//! The saved scripts a `note_search` reply lists after its notes, so an agent finds a script
 //! without another tool call.
 //!
 //! The search text is split into words the way note search splits it (alphanumeric runs,
@@ -41,7 +41,7 @@ pub(super) fn block(server: &mut Server, view: &View, query: &str) -> Option<Str
         Ok(summaries) => summaries,
         Err(error) => {
             eprintln!(
-                "harness-memory: memory_search left out saved scripts: {}",
+                "harness-memory: note_search left out saved scripts: {}",
                 failure(&error)
             );
             return None;

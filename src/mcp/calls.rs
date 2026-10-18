@@ -31,13 +31,14 @@ pub(super) struct Reply {
 /// Runs tool `name`; `None` when there is no such tool.
 pub(super) fn call(server: &mut Server, name: &str, arguments: Value) -> Option<Reply> {
     let result = match name {
-        "memory_remember" => parse(arguments).and_then(|args| remember(server, args)),
-        "memory_update" => parse(arguments).and_then(|args| update(server, args)),
-        "memory_search" => parse(arguments).and_then(|args| search(server, args)),
-        "memory_get" => parse(arguments).and_then(|args| get(server, args)),
-        "memory_link" => parse(arguments).and_then(|args| link(server, args)),
-        "memory_neighbors" => parse(arguments).and_then(|args| neighbors(server, args)),
-        "memory_forget" => parse(arguments).and_then(|args| forget(server, args)),
+        "note_save" => parse(arguments).and_then(|args| remember(server, args)),
+        "note_update" => parse(arguments).and_then(|args| update(server, args)),
+        "note_search" => parse(arguments).and_then(|args| search(server, args)),
+        "note_get" => parse(arguments).and_then(|args| get(server, args)),
+        "note_delete" => parse(arguments).and_then(|args| delete_note(server, args)),
+        "entity_link" => parse(arguments).and_then(|args| link(server, args)),
+        "entity_neighbors" => parse(arguments).and_then(|args| neighbors(server, args)),
+        "entity_delete" => parse(arguments).and_then(|args| delete_entity(server, args)),
         _ => return super::calls_scripts::call(server, name, arguments),
     };
 
@@ -115,8 +116,16 @@ struct NeighborsArgs {
 }
 
 #[derive(Deserialize)]
-struct ForgetArgs {
-    id: Option<i64>,
+#[serde(deny_unknown_fields)]
+struct NoteDeleteArgs {
+    id: i64,
+    scope: Option<String>,
+    project_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntityDeleteArgs {
     entity: Option<String>,
     from: Option<String>,
     relation: Option<String>,
@@ -152,7 +161,7 @@ fn remember(server: &mut Server, args: RememberArgs) -> Result<String, String> {
     let now = now();
     let home = server.projects.home();
     let mut text = format!(
-        "{FRAME}\n{}\nsimilar notes (update or forget them if outdated or duplicate):",
+        "{FRAME}\n{}\nsimilar notes (update or delete them if outdated or duplicate):",
         saved_line(&saved)
     );
 
@@ -337,25 +346,24 @@ fn neighbors(server: &mut Server, args: NeighborsArgs) -> Result<String, String>
     Ok(reply.finish())
 }
 
-fn forget(server: &mut Server, args: ForgetArgs) -> Result<String, String> {
+fn delete_note(server: &mut Server, args: NoteDeleteArgs) -> Result<String, String> {
+    // A note is looked up in this repository and the global scope unless a scope is named.
+    let scope = args.scope.as_deref().unwrap_or("both");
+    let view = view(server, Some(scope), args.project_path.as_deref())?;
+
+    forget_with(server, &view, &Target::Global, &Forget::Note(args.id))?;
+    Ok(format!("forgot note {}", args.id))
+}
+
+fn delete_entity(server: &mut Server, args: EntityDeleteArgs) -> Result<String, String> {
     let relation_form = args.from.is_some() || args.relation.is_some() || args.to.is_some();
-    let forms = usize::from(args.id.is_some()) + usize::from(args.entity.is_some()) + usize::from(relation_form);
+    let forms = usize::from(args.entity.is_some()) + usize::from(relation_form);
 
     if forms != 1 {
-        return Err("give exactly one of: id | entity | from + relation + to".to_owned());
+        return Err("give exactly one of: entity | from + relation + to".to_owned());
     }
 
-    let scope = args.scope.as_deref();
-    let path = args.project_path.as_deref();
-
-    if let Some(id) = args.id {
-        // A note is looked up in this repository and the global scope unless a scope is named.
-        let view = view(server, Some(scope.unwrap_or("both")), path)?;
-        forget_with(server, &view, &Target::Global, &Forget::Note(id))?;
-        return Ok(format!("forgot note {id}"));
-    }
-
-    let target = target(server, scope, path)?;
+    let target = target(server, args.scope.as_deref(), args.project_path.as_deref())?;
     let view = View::around(&target);
 
     if let Some(name) = args.entity {

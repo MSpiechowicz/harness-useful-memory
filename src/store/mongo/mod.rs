@@ -679,7 +679,7 @@ const SOURCE_MAX: usize = 64;
 /// The longest checkout root or project key read back.
 const PATH_MAX: usize = 4096;
 
-/// Entities listed for one note (each `memory_remember` adds at most
+/// Entities listed for one note (each `note_save` adds at most
 /// [`ENTITIES_PER_NOTE`](crate::limits::ENTITIES_PER_NOTE)).
 const NOTE_ENTITIES_MAX: usize = 100;
 

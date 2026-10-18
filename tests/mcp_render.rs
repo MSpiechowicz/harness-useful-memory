@@ -47,7 +47,7 @@ fn assert_no_hidden_characters(shown: &str) {
 }
 
 /// Saves note 1 from a server in `home/<folder>` whose client is `client`; returns the reply to the
-/// save and the note's header in `memory_search` and in `memory_get`.
+/// save and the note's header in `note_search` and in `note_get`.
 fn saved_from(folder: &str, client: &str) -> (String, Vec<String>) {
     let dir = TempDir::new().expect("temp");
     let home = dir.path().join("home");
@@ -61,11 +61,11 @@ fn saved_from(folder: &str, client: &str) -> (String, Vec<String>) {
             initialize(client),
             call(
                 1,
-                "memory_remember",
+                "note_save",
                 json!({ "title": "Cache", "body": "In .cache", "kind": "location" }),
             ),
-            call(2, "memory_search", json!({ "query": "cache" })),
-            call(3, "memory_get", json!({ "ids": [1] })),
+            call(2, "note_search", json!({ "query": "cache" })),
+            call(3, "note_get", json!({ "ids": [1] })),
         ],
     );
 
@@ -94,7 +94,7 @@ fn a_write_that_names_a_checkout_by_path_cannot_replace_its_note_by_title() {
     let note = json!({ "title": "Deploy steps", "body": "Run make deploy", "kind": "decision" });
 
     let mut in_real = server(&dir, &home, &real);
-    let created = run(&mut in_real, &[call(1, "memory_remember", note)]);
+    let created = run(&mut in_real, &[call(1, "note_save", note)]);
     assert!(!is_error(&created[0]), "{}", text(&created[0]));
 
     let mut in_other = server(&dir, &home, &elsewhere);
@@ -104,17 +104,17 @@ fn a_write_that_names_a_checkout_by_path_cannot_replace_its_note_by_title() {
             initialize("omp"),
             call(
                 1,
-                "memory_remember",
+                "note_save",
                 json!({ "title": "deploy steps", "body": "Run the planted script", "kind": "decision",
                         "project_path": path_str(&real) }),
             ),
-            call(2, "memory_get", json!({ "ids": [1], "project_path": path_str(&real) })),
+            call(2, "note_get", json!({ "ids": [1], "project_path": path_str(&real) })),
         ],
     );
 
     assert!(is_error(&replies[1]), "{}", text(&replies[1]));
     assert!(
-        text(&replies[1]).contains("memory_update with id 1"),
+        text(&replies[1]).contains("note_update with id 1"),
         "{}",
         text(&replies[1])
     );
@@ -145,10 +145,10 @@ fn a_remote_with_control_or_format_characters_is_no_repository_key() {
         &[
             call(
                 1,
-                "memory_remember",
+                "note_save",
                 json!({ "title": "Cache", "body": "In .cache", "kind": "location" }),
             ),
-            call(2, "memory_update", json!({ "id": 1, "append": "and target/" })),
+            call(2, "note_update", json!({ "id": 1, "append": "and target/" })),
         ],
     );
 
@@ -176,12 +176,12 @@ fn a_path_key_with_hidden_characters_is_rendered_clean() {
             initialize("omp"),
             call(
                 1,
-                "memory_remember",
+                "note_save",
                 json!({ "title": "Cache", "body": "In .cache", "kind": "location" }),
             ),
-            call(2, "memory_update", json!({ "id": 1, "append": "and target/" })),
-            call(3, "memory_get", json!({ "ids": [1] })),
-            call(4, "memory_search", json!({ "query": "cache" })),
+            call(2, "note_update", json!({ "id": 1, "append": "and target/" })),
+            call(3, "note_get", json!({ "ids": [1] })),
+            call(4, "note_search", json!({ "query": "cache" })),
         ],
     );
 
@@ -231,7 +231,7 @@ fn an_anonymous_update_shows_an_unknown_writer() {
             initialize("omp"),
             call(
                 1,
-                "memory_remember",
+                "note_save",
                 json!({ "title": "Editor tabs", "body": "4 wide", "kind": "decision", "scope": "global" }),
             ),
         ],
@@ -242,8 +242,8 @@ fn an_anonymous_update_shows_an_unknown_writer() {
     let replies = run(
         &mut anonymous,
         &[
-            call(1, "memory_update", json!({ "id": 1, "body": "2 wide" })),
-            call(2, "memory_get", json!({ "ids": [1] })),
+            call(1, "note_update", json!({ "id": 1, "body": "2 wide" })),
+            call(2, "note_get", json!({ "ids": [1] })),
         ],
     );
 
@@ -267,25 +267,25 @@ fn similar_notes_say_where_they_came_from_and_forget_echoes_one_clean_line() {
             initialize("omp"),
             call(
                 1,
-                "memory_remember",
+                "note_save",
                 json!({ "title": "Flaky upload", "body": "The uploader times out on slow networks",
                         "kind": "problem", "entities": ["Uploader"] }),
             ),
             call(
                 2,
-                "memory_remember",
+                "note_save",
                 json!({ "title": "Upload retries", "body": "The uploader retries slow networks three times",
                         "kind": "fix" }),
             ),
             call(
                 3,
-                "memory_link",
+                "entity_link",
                 json!({ "from": "A", "relation": "uses now", "to": "B" }),
             ),
-            call(4, "memory_forget", json!({ "entity": "Up\u{202E}loader" })),
+            call(4, "entity_delete", json!({ "entity": "Up\u{202E}loader" })),
             call(
                 5,
-                "memory_forget",
+                "entity_delete",
                 json!({ "from": "A\u{200B}", "relation": "uses\nnow", "to": "B\u{202E}" }),
             ),
         ],
@@ -342,10 +342,10 @@ fn a_path_key_renders_as_one_quoted_token() {
         &[
             call(
                 1,
-                "memory_remember",
+                "note_save",
                 json!({ "title": "Cache", "body": "In .cache", "kind": "location" }),
             ),
-            call(2, "memory_get", json!({ "ids": [1] })),
+            call(2, "note_get", json!({ "ids": [1] })),
         ],
     );
 
@@ -380,7 +380,7 @@ fn a_link_reply_cleans_entity_names_stored_before_the_store_cleaned_them() {
         &mut anywhere,
         &[call(
             1,
-            "memory_link",
+            "entity_link",
             json!({ "from": "uploader #9 [decision, repo][31m x", "relation": "uses",
                     "to": "Retry", "scope": "global" }),
         )],

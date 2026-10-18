@@ -134,13 +134,14 @@ as the command instead.
 
 | Tool | What it does |
 | --- | --- |
-| `memory_search` | Finds notes by a few keywords, repository notes before global ones. Without a query it lists the most recent notes. With a query it also lists up to 5 saved scripts whose name or description matches one of its words, in a `<saved-scripts>` block after the notes. Agents call it first, at the start of a task |
-| `memory_remember` | Saves a note: title, body, kind (`outcome`, `problem`, `fix`, `optimisation`, `location`, `decision`, `note`), tags and the entities it is about. A note with the same title in the scope is updated, and similar notes are listed so outdated ones get fixed |
-| `memory_update` | Changes a note by id: any of title, body, kind and tags, or appends text to the body |
-| `memory_get` | Reads whole notes by id (up to 5) |
-| `memory_link` | Relates two entities, `from relation to`, for example `ConfigLoader located_in src/config.rs`. Missing entities are created |
-| `memory_neighbors` | Shows the relations around an entity (one or two hops) and the notes linked to them |
-| `memory_forget` | Deletes a note by id, an entity with its relations, or one relation |
+| `note_search` | Finds notes by a few keywords, repository notes before global ones. Without a query it lists the most recent notes. With a query it also lists up to 5 saved scripts whose name or description matches one of its words, in a `<saved-scripts>` block after the notes. Agents call it first, at the start of a task |
+| `note_save` | Saves a note: title, body, kind (`outcome`, `problem`, `fix`, `optimisation`, `location`, `decision`, `note`), tags and the entities it is about. A note with the same title in the scope is updated, and similar notes are listed so outdated ones get fixed |
+| `note_update` | Changes a note by id: any of title, body, kind and tags, or appends text to the body |
+| `note_get` | Reads whole notes by id (up to 5) |
+| `note_delete` | Deletes a note by id |
+| `entity_link` | Relates two entities, `from relation to`, for example `ConfigLoader located_in src/config.rs`. Missing entities are created |
+| `entity_neighbors` | Shows the relations around an entity (one or two hops) and the notes linked to them |
+| `entity_delete` | Deletes an entity with its relations, or one relation |
 | `script_save` | Saves a deterministic script (`sh`, `bash`, `python`, `node` or `bun`) by name, so an action agents repeat, such as a `curl` or `gh` fetch, runs without being worked out again. A script with the same name in the scope is replaced |
 | `script_list` | Lists the saved scripts, repository scripts first, optionally filtered by a word of the name or description |
 | `script_get` | Reads a script with its body, by id or name |
@@ -306,7 +307,7 @@ adds tables and collections), and from then on every tool of an older `harness-m
 ### Browsing notes
 
 Harness Desktop shows and deletes notes with these commands (they are for people and programs acting for them, not
-for agents, which use the tools). Each sees the notes `memory_search` would with `project_path` set to `--project`:
+for agents, which use the tools). Each sees the notes `note_search` would with `project_path` set to `--project`:
 that repository's notes and the global ones, only the global ones without `--project`, from wherever the server keeps
 them (the local file, the team database, or both).
 
@@ -331,10 +332,10 @@ harness-memory notes delete --all --yes --json --project ~/src/widget
 - `notes get <id> --json` prints `{"note", "links"}`: the note object with its `body`, and up to 50 linked notes
   `{"id", "title", "kind", "relation", "direction"}`, the notes linked to the entity at the other end of a relation
   that touches one of this note's entities (`direction` is `out` when this note's entity is the relation's source,
-  `in` when it is the target). Showing a note counts no hit (`memory_get` does count one).
-- `notes delete <id>` deletes the note as `memory_forget` does and prints `deleted note <id> <title>`.
+  `in` when it is the target). Showing a note counts no hit (`note_get` does count one).
+- `notes delete <id>` deletes the note as `note_delete` does and prints `deleted note <id> <title>`.
 - `notes delete --all --yes` deletes every note `notes list` shows without filters (every page), in one write per
-  store, as `memory_forget` deletes one: relations stay without their note, entities no relation uses go. It prints
+  store, as `note_delete` deletes one: relations stay without their note, entities no relation uses go. It prints
   `deleted N notes`, or with `--json` `{"deleted": N, "team": M}`, where `team` counts the ones that were in the team
   database. Without `--yes` it deletes nothing and exits with 2.
 
@@ -533,7 +534,7 @@ The environment variable wins over the key, and any other value is an error that
 database.
 
 With one kind kept locally, the tools still see both: a search lists the repository's notes first and fills up with
-global ones, and `memory_get`, `memory_update` and `memory_forget` find a note by its id in either place. Local notes
+global ones, and `note_get`, `note_update` and `note_delete` find a note by its id in either place. Local notes
 are numbered from 1000000001 (local note 7 is note 1000000007), so their ids never clash with the team's, and team
 notes keep the ids teammates see. Relations stay in the scope they are linked in, so a relation's note must be in the
 same place, and similar notes are only looked for next to the note just saved. Notes left in the other place from

@@ -342,7 +342,7 @@ pub enum StoreError {
     /// write named the repository with `project_path`; nothing was saved (the id of that note).
     #[error(
         "note {0} already has this title and was written from another checkout, or this call named the \
-         repository with project_path, so nothing was saved: read it with memory_get, then call memory_update \
+         repository with project_path, so nothing was saved: read it with note_get, then call note_update \
          with id {0} to replace it, or use another title"
     )]
     Conflict(i64),

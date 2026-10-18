@@ -5,8 +5,8 @@ expression: "replies[0][\"result\"]"
 {
   "tools": [
     {
-      "name": "memory_remember",
-      "description": "Call before you finish: save what you learned for later sessions, after finishing work, fixing a non-obvious problem, finding where something lives, or an optimisation. Use repo-relative paths. A note with the same title in the scope is updated (a repository note written from another checkout, or reached through project_path, is reported instead: replace it with memory_update); similar notes are listed so you can update or forget outdated ones. Never store secrets.",
+      "name": "note_save",
+      "description": "Call before you finish: save what you learned for later sessions, after finishing work, fixing a non-obvious problem, finding where something lives, or an optimisation. Use repo-relative paths. A note with the same title in the scope is updated (a repository note written from another checkout, or reached through project_path, is reported instead: replace it with note_update). Similar notes are listed so you can update or delete outdated ones. Never store secrets.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -73,7 +73,7 @@ expression: "replies[0][\"result\"]"
       }
     },
     {
-      "name": "memory_update",
+      "name": "note_update",
       "description": "Correct or extend a note by id. Give only the fields to change; append adds text to the body.",
       "inputSchema": {
         "type": "object",
@@ -139,7 +139,7 @@ expression: "replies[0][\"result\"]"
       }
     },
     {
-      "name": "memory_search",
+      "name": "note_search",
       "description": "Call FIRST at the start of every task: returns known fixes, decisions and file locations for this repository. Find notes by a few keywords; repository notes are listed before global ones, and without a query the most recent notes are listed. A message that starts with a `<harness-memory-recall>` block already carries the notes found for that message: search further only if needed. Saved scripts whose name or description match the keywords are listed after the notes: prefer script_run to retyping them.",
       "inputSchema": {
         "type": "object",
@@ -192,7 +192,7 @@ expression: "replies[0][\"result\"]"
       }
     },
     {
-      "name": "memory_get",
+      "name": "note_get",
       "description": "Read whole notes by id.",
       "inputSchema": {
         "type": "object",
@@ -228,7 +228,38 @@ expression: "replies[0][\"result\"]"
       }
     },
     {
-      "name": "memory_link",
+      "name": "note_delete",
+      "description": "Delete an outdated or wrong note by id, looked up in this repository and the global scope unless scope is given.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Note id"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "repo",
+              "global",
+              "both"
+            ],
+            "default": "both",
+            "description": "repo: this repository; global: shared by all repositories"
+          },
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository, when the server cannot tell it from its working directory"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "entity_link",
       "description": "Relate two entities: `from relation to`, for example `GitCli located_in business/src/git/cli.rs` or `retry-fix resolves flaky-test`. Missing entities are created.",
       "inputSchema": {
         "type": "object",
@@ -272,7 +303,7 @@ expression: "replies[0][\"result\"]"
       }
     },
     {
-      "name": "memory_neighbors",
+      "name": "entity_neighbors",
       "description": "Show the relations around an entity and the notes linked to them.",
       "inputSchema": {
         "type": "object",
@@ -315,15 +346,11 @@ expression: "replies[0][\"result\"]"
       }
     },
     {
-      "name": "memory_forget",
-      "description": "Delete an outdated or wrong note (id, looked up in this repository and the global scope unless scope is given), an entity with its relations (entity), or one relation (from, relation, to). Give exactly one of these forms.",
+      "name": "entity_delete",
+      "description": "Delete an entity with its relations (entity), or one relation (from, relation, to). Give exactly one of these forms.",
       "inputSchema": {
         "type": "object",
         "properties": {
-          "id": {
-            "type": "integer",
-            "description": "Note id"
-          },
           "entity": {
             "type": "string",
             "description": "Entity name"

@@ -121,7 +121,7 @@ fn stderr(output: &Output) -> String {
 
 /// Remembers a note through the server and returns its id.
 fn remember(server: &mut Client, arguments: Value) -> i64 {
-    let text = server.call("memory_remember", arguments);
+    let text = server.call("note_save", arguments);
     let id = text
         .lines()
         .find_map(|line| line.strip_prefix("created note "))
@@ -288,9 +288,9 @@ fn lists_gets_and_deletes(folders: &Folders, repo_place: &str, global_place: &st
     );
 
     let mut widget = folders.server(&folders.widget);
-    widget.call("memory_get", json!({ "ids": [fix] }));
+    widget.call("note_get", json!({ "ids": [fix] }));
     assert!(widget.finish().success());
-    assert_eq!(folders.json(&get_fix)["note"]["hits"], 1, "memory_get counts a hit");
+    assert_eq!(folders.json(&get_fix)["note"]["hits"], 1, "note_get counts a hit");
 
     for args in [
         vec!["notes", "get", &other.to_string(), "--json", "--project", &project],
@@ -527,11 +527,11 @@ fn get_lists_the_notes_linked_through_relations() {
         json!({ "title": "Unlinked", "body": "Alone", "kind": "note", "entities": ["misc.rs"] }),
     );
     server.call(
-        "memory_link",
+        "entity_link",
         json!({ "from": "auth.rs", "relation": "depends_on", "to": "db.rs" }),
     );
     server.call(
-        "memory_link",
+        "entity_link",
         json!({ "from": "cache.rs", "relation": "wraps", "to": "auth.rs" }),
     );
     assert!(server.finish().success());

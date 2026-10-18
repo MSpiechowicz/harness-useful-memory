@@ -49,10 +49,13 @@ fn initialize_negotiates_the_version_and_sends_instructions() {
     let instructions = replies[0]["result"]["instructions"].as_str().expect("instructions");
     assert!(instructions.chars().count() <= 1600);
     for tool in [
-        "memory_search",
-        "memory_remember",
-        "memory_update",
-        "memory_forget",
+        "note_search",
+        "note_save",
+        "note_update",
+        "note_delete",
+        "entity_link",
+        "entity_neighbors",
+        "entity_delete",
         "project_path",
         "script_save",
         "script_run",
@@ -74,7 +77,7 @@ fn tools_list_snapshot() {
     );
     insta::assert_json_snapshot!(replies[0]["result"]);
 
-    // memory_search asks to be called first, memory_remember last.
+    // note_search asks to be called first, note_save last.
     let description = |name: &str| {
         replies[0]["result"]["tools"]
             .as_array()
@@ -86,13 +89,13 @@ fn tools_list_snapshot() {
             .to_owned()
     };
 
-    let search = description("memory_search");
+    let search = description("note_search");
     assert!(search.starts_with(
         "Call FIRST at the start of every task: returns known fixes, decisions and file locations for this repository."
     ));
     assert!(search.contains("`<harness-memory-recall>` block"), "{search}");
 
-    let remember = description("memory_remember");
+    let remember = description("note_save");
     assert!(
         remember.starts_with("Call before you finish: save what you learned"),
         "{remember}"
@@ -177,23 +180,15 @@ fn tool_failures_are_tool_results_with_is_error() {
     let replies = run(
         &mut server,
         &[
-            call(
-                1,
-                "memory_remember",
-                json!({ "title": "", "body": "b", "kind": "note" }),
-            ),
-            call(
-                2,
-                "memory_remember",
-                json!({ "title": "t", "body": "b", "kind": "gossip" }),
-            ),
-            call(3, "memory_remember", json!({ "body": "b", "kind": "note" })),
-            call(4, "memory_get", json!({ "ids": [42] })),
-            call(5, "memory_forget", json!({ "id": 1, "entity": "x" })),
-            call(6, "memory_search", json!({ "scope": "everywhere" })),
+            call(1, "note_save", json!({ "title": "", "body": "b", "kind": "note" })),
+            call(2, "note_save", json!({ "title": "t", "body": "b", "kind": "gossip" })),
+            call(3, "note_save", json!({ "body": "b", "kind": "note" })),
+            call(4, "note_get", json!({ "ids": [42] })),
+            call(5, "note_delete", json!({ "id": 1, "entity": "x" })),
+            call(6, "note_search", json!({ "scope": "everywhere" })),
             call(
                 7,
-                "memory_remember",
+                "note_save",
                 json!({ "title": "Fine", "body": "b", "kind": "outcome" }),
             ),
         ],
@@ -214,7 +209,7 @@ fn tool_failures_are_tool_results_with_is_error() {
 }
 
 #[test]
-fn remember_update_search_link_neighbors_and_forget_round_trip() {
+fn save_update_search_link_neighbors_and_delete_round_trip() {
     let dir = TempDir::new().expect("temp");
     let mut server = project_server(&dir);
     let note = json!({ "title": "Flaky upload", "body": "The uploader times out on slow networks",
@@ -223,29 +218,29 @@ fn remember_update_search_link_neighbors_and_forget_round_trip() {
     let replies = run(
         &mut server,
         &[
-            call(1, "memory_remember", note.clone()),
-            call(2, "memory_remember", note),
+            call(1, "note_save", note.clone()),
+            call(2, "note_save", note),
             call(
                 3,
-                "memory_remember",
+                "note_save",
                 json!({ "title": "Upload retries", "kind": "fix",
                                                "body": "The uploader retries slow networks three times" }),
             ),
-            call(4, "memory_update", json!({ "id": 1, "append": "Seen on CI too" })),
-            call(5, "memory_search", json!({ "query": "uploader" })),
+            call(4, "note_update", json!({ "id": 1, "append": "Seen on CI too" })),
+            call(5, "note_search", json!({ "query": "uploader" })),
             call(
                 6,
-                "memory_link",
+                "entity_link",
                 json!({ "from": "Upload retries", "relation": "resolves", "to": "Uploader", "note_id": 2 }),
             ),
-            call(7, "memory_neighbors", json!({ "entity": "uploader" })),
+            call(7, "entity_neighbors", json!({ "entity": "uploader" })),
             call(
                 8,
-                "memory_forget",
+                "entity_delete",
                 json!({ "from": "Upload retries", "relation": "resolves", "to": "Uploader" }),
             ),
-            call(9, "memory_forget", json!({ "id": 2 })),
-            call(10, "memory_search", json!({ "query": "retries" })),
+            call(9, "note_delete", json!({ "id": 2 })),
+            call(10, "note_search", json!({ "query": "retries" })),
         ],
     );
 
@@ -281,6 +276,61 @@ fn remember_update_search_link_neighbors_and_forget_round_trip() {
 }
 
 #[test]
+fn each_delete_tool_takes_only_its_own_form() {
+    let dir = TempDir::new().expect("temp");
+    let mut server = project_server(&dir);
+
+    let replies = run(
+        &mut server,
+        &[
+            call(
+                1,
+                "note_save",
+                json!({ "title": "Shared", "body": "global body", "kind": "note", "scope": "global",
+                        "entities": ["Uploader"] }),
+            ),
+            call(2, "note_delete", json!({ "id": 1, "entity": "Uploader" })),
+            call(3, "note_delete", json!({})),
+            call(4, "entity_delete", json!({ "id": 1 })),
+            call(5, "entity_delete", json!({})),
+            call(6, "entity_delete", json!({ "entity": "Uploader", "from": "A" })),
+            call(7, "entity_delete", json!({ "from": "A", "relation": "uses" })),
+            call(8, "note_get", json!({ "ids": [1] })),
+            call(9, "note_delete", json!({ "id": 1 })),
+            call(10, "memory_forget", json!({ "id": 1 })),
+        ],
+    );
+
+    for reply in &replies[1..7] {
+        assert!(is_error(reply), "{reply}");
+    }
+    assert!(
+        text(&replies[1]).contains("unknown field `entity`"),
+        "{}",
+        text(&replies[1])
+    );
+    assert!(
+        text(&replies[2]).contains("missing field `id`"),
+        "{}",
+        text(&replies[2])
+    );
+    assert!(
+        text(&replies[3]).contains("unknown field `id`"),
+        "{}",
+        text(&replies[3])
+    );
+    assert_eq!(text(&replies[4]), "give exactly one of: entity | from + relation + to");
+    assert_eq!(text(&replies[5]), "give exactly one of: entity | from + relation + to");
+    assert_eq!(text(&replies[6]), "a relation needs from, relation and to");
+
+    // The refused calls deleted nothing, and a global note is found without a scope.
+    assert!(text(&replies[7]).contains("Shared"), "{}", text(&replies[7]));
+    assert_eq!(text(&replies[8]), "forgot note 1");
+    assert_eq!(replies[9]["error"]["code"], -32602);
+    assert_eq!(replies[9]["error"]["message"], "unknown tool: memory_forget");
+}
+
+#[test]
 fn replies_stay_within_their_caps() {
     let dir = TempDir::new().expect("temp");
     let mut server = project_server(&dir);
@@ -290,13 +340,13 @@ fn replies_stay_within_their_caps() {
             let title = format!("Alpha note {index} {}", "with a long descriptive title ".repeat(3));
             call(
                 index,
-                "memory_remember",
+                "note_save",
                 json!({ "title": title, "body": body, "kind": "note" }),
             )
         })
         .collect();
-    messages.push(call(100, "memory_search", json!({ "query": "alpha", "limit": 20 })));
-    messages.push(call(101, "memory_get", json!({ "ids": [1, 2, 3, 4, 5] })));
+    messages.push(call(100, "note_search", json!({ "query": "alpha", "limit": 20 })));
+    messages.push(call(101, "note_get", json!({ "ids": [1, 2, 3, 4, 5] })));
 
     let replies = run(&mut server, &messages);
     let search = text(&replies[20]);
@@ -318,18 +368,14 @@ fn without_a_repository_repo_scope_asks_for_project_path() {
     let replies = run(
         &mut server,
         &[
-            call(
-                1,
-                "memory_remember",
-                json!({ "title": "t", "body": "b", "kind": "note" }),
-            ),
+            call(1, "note_save", json!({ "title": "t", "body": "b", "kind": "note" })),
             call(
                 2,
-                "memory_remember",
+                "note_save",
                 json!({ "title": "Shared", "body": "global body", "kind": "note", "scope": "global" }),
             ),
-            call(3, "memory_search", json!({})),
-            call(4, "memory_search", json!({ "scope": "repo" })),
+            call(3, "note_search", json!({})),
+            call(4, "note_search", json!({ "scope": "repo" })),
         ],
     );
 

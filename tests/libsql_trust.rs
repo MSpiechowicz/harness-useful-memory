@@ -79,7 +79,7 @@ fn another_checkout_conflicts(db: &Database) {
         matches!(refused, StoreError::Conflict(id) if id == first.id),
         "{refused:?}"
     );
-    assert!(refused.to_string().contains("memory_update"), "{refused}");
+    assert!(refused.to_string().contains("note_update"), "{refused}");
 
     let note = &store.get(&both(REPO), &[first.id]).expect("get")[0];
     assert_eq!(note.body, "Run make deploy");

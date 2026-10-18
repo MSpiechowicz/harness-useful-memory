@@ -9,7 +9,7 @@
   "matcher": null,
   "action": {
     "type": "followUp",
-    "text": "If this turn taught you something worth keeping, save it to Harness Memory (memory_remember or memory_update). Save any command sequence you would run again as a script (script_save). Reply briefly, or say nothing needs saving."
+    "text": "If this turn taught you something worth keeping, save it to Harness Memory (note_save or note_update). Save any command sequence you would run again as a script (script_save). Reply briefly, or say nothing needs saving."
   },
   "enabled": true,
   "createdAt": "2026-10-17T10:00:00Z",

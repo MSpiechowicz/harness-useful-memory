@@ -451,7 +451,7 @@ fn ensure_title_free(ctx: &mut Ctx<'_>, note: &Note, title_norm: &str) -> Result
 
     match other {
         Some(other) => Err(Fail::Store(StoreError::Invalid(format!(
-            "note {} already has this title; update that note or forget one of them",
+            "note {} already has this title: update that note or delete one of them",
             int(&other, "_id")
         )))),
         None => Ok(()),

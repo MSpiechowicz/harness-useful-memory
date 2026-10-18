@@ -307,7 +307,7 @@ fn ensure_title_free(db: &mut dyn Sql, note: &Note, title_norm: &str) -> Result<
 
     match other {
         Some(other) => Err(StoreError::Invalid(format!(
-            "note {other} already has this title; update that note or forget one of them"
+            "note {other} already has this title: update that note or delete one of them"
         ))),
         None => Ok(()),
     }

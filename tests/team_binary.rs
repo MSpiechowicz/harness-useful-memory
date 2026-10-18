@@ -262,14 +262,14 @@ fn two_machines_share_one_team_memory() {
 
     let mut alice = team_client(&first, db.url());
     let created = alice.call(
-        "memory_remember",
+        "note_save",
         json!({ "title": "Uploader location", "body": "src/upload.rs holds the uploader", "kind": "location" }),
     );
     assert!(created.starts_with("created note"), "{created}");
     assert!(alice.finish().success());
 
     let mut bob = team_client(&second, db.url());
-    let found = bob.call("memory_search", json!({ "query": "uploader" }));
+    let found = bob.call("note_search", json!({ "query": "uploader" }));
     assert!(found.contains("Uploader location"), "{found}");
     assert!(bob.finish().success());
 
@@ -642,22 +642,22 @@ fn a_split_server_shares_one_scope_and_keeps_the_other() {
 
     let mut alice = start(&first);
     let shared = alice.call(
-        "memory_remember",
+        "note_save",
         json!({ "title": "Uploader location", "body": "src/upload.rs holds the uploader", "kind": "location" }),
     );
     assert!(shared.starts_with("created note"), "{shared}");
     let private = alice.call(
-        "memory_remember",
+        "note_save",
         json!({ "title": "Uploader habits", "body": "Alice debugs the uploader with prints", "kind": "note", "scope": "global" }),
     );
     assert!(private.starts_with("created note 1000000001"), "{private}");
 
-    let found = alice.call("memory_search", json!({ "query": "uploader" }));
+    let found = alice.call("note_search", json!({ "query": "uploader" }));
     assert!(
         found.contains("Uploader location") && found.contains("Uploader habits"),
         "{found}"
     );
-    let read = alice.call("memory_get", json!({ "ids": [1, 1000000001] }));
+    let read = alice.call("note_get", json!({ "ids": [1, 1000000001] }));
     assert!(
         read.contains("Uploader location") && read.contains("Uploader habits"),
         "{read}"
@@ -669,7 +669,7 @@ fn a_split_server_shares_one_scope_and_keeps_the_other() {
     );
 
     let mut bob = start(&second);
-    let found = bob.call("memory_search", json!({ "query": "uploader" }));
+    let found = bob.call("note_search", json!({ "query": "uploader" }));
     assert!(found.contains("Uploader location"), "{found}");
     assert!(!found.contains("Uploader habits"), "{found}");
     assert!(bob.finish().success());

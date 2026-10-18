@@ -83,7 +83,7 @@ pub fn note_block(note: &Note, now: i64, home: &Path) -> String {
 }
 
 /// `- #<id> [<kind>, from "…" via "…"] <title> (updated <age>)`: a note listed after
-/// `memory_remember`.
+/// `note_save`.
 pub fn similar_line(hit: &Hit, now: i64, home: &Path) -> String {
     let mut header = format!("- #{} [{}", hit.id, hit.kind.as_str());
     push_provenance(&mut header, &hit.provenance, home);

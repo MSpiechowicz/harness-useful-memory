@@ -1,6 +1,6 @@
 //! The note commands of the `harness-memory` executable, for the person at the terminal (and
 //! Harness Desktop on their behalf), never for an agent's MCP calls. Each sees the notes
-//! `memory_search` would with `project_path` set to `--project`: that repository's notes and the
+//! `note_search` would with `project_path` set to `--project`: that repository's notes and the
 //! global ones, only the global ones without `--project`. The store is the one the MCP server
 //! opens (the local file, the team database, or both split by scope).
 //!
@@ -24,11 +24,11 @@
 //!   note object with its body, and up to 50 notes linked through the graph: the notes linked to
 //!   the entity at the other end of a relation that touches one of this note's entities
 //!   (`direction` `out` when this note's entity is the relation's source, `in` when it is the
-//!   target). Showing the note counts no hit (`memory_get` does count one).
-//! - `harness-memory notes delete <id> [--project PATH]` deletes the note as `memory_forget` does
+//!   target). Showing the note counts no hit (`note_get` does count one).
+//! - `harness-memory notes delete <id> [--project PATH]` deletes the note as `note_delete` does
 //!   and prints `deleted note <id> <title>`.
 //! - `harness-memory notes delete --all --yes [--project PATH] [--json]` deletes every note
-//!   `notes list` shows without filters (all pages) in one write per store, as `memory_forget`
+//!   `notes list` shows without filters (all pages) in one write per store, as `note_delete`
 //!   deletes one, and prints `deleted N notes` (and how many came from the team database), or
 //!   `{"deleted": N, "team": M}` with `--json` (`team`: how many were kept in the team database).
 //!   Without `--yes` it deletes nothing and exits 2.
