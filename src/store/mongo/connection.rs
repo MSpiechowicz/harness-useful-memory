@@ -553,7 +553,14 @@ mod tests {
             assert!(tls_files(&mut options, documentdb).expect("own file").is_none());
             assert_eq!(ca_of(&options), Some(own.clone()));
 
-            let mut missing = parse("mongodb://db.example.com/?tlsCAFile=%2Fnowhere%2Fmy-ca.pem");
+            // Absolute on every platform (`/nowhere` is not on Windows, which needs a drive).
+            let gone = dir
+                .path()
+                .join("nowhere")
+                .join("my-ca.pem")
+                .to_string_lossy()
+                .replace('/', "%2F");
+            let mut missing = parse(&format!("mongodb://db.example.com/?tlsCAFile={gone}"));
             let error = tls_files(&mut missing, documentdb).expect_err("missing");
             assert!(matches!(error, StoreError::Invalid(_)), "{error:?}");
             assert!(error.to_string().contains("does not exist"), "{error}");
