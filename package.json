@@ -1,6 +1,6 @@
 {
   "name": "harness-memory",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Project memory for coding agents: a local stdio MCP server with notes and an entity graph in SQLite",
   "license": "GPL-3.0-or-later",
   "private": true,

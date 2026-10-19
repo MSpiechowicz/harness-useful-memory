@@ -1,3 +1,15 @@
+# [2.2.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.1.0...v2.2.0) (2026-10-19)
+
+
+### Bug Fixes
+
+* **test:** a missing CA file path that is absolute on Windows too ([8aa3e96](https://github.com/MSpiechowicz/harness-useful-memory/commit/8aa3e965e983ecef8801f278a80396496067c8af))
+
+
+### Features
+
+* **team:** Amazon DocumentDB as a team database ([849b745](https://github.com/MSpiechowicz/harness-useful-memory/commit/849b745245b0acb711810fe97c943a0a652fc435))
+
 # [2.1.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.0.0...v2.1.0) (2026-10-19)
 
 
