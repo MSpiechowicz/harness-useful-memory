@@ -255,6 +255,7 @@ A script a teammate saved in the team database, or one whose body or language ch
   harness-memory trust 12=<sha256>                   # approve script 12 if it still has the sha256 you reviewed
   harness-memory trust 12 14                         # approve scripts 12 and 14 as they are now
   harness-memory trust --all                         # approve every visible script that needs it, as it is now
+  harness-memory scripts get 12 --json              # script 12 with its body: {"script": {...}}
   harness-memory scripts delete 12                   # delete script 12 as script_delete does
   harness-memory scripts delete --all --yes --json   # delete every script scripts list shows: {"deleted": N, "team": M}
   ```
@@ -274,14 +275,19 @@ A script a teammate saved in the team database, or one whose body or language ch
   "global"}, "review": {"needed", "trusted"}, "scripts"}`, and takes `--group needsReview|repo|global` (`--untrusted`
   is `--group needsReview`), `--scope repo|global`, `--review needed|trusted`, `--query TEXT` (name or description,
   ignoring case), `--sort name|language|scope|place|runs|lastRun|updated`, `--order asc|desc`, `--offset N` and
-  `--limit N` (1 to 200, 50 by default).
+  `--limit N` (1 to 200, 50 by default). Each script has `place` (`team` or `local`: where it is kept), `readOnly` (a
+  team script while `scripts = "remote+local"`) and `hidden` (hidden on this computer). With a team database the object
+  also has `hiddenCount` (the team scripts of the view hidden on this computer) and `localCounts` (`{"repo", "global"}`:
+  the scripts in the local file per scope, every repository's). `--hidden` lists only the hidden team scripts instead,
+  with the same filters, order and paging (`total` counts them); a hidden script the team database no longer has
+  leaves the hidden list.
   The groups do not overlap: `needsReview` holds every script that needs approval, `repo` and `global` the other
   scripts of that scope. `--scope` keeps the scripts of one scope, `--review needed` the ones that need approval (the
   `needsReview` group) and `--review trusted` every other one. `--scope` and `--review` combine with each other but not
   with `--group` (that is a usage error). The group counts follow `--query`, the `scopes` counts follow `--query` and
   `--review`, the `review` counts follow `--query` and `--scope`, and `total` follows every filter. By name (A to Z,
   repository scripts first on a tie) unless `--sort updated` (newest first), `language`, `scope` (global scripts
-  first), `place` (the listed scripts are all in one place, so by id), `runs` (the run count) or `lastRun` (a script
+  first), `place` (this computer's first, then by id), `runs` (the run count) or `lastRun` (a script
   never run comes last whichever the order), all ascending. `--order` turns any round, and ties go by id. Approval is
   decided on this computer, so every visible script is read and the page is cut there. Usage errors exit with 2.
 
@@ -289,12 +295,17 @@ A script a teammate saved in the team database, or one whose body or language ch
   remembered first, so saving its code again trusts nothing) and prints `deleted script <id> <name>`, or exits with 1
   and `harness-memory: script <id> not found`. `scripts delete --all --yes` does that for every script `scripts list`
   shows without filters (every group and page) in one write, and prints `deleted N scripts`, or with `--json`
-  `{"deleted": N, "team": M}`, where `team` counts the ones that were in the team database. Without `--yes` it deletes
-  nothing and exits with 2.
+  `{"deleted": N, "team": M}`, where `team` counts the ones that were in the team database. With `scripts =
+  "remote+local"` it deletes only this computer's scripts and counts the team's that stay (`{"deleted": N, "team": 0,
+  "kept": K}`). Without `--yes` it deletes nothing and exits with 2. A team script that is read-only here is not
+  deleted by `scripts delete <id>` either: it exits with 1 and names `harness-memory scripts hide <id>`.
+
+  `scripts get <id> --json [--project PATH] [--hidden]` prints `{"script": {...}}`, the list's object with its
+  `body`; a hidden team script is not found unless `--hidden` is given.
 
 To skip the approval for the team's scripts, set `trust_team_scripts = true` in the [config file](#configure-each-teammate) (or
 `HARNESS_MEMORY_TRUST_TEAM_SCRIPTS=1`): every script read from the team database then runs as if you had approved it,
-and `harness-memory check` adds `team scripts: trusted automatically` (only when scripts are kept in the team
+and `harness-memory check` adds `team scripts: trusted automatically` (only when scripts are read from the team
 database). Anyone who can write to the team database can
 then run code on your computer. Scripts saved on this computer stay trusted either way.
 
@@ -559,9 +570,9 @@ In `~/.codex/config.toml` that is a `[mcp_servers.harness-memory.env]` table wit
 `"environment": { ... }` key in its `local` entry.
 
 To check it, run `harness-memory check`. It reads the settings the server would read, opens the database the same way
-and prints one line, without the credentials, then where scripts are kept (`scripts: team database` or
-`scripts: this computer`, followed by `team scripts: trusted automatically` when `trust_team_scripts` is on and
-scripts are kept in the team database):
+and prints one line, without the credentials, then where scripts are kept (`scripts: team database`,
+`scripts: this computer` or `scripts: team database and this computer`, followed by `team scripts: trusted
+automatically` when `trust_team_scripts` is on and scripts are read from the team database):
 
 ```text
 ok: PostgreSQL at postgres://harness_memory@db.example.com:5432/harness_memory?… (schema 4)
@@ -584,21 +595,22 @@ message). A connection lost later in a session comes back as a tool error. The c
 ### Which notes are shared
 
 By default both kinds of notes go to the team database. Two optional keys keep one kind on this computer, in the local
-SQLite file, while the other is shared:
+SQLite file, while the other is shared, or read the team's notes of a kind while saving your own on this computer:
 
 | Key | Environment variable | Values | Default |
 | --- | --- | --- | --- |
-| `repository_notes` | `HARNESS_MEMORY_REPOSITORY_NOTES` | `"remote"` (team database) or `"local"` (this computer) | `"remote"` |
-| `global_notes` | `HARNESS_MEMORY_GLOBAL_NOTES` | `"remote"` (team database) or `"local"` (this computer) | `"remote"` |
+| `repository_notes` | `HARNESS_MEMORY_REPOSITORY_NOTES` | `"remote"` (team database), `"local"` (this computer) or `"remote+local"` (read both, save here) | `"remote"` |
+| `global_notes` | `HARNESS_MEMORY_GLOBAL_NOTES` | `"remote"` (team database), `"local"` (this computer) or `"remote+local"` (read both, save here) | `"remote"` |
 
 ```toml
 database_url = "postgres://..."
 global_notes = "local"   # share repository notes with the team, keep personal global notes here
+# repository_notes = "remote+local"   # see the team's repository notes, save new ones on this computer only
 ```
 
-The environment variable wins over the key, and any other value is an error that stops the server. With both set to
-`"local"` the team database is not used at all (the server says so on stderr). The keys only matter with a team
-database.
+The environment variable wins over the key, and any other value is an error that stops the server (`hooks` and
+`routines` take `"remote"` or `"local"` only). With both set to `"local"` the team database is not used at all (the
+server says so on stderr). The keys only matter with a team database.
 
 With one kind kept locally, the tools still see both: a search lists the repository's notes first and fills up with
 global ones, and `note_get`, `note_update` and `note_delete` find a note by its id in either place. Local notes
@@ -608,6 +620,49 @@ same place, and similar notes are only looked for next to the note just saved. N
 before you changed the keys are not shown; `push` copies local notes of a shared kind into the team database.
 `harness-memory check` adds where each kind goes (`; repository notes: team database, global notes: this computer;
 local database at …`).
+
+With a kind set to `"remote+local"` the tools read the team's notes of that kind and this computer's, and every note
+they save goes to this computer. The team's notes of that kind are read-only there: `note_update`, `note_delete` and
+`entity_link` with a team note's id are refused, and similar notes listed after `note_save` are marked `(team,
+read-only)`. Searches take turns between the two places, and similar notes are looked for in both. `notes delete --all`
+deletes only this computer's notes of that kind and counts the team's that stay (`kept`).
+
+A team note you do not want to see can be hidden on this computer, with `harness-memory notes hide <id>` (or Hide on
+this computer in Harness Desktop), whatever the kind is set to: the team database is not changed, but the note is left
+out of every search, list, `note_get`, similar notes and `entity_neighbors` here, also for servers that are already
+running. `notes list --hidden` lists the hidden ones and `notes unhide <id>` shows one again. The list is kept per team
+database in the local SQLite file (at most 500 notes).
+
+### Where scripts are kept
+
+Scripts go to the team database too, unless `scripts` (or `HARNESS_MEMORY_SCRIPTS`) says otherwise: `"remote"` (the
+default), `"local"` (this computer) or `"remote+local"` (read the team's scripts and this computer's, save new ones
+here). Like the note keys it only matters with a team database.
+
+```toml
+scripts = "remote+local"   # run the team's scripts, keep the ones your agents save on this computer
+```
+
+With `"remote+local"` both are listed (this computer's first on the same name), and a name is looked up on this
+computer first: its repository scripts, the team's, its global ones, the team's. Local scripts are numbered from
+1000000001, like local notes. The team's scripts are read-only there (`script_delete` with a team script is refused,
+naming `harness-memory scripts hide`), and `scripts delete --all` deletes only this computer's. Each script keeps its
+own approval: a team script is approved under the team database (and `trust_team_scripts` trusts the team's only), a
+local one on this computer, by the id it has there.
+
+A team script you do not want to see can be hidden on this computer, with `harness-memory scripts hide <id>` (or Hide
+on this computer in Harness Desktop), with `"remote"` and `"remote+local"` alike: it is left out of `script_list`,
+`script_get`, `script_run`, the scripts `note_search` lists and `scripts list`, also for running servers, and saving a
+script under its name with `"remote"` is refused. `scripts list --hidden` lists the hidden ones and
+`harness-memory scripts unhide <id>` shows one again (`--json` prints `{"hidden": <id>}` or `{"unhidden": <id>}`); a
+script saved on this computer cannot be hidden (delete it instead). The list is kept per team database in the local
+SQLite file (at most 500 scripts). When it cannot be read, nothing is hidden, but nothing in the team database is
+changed either.
+
+With `"remote"` the scripts left in the local file are not read. `harness-memory scripts push` copies them into the
+team database (see [Seed it from existing notes](#seed-it-from-existing-notes)), and `harness-memory scripts
+discard-local (--all | ID[,ID...] | -) [--scope repo|global] --yes [--json]` deletes them by their local ids (`localId`
+in `scripts push --json`, `-` reads them from stdin), only while `scripts = "remote"`.
 
 ### Sharing hooks
 
@@ -745,7 +800,9 @@ harness-memory push --repo . --no-global   # only this checkout's repository, no
 
 It reads the local file (`HARNESS_MEMORY_DIR` applies) and writes to the database in your configuration. Each teammate can
 push their own notes. By default `push` takes everything: every repository's notes and the global ones. A kind kept on
-this computer (`repository_notes` or `global_notes` set to `"local"`) is left out, and `push` says so.
+this computer (`repository_notes` or `global_notes` set to `"local"`) is left out, and `push` says so. A kind set to
+`"remote+local"` is left out too unless `--scope repo` or `--scope global` names it: its new notes are meant to stay on
+this computer. `--scope repo|global` pushes only that kind.
 
 - **Review first.** Everything you push becomes visible to the whole team. `--dry-run` lists, under each repository key
   (and `global`), the titles of the notes it would add or change. Repositories without a remote are keyed by their
@@ -755,13 +812,69 @@ this computer (`repository_notes` or `global_notes` set to `"local"`) is left ou
   for the repository of the folder you run it in (found the way the server finds it). `--no-global` leaves the global
   notes out.
 - **It can replace a teammate's text.** A note with the same title in the same repository (or in global) is skipped
-  when the team's copy is as new or newer, and replaced when your local copy was changed later. So `push` can overwrite
-  a teammate's text of a same-titled note when your copy is newer. It names every such note (`"Title" (key): overwrote
-  the team's version`) and counts them as overwritten, apart from updates that only changed the kind or tags.
+  when it is identical or the team's copy is as new or newer, and replaced when your local copy was changed later. So
+  `push` can overwrite a teammate's text of a same-titled note when your copy is newer: a conflict. By default it does,
+  names every such note (`"Title" (key): overwrote the team's version`) and counts them as overwritten, apart from
+  updates that only changed the kind or tags. `--overwrite none` keeps the team's text of every conflict, `--overwrite
+  all` replaces it, and `--overwrite 12,40` (local note ids, or `-` to read them from stdin) replaces only those.
+- **Move instead of copy.** `--delete-copied` deletes from this computer the notes the team database now holds as they
+  are here (added, updated, overwritten or identical) once the push is done. Conflicts it kept, notes the team changed
+  later and notes that failed to push stay. So does a note the team already had (updated, overwritten or identical)
+  when the team's note lacks some of its linked entities, since only an added note takes its entities along. When a
+  relation fails to push, nothing is deleted and the run reports it (the relation of a note that failed stays here
+  with its note, and the rest is deleted). It does not go with `--dry-run`.
+- **Hidden notes stay as they are.** A team note you hid on this computer is never written over. A local note with
+  its title (in the same repository, or in global) that would be copied there fails instead, names `harness-memory
+  notes unhide <id>`, and stays on this computer. `--dry-run` reports it the same way. If the list of hidden notes
+  cannot be read, nothing is pushed.
 
-It prints how many notes were added, updated, overwritten and skipped, and how many relations were added or already
-there. If the team database was set up by a newer `harness-memory`, `push` stops before writing anything: update this
-one first.
+It prints how many notes were added, updated, overwritten, kept and skipped, and how many relations were added or
+already there. If the team database was set up by a newer `harness-memory`, `push` stops before writing anything:
+update this one first.
+
+`--json` prints one object instead, the same for a dry run and a real one, exit 0 when it worked or there was nothing to
+push, 1 when a note or relation failed:
+
+```json
+{"dryRun": true, "nothing": null,
+ "notes": {"added": 1, "updated": 0, "overwritten": 0, "kept": 1, "identical": 0, "teamNewer": 0, "failed": 0},
+ "relations": {"added": 0, "unchanged": 0}, "entitiesCut": 0, "deleted": null,
+ "changes": [{"localId": 12, "scope": "repo", "repo": "github.com/acme/widget", "title": "Deploy steps",
+   "action": "keep", "conflict": true, "teamId": 34, "localUpdatedAt": "2026-10-19T08:00:00Z",
+   "teamUpdatedAt": "2026-10-18T17:30:00Z", "deleted": false, "changedSince": false, "failed": false}],
+ "failed": []}
+```
+
+`nothing` says why there was nothing to push (otherwise `null`). Each change has an `action` of `add`, `update`,
+`overwrite`, `keep`, `identical` or `teamNewer`, and `conflict` marks a newer local note whose text differs from the
+team's, whichever way `--overwrite` decided it. A change whose note could not be written has `failed: true`, keeps
+its `action`, and is not counted in `notes` (`notes.failed` counts it). `deleted` counts what `--delete-copied` deleted
+(`null` without it), and `changedSince: true` marks a copied note it left because the note changed on this computer
+after the push read it. A relation whose note failed is not pushed either and is listed in `failed` with that note's
+`localId`. The relations of a note whose team note you hid and the push left as it is are not linked to it and count as
+`unchanged`.
+`harness-memory scripts push` does the same for the scripts saved on this computer, with the same options: a script
+matches the team's of the same scope, repository and name, and is `identical` (same code, description and timeout),
+`teamNewer` (the team's changed at or after yours), `update` (same code, another description or timeout), or a
+conflict (`overwrite` or `keep`, as `--overwrite` says, with local script ids). It pushes while `scripts = "remote"`,
+with `"remote+local"` only when `--scope` names the scope, never with `"local"`. A script this computer trusts stays
+trusted once copied (one waiting for approval never becomes trusted), a team script hidden on this computer is never
+written over (it fails, in a dry run too), and `--delete-copied` deletes a local script only when it did not change since it was read. Its `--json`
+object has `scripts` totals instead of `notes`, no `relations` or `entitiesCut`, and each change a `name` and
+`trusted` (true when this computer's trust went along):
+
+```json
+{"dryRun": false, "nothing": null,
+ "scripts": {"added": 1, "updated": 0, "overwritten": 0, "kept": 0, "identical": 0, "teamNewer": 0, "failed": 0},
+ "deleted": null,
+ "changes": [{"localId": 3, "scope": "repo", "repo": "github.com/acme/widget", "name": "open-prs", "action": "add",
+   "conflict": false, "teamId": 9, "localUpdatedAt": "2026-10-19T08:00:00Z", "teamUpdatedAt": null,
+   "deleted": false, "changedSince": false, "failed": false, "trusted": true}],
+ "failed": []}
+```
+
+`harness-memory features` lists what this build supports, one per line (`push-json`, `scripts-remote-local`,
+`scripts-hide` and `scripts-push-json` among them), so a tool can check before it asks for them.
 
 ### Security and backups
 

@@ -66,8 +66,9 @@ pub(super) fn prune_entity(ctx: &mut Ctx<'_>, project: Option<&str>, norm: &str)
     Ok(())
 }
 
-/// Deletes the entities of the scope `project` that no relation uses, once its notes are gone.
-pub(super) fn prune_scope(ctx: &mut Ctx<'_>, project: Option<&str>) -> Result<(), Fail> {
+/// Deletes the entities of the scope `project` that no relation uses and that are not `kept` (the
+/// entities of the notes left), once its notes are gone.
+pub(super) fn prune_scope(ctx: &mut Ctx<'_>, project: Option<&str>, kept: &[String]) -> Result<(), Fail> {
     let scope = scope_value(project);
     let relations = ctx.find(
         RELATIONS,
@@ -81,6 +82,7 @@ pub(super) fn prune_scope(ctx: &mut Ctx<'_>, project: Option<&str>) -> Result<()
         .iter()
         .flat_map(|relation| [text(relation, "src"), text(relation, "dst")])
         .flatten()
+        .chain(kept.iter().cloned())
         .collect();
     used.sort_unstable();
     used.dedup();

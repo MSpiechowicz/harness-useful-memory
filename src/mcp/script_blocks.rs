@@ -59,11 +59,15 @@ impl Approval {
 }
 
 /// A summary with the facts the store does not keep: the body's SHA-256 (from the body itself when
-/// it was read), where scripts are kept, and whether this machine trusts the body.
+/// it was read), where the script is kept, whether it is read-only here (a team script while
+/// scripts are `remote+local`) or hidden on this computer, and whether this machine trusts the
+/// body.
 pub struct Shown<'a> {
     pub summary: &'a ScriptSummary,
     pub sha256: &'a str,
     pub place: Place,
+    pub read_only: bool,
+    pub hidden: bool,
     pub approval: Approval,
 }
 
@@ -83,6 +87,8 @@ impl Shown<'_> {
             "sha256": self.sha256,
             "timeoutSecs": summary.timeout_secs,
             "place": place_label(self.place),
+            "readOnly": self.read_only,
+            "hidden": self.hidden,
             "author": author_json(provenance),
             "createdAt": rfc3339(summary.created_at),
             "updatedAt": rfc3339(summary.updated_at),
@@ -101,7 +107,8 @@ impl Shown<'_> {
         value
     }
 
-    /// `- #<id> <name> [<language>, <scope>, <place>, <runs>, <trust>] <description>`.
+    /// `- #<id> <name> [<language>, <scope>, <place>, <runs>, <trust>] <description>` (the place
+    /// `team, read-only` for a read-only script).
     pub fn line(&self) -> String {
         let summary = self.summary;
         let runs = match (summary.last_run_at, summary.last_exit_code) {
@@ -116,10 +123,21 @@ impl Shown<'_> {
             summary.name,
             summary.language.as_str(),
             scope_label(summary),
-            place_label(self.place),
+            self.place_text(),
             trust_label(self.approval),
             clean::line(&summary.description)
         )
+    }
+
+    /// `team`, `team, read-only` or `local`.
+    fn place_text(&self) -> String {
+        let place = place_label(self.place);
+
+        if self.read_only {
+            format!("{place}, read-only")
+        } else {
+            place.to_owned()
+        }
     }
 
     /// The header with every field, the description, and the indented body.
@@ -131,7 +149,7 @@ impl Shown<'_> {
             summary.name,
             summary.language.as_str(),
             scope_label(summary),
-            place_label(self.place),
+            self.place_text(),
             self.sha256,
             summary.timeout_secs,
             date(summary.updated_at)
@@ -170,7 +188,7 @@ pub fn saved_line(shown: &Shown, created: bool) -> String {
         shown.summary.id,
         shown.summary.name,
         scope_label(shown.summary),
-        place_label(shown.place),
+        shown.place_text(),
         shown.sha256
     )
 }

@@ -6,7 +6,7 @@ expression: "replies[0][\"result\"]"
   "tools": [
     {
       "name": "note_save",
-      "description": "Call before you finish: save what you learned for later sessions, after finishing work, fixing a non-obvious problem, finding where something lives, or an optimisation. Use repo-relative paths. A note with the same title in the scope is updated (a repository note written from another checkout, or reached through project_path, is reported instead: replace it with note_update). Similar notes are listed so you can update or delete outdated ones. Never store secrets.",
+      "description": "Call before you finish: save what you learned for later sessions, after finishing work, fixing a non-obvious problem, finding where something lives, or an optimisation. Use repo-relative paths. A note with the same title in the scope is updated (a repository note written from another checkout, or reached through project_path, is reported instead: replace it with note_update). Similar notes are listed so you can update or delete outdated ones (those marked team, read-only cannot be changed from here). Never store secrets.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -74,7 +74,7 @@ expression: "replies[0][\"result\"]"
     },
     {
       "name": "note_update",
-      "description": "Correct or extend a note by id. Give only the fields to change; append adds text to the body.",
+      "description": "Correct or extend a note by id. Give only the fields to change; append adds text to the body. A team note of a scope set to remote+local is read-only (refused): save a new note instead.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -229,7 +229,7 @@ expression: "replies[0][\"result\"]"
     },
     {
       "name": "note_delete",
-      "description": "Delete an outdated or wrong note by id, looked up in this repository and the global scope unless scope is given.",
+      "description": "Delete an outdated or wrong note by id, looked up in this repository and the global scope unless scope is given. A team note of a scope set to remote+local is read-only (refused).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -260,7 +260,7 @@ expression: "replies[0][\"result\"]"
     },
     {
       "name": "entity_link",
-      "description": "Relate two entities: `from relation to`, for example `GitCli located_in business/src/git/cli.rs` or `retry-fix resolves flaky-test`. Missing entities are created.",
+      "description": "Relate two entities: `from relation to`, for example `GitCli located_in business/src/git/cli.rs` or `retry-fix resolves flaky-test`. Missing entities are created. note_id cannot be a read-only team note (scope set to remote+local).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -387,7 +387,7 @@ expression: "replies[0][\"result\"]"
     },
     {
       "name": "script_save",
-      "description": "Save a deterministic action you repeat (a curl or gh fetch, a report, a lookup) as a script, so later sessions run it with script_run instead of working it out again. A script with the same name in the scope is replaced. Scripts run with the user's environment: read secrets from environment variables (for example $GH_TOKEN), never write them into the body (a body holding a credential is refused). Arguments arrive as $1, $2 (sys.argv, process.argv), never through a shell. What you save runs here without approval, since you wrote it: never save the code of a script that waits for approval, edited or not, to run it (an unedited copy waits for approval too).",
+      "description": "Save a deterministic action you repeat (a curl or gh fetch, a report, a lookup) as a script, so later sessions run it with script_run instead of working it out again. A script with the same name in the scope is replaced. Scripts run with the user's environment: read secrets from environment variables (for example $GH_TOKEN), never write them into the body (a body holding a credential is refused). Arguments arrive as $1, $2 (sys.argv, process.argv), never through a shell. What you save runs here without approval, since you wrote it: never save the code of a script that waits for approval, edited or not, to run it (an unedited copy waits for approval too). When scripts are set to remote+local, new scripts are saved on this computer, next to the team's.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -453,7 +453,7 @@ expression: "replies[0][\"result\"]"
     },
     {
       "name": "script_list",
-      "description": "List saved scripts, repository scripts first: check here before working out a repeated action again. Without a query every visible script is listed.",
+      "description": "List saved scripts, repository scripts first: check here before working out a repeated action again. Without a query every visible script is listed. `place` says where a script is kept (team or local); `readOnly` marks a team script that cannot be changed from here (scripts set to remote+local).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -482,7 +482,7 @@ expression: "replies[0][\"result\"]"
     },
     {
       "name": "script_get",
-      "description": "Read a script with its body, by id or name (a name is looked up in this repository first, then in the global scope). `approval` says why this machine runs it (local: saved here, approved: approved by the user here, team: every team script is trusted) or that the user must approve it first (needed).",
+      "description": "Read a script with its body, by id or name (a name is looked up in this repository first, then in the global scope, a script saved on this computer before a team one with the same name). `approval` says why this machine runs it (local: saved here, approved: approved by the user here, team: every team script is trusted) or that the user must approve it first (needed).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -566,7 +566,7 @@ expression: "replies[0][\"result\"]"
     },
     {
       "name": "script_delete",
-      "description": "Delete a stale or wrong script by id or name.",
+      "description": "Delete a stale or wrong script by id or name. A team script is read-only when scripts are set to remote+local (refused): save a script of your own instead.",
       "inputSchema": {
         "type": "object",
         "properties": {

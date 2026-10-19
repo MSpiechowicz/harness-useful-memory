@@ -9,9 +9,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 use harness_memory::Server;
+use harness_memory::backend::NotesPlace;
 use harness_memory::mcp::{ALIVE_FILE, APPROVAL_WAIT_VAR, REQUESTS_FOLDER};
 use harness_memory::project::ProjectResolver;
-use harness_memory::store::{Language, Provenance, ScriptDraft, ScriptStore, SqliteStore, Target};
+use harness_memory::store::{
+    HiddenScripts, Language, Provenance, ScriptDraft, ScriptStore, SplitScripts, SqliteStore, Target,
+};
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -76,6 +79,24 @@ impl Fixture {
                       "params": { "protocolVersion": "2025-06-18", "clientInfo": { "name": client } } })],
         );
         server
+    }
+
+    /// [`Self::server`] reading its scripts as `place` routes them, with `data/team.sqlite3` as the
+    /// team database (named `team_key` in this machine's trust) and `data/memory.sqlite3` as this
+    /// computer's file, leaving out the team scripts hidden there.
+    pub fn split_server(&self, wait_ms: u64, place: NotesPlace, team_key: &str) -> Server {
+        let team = SqliteStore::open(&self.data().join("team.sqlite3")).expect("team store");
+        let hidden = self.hidden_scripts(team_key);
+        let scripts = SplitScripts::new(Box::new(team), Box::new(self.store()), place, Some(hidden));
+
+        self.server_over(wait_ms, "tests", Box::new(scripts))
+            .with_scripts_place(place)
+            .with_team_key(team_key.to_owned())
+    }
+
+    /// The team scripts of `team_key` hidden in `data/memory.sqlite3`.
+    pub fn hidden_scripts(&self, team_key: &str) -> HiddenScripts {
+        HiddenScripts::new(self.data().join("memory.sqlite3"), team_key)
     }
 
     /// Saves global script `name` straight into the store, as a teammate's machine would; its id.

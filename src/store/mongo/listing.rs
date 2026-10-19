@@ -8,7 +8,9 @@ use super::notes::{Stored, stored};
 use super::scripts::literal_pattern;
 use super::{Ctx, ENTITIES, ENTITY_NORM_MAX, Fail, NOTES, cut, int, note_fields, scope_value, text, visible};
 use crate::limits::{ENTITY_MAX, TITLE_MAX};
-use crate::store::listing::{NoteListQuery, NotePage, NoteRow, NoteSort, page_limit, query_entity, query_text, scoped};
+use crate::store::listing::{
+    NoteListQuery, NotePage, NoteRow, NoteSort, checked_exclude, page_limit, query_entity, query_text, scoped,
+};
 use crate::store::{NoteKind, Scope, View};
 
 /// The longest normalized title read back (lowercasing can lengthen a title).
@@ -34,6 +36,12 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage,
 
     if let Some(entity) = query_entity(query) {
         kept.insert("entities", entity);
+    }
+
+    let exclude = checked_exclude(&query.exclude)?;
+
+    if !exclude.is_empty() {
+        kept.insert("_id", doc! { "$nin": exclude });
     }
 
     let mut counts_filter = visible(&query.view);

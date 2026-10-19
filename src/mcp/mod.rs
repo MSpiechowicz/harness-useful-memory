@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::backend::Place;
+use crate::backend::{NotesPlace, Place};
 use crate::limits::LINE_MAX;
 use crate::project::ProjectResolver;
 use crate::store::{MemoryStore, ScriptStore, TrustStore};
@@ -44,13 +44,13 @@ use protocol::{INVALID_PARAMS, INVALID_REQUEST, Line, METHOD_NOT_FOUND, PARSE_ER
 /// How often the serving loop looks whether the server got SIGTERM while no input comes.
 const TERMINATE_POLL: Duration = Duration::from_millis(100);
 
-/// The state one server process keeps: the note store, the script store and where it is, the
-/// other script store (see [`Self::with_other_scripts`]), this machine's script trust (and whether
-/// team scripts count as approved), the project resolver and the client's name.
+/// The state one server process keeps: the note store, the script store and where scripts are
+/// read, the other script store (see [`Self::with_other_scripts`]), this machine's script trust
+/// (and whether team scripts count as approved), the project resolver and the client's name.
 pub struct Server {
     store: Box<dyn MemoryStore>,
     scripts: Box<dyn ScriptStore>,
-    scripts_place: Place,
+    scripts_place: NotesPlace,
     /// The trust name of the team database ([`crate::backend::Backend::team_key`]).
     team_key: String,
     other_scripts: Option<Box<dyn ScriptStore>>,
@@ -83,7 +83,7 @@ impl Server {
         Self {
             store,
             scripts,
-            scripts_place: Place::Local,
+            scripts_place: NotesPlace::Local,
             team_key: "team".to_owned(),
             other_scripts: None,
             trust,
@@ -101,23 +101,25 @@ impl Server {
         self
     }
 
-    /// The server with its scripts kept in `place` (see [`crate::backend::Selection::scripts_place`]),
-    /// which the script tools report.
-    pub fn with_scripts_place(mut self, place: Place) -> Self {
-        self.scripts_place = place;
+    /// The server with its scripts read from `place` (see
+    /// [`crate::backend::Selection::scripts_place`]), which the script tools report: a store that
+    /// keeps every script in one place keeps them where `place` saves them, a
+    /// [`crate::store::SplitScripts`] says per script ([`ScriptStore::origin`]).
+    pub fn with_scripts_place(mut self, place: impl Into<NotesPlace>) -> Self {
+        self.scripts_place = place.into();
         self
     }
 
     /// The server naming the team database `key` in this machine's script trust (`team` unless
-    /// set, see [`crate::backend::Selection::scripts_key`]).
+    /// set, see [`crate::backend::Selection::scripts_trust_key`]).
     pub fn with_team_key(mut self, key: String) -> Self {
         self.team_key = key;
         self
     }
 
-    /// The server with `store`, the scripts in the place scripts are not routed to (the team
-    /// database when they stay on this computer, else the local file): `script_save` does not
-    /// trust a copy of a script waiting for approval there either.
+    /// The server with `store`, the scripts in the place scripts are not read from (the team
+    /// database when they stay on this computer, the local file when they are `remote`):
+    /// `script_save` does not trust a copy of a script waiting for approval there either.
     pub fn with_other_scripts(mut self, store: Box<dyn ScriptStore>) -> Self {
         self.other_scripts = Some(store);
         self
@@ -144,12 +146,20 @@ impl Server {
         }
     }
 
-    /// Where the other script store is: the place scripts are not routed to.
-    fn other_place(&self) -> Place {
+    /// Where the other script store is: the place scripts are not read from (none with
+    /// `remote+local`, which reads both).
+    fn other_place(&self) -> Option<Place> {
         match self.scripts_place {
-            Place::Local => Place::Remote,
-            Place::Remote => Place::Local,
+            NotesPlace::Local => Some(Place::Remote),
+            NotesPlace::Remote => Some(Place::Local),
+            NotesPlace::RemoteLocal => None,
         }
+    }
+
+    /// Where the script the script store shows as `id` is kept, and its id there (the id this
+    /// machine's trust names it by).
+    fn spot(&self, id: i64) -> (Place, i64) {
+        self.scripts.origin(id).spot(id, self.scripts_place.writes())
     }
 
     /// Answers one parsed message; `None` for notifications and client answers.

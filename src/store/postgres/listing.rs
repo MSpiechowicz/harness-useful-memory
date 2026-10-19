@@ -1,6 +1,7 @@
 //! A page of notes ([`crate::store::listing`]) in PostgreSQL: the counts per kind and scope and
 //! the page, then the entity names of the page's notes. `strpos`, not `LIKE`, so `%` and `_` in
-//! the text are plain characters; titles sort by code point (`COLLATE "C"`), like SQLite.
+//! the text are plain characters; titles sort by code point (`COLLATE "C"`), like SQLite. The ids
+//! left out ([`NoteListQuery::exclude`]) go in as one `bigint[]`.
 
 use postgres::GenericClient;
 
@@ -8,7 +9,8 @@ use super::notes::{VISIBLE, kind_from_sql, note_from_row, row_columns};
 use super::{KIND_MAX, backend, column, cut, view_params};
 use crate::limits::ENTITY_MAX;
 use crate::store::listing::{
-    NoteListQuery, NotePage, NoteRow, NoteSort, direction, page_limit, query_entity, query_text, scoped,
+    NoteListQuery, NotePage, NoteRow, NoteSort, checked_exclude, direction, page_limit, query_entity, query_text,
+    scoped,
 };
 use crate::store::{NoteKind, Scope, StoreError};
 
@@ -21,15 +23,17 @@ const KEPT: &str = "($1::text IS NULL OR strpos(lower(n.title), lower($1::text))
 pub(super) fn list(client: &mut impl GenericClient, query: &NoteListQuery) -> Result<NotePage, StoreError> {
     let text = query_text(query)?;
     let entity = query_entity(query);
+    let exclude = checked_exclude(&query.exclude)?.to_vec();
     let (repo, global) = view_params(client, &query.view)?;
 
     let counts_sql = format!(
         "SELECT {}, n.project_id IS NULL, count(*) FROM notes n WHERE {VISIBLE} AND {KEPT}
+           AND n.id <> ALL($5::bigint[])
          GROUP BY n.kind, n.project_id IS NULL",
         cut("n.kind", KIND_MAX)
     );
     let counted: Vec<(NoteKind, Scope, usize)> = client
-        .query(&counts_sql, &[&text, &repo, &global, &entity])
+        .query(&counts_sql, &[&text, &repo, &global, &entity, &exclude])
         .map_err(backend)?
         .iter()
         .map(|row| {
@@ -51,7 +55,7 @@ pub(super) fn list(client: &mut impl GenericClient, query: &NoteListQuery) -> Re
     };
     let sql = format!(
         "SELECT {} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
-         WHERE {VISIBLE} AND {KEPT} AND ($5::text IS NULL OR n.kind = $5::text)
+         WHERE {VISIBLE} AND {KEPT} AND ($5::text IS NULL OR n.kind = $5::text) AND n.id <> ALL($8::bigint[])
          ORDER BY {order} LIMIT $6 OFFSET $7",
         row_columns()
     );
@@ -62,7 +66,10 @@ pub(super) fn list(client: &mut impl GenericClient, query: &NoteListQuery) -> Re
     let (repo, global) = scoped(query, repo, global);
 
     let mut rows: Vec<NoteRow> = client
-        .query(&sql, &[&text, &repo, &global, &entity, &kind, &limit, &offset])
+        .query(
+            &sql,
+            &[&text, &repo, &global, &entity, &kind, &limit, &offset, &exclude],
+        )
         .map_err(backend)?
         .iter()
         .map(|row| note_from_row(row).map(NoteRow::from))

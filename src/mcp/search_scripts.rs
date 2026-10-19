@@ -5,9 +5,10 @@
 //! lowercased, accents dropped; common English words left out, the last word matching as a
 //! prefix), and a script matches when its name or description holds one of them. Scripts are
 //! ranked by the words they match, then by runs, then by the latest write. They come from the
-//! store scripts are routed to (the local file or the team database), and a script whose name or
-//! description holds a [`hidden_character`] is never listed. A failing script store leaves the
-//! block out and never fails the search.
+//! script store (the local file, the team database, or both with `remote+local`; the team scripts
+//! hidden on this computer are left out), and a script whose name or description holds a
+//! [`hidden_character`] is never listed. A failing script store leaves the block out and never
+//! fails the search.
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
@@ -17,6 +18,7 @@ use unicode_normalization::char::is_combining_mark;
 
 use super::Server;
 use super::script_blocks::SCRIPTS_FRAME;
+use crate::backend::Place;
 use crate::limits::QUERY_TOKENS_MAX;
 use crate::store::{Scope, ScriptSummary, StoreError, View, clean, hidden_character};
 use crate::support::text::STOPWORDS;
@@ -71,7 +73,7 @@ pub(super) fn block(server: &mut Server, view: &View, query: &str) -> Option<Str
     let lines: Vec<String> = ranked
         .iter()
         .take(LISTED_MAX)
-        .map(|(_, summary)| line(summary, &summaries))
+        .map(|(_, summary)| line(summary, by_name(server, summary, &summaries)))
         .collect();
 
     Some(format!(
@@ -144,9 +146,21 @@ fn shown_safely(summary: &ScriptSummary) -> bool {
     hidden_character(&summary.name).is_none() && hidden_character(&summary.description).is_none()
 }
 
-/// `- <name>: <description> (<language>) → script_run name=<name>`; a global script that a
-/// repository script of the same name hides is run by `id=<id>`.
-fn line(summary: &ScriptSummary, visible: &[ScriptSummary]) -> String {
+/// True when `script_run name=<name>` runs `summary`: no other `visible` script of that name comes
+/// first in a name lookup (repository scripts before global ones, this computer's before the
+/// team's).
+fn by_name(server: &Server, summary: &ScriptSummary, visible: &[ScriptSummary]) -> bool {
+    let rank = |script: &ScriptSummary| (script.scope == Scope::Global, server.spot(script.id).0 == Place::Remote);
+    let own = rank(summary);
+
+    !visible
+        .iter()
+        .any(|other| other.id != summary.id && other.name == summary.name && rank(other) < own)
+}
+
+/// `- <name>: <description> (<language>) → script_run name=<name>`; a script another one of the
+/// same name hides (see [`by_name`]) is run by `id=<id>`.
+fn line(summary: &ScriptSummary, by_name: bool) -> String {
     let name = clean::line(&summary.name);
     let description = description(&summary.description);
     let description = if description.is_empty() {
@@ -155,14 +169,10 @@ fn line(summary: &ScriptSummary, visible: &[ScriptSummary]) -> String {
         format!(": {description}")
     };
 
-    let hidden_by_repo = summary.scope == Scope::Global
-        && visible
-            .iter()
-            .any(|other| other.scope == Scope::Repo && other.name == summary.name);
-    let call = if hidden_by_repo {
-        format!("id={}", summary.id)
-    } else {
+    let call = if by_name {
         format!("name={name}")
+    } else {
+        format!("id={}", summary.id)
     };
 
     format!(

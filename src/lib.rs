@@ -8,11 +8,13 @@
 //!   database backends.
 //! - [`backend`]: which store to use (the local file, or a team database from the environment or
 //!   the config file).
-//! - [`push`]: copies the local memory into a team database.
+//! - [`push`] and [`push_scripts`]: copy the local notes and scripts into a team database
+//!   ([`cli_push`] reads their options).
 //! - [`mcp`]: the stdio JSON-RPC server and its tools.
 //! - [`limits`]: per-call limits (the amount of memory itself is never capped).
 //! - [`open`]: the script and trust stores the server opens on first use.
-//! - [`cli_trust`]: the `scripts list` and `trust` commands, where a person approves scripts.
+//! - [`cli_trust`]: the `scripts` and `trust` commands, where a person lists, hides, copies and
+//!   approves scripts.
 //! - [`cli_notes`]: the `notes list`, `notes get` and `notes delete` commands, where a person
 //!   browses and deletes notes.
 //! - [`cli_team_docs`]: the `hooks` and `routines` commands, through which Harness Desktop shares
@@ -25,7 +27,10 @@
 
 pub mod backend;
 mod cli;
+mod cli_discard;
 pub mod cli_notes;
+pub mod cli_push;
+mod cli_scripts;
 pub mod cli_team_docs;
 pub mod cli_trust;
 pub mod limits;
@@ -34,6 +39,7 @@ pub mod mcp;
 pub mod open;
 pub mod project;
 pub mod push;
+pub mod push_scripts;
 pub mod store;
 pub mod support;
 

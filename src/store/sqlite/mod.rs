@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, TransactionBehavior};
 
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, ProjectKey};
-use super::{Forgotten, NoteListQuery, NotePage, Saved, SearchQuery, StoreError, Target, View};
+use super::{Forgotten, NoteListQuery, NotePage, Saved, Scope, SearchQuery, StoreError, Target, View};
 use engine::Engine;
 use local::Local;
 use schema::SchemaState;
@@ -85,6 +85,43 @@ impl SqliteStore {
         self.newer
     }
 
+    /// The notes of the file per scope, every repository's: `(repository, global)`.
+    pub fn scope_counts(&mut self) -> Result<(usize, usize), StoreError> {
+        let rows = self.read(|db| db.query("SELECT project_id IS NULL, count(*) FROM notes GROUP BY 1", &[]))?;
+        let mut counts = (0, 0);
+
+        for row in &rows {
+            let is_global: i64 = row.get(0)?;
+            let count = usize::try_from(row.get::<i64>(1)?).unwrap_or(0);
+
+            if is_global == 0 {
+                counts.0 += count;
+            } else {
+                counts.1 += count;
+            }
+        }
+
+        Ok(counts)
+    }
+
+    /// Every note of the file, every repository's, oldest first: its id, scope and repository key.
+    pub fn note_scopes(&mut self) -> Result<Vec<(i64, Scope, Option<String>)>, StoreError> {
+        let rows = self.read(|db| {
+            db.query(
+                "SELECT n.id, p.key FROM notes n LEFT JOIN projects p ON p.id = n.project_id ORDER BY n.id",
+                &[],
+            )
+        })?;
+
+        rows.iter()
+            .map(|row| {
+                let key: Option<String> = row.get(1)?;
+                let scope = if key.is_some() { Scope::Repo } else { Scope::Global };
+                Ok((row.get(0)?, scope, key))
+            })
+            .collect()
+    }
+
     fn conn(&mut self) -> Result<&mut Connection, StoreError> {
         if self.newer {
             return Err(StoreError::NewerSchema);
@@ -136,6 +173,10 @@ impl MemoryStore for SqliteStore {
         engine::similar(self, view, id, limit)
     }
 
+    fn similar_text(&mut self, view: &View, text: (&str, &str), limit: usize) -> Result<Vec<Hit>, StoreError> {
+        engine::similar_text(self, view, text, limit)
+    }
+
     fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {
         engine::link(self, target, link)
     }
@@ -148,8 +189,8 @@ impl MemoryStore for SqliteStore {
         engine::forget(self, view, target, what)
     }
 
-    fn forget_notes(&mut self, view: &View) -> Result<Forgotten, StoreError> {
-        engine::forget_notes(self, view)
+    fn forget_notes(&mut self, view: &View, exclude: &[i64]) -> Result<Forgotten, StoreError> {
+        engine::forget_notes(self, view, exclude)
     }
 
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {

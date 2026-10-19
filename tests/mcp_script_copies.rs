@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 use common::approval::{Fixture, approval, ok, refusal, tool, wait_for_request};
 use common::mcp::text;
 use common::stdio::{BINARY, without_team_settings};
-use harness_memory::backend::Place;
+use harness_memory::backend::{NotesPlace, Place};
 use harness_memory::mcp::APPROVAL_WAIT_VAR;
-use harness_memory::store::{Provenance, SqliteStore};
+use harness_memory::store::{Provenance, ScriptStore, SqliteStore, View};
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 
@@ -221,4 +221,107 @@ fn a_client_that_hangs_up_while_the_user_is_asked_runs_nothing() {
 
     assert!(!marker.exists(), "the script ran without an answer");
     assert_eq!(fixture.leftovers(), Vec::<String>::new());
+}
+
+#[test]
+#[cfg(unix)]
+fn a_copy_saved_here_of_a_waiting_team_script_is_not_trusted() {
+    let fixture = Fixture::new();
+    let body = "printf team";
+    let id = fixture.save_into("team.sqlite3", "teammate", body, Provenance::default());
+
+    // Both stores are read: the teammate's script waits in the same list.
+    let mut server = fixture.split_server(200, NotesPlace::RemoteLocal, "team:aaaaaaaaaaaaaaaa");
+    let copy = tool(&mut server, "script_save", save("copied", "sh", body));
+    assert_eq!(copy["result"]["structuredContent"]["script"]["place"], "local");
+    assert_eq!(copy["result"]["structuredContent"]["script"]["approval"], "needed");
+    assert!(
+        text(&copy).contains(&format!("it is the code of script {id} teammate")),
+        "{}",
+        text(&copy)
+    );
+    refusal(&tool(&mut server, "script_run", json!({ "name": "copied" })));
+
+    // Code the agent wrote itself is trusted here.
+    let fresh = ok(&mut server, "script_save", save("fresh", "sh", "printf fresh"));
+    assert_eq!(fresh["script"]["approval"], "local");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_copy_of_a_hidden_waiting_team_script_is_not_trusted() {
+    const TEAM: &str = "team:aaaaaaaaaaaaaaaa";
+
+    for place in [NotesPlace::Remote, NotesPlace::RemoteLocal] {
+        let fixture = Fixture::new();
+        let body = "printf hidden";
+        fixture.save_into("team.sqlite3", "teammate", body, Provenance::default());
+
+        // The teammate's script waits for approval, hidden on this computer.
+        let summary = SqliteStore::open(&fixture.data().join("team.sqlite3"))
+            .expect("team")
+            .list_scripts(
+                &View {
+                    repo: None,
+                    global: true,
+                },
+                None,
+            )
+            .expect("list")
+            .remove(0);
+        assert!(fixture.hidden_scripts(TEAM).hide(&summary).expect("hide"));
+
+        let mut server = fixture.split_server(200, place, TEAM);
+        let copy = tool(&mut server, "script_save", save("copied", "sh", body));
+        assert_eq!(copy["result"]["isError"], false, "{place:?}: {}", text(&copy));
+        assert_eq!(
+            copy["result"]["structuredContent"]["script"]["approval"],
+            "needed",
+            "{place:?}: {}",
+            text(&copy)
+        );
+        assert!(
+            text(&copy).ends_with(
+                "\nit needs the user's approval before it runs: it is the code of a team script hidden on this \
+                 computer, which is not approved on this machine"
+            ),
+            "{place:?}: {}",
+            text(&copy)
+        );
+        refusal(&tool(&mut server, "script_run", json!({ "name": "copied" })));
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_save_is_not_trusted_while_the_hidden_scripts_cannot_be_read() {
+    const TEAM: &str = "team:aaaaaaaaaaaaaaaa";
+
+    let fixture = Fixture::new();
+    fixture.save_into("team.sqlite3", "teammate", "printf team", Provenance::default());
+
+    // A hidden list whose table cannot be read: every read shows everything, a check fails.
+    drop(fixture.store());
+    rusqlite::Connection::open(fixture.data().join("memory.sqlite3"))
+        .expect("raw local")
+        .execute_batch("CREATE TABLE hidden_team_scripts (team TEXT NOT NULL)")
+        .expect("unreadable table");
+
+    let mut server = fixture.split_server(200, NotesPlace::RemoteLocal, TEAM);
+    let saved = tool(&mut server, "script_save", save("fresh", "sh", "printf fresh"));
+    assert_eq!(saved["result"]["isError"], false, "{}", text(&saved));
+    assert_eq!(
+        saved["result"]["structuredContent"]["script"]["approval"],
+        "needed",
+        "{}",
+        text(&saved)
+    );
+    assert!(
+        text(&saved).contains(
+            "\nit needs the user's approval before it runs: the scripts waiting for approval could not be checked ("
+        ),
+        "{}",
+        text(&saved)
+    );
+    refusal(&tool(&mut server, "script_run", json!({ "name": "fresh" })));
 }

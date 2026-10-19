@@ -1,38 +1,60 @@
 //! The script commands of the `harness-memory` executable, for the person at the terminal (and
-//! Harness Desktop on their behalf), never for an agent's MCP calls:
+//! Harness Desktop on their behalf), never for an agent's MCP calls. Each sees the scripts the MCP
+//! server's `script_list` would (the repository of `--project`, else of the working directory,
+//! and the global scope), through the same store: with `scripts = "remote+local"` the team's
+//! scripts and this computer's (shown past [`crate::store::split::LOCAL_ID_OFFSET`]), and never a
+//! team script hidden on this computer (see [`crate::store::SplitScripts`]).
 //!
 //! - `harness-memory scripts list --json [--project PATH] [--group needsReview|repo|global]
 //!   [--scope repo|global] [--review needed|trusted] [--query TEXT]
 //!   [--sort name|language|scope|place|runs|lastRun|updated] [--order asc|desc] [--offset N]
-//!   [--limit N]` prints `{"total": N, "groups": {"needsReview": N, "repo": N, "global": N},
-//!   "scopes": {"repo": N, "global": N}, "review": {"needed": N, "trusted": N}, "scripts": [...]}`:
-//!   one page of the visible scripts (the repository of `--project`, else of the working
-//!   directory, and the global scope) as the objects `script_list` returns. The groups do not
-//!   overlap: `needsReview` holds every script that needs approval, `repo` and `global` the others
-//!   of their scope. `--scope` keeps the scripts of one scope, `--review needed` those that need
-//!   approval (the `needsReview` group), `--review trusted` every other one; the two combine,
-//!   and neither combines with `--group`. `--query` keeps the scripts whose name or description
-//!   contains it, ignoring case (as `script_list` does). The group counts follow `--query`, the
-//!   scope counts `--query` and `--review`, the review counts `--query` and `--scope`, the total
-//!   every filter. By name (ties: repository scripts first) ascending unless `--sort updated`
-//!   (newest first), `language`, `scope` (global scripts first), `place` (every listed script is
-//!   in one place, so by id), `runs` (the run count) or `lastRun` (the latest run; a script never
-//!   run comes last either way), all ascending; `--order` turns any round, ties go by id.
-//!   `--limit` is 1 to 200, 50 when not given; `--untrusted` is `--group needsReview`. Approval
-//!   is decided on this machine, so every visible script is read and the page is cut here, not
-//!   in the database.
+//!   [--limit N] [--hidden]` prints `{"total": N, "groups": {"needsReview": N, "repo": N,
+//!   "global": N}, "scopes": {"repo": N, "global": N}, "review": {"needed": N, "trusted": N},
+//!   "scripts": [...]}`: one page of the visible scripts as the objects `script_list` returns
+//!   (`place` per script, `team` or `local`; `readOnly` for a team script while scripts are
+//!   `remote+local`; `hidden`). The groups do not overlap: `needsReview` holds every script that
+//!   needs approval, `repo` and `global` the others of their scope. `--scope` keeps the scripts of
+//!   one scope, `--review needed` those that need approval (the `needsReview` group),
+//!   `--review trusted` every other one; the two combine, and neither combines with `--group`.
+//!   `--query` keeps the scripts whose name or description contains it, ignoring case (as
+//!   `script_list` does). The group counts follow `--query`, the scope counts `--query` and
+//!   `--review`, the review counts `--query` and `--scope`, the total every filter. By name (ties:
+//!   repository scripts first, then this computer's) ascending unless `--sort updated` (newest
+//!   first), `language`, `scope` (global scripts first), `place` (this computer's first, then by
+//!   id), `runs` (the run count) or `lastRun` (the latest run; a script never run comes last either
+//!   way), all ascending; `--order` turns any round, ties go by id. `--limit` is 1 to 200, 50 when
+//!   not given; `--untrusted` is `--group needsReview`. Approval is decided on this machine, so
+//!   every visible script is read and the page is cut here, not in the database. With a team
+//!   database the object also has `hiddenCount` (the team scripts of the view hidden on this
+//!   computer) and `localCounts` (`{"repo": N, "global": N}`: the scripts in the local file per
+//!   scope, every repository's, 0 without the file). `--hidden` lists only the hidden team scripts
+//!   of the view instead (the filters, the order and the paging apply to them, `total` counts
+//!   them); a hidden script the team database no longer has is dropped from the hidden list.
+//! - `harness-memory scripts get <id> --json [--project PATH] [--hidden]` prints
+//!   `{"script": {... "body"}}`: the list object with the body. A hidden team script is not found
+//!   unless `--hidden` is given.
+//! - `harness-memory scripts hide|unhide <id> [--project PATH] [--json]` hide a team script on this
+//!   computer or show it again (see [`crate::cli_scripts::hidden`]).
 //! - `harness-memory scripts delete <id> [--project PATH]` deletes a visible script as
 //!   `script_delete` does (a version that needs approval is remembered first, so saving its code
 //!   again trusts nothing) and prints `deleted script <id> <name>`; a script that is not visible
-//!   exits 1 with `harness-memory: script <id> not found`.
+//!   exits 1 with `harness-memory: script <id> not found`, a read-only team script exits 1 naming
+//!   `harness-memory scripts hide`.
 //! - `harness-memory scripts delete --all --yes [--project PATH] [--json]` does that for every
-//!   script `scripts list` shows without filters (all groups, all pages), deleted in one write,
-//!   and prints `deleted N scripts` (and how many came from the team database), or
+//!   script `scripts list` shows without filters (all groups, all pages), deleted in one write per
+//!   store, and prints `deleted N scripts` (and how many came from the team database), or
 //!   `{"deleted": N, "team": M}` with `--json` (`team`: how many were kept in the team database).
-//!   Without `--yes` it deletes nothing and exits 2.
+//!   With `remote+local` only the scripts on this computer go: the team scripts stay, counted as
+//!   `kept` (`{"deleted": N, "team": 0, "kept": K}`). Without `--yes` it deletes nothing and exits
+//!   2.
+//! - `harness-memory scripts discard-local (--all | ID[,ID...] | -) [--scope repo|global] --yes
+//!   [--json]` deletes scripts from the local file while scripts are `remote` (see
+//!   [`crate::cli_scripts::discard`]).
+//! - `harness-memory scripts push [...]` copies the scripts saved on this computer into the team
+//!   database (see [`crate::cli_scripts::push`]).
 //! - `harness-memory trust <id>=<sha256>... [--project PATH]` approves those scripts on this
-//!   machine when each still has the `sha256` that was reviewed (the `sha256` of `scripts list`);
-//!   a script changed since is not approved. `harness-memory trust <id>...` and
+//!   machine when each still has the `sha256` that was reviewed (the `id` and `sha256` of
+//!   `scripts list`); a script changed since is not approved. `harness-memory trust <id>...` and
 //!   `harness-memory trust --all [--project PATH]` (every visible script that needs it) approve the
 //!   versions there are now, for a person who reads them in the terminal: they run only with a
 //!   terminal as standard input (an agent's shell tool has none, so it cannot approve what no one
@@ -42,27 +64,28 @@
 //!
 //! Exit codes and errors as in [`crate::cli`].
 
-use std::cmp::Ordering;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use serde_json::{Value, json};
 
-use crate::backend::{self, Place, Selection};
-use crate::cli::{self, Args, Delete, PAGE_OPTIONS, Page};
-use crate::limits::QUERY_MAX;
-use crate::mcp::{Approval, Shown, approval_of};
-use crate::open::{open_scripts, open_trust};
-use crate::store::{
-    Scope, Script, ScriptRef, ScriptStore, ScriptSummary, TrustOrigin, TrustStore, TrustedVersion, View,
-};
+use crate::backend::{NotesPlace, Place, Selection};
+use crate::cli::{self, Args, Delete};
+use crate::cli_scripts::{Opened, discard, hidden, list, not_found, push};
+use crate::store::{Script, ScriptRef, TrustOrigin, TrustedVersion};
 use crate::store::{foreign_encoding, foreign_encoding_error, hidden_character, hidden_character_error};
 
 /// The usage of these commands, for the executable's usage line.
 pub const USAGE: &str = "scripts list --json [--project PATH] [--group needsReview|repo|global] [--scope \
-                         repo|global] [--review needed|trusted] [--query TEXT] [--sort name|language|scope|place|runs|lastRun|updated] [--order asc|desc] [--offset N] [--limit N] | scripts delete <id> \
-                         [--project PATH] | scripts delete --all --yes [--project PATH] [--json] | trust \
-                         <id>[=<sha256>]... | --all [--project PATH]";
+                         repo|global] [--review needed|trusted] [--query TEXT] [--sort \
+                         name|language|scope|place|runs|lastRun|updated] [--order asc|desc] [--offset N] [--limit N] \
+                         [--hidden] | scripts get <id> --json [--project PATH] [--hidden] | scripts hide <id> \
+                         [--project PATH] [--json] | scripts unhide <id> [--project PATH] [--json] | scripts delete \
+                         <id> [--project PATH] | scripts delete --all --yes [--project PATH] [--json] | scripts \
+                         discard-local (--all | ID[,ID...] | -) [--scope repo|global] --yes [--json] | scripts push \
+                         [--dry-run] [--json] [--overwrite none|all|ID[,ID...]|-] [--delete-copied] [--scope \
+                         repo|global] [--repo <key|.>] [--no-global] | trust <id>[=<sha256>]... | --all [--project \
+                         PATH]";
 
 /// The line `harness-memory check` adds when every team script runs without approval.
 pub fn check_line(selection: &Selection) -> Option<&'static str> {
@@ -74,9 +97,65 @@ pub fn check_line(selection: &Selection) -> Option<&'static str> {
 /// `harness-memory scripts <args>`.
 pub fn scripts(args: &[Option<&str>]) -> ExitCode {
     match args {
+        [Some("get"), rest @ ..] => get(rest),
+        [Some("hide"), rest @ ..] => hidden::hide(rest),
+        [Some("unhide"), rest @ ..] => hidden::unhide(rest),
         [Some("delete"), rest @ ..] => delete(rest),
-        _ => list(args),
+        [Some("discard-local"), rest @ ..] => discard::discard_local(rest),
+        [Some("push"), rest @ ..] => push::push(rest),
+        _ => list::list(args),
     }
+}
+
+/// `scripts get`.
+fn get(args: &[Option<&str>]) -> ExitCode {
+    let Some((id, project, show_hidden)) = parse_get(args) else {
+        return usage();
+    };
+
+    let Some(mut opened) = Opened::open(project.as_deref()) else {
+        return ExitCode::FAILURE;
+    };
+
+    let found = match opened.scripts.get_script(&opened.view, &ScriptRef::Id(id)) {
+        Ok(Some(script)) => Ok(Some((script, false))),
+        Ok(None) if show_hidden => hidden::script(&mut opened, id).map(|script| script.map(|script| (script, true))),
+        Ok(None) => Ok(None),
+        Err(error) => Err(error),
+    };
+
+    let (script, is_hidden) = match found {
+        Ok(Some(found)) => found,
+        Ok(None) => return not_found(id),
+        Err(error) => return opened.failed(&error.to_string()),
+    };
+
+    let approval = match opened.approval(&script.summary) {
+        Ok(approval) => approval,
+        Err(message) => return opened.failed(&message),
+    };
+
+    let mut shown = opened.json(&script.summary, approval, is_hidden);
+    shown["body"] = Value::String(script.body);
+
+    println!("{}", json!({ "script": shown }));
+    ExitCode::SUCCESS
+}
+
+/// The script id, `--project` and `--hidden` after `scripts get`, which needs `--json`; `None` for
+/// anything else.
+fn parse_get(args: &[Option<&str>]) -> Option<(i64, Option<String>, bool)> {
+    let parsed = Args::parse(args, &["--json", "--hidden"], &["--project"])?;
+
+    let [id] = parsed.positional[..] else {
+        return None;
+    };
+
+    if !parsed.flag("--json") {
+        return None;
+    }
+
+    Some((id.parse().ok()?, parsed.project().ok()?, parsed.flag("--hidden")))
 }
 
 /// `scripts delete`.
@@ -89,19 +168,33 @@ fn delete(args: &[Option<&str>]) -> ExitCode {
     }
 }
 
-/// `scripts delete <id>`.
+/// `scripts delete <id>`: deletes the visible script `id` as `script_delete` does, after deciding
+/// its approval (which remembers a version that needs it).
 fn delete_one(id: i64, project: Option<&str>) -> ExitCode {
     let Some(mut opened) = Opened::open(project) else {
         return ExitCode::FAILURE;
     };
 
-    match opened.delete(id) {
-        Ok(Some(name)) => {
-            println!("deleted script {id} {name}");
+    let found = match opened.scripts.get_script(&opened.view, &ScriptRef::Id(id)) {
+        Ok(found) => found,
+        Err(error) => return opened.failed(&error.to_string()),
+    };
+
+    let Some(Script { summary, .. }) = found else {
+        return not_found(id);
+    };
+
+    if let Err(message) = opened.approval(&summary) {
+        return opened.failed(&message);
+    }
+
+    match opened.scripts.delete_script(&opened.view, &ScriptRef::Id(id)) {
+        Ok(true) => {
+            println!("deleted script {id} {}", summary.name);
             ExitCode::SUCCESS
         }
-        Ok(None) => opened.failed(&format!("script {id} not found")),
-        Err(message) => opened.failed(&message),
+        Ok(false) => not_found(id),
+        Err(error) => opened.failed(&error.to_string()),
     }
 }
 
@@ -112,89 +205,28 @@ fn delete_all(project: Option<&str>, json: bool) -> ExitCode {
     };
 
     // Listing decides each script's approval, which remembers the versions that need it.
-    let ids: Vec<i64> = match opened.list(None) {
-        Ok(listed) => listed.iter().map(|(summary, _)| summary.id).collect(),
+    let listed: Vec<(i64, Place)> = match opened.list(None) {
+        Ok(listed) => listed
+            .iter()
+            .map(|(summary, _)| (summary.id, opened.spot(summary.id).0))
+            .collect(),
         Err(message) => return opened.failed(&message),
     };
 
+    let ids: Vec<i64> = listed.iter().map(|(id, _)| *id).collect();
     let deleted = match opened.scripts.delete_scripts(&opened.view, &ids) {
         Ok(deleted) => deleted,
         Err(error) => return opened.failed(&error.to_string()),
     };
 
-    let team = if opened.place == Place::Remote { deleted } else { 0 };
+    let place = opened.selection.scripts_place();
+    let team = if place == NotesPlace::Remote { deleted } else { 0 };
 
-    cli::deleted_all("script", deleted, team, json);
-    ExitCode::SUCCESS
-}
+    // With `remote+local` the team scripts are read-only, so they stay.
+    let kept =
+        (place == NotesPlace::RemoteLocal).then(|| listed.iter().filter(|(_, side)| *side == Place::Remote).count());
 
-/// `scripts list`.
-fn list(args: &[Option<&str>]) -> ExitCode {
-    let Some(options) = parse_list(args) else {
-        return usage();
-    };
-
-    let Some(mut opened) = Opened::open(options.project.as_deref()) else {
-        return ExitCode::FAILURE;
-    };
-
-    let page = &options.page;
-
-    if page.query.chars().count() > QUERY_MAX {
-        return opened.failed(&format!("query is longer than {QUERY_MAX} characters"));
-    }
-
-    let query = (!page.query.is_empty()).then_some(page.query.as_str());
-    let mut listed = match opened.list(query) {
-        Ok(listed) => listed,
-        Err(message) => return opened.failed(&message),
-    };
-
-    let count = |keeps: &dyn Fn(&ScriptSummary, Approval) -> bool| {
-        listed
-            .iter()
-            .filter(|(summary, approval)| keeps(summary, *approval))
-            .count()
-    };
-    let in_group = |group: Group| count(&|summary, approval| Group::of(summary, approval) == group);
-    let in_scope = |scope: Scope| count(&|summary, approval| summary.scope == scope && options.review_keeps(approval));
-    let in_review =
-        |review: Review| count(&|summary, approval| Review::of(approval) == review && options.scope_keeps(summary));
-
-    let groups = json!({
-        "needsReview": in_group(Group::NeedsReview),
-        "repo": in_group(Group::Repo),
-        "global": in_group(Group::Global),
-    });
-    let scopes = json!({
-        "repo": in_scope(Scope::Repo),
-        "global": in_scope(Scope::Global),
-    });
-    let review = json!({
-        "needed": in_review(Review::Needed),
-        "trusted": in_review(Review::Trusted),
-    });
-
-    listed.retain(|(summary, approval)| options.keeps(summary, *approval));
-    listed.sort_by(|(a, _), (b, _)| options.compare(a, b));
-
-    let objects: Vec<Value> = listed
-        .iter()
-        .skip(page.offset)
-        .take(page.limit)
-        .map(|(summary, approval)| opened.json(summary, *approval))
-        .collect();
-
-    println!(
-        "{}",
-        json!({
-            "total": listed.len(),
-            "groups": groups,
-            "scopes": scopes,
-            "review": review,
-            "scripts": objects,
-        })
-    );
+    cli::deleted_all_keeping("script", (deleted, team), kept, json);
     ExitCode::SUCCESS
 }
 
@@ -241,7 +273,7 @@ pub fn trust(args: &[Option<&str>]) -> ExitCode {
     let mut refusals = Vec::new();
 
     for pick in picks {
-        match opened.approve(&pick) {
+        match approve(&mut opened, &pick) {
             Ok(Approved::Line(line)) => println!("{line}"),
             Ok(Approved::Refused(message)) => refusals.push(message),
             Err(message) => return opened.failed(&message),
@@ -263,147 +295,59 @@ pub fn trust(args: &[Option<&str>]) -> ExitCode {
     }
 }
 
-/// The options of `scripts list --json`.
-#[derive(Debug)]
-struct ListOptions {
-    group: Option<Group>,
-    /// `--scope`; never given with [`Self::group`].
-    scope: Option<Scope>,
-    /// `--review`; never given with [`Self::group`].
-    review: Option<Review>,
-    project: Option<String>,
-    sort: ScriptSort,
-    descending: bool,
-    page: Page,
-}
+/// Approves the script `pick` names (its id as `scripts list` shows it) as read now, unless it
+/// changed since the `sha256` the person reviewed or its body holds a [`hidden_character`] or
+/// declares a [`foreign_encoding`]. The trust is recorded where the script is kept, under its id
+/// there.
+fn approve(opened: &mut Opened, pick: &Pick) -> Result<Approved, String> {
+    let id = pick.id;
+    let script = opened
+        .scripts
+        .get_script(&opened.view, &ScriptRef::Id(id))
+        .map_err(|error| error.to_string())?;
 
-impl ListOptions {
-    /// True when the group, the scope and the review asked for keep the script.
-    fn keeps(&self, summary: &ScriptSummary, approval: Approval) -> bool {
-        let in_group = self.group.is_none_or(|group| Group::of(summary, approval) == group);
+    let Some(script) = script else {
+        return Ok(Approved::Refused(format!("script {id} not found")));
+    };
 
-        in_group && self.scope_keeps(summary) && self.review_keeps(approval)
+    let Script { summary, body } = &script;
+    let name = &summary.name;
+
+    if pick.sha256.as_ref().is_some_and(|reviewed| *reviewed != summary.sha256) {
+        return Ok(Approved::Refused(format!(
+            "script {id} {name} changed since you reviewed it"
+        )));
     }
 
-    /// True when the scope asked for (if any) keeps the script.
-    fn scope_keeps(&self, summary: &ScriptSummary) -> bool {
-        self.scope.is_none_or(|scope| summary.scope == scope)
+    if let Some(found) = hidden_character(body) {
+        return Ok(Approved::Refused(format!(
+            "script {id} {name} was not trusted, it can never run: {}",
+            hidden_character_error(found)
+        )));
     }
 
-    /// True when the review asked for (if any) keeps a script with `approval`.
-    fn review_keeps(&self, approval: Approval) -> bool {
-        self.review.is_none_or(|review| Review::of(approval) == review)
+    if let Some(encoding) = foreign_encoding(summary.language, body) {
+        return Ok(Approved::Refused(format!(
+            "script {id} {name} was not trusted, it can never run: {}",
+            foreign_encoding_error(&encoding)
+        )));
     }
 
-    /// The order of the list: by [`Self::sort`], then by id, turned round when descending; a
-    /// script never run comes after the others by `lastRun` either way.
-    fn compare(&self, a: &ScriptSummary, b: &ScriptSummary) -> Ordering {
-        let is_repo = |summary: &ScriptSummary| summary.scope == Scope::Repo;
+    let (side, raw) = opened.spot(id);
+    let key = opened.selection.scripts_trust_key(side);
+    let trusted = opened
+        .trust
+        .trust_of(&key, raw, &summary.sha256)
+        .map_err(|error| error.to_string())?;
 
-        let ascending = match self.sort {
-            ScriptSort::Name => a.name.cmp(&b.name).then(is_repo(b).cmp(&is_repo(a))),
-            ScriptSort::Language => a.language.as_str().cmp(b.language.as_str()),
-            ScriptSort::Scope => is_repo(a).cmp(&is_repo(b)),
-            ScriptSort::Place => Ordering::Equal,
-            ScriptSort::Runs => a.run_count.cmp(&b.run_count),
-            ScriptSort::LastRun => match (a.last_run_at, b.last_run_at) {
-                (Some(a_run), Some(b_run)) => a_run.cmp(&b_run),
-                (Some(_), None) => return Ordering::Less,
-                (None, Some(_)) => return Ordering::Greater,
-                (None, None) => Ordering::Equal,
-            },
-            ScriptSort::Updated => a.updated_at.cmp(&b.updated_at),
-        }
-        .then(a.id.cmp(&b.id));
-
-        if self.descending {
-            ascending.reverse()
-        } else {
-            ascending
-        }
-    }
-}
-
-/// What `scripts list` sorts by (see the module docs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScriptSort {
-    Name,
-    Language,
-    Scope,
-    Place,
-    Runs,
-    LastRun,
-    Updated,
-}
-
-impl ScriptSort {
-    fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "name" => Some(Self::Name),
-            "language" => Some(Self::Language),
-            "scope" => Some(Self::Scope),
-            "place" => Some(Self::Place),
-            "runs" => Some(Self::Runs),
-            "lastRun" => Some(Self::LastRun),
-            "updated" => Some(Self::Updated),
-            _ => None,
-        }
-    }
-}
-
-/// The group of a listed script: every script that needs approval, else its scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Group {
-    NeedsReview,
-    Repo,
-    Global,
-}
-
-impl Group {
-    fn of(summary: &ScriptSummary, approval: Approval) -> Self {
-        if !approval.is_trusted() {
-            return Self::NeedsReview;
-        }
-
-        match summary.scope {
-            Scope::Repo => Self::Repo,
-            Scope::Global => Self::Global,
-        }
+    if trusted.is_some_and(|record| record.is_for(summary)) {
+        return Ok(Approved::Line(format!("script {id} {name} is already trusted")));
     }
 
-    fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "needsReview" => Some(Self::NeedsReview),
-            "repo" => Some(Self::Repo),
-            "global" => Some(Self::Global),
-            _ => None,
-        }
-    }
-}
+    let version = TrustedVersion::of(&key, raw, &script, TrustOrigin::Approved);
+    opened.trust.trust(&version).map_err(|error| error.to_string())?;
 
-/// Whether a listed script needs approval (the [`Group::NeedsReview`] scripts) or not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Review {
-    Needed,
-    Trusted,
-}
-
-impl Review {
-    fn of(approval: Approval) -> Self {
-        if approval.is_trusted() {
-            Self::Trusted
-        } else {
-            Self::Needed
-        }
-    }
-
-    fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "needed" => Some(Self::Needed),
-            "trusted" => Some(Self::Trusted),
-            _ => None,
-        }
-    }
+    Ok(Approved::Line(format!("trusted script {id} {name}")))
 }
 
 /// The options of `trust`: the scripts, or `None` for `--all`.
@@ -457,56 +401,6 @@ enum Approved {
     Refused(String),
 }
 
-/// The options after `scripts`; `None` for anything but `list --json` with known, unrepeated
-/// options and valid values, and for a group (`--group`, `--untrusted`) with `--scope` or
-/// `--review`.
-fn parse_list(args: &[Option<&str>]) -> Option<ListOptions> {
-    let valued = [
-        &PAGE_OPTIONS[..],
-        &["--project", "--group", "--scope", "--review", "--sort"],
-    ]
-    .concat();
-    let parsed = Args::parse(args, &["--json", "--untrusted"], &valued)?;
-
-    if parsed.positional != ["list"] || !parsed.flag("--json") {
-        return None;
-    }
-
-    let group = match (parsed.flag("--untrusted"), parsed.value("--group")) {
-        (true, Some(_)) => return None,
-        (true, None) => Some(Group::NeedsReview),
-        (false, Some(raw)) => Some(Group::parse(raw)?),
-        (false, None) => None,
-    };
-
-    let scope = parsed.scope().ok()?;
-    let review = match parsed.value("--review") {
-        Some(raw) => Some(Review::parse(raw)?),
-        None => None,
-    };
-
-    if group.is_some() && (scope.is_some() || review.is_some()) {
-        return None;
-    }
-
-    let sort = match parsed.value("--sort") {
-        Some(raw) => ScriptSort::parse(raw)?,
-        None => ScriptSort::Name,
-    };
-
-    let page = Page::of(&parsed)?;
-
-    Some(ListOptions {
-        group,
-        scope,
-        review,
-        project: parsed.project().ok()?,
-        sort,
-        descending: page.descending.unwrap_or(sort == ScriptSort::Updated),
-        page,
-    })
-}
-
 /// The options after `trust`; `None` unless they name scripts or `--all` (not both).
 fn parse_trust(args: &[Option<&str>]) -> Option<TrustOptions> {
     let parsed = Args::parse(args, &["--all"], &["--project"])?;
@@ -527,158 +421,8 @@ fn parse_trust(args: &[Option<&str>]) -> Option<TrustOptions> {
     }
 }
 
-fn usage() -> ExitCode {
+pub(crate) fn usage() -> ExitCode {
     cli::usage(USAGE)
-}
-
-/// The script store, this machine's trust and the visible scripts, opened like the server does.
-struct Opened {
-    scripts: Box<dyn ScriptStore>,
-    trust: Box<dyn TrustStore>,
-    place: Place,
-    /// The trust name of where the scripts are ([`Selection::scripts_key`]).
-    key: String,
-    team_trusted: bool,
-    view: View,
-    secrets: backend::Secrets,
-}
-
-impl Opened {
-    /// Opens the stores for the scripts visible from `project` (else the working directory);
-    /// `None`, with the reason printed, when the settings or the project are wrong.
-    fn open(project: Option<&str>) -> Option<Self> {
-        let (env, selection) = cli::settings()?;
-        let repo = cli::repository(&env, project)?;
-
-        Some(Self {
-            scripts: open_scripts(&env, &selection),
-            trust: open_trust(&env),
-            place: selection.scripts_place(),
-            key: selection.scripts_key(),
-            team_trusted: selection.team_scripts_trusted(),
-            view: View { repo, global: true },
-            secrets: selection.backend.secrets(),
-        })
-    }
-
-    /// Every visible script `query` keeps, with how this machine may run it, as `script_list`
-    /// lists them.
-    fn list(&mut self, query: Option<&str>) -> Result<Vec<(ScriptSummary, Approval)>, String> {
-        let summaries = self
-            .scripts
-            .list_scripts(&self.view, query)
-            .map_err(|error| error.to_string())?;
-
-        summaries
-            .into_iter()
-            .map(|summary| {
-                let approval = approval_of(
-                    self.trust.as_mut(),
-                    self.team_trusted,
-                    &self.key,
-                    &summary,
-                    &summary.sha256,
-                )?;
-                Ok((summary, approval))
-            })
-            .collect()
-    }
-
-    /// Deletes the visible script `id` as `script_delete` does, after deciding its approval (which
-    /// remembers a version that needs it); its name, `None` when it is not visible.
-    fn delete(&mut self, id: i64) -> Result<Option<String>, String> {
-        let found = self
-            .scripts
-            .get_script(&self.view, &ScriptRef::Id(id))
-            .map_err(|error| error.to_string())?;
-
-        let Some(Script { summary, .. }) = found else {
-            return Ok(None);
-        };
-
-        approval_of(
-            self.trust.as_mut(),
-            self.team_trusted,
-            &self.key,
-            &summary,
-            &summary.sha256,
-        )?;
-
-        let deleted = self
-            .scripts
-            .delete_script(&self.view, &ScriptRef::Id(id))
-            .map_err(|error| error.to_string())?;
-
-        Ok(deleted.then_some(summary.name))
-    }
-
-    /// The `script_list` object of `summary`.
-    fn json(&self, summary: &ScriptSummary, approval: Approval) -> Value {
-        Shown {
-            summary,
-            sha256: &summary.sha256,
-            place: self.place,
-            approval,
-        }
-        .json()
-    }
-
-    /// Approves the script `pick` names as read now, unless it changed since the `sha256` the
-    /// person reviewed or its body holds a [`hidden_character`] or declares a [`foreign_encoding`].
-    fn approve(&mut self, pick: &Pick) -> Result<Approved, String> {
-        let id = pick.id;
-        let script = self
-            .scripts
-            .get_script(&self.view, &ScriptRef::Id(id))
-            .map_err(|error| error.to_string())?;
-
-        let Some(script) = script else {
-            return Ok(Approved::Refused(format!("script {id} not found")));
-        };
-
-        let Script { summary, body } = &script;
-        let name = &summary.name;
-
-        if pick.sha256.as_ref().is_some_and(|reviewed| *reviewed != summary.sha256) {
-            return Ok(Approved::Refused(format!(
-                "script {id} {name} changed since you reviewed it"
-            )));
-        }
-
-        if let Some(found) = hidden_character(body) {
-            return Ok(Approved::Refused(format!(
-                "script {id} {name} was not trusted, it can never run: {}",
-                hidden_character_error(found)
-            )));
-        }
-
-        if let Some(encoding) = foreign_encoding(summary.language, body) {
-            return Ok(Approved::Refused(format!(
-                "script {id} {name} was not trusted, it can never run: {}",
-                foreign_encoding_error(&encoding)
-            )));
-        }
-
-        let trusted = self
-            .trust
-            .trust_of(&self.key, id, &summary.sha256)
-            .map_err(|error| error.to_string())?;
-
-        if trusted.is_some_and(|record| record.is_for(summary)) {
-            return Ok(Approved::Line(format!("script {id} {name} is already trusted")));
-        }
-
-        let version = TrustedVersion::of(&self.key, &script, TrustOrigin::Approved);
-        self.trust.trust(&version).map_err(|error| error.to_string())?;
-
-        Ok(Approved::Line(format!("trusted script {id} {name}")))
-    }
-
-    /// Prints `message` without the database credentials; exit 1.
-    fn failed(&self, message: &str) -> ExitCode {
-        eprintln!("harness-memory: {}", self.secrets.scrub(message));
-        ExitCode::FAILURE
-    }
 }
 
 #[cfg(test)]
@@ -693,7 +437,7 @@ mod tests {
     fn check_names_trusted_team_scripts_only_when_scripts_go_to_the_team_database() {
         use crate::backend::{Backend, Routing};
 
-        let selection = |backend: Backend, scripts: Place, trust_team_scripts: bool| Selection {
+        let selection = |backend: Backend, scripts: NotesPlace, trust_team_scripts: bool| Selection {
             backend,
             routing: Routing {
                 scripts,
@@ -710,72 +454,16 @@ mod tests {
             url: "postgres://db/memory".to_owned(),
         };
 
-        assert_eq!(
-            check_line(&selection(team(), Place::Remote, true)),
-            Some("team scripts: trusted automatically")
-        );
-        assert_eq!(check_line(&selection(team(), Place::Remote, false)), None);
-        assert_eq!(check_line(&selection(team(), Place::Local, true)), None);
-        assert_eq!(check_line(&selection(Backend::Local, Place::Remote, true)), None);
-    }
-
-    #[test]
-    fn list_options_need_json_and_take_a_project() {
-        let parsed = parse_list(&args(&["list", "--json", "--project", "/w", "--untrusted"])).expect("valid");
-        assert_eq!(parsed.group, Some(Group::NeedsReview));
-        assert_eq!((parsed.sort, parsed.descending), (ScriptSort::Name, false));
-        assert_eq!(parsed.project.as_deref(), Some("/w"));
-
-        for (raw, sort) in [
-            ("language", ScriptSort::Language),
-            ("scope", ScriptSort::Scope),
-            ("place", ScriptSort::Place),
-            ("runs", ScriptSort::Runs),
-            ("lastRun", ScriptSort::LastRun),
-        ] {
-            let parsed = parse_list(&args(&["list", "--json", "--sort", raw])).expect("valid");
-            assert_eq!((parsed.sort, parsed.descending), (sort, false), "{raw}");
+        for scripts in [NotesPlace::Remote, NotesPlace::RemoteLocal] {
+            assert_eq!(
+                check_line(&selection(team(), scripts, true)),
+                Some("team scripts: trusted automatically")
+            );
         }
 
-        let filtered =
-            parse_list(&args(&["list", "--json", "--scope", "global", "--review", "needed"])).expect("valid");
-        assert_eq!(
-            (filtered.group, filtered.scope, filtered.review),
-            (None, Some(Scope::Global), Some(Review::Needed))
-        );
-
-        let updated = parse_list(&args(&["list", "--json", "--group", "repo", "--sort", "updated"])).expect("valid");
-        assert_eq!(
-            (updated.group, updated.sort, updated.descending),
-            (Some(Group::Repo), ScriptSort::Updated, true)
-        );
-        assert_eq!(
-            parse_list(&args(&["list", "--json", "--project=/w"]))
-                .expect("valid")
-                .project
-                .as_deref(),
-            Some("/w")
-        );
-
-        for bad in [
-            &["list"][..],
-            &["--json"],
-            &["show", "--json"],
-            &["list", "--json", "--json"],
-            &["list", "--json", "--project"],
-            &["list", "--json", "--project", "/a", "--project", "/b"],
-            &["list", "--json", "--yaml"],
-            &["list", "--json", "--untrusted", "--group", "repo"],
-            &["list", "--json", "--untrusted", "--scope", "repo"],
-            &["list", "--json", "--group", "repo", "--review", "trusted"],
-            &["list", "--json", "--scope", "both"],
-            &["list", "--json", "--review", "pending"],
-            &["list", "--json", "--group", "trusted"],
-            &["list", "--json", "--sort", "size"],
-            &["list", "--json", "--limit", "500"],
-        ] {
-            assert!(parse_list(&args(bad)).is_none(), "{bad:?}");
-        }
+        assert_eq!(check_line(&selection(team(), NotesPlace::Remote, false)), None);
+        assert_eq!(check_line(&selection(team(), NotesPlace::Local, true)), None);
+        assert_eq!(check_line(&selection(Backend::Local, NotesPlace::Remote, true)), None);
     }
 
     #[test]

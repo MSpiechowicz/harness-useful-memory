@@ -5,6 +5,7 @@
 
 use super::sql::Sql;
 use super::{graph, listing, notes, search};
+use crate::store::listing::excluded_json;
 use crate::store::{Edge, Forget, Hit, Link, Neighborhood, Note, NoteDraft, NotePatch, Saved, SearchQuery, clean};
 use crate::store::{Forgotten, NoteListQuery, NotePage, StoreError, Target, View};
 
@@ -50,6 +51,15 @@ pub(crate) fn similar(engine: &mut impl Engine, view: &View, id: i64, limit: usi
     engine.read(|db| search::similar(db, view, id, limit))
 }
 
+pub(crate) fn similar_text(
+    engine: &mut impl Engine,
+    view: &View,
+    text: (&str, &str),
+    limit: usize,
+) -> Result<Vec<Hit>, StoreError> {
+    engine.read(|db| search::resembling(db, view, text, None, limit))
+}
+
 pub(crate) fn link(engine: &mut impl Engine, target: &Target, link: &Link) -> Result<Edge, StoreError> {
     let link = clean::link(link)?;
     engine.write(|db| graph::link(db, target, &link))
@@ -80,8 +90,9 @@ pub(crate) fn forget(
     })
 }
 
-pub(crate) fn forget_notes(engine: &mut impl Engine, view: &View) -> Result<Forgotten, StoreError> {
-    engine.write(|db| notes::forget_all(db, view))
+pub(crate) fn forget_notes(engine: &mut impl Engine, view: &View, exclude: &[i64]) -> Result<Forgotten, StoreError> {
+    let exclude = excluded_json(exclude)?;
+    engine.write(|db| notes::forget_all(db, view, &exclude))
 }
 
 /// The note titled like `title` in the scope `target`, read exactly and without counting a hit.

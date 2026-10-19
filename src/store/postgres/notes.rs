@@ -227,18 +227,19 @@ pub(super) fn forget(tx: &mut Transaction<'_>, view: &View, id: i64) -> Result<u
 
 /// Deletes every note visible in `view`, then the entities of those scopes that no note or
 /// relation uses (a deleted note's relations stay, their `note_id` cleared by the schema).
-pub(super) fn forget_all(tx: &mut Transaction<'_>, view: &View) -> Result<Forgotten, StoreError> {
+pub(super) fn forget_all(tx: &mut Transaction<'_>, view: &View, exclude: &[i64]) -> Result<Forgotten, StoreError> {
     let (repo, global) = view_params(tx, view)?;
     let mut forgotten = Forgotten::default();
 
     let deleted = tx
         .query(
             "WITH gone AS (
-                 DELETE FROM notes WHERE project_id = $1::bigint OR ($2::boolean AND project_id IS NULL)
+                 DELETE FROM notes WHERE (project_id = $1::bigint OR ($2::boolean AND project_id IS NULL))
+                   AND id <> ALL($3::bigint[])
                  RETURNING project_id IS NULL AS is_global
              )
              SELECT is_global, count(*) FROM gone GROUP BY is_global",
-            &[&repo, &global],
+            &[&repo, &global, &exclude],
         )
         .map_err(backend)?;
 

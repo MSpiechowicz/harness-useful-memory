@@ -16,7 +16,7 @@
 
 use std::cmp::Ordering;
 
-use crate::limits::{LIST_PAGE_MAX, QUERY_MAX};
+use crate::limits::{HIDDEN_MAX, LIST_PAGE_MAX, QUERY_MAX};
 use crate::store::{Note, NoteKind, Provenance, Scope, StoreError, View, clean};
 
 /// One page of notes to list.
@@ -37,6 +37,9 @@ pub struct NoteListQuery {
     pub offset: usize,
     /// Rows on the page (clamped to 1 to [`LIST_PAGE_MAX`]).
     pub limit: usize,
+    /// Note ids left out of the page and the counts (the team notes hidden on this computer), at
+    /// most [`HIDDEN_MAX`].
+    pub exclude: Vec<i64>,
 }
 
 /// The order of a [`NoteListQuery`].
@@ -182,6 +185,24 @@ pub(crate) fn query_text(query: &NoteListQuery) -> Result<Option<&str>, StoreErr
     }
 
     Ok((!text.is_empty()).then_some(text))
+}
+
+/// `ids` as a JSON array (`[3,7]`), for `json_each`; an error when more than [`HIDDEN_MAX`].
+pub(crate) fn excluded_json(ids: &[i64]) -> Result<String, StoreError> {
+    let ids = checked_exclude(ids)?;
+    let listed: Vec<String> = ids.iter().map(i64::to_string).collect();
+    Ok(format!("[{}]", listed.join(",")))
+}
+
+/// `ids` when there are at most [`HIDDEN_MAX`] of them, else an error.
+pub(crate) fn checked_exclude(ids: &[i64]) -> Result<&[i64], StoreError> {
+    if ids.len() > HIDDEN_MAX {
+        return Err(StoreError::Invalid(format!(
+            "at most {HIDDEN_MAX} note ids can be left out"
+        )));
+    }
+
+    Ok(ids)
 }
 
 /// The normalized entity name of `query`; `None` when there is none or it is blank.

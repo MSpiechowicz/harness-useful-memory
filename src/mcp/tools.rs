@@ -57,8 +57,8 @@ fn note_save() -> Value {
         "Call before you finish: save what you learned for later sessions, after finishing work, fixing a \
          non-obvious problem, finding where something lives, or an optimisation. Use repo-relative paths. A note with the same \
          title in the scope is updated (a repository note written from another checkout, or reached through \
-         project_path, is reported instead: replace it with note_update). Similar notes are listed so you can update or delete outdated ones. \
-         Never store secrets.",
+         project_path, is reported instead: replace it with note_update). Similar notes are listed so you can update or delete outdated ones \
+         (those marked team, read-only cannot be changed from here). Never store secrets.",
         json!({
             "title": text(&format!("Short, specific title (1-{TITLE_MAX} characters)")),
             "body": text(&format!("The knowledge itself, concise (1-{BODY_MAX} characters)")),
@@ -80,7 +80,8 @@ fn note_save() -> Value {
 fn note_update() -> Value {
     tool(
         "note_update",
-        "Correct or extend a note by id. Give only the fields to change; append adds text to the body.",
+        "Correct or extend a note by id. Give only the fields to change; append adds text to the body. A \
+         team note of a scope set to remote+local is read-only (refused): save a new note instead.",
         json!({
             "id": { "type": "integer", "description": "Note id" },
             "title": text(&format!("New title (1-{TITLE_MAX} characters)")),
@@ -142,7 +143,8 @@ fn entity_link() -> Value {
     tool(
         "entity_link",
         "Relate two entities: `from relation to`, for example `GitCli located_in business/src/git/cli.rs` \
-         or `retry-fix resolves flaky-test`. Missing entities are created.",
+         or `retry-fix resolves flaky-test`. Missing entities are created. note_id cannot be a read-only team \
+         note (scope set to remote+local).",
         json!({
             "from": text(&format!("Entity name (at most {ENTITY_MAX} characters)")),
             "relation": text(&format!("Relation such as located_in, resolves, depends_on (at most {RELATION_MAX} characters)")),
@@ -174,7 +176,7 @@ fn note_delete() -> Value {
     tool(
         "note_delete",
         "Delete an outdated or wrong note by id, looked up in this repository and the global scope unless \
-         scope is given.",
+         scope is given. A team note of a scope set to remote+local is read-only (refused).",
         json!({
             "id": { "type": "integer", "description": "Note id" },
             "scope": scope(true, "both"),

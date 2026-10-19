@@ -23,6 +23,7 @@ use unicode_normalization::char::is_combining_mark;
 use super::notes::{VISIBLE, entities_of, kind_from_sql, scope_of};
 use super::{KIND_MAX, PATH_MAX, SOURCE_MAX, backend, column, cut, view_params};
 use crate::limits::{BODY_MAX, QUERY_MAX, QUERY_TOKENS_MAX, SEARCH_LIMIT_MAX, SNIPPET_MAX, SNIPPET_TOKENS, TITLE_MAX};
+use crate::store::listing::checked_exclude;
 use crate::store::{Hit, NoteKind, Provenance, SearchQuery, StoreError, View};
 use crate::support::text::STOPWORDS;
 
@@ -47,12 +48,13 @@ fn hit_columns() -> String {
     )
 }
 
-/// Row filters besides the view: the note kind, and the checkout root of
-/// [`SearchQuery::checkout`].
+/// Row filters besides the view: the note kind, the checkout root of [`SearchQuery::checkout`] and
+/// the ids [`SearchQuery::exclude`] leaves out.
 #[derive(Default)]
 struct Filter<'a> {
     kind: Option<&'a str>,
     checkout: Option<&'a str>,
+    exclude: Vec<i64>,
 }
 
 /// A matched row with the body, which [`similar`] compares.
@@ -79,6 +81,7 @@ pub(super) fn search(client: &mut impl GenericClient, query: &SearchQuery) -> Re
     let filter = Filter {
         kind: query.kind.map(NoteKind::as_str),
         checkout: checkout.as_deref(),
+        exclude: checked_exclude(&query.exclude)?.to_vec(),
     };
 
     let rows = if words.is_empty() {
@@ -111,11 +114,22 @@ pub(super) fn similar(
     let title: String = column(&row, 0)?;
     let body: String = column(&row, 1)?;
 
+    resembling(client, view, (&title, &body), Some(id), limit)
+}
+
+/// Up to `limit` notes in `view` resembling a note of `title` and `body`, leaving out note `skip`.
+pub(super) fn resembling(
+    client: &mut impl GenericClient,
+    view: &View,
+    (title, body): (&str, &str),
+    skip: Option<i64>,
+    limit: usize,
+) -> Result<Vec<Hit>, StoreError> {
     let mut keys: Vec<String> = Vec::new();
-    let title_words = words(&title, SIMILAR_TOKENS)
+    let title_words = words(title, SIMILAR_TOKENS)
         .into_iter()
         .filter(|word| word.chars().count() >= 3);
-    let body_words = words(&body, usize::MAX)
+    let body_words = words(body, usize::MAX)
         .into_iter()
         .filter(|word| word.chars().count() >= 4);
 
@@ -141,7 +155,7 @@ pub(super) fn similar(
         view,
         &Filter::default(),
         usize::try_from(SIMILAR_CANDIDATES).unwrap_or(10),
-        Some(id),
+        skip,
     )?;
     let needed = keys.len().min(2);
 
@@ -251,6 +265,9 @@ impl<'a> Matcher<'a> {
 const SAME_CHECKOUT: &str =
     "($7::text IS NULL OR (n.project_id IS NOT NULL AND n.writer_root = $7::text AND NOT n.via_override))";
 
+/// The condition of [`Filter::exclude`] (`$8` the ids).
+const NOT_EXCLUDED: &str = "n.id <> ALL($8::bigint[])";
+
 fn matching(
     client: &mut impl GenericClient,
     matcher: &Matcher<'_>,
@@ -263,7 +280,7 @@ fn matching(
         "SELECT {}
          FROM notes n, to_tsquery('simple'::regconfig, $1) q
          WHERE n.search @@ q AND {VISIBLE} AND ($4::text IS NULL OR n.kind = $4::text) AND n.id != $6
-           AND {SAME_CHECKOUT}
+           AND {SAME_CHECKOUT} AND {NOT_EXCLUDED}
          ORDER BY n.project_id IS NULL, ts_rank('{WEIGHTS}'::float4[], n.search, q, 1) DESC,
                   n.updated_at DESC, n.hits DESC, n.id DESC
          LIMIT $5",
@@ -271,7 +288,7 @@ fn matching(
     );
 
     let tsquery = matcher.tsquery();
-    let params: [&(dyn ToSql + Sync); 7] = [
+    let params: [&(dyn ToSql + Sync); 8] = [
         &tsquery,
         &repo,
         &global,
@@ -279,6 +296,7 @@ fn matching(
         &limit_param(limit),
         &exclude.unwrap_or(0),
         &filter.checkout,
+        &filter.exclude,
     ];
 
     let rows = client.query(&sql, &params).map_err(backend)?;
@@ -293,18 +311,19 @@ fn recent(
     filter: &Filter<'_>,
     limit: usize,
 ) -> Result<Vec<Candidate>, StoreError> {
-    // The parameters keep the numbers of `matching`, so VISIBLE and SAME_CHECKOUT fit both.
+    // The parameters keep the numbers of `matching`, so VISIBLE, SAME_CHECKOUT and NOT_EXCLUDED fit
+    // both.
     let sql = format!(
         "SELECT {}
          FROM notes n
          WHERE $1::text IS NULL AND {VISIBLE} AND ($4::text IS NULL OR n.kind = $4::text)
-           AND n.id != $6 AND {SAME_CHECKOUT}
+           AND n.id != $6 AND {SAME_CHECKOUT} AND {NOT_EXCLUDED}
          ORDER BY n.project_id IS NULL, n.updated_at DESC, n.hits DESC, n.id DESC
          LIMIT $5",
         hit_columns()
     );
 
-    let params: [&(dyn ToSql + Sync); 7] = [
+    let params: [&(dyn ToSql + Sync); 8] = [
         &None::<String>,
         &repo,
         &global,
@@ -312,6 +331,7 @@ fn recent(
         &limit_param(limit),
         &0_i64,
         &filter.checkout,
+        &filter.exclude,
     ];
 
     let rows = client.query(&sql, &params).map_err(backend)?;

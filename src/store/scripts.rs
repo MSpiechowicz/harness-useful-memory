@@ -23,6 +23,7 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 
 use super::{Provenance, Scope, StoreError, Target, View};
+use crate::backend::Place;
 use crate::limits::{SCRIPT_BODY_MAX, SCRIPT_DESCRIPTION_MAX, SCRIPT_NAME_MAX, SCRIPT_TIMEOUT_MAX};
 use crate::support::redact::{has_credentials, redact_text};
 use crate::support::text::is_format_character;
@@ -124,6 +125,34 @@ pub enum ScriptRef {
     Name(String),
 }
 
+/// Where a script a store lists is kept, and its id there (see [`ScriptStore::origin`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptOrigin {
+    /// The store keeps every script in one place, under the id it shows.
+    Single,
+    /// In the team database as script `raw`; `read_only` when scripts are `remote+local`.
+    Team { raw: i64, read_only: bool },
+    /// In the local SQLite file of this computer as script `raw`.
+    Local { raw: i64 },
+}
+
+impl ScriptOrigin {
+    /// The place the script is kept and its id there, `single` being where a [`Self::Single`]
+    /// store keeps its scripts (shown id `id`).
+    pub fn spot(self, id: i64, single: Place) -> (Place, i64) {
+        match self {
+            Self::Single => (single, id),
+            Self::Team { raw, .. } => (Place::Remote, raw),
+            Self::Local { raw } => (Place::Local, raw),
+        }
+    }
+
+    /// True for a team script that cannot be changed from here.
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Self::Team { read_only: true, .. })
+    }
+}
+
 /// A script backend. Like [`super::MemoryStore`], one store serves one process.
 pub trait ScriptStore: Send {
     /// Saves `draft` in the scope `target`, replacing the script with the same name there (its
@@ -157,6 +186,20 @@ pub trait ScriptStore: Send {
 
     /// Counts a run of script `id` that ended at `at` (Unix seconds) with `exit_code`.
     fn record_run(&mut self, id: i64, exit_code: Option<i32>, at: i64) -> Result<(), StoreError>;
+
+    /// The team scripts visible in `view` that this computer hides from every read, under the ids
+    /// they are shown as: for checks that must see them too, never to show them. An error when the
+    /// hidden list cannot be read; none for a store without a hidden list (the default).
+    fn hidden_scripts(&mut self, _view: &View) -> Result<Vec<ScriptSummary>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    /// Where the script this store shows as `id` is kept: [`ScriptOrigin::Single`] for a store of
+    /// one place (the default), the team database or this computer for a
+    /// [`super::SplitScripts`].
+    fn origin(&self, _id: i64) -> ScriptOrigin {
+        ScriptOrigin::Single
+    }
 }
 
 /// How this machine came to trust a script version.
@@ -189,8 +232,9 @@ impl TrustOrigin {
 #[derive(Debug, Clone, Copy)]
 pub struct TrustedVersion<'a> {
     /// Where the script is kept: `local`, or `team:<hash>` naming the team database (see
-    /// [`crate::backend::Selection::scripts_key`]).
+    /// [`crate::backend::Selection::scripts_trust_key`]).
     pub place: &'a str,
+    /// The script's id where it is kept (never an id a [`super::SplitScripts`] shows).
     pub script_id: i64,
     pub name: &'a str,
     pub scope: Scope,
@@ -202,11 +246,12 @@ pub struct TrustedVersion<'a> {
 }
 
 impl<'a> TrustedVersion<'a> {
-    /// The version of `script` (as read from the store) kept in `place`, trusted as `origin`.
-    pub fn of(place: &'a str, script: &'a Script, origin: TrustOrigin) -> Self {
+    /// The version of `script` (as read from the store) kept in `place` as script `raw_id`,
+    /// trusted as `origin`.
+    pub fn of(place: &'a str, raw_id: i64, script: &'a Script, origin: TrustOrigin) -> Self {
         Self {
             place,
-            script_id: script.summary.id,
+            script_id: raw_id,
             name: &script.summary.name,
             scope: script.summary.scope,
             project: script.summary.project.as_deref(),

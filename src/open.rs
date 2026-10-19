@@ -5,61 +5,78 @@
 
 use std::path::Path;
 
-use crate::backend::{self, Backend, Place, Selection};
+use crate::backend::{self, Backend, NotesPlace, Selection};
 use crate::location::{DIR_VAR, Migration, legacy_database_path, migrate_legacy, override_is_relative};
-use crate::store::{Lazy, MemoryStore, Scope, ScriptStore, SplitStore, SqliteStore, TrustStore};
+use crate::store::{
+    HiddenNotes, HiddenScripts, Lazy, MemoryStore, Scope, ScriptStore, SplitScripts, SplitStore, SqliteStore,
+    TrustStore,
+};
 use crate::support::Env;
 
 /// The scripts: in the local SQLite file without a team database or with `scripts = "local"`
-/// ([`Selection::scripts_place`]), else in the team database (its own connection).
+/// ([`Selection::scripts_place`]), else a [`SplitScripts`] reading the team database (its own
+/// connection), and this computer's file too with `remote+local`, leaving out the team scripts
+/// hidden on this computer ([`open_hidden_scripts`]).
 pub fn open_scripts(env: &Env, selection: &Selection) -> Box<dyn ScriptStore> {
-    if selection.scripts_place() == Place::Local {
-        let path = crate::database_path(env);
-        let env = env.clone();
+    let place = selection.scripts_place();
+    let local = local_scripts(env);
 
-        return Box::new(Lazy::new(move || {
-            open_local(&env, path.as_deref()).map(|store| Box::new(store) as Box<dyn ScriptStore>)
-        }));
+    if place == NotesPlace::Local {
+        return local;
     }
 
-    let team = selection.backend.clone();
+    let team = team_scripts(&selection.backend);
+    let hidden = open_hidden_scripts(env, selection);
+    Box::new(SplitScripts::new(team, local, place, hidden))
+}
+
+/// The script store scripts are not read from, when there is one: the team database when they
+/// stay on this computer, else the local SQLite file. `script_save` looks there for a script that
+/// waits for approval, so copying one does not trust it. `None` without a team database, with
+/// `remote+local` (both are read already), or when scripts and notes all stay on this computer
+/// (the team database is then never contacted).
+pub fn open_other_scripts(env: &Env, selection: &Selection) -> Option<Box<dyn ScriptStore>> {
+    if selection.backend == Backend::Local {
+        return None;
+    }
+
+    match selection.scripts_place() {
+        NotesPlace::RemoteLocal => None,
+        NotesPlace::Remote => Some(local_scripts(env)),
+        NotesPlace::Local if selection.routing.is_all_local() => None,
+        NotesPlace::Local => Some(team_scripts(&selection.backend)),
+    }
+}
+
+/// The team scripts hidden on this computer, in the local SQLite file under the team database's
+/// [`Backend::team_key`]; `None` when scripts are not read from the team database or the data
+/// folder is unknown. Nothing is opened (or created) yet.
+pub fn open_hidden_scripts(env: &Env, selection: &Selection) -> Option<HiddenScripts> {
+    if !selection.scripts_place().reads_team() {
+        return None;
+    }
+
+    let path = crate::database_path(env)?;
+    Some(HiddenScripts::new(path, selection.backend.team_key()))
+}
+
+/// The scripts of the local SQLite file, opened on first use.
+fn local_scripts(env: &Env) -> Box<dyn ScriptStore> {
+    let path = crate::database_path(env);
+    let env = env.clone();
+
+    Box::new(Lazy::new(move || {
+        open_local(&env, path.as_deref()).map(|store| Box::new(store) as Box<dyn ScriptStore>)
+    }))
+}
+
+/// The scripts of the team database `backend`, opened on first use.
+fn team_scripts(backend: &Backend) -> Box<dyn ScriptStore> {
+    let team = backend.clone();
 
     Box::new(Lazy::new(move || {
         backend::open_scripts(&team).unwrap_or_else(|| Err("no team database is set".to_owned()))
     }))
-}
-
-/// The script store scripts are not routed to, when there is one: the team database when they
-/// stay on this computer, else the local SQLite file. `script_save` looks there for a script that
-/// waits for approval, so copying one does not trust it. `None` without a team database, or when
-/// scripts and notes all stay on this computer (the team database is then never contacted).
-pub fn open_other_scripts(env: &Env, selection: &Selection) -> Option<Box<dyn ScriptStore>> {
-    if selection.backend == backend::Backend::Local {
-        return None;
-    }
-
-    if selection.scripts_place() == Place::Local && selection.routing.is_all_local() {
-        return None;
-    }
-
-    let other = Selection {
-        backend: selection.backend.clone(),
-        routing: backend::Routing {
-            scripts: match selection.scripts_place() {
-                Place::Local => Place::Remote,
-                Place::Remote => Place::Local,
-            },
-            ..selection.routing
-        },
-        trust_team_scripts: selection.trust_team_scripts,
-        hooks: selection.hooks,
-        trust_team_hooks: selection.trust_team_hooks,
-        routines: selection.routines,
-        trust_team_routines: selection.trust_team_routines,
-        warnings: Vec::new(),
-    };
-
-    Some(open_scripts(env, &other))
 }
 
 /// The script versions this machine trusts: always the local SQLite file, wherever scripts are.
@@ -85,9 +102,11 @@ fn open_local(env: &Env, path: Option<&Path>) -> Result<SqliteStore, String> {
     SqliteStore::open(path).map_err(|error| error.to_string())
 }
 
-/// The notes store the server and `harness-memory notes` use: the local one, the team database,
-/// or both split by scope (see [`crate::backend::Routing`]); `None` (with the reason printed)
-/// when one cannot be opened.
+/// The notes store the server and `harness-memory notes` use: the local one, or the team database
+/// with the local file as [`crate::backend::Routing`] says (a [`SplitStore`], which also leaves out
+/// the team notes hidden on this computer, see [`open_hidden`]); `None` (with the reason printed)
+/// when one cannot be opened. With every scope in the team database the local file is only opened
+/// when a call needs it, which none does.
 pub fn open_notes(env: &Env, selection: &Selection) -> Option<Box<dyn MemoryStore>> {
     let Selection { backend, routing, .. } = selection;
 
@@ -97,32 +116,53 @@ pub fn open_notes(env: &Env, selection: &Selection) -> Option<Box<dyn MemoryStor
 
     let team = open_team_notes(backend)?;
 
-    if !routing.is_split() {
-        return Some(team);
-    }
-
-    let local = open_local_notes(env)?;
-    let local_scope = if routing.repository == Place::Local {
-        Scope::Repo
+    let local: Box<dyn MemoryStore> = if routing.needs_both_stores() {
+        open_local_notes(env)?
     } else {
-        Scope::Global
+        let env = env.clone();
+        Box::new(Lazy::new(move || {
+            open_local_notes(&env).ok_or_else(|| "cannot open the local database".to_owned())
+        }))
     };
 
-    Some(Box::new(SplitStore::new(team, local, local_scope)))
+    let hidden = open_hidden(env, selection);
+    Some(Box::new(SplitStore::routed(
+        team,
+        local,
+        routing.repository,
+        routing.global,
+        hidden,
+    )))
 }
 
-/// Where the notes of `scope` are kept under `selection`, as [`open_notes`] opens them.
-pub fn notes_place(selection: &Selection, scope: Scope) -> Place {
+/// Where the notes of `scope` are read and saved under `selection`, as [`open_notes`] opens them.
+pub fn notes_place(selection: &Selection, scope: Scope) -> NotesPlace {
     let Selection { backend, routing, .. } = selection;
 
     if *backend == Backend::Local || routing.is_all_local() {
-        return Place::Local;
+        return NotesPlace::Local;
     }
 
     match scope {
         Scope::Repo => routing.repository,
         Scope::Global => routing.global,
     }
+}
+
+/// The team notes hidden on this computer, in the local SQLite file under the team database's
+/// [`Backend::team_key`]; `None` when no scope reads the team database or the data folder is
+/// unknown. Nothing is opened (or created) yet.
+pub fn open_hidden(env: &Env, selection: &Selection) -> Option<HiddenNotes> {
+    let reads_team = [Scope::Repo, Scope::Global]
+        .into_iter()
+        .any(|scope| notes_place(selection, scope).reads_team());
+
+    if !reads_team {
+        return None;
+    }
+
+    let path = crate::database_path(env)?;
+    Some(HiddenNotes::new(path, selection.backend.team_key()))
 }
 
 /// The team database; `None` (with the reason printed) when it cannot be opened. That stops the

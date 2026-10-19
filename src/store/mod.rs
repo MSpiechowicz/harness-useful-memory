@@ -2,7 +2,9 @@
 //!
 //! [`MemoryStore`] is what the MCP tools call; [`sqlite::SqliteStore`] is the local backend,
 //! [`postgres::PostgresStore`], [`libsql::LibsqlStore`] and [`mongo::MongoStore`] are shared team
-//! databases, and [`split::SplitStore`] keeps one scope in a team database and the other locally.
+//! databases, and [`split::SplitStore`] reads notes from a team database and the local file as
+//! the routing says, leaving out the team notes [`hidden::HiddenNotes`] hides on this computer
+//! ([`split_scripts::SplitScripts`] does the same for scripts, with [`hidden::HiddenScripts`]).
 //! Every backend validates its input against [`crate::limits`] and masks secrets with
 //! `redact_text` before anything is stored (the helpers in [`clean`] do both), so callers may pass
 //! raw agent text.
@@ -14,6 +16,7 @@
 //! types of [`MemoryStore::list_notes`].
 
 pub mod clean;
+pub mod hidden;
 pub mod hooks;
 pub mod lazy;
 pub mod libsql;
@@ -23,11 +26,13 @@ pub mod postgres;
 pub mod routines;
 pub mod scripts;
 pub mod split;
+pub mod split_scripts;
 pub mod sqlite;
 pub mod team_docs;
 
 use std::path::PathBuf;
 
+pub use hidden::{HiddenEntry, HiddenNote, HiddenNotes, HiddenScripts};
 pub use hooks::{HookDelete, HookDraft, HookPage, HookPut, HookStore, TeamHook, checked_hook, hook_sha256};
 pub use lazy::Lazy;
 pub use libsql::LibsqlStore;
@@ -36,11 +41,12 @@ pub use mongo::MongoStore;
 pub use postgres::PostgresStore;
 pub use routines::{RoutineDelete, RoutineDraft, RoutinePage, RoutinePut, RoutineStore, TeamRoutine, checked_routine};
 pub use scripts::{
-    Language, PreviousVersion, SavedScript, Script, ScriptDraft, ScriptRef, ScriptStore, ScriptSummary, TrustOrigin,
-    TrustRecord, TrustStore, TrustedVersion, checked_draft, declares_encoding, foreign_encoding,
+    Language, PreviousVersion, SavedScript, Script, ScriptDraft, ScriptOrigin, ScriptRef, ScriptStore, ScriptSummary,
+    TrustOrigin, TrustRecord, TrustStore, TrustedVersion, checked_draft, declares_encoding, foreign_encoding,
     foreign_encoding_error, hidden_character, hidden_character_error, is_valid_name, script_sha256, visible_body,
 };
 pub use split::SplitStore;
+pub use split_scripts::SplitScripts;
 pub use sqlite::SqliteStore;
 pub(crate) use sqlite::prepare_new_file;
 pub use team_docs::{DocDelete, DocDraft, DocKind, DocPage, DocPut, TeamDoc, TeamDocStore, checked_doc, doc_sha256};
@@ -243,6 +249,9 @@ pub struct SearchQuery {
     /// `project_path` ([`Provenance::root`] equal to it, not [`Provenance::via_override`]); global
     /// notes are left out too. Memory recall searches this way.
     pub checkout: Option<PathBuf>,
+    /// Note ids left out (the team notes hidden on this computer), at most
+    /// [`crate::limits::HIDDEN_MAX`].
+    pub exclude: Vec<i64>,
 }
 
 /// One search row.
@@ -300,6 +309,17 @@ pub enum Forget {
     Entity(String),
     /// One relation.
     Relation { from: String, relation: String, to: String },
+}
+
+/// Where a note lives ([`MemoryStore::origin`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteOrigin {
+    /// The only database of a store over one (local or team).
+    Single,
+    /// The team database of a [`SplitStore`]; `read_only` in a scope routed `remote+local`.
+    Team { read_only: bool },
+    /// The local SQLite file of a [`SplitStore`].
+    Local,
 }
 
 /// How many notes [`MemoryStore::forget_notes`] deleted, by scope.
@@ -398,6 +418,20 @@ pub trait MemoryStore: Send {
     /// Up to `limit` notes in `view` resembling note `id` (which is left out).
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError>;
 
+    /// Up to `limit` notes in `view` resembling a note of another store, given as its `(title,
+    /// body)` ([`crate::store::SplitStore`] looks in both stores this way). The default finds none.
+    fn similar_text(&mut self, view: &View, text: (&str, &str), limit: usize) -> Result<Vec<Hit>, StoreError> {
+        let _ = (view, text, limit);
+        Ok(Vec::new())
+    }
+
+    /// Where note `id` of `scope` (as this store shows it) lives, and whether it can be changed
+    /// here. A store over one database keeps every note in one place: [`NoteOrigin::Single`].
+    fn origin(&self, id: i64, scope: Scope) -> NoteOrigin {
+        let _ = (id, scope);
+        NoteOrigin::Single
+    }
+
     /// Records `link` in the target scope, creating its entities when missing.
     fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError>;
 
@@ -408,10 +442,11 @@ pub trait MemoryStore: Send {
     /// Returns the number of deleted rows (relations included for an entity).
     fn forget(&mut self, view: &View, target: &Target, what: &Forget) -> Result<usize, StoreError>;
 
-    /// Deletes every note visible in `view` in one write, as [`MemoryStore::forget`] deletes one:
-    /// the relations stay (without their note), and an entity of those scopes that no relation
-    /// uses any more goes.
-    fn forget_notes(&mut self, view: &View) -> Result<Forgotten, StoreError>;
+    /// Deletes every note visible in `view` but those `exclude` names (at most
+    /// [`crate::limits::HIDDEN_MAX`], as [`NoteListQuery::exclude`]) in one write, as
+    /// [`MemoryStore::forget`] deletes one: the relations stay (without their note), and an entity
+    /// of those scopes that no note or relation uses any more goes.
+    fn forget_notes(&mut self, view: &View, exclude: &[i64]) -> Result<Forgotten, StoreError>;
 
     /// The note in the scope `target` (not the global scope too) whose title compares equal to
     /// `title` the way [`MemoryStore::remember`] compares titles. `harness-memory push` uses it to
@@ -439,6 +474,7 @@ pub trait MemoryStore: Send {
             kind: None,
             limit: crate::limits::SEARCH_LIMIT_MAX,
             checkout: None,
+            exclude: Vec::new(),
         };
 
         let found = self

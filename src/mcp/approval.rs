@@ -80,8 +80,9 @@ pub(super) enum Answer {
 }
 
 /// How this machine may run version `sha256` of the script `summary` describes, kept in `place`
-/// (its trust name, see [`crate::backend::Selection::scripts_key`]); `team_trusted` when the
-/// script was read from the team database and `trust_team_scripts` is on. A version trusted as
+/// (its trust name, see [`crate::backend::Selection::scripts_trust_key`]) as script `script_id`
+/// (its id there, which a [`crate::store::SplitScripts`] may show otherwise); `team_trusted` when
+/// the script was read from the team database and `trust_team_scripts` is on. A version trusted as
 /// another name, scope or repository ([`crate::store::TrustRecord::is_for`]) needs approval
 /// again. A version that needs approval is remembered ([`TrustStore::note_unapproved`], as well
 /// as it can be), so `script_save` never trusts its code.
@@ -89,11 +90,12 @@ pub(crate) fn approval_of(
     trust: &mut dyn TrustStore,
     team_trusted: bool,
     place: &str,
+    script_id: i64,
     summary: &ScriptSummary,
     sha256: &str,
 ) -> Result<Approval, String> {
     let record = trust
-        .trust_of(place, summary.id, sha256)
+        .trust_of(place, script_id, sha256)
         .map_err(|error| error.to_string())?
         .filter(|record| record.is_for(summary));
 
@@ -144,8 +146,9 @@ pub(super) fn ask(server: &mut Server, script: &Script, summary: Value, input: &
 
     sweep(&requests);
 
-    let place = server.place_key(server.scripts_place);
-    let previous = match server.trust.previous(&place, script.summary.id) {
+    let (side, raw) = server.spot(script.summary.id);
+    let place = server.place_key(side);
+    let previous = match server.trust.previous(&place, raw) {
         Ok(previous) => previous,
         Err(error) => return Answer::Unasked(Some(error.to_string())),
     };

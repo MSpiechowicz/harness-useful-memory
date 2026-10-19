@@ -179,15 +179,16 @@ pub(super) fn forget(db: &mut dyn Sql, view: &View, id: i64) -> Result<usize, St
 
 /// Deletes every note visible in `view`, then the entities of those scopes that no note or
 /// relation uses (a deleted note's relations stay, their `note_id` cleared by the schema).
-pub(super) fn forget_all(db: &mut dyn Sql, view: &View) -> Result<Forgotten, StoreError> {
-    const SCOPES: &str = "(project_id = ?1 OR (?2 AND project_id IS NULL))";
+pub(super) fn forget_all(db: &mut dyn Sql, view: &View, exclude: &str) -> Result<Forgotten, StoreError> {
+    const SCOPES: &str =
+        "(project_id = ?1 OR (?2 AND project_id IS NULL)) AND id NOT IN (SELECT value FROM json_each(?3))";
 
     let (repo, global) = view_params(db, view)?;
     let mut forgotten = Forgotten::default();
 
     for row in db.query(
         &format!("SELECT project_id IS NULL, count(*) FROM notes WHERE {SCOPES} GROUP BY 1"),
-        args![repo, global],
+        args![repo, global, exclude],
     )? {
         let is_global: bool = row.get(0)?;
         let count = usize::try_from(row.get::<i64>(1)?).unwrap_or(0);
@@ -199,7 +200,10 @@ pub(super) fn forget_all(db: &mut dyn Sql, view: &View) -> Result<Forgotten, Sto
         }
     }
 
-    db.execute(&format!("DELETE FROM notes WHERE {SCOPES}"), args![repo, global])?;
+    db.execute(
+        &format!("DELETE FROM notes WHERE {SCOPES}"),
+        args![repo, global, exclude],
+    )?;
     graph::prune_entities(db, repo, global)?;
 
     Ok(forgotten)

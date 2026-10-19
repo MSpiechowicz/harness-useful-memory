@@ -16,6 +16,7 @@ use unicode_normalization::char::is_combining_mark;
 use super::notes::{entities_of, kind_of, provenance_of};
 use super::{Ctx, Fail, NOTES, cut, error_code, int, note_fields, scope_of, strings, text, visible};
 use crate::limits::{BODY_MAX, QUERY_MAX, QUERY_TOKENS_MAX, SEARCH_LIMIT_MAX, SNIPPET_MAX, SNIPPET_TOKENS, TITLE_MAX};
+use crate::store::listing::checked_exclude;
 use crate::store::{Hit, NoteKind, Provenance, SearchQuery, StoreError, View};
 use crate::support::text::STOPWORDS;
 
@@ -92,7 +93,7 @@ pub(super) fn search(ctx: &mut Ctx<'_>, query: &SearchQuery, text_index: bool) -
 
     let limit = query.limit.clamp(1, SEARCH_LIMIT_MAX);
     let words = words(text, QUERY_TOKENS_MAX);
-    let filter = filter(query);
+    let filter = filter(query)?;
 
     let Some(last) = words.last() else {
         let found = ctx.find(
@@ -164,11 +165,23 @@ pub(super) fn similar(
     let title = text(&source, "title").unwrap_or_default();
     let body = text(&source, "body").unwrap_or_default();
 
+    resembling(ctx, view, (&title, &body), Some(id), limit, text_index)
+}
+
+/// Up to `limit` notes in `view` resembling a note of `title` and `body`, leaving out note `skip`.
+pub(super) fn resembling(
+    ctx: &mut Ctx<'_>,
+    view: &View,
+    (title, body): (&str, &str),
+    skip: Option<i64>,
+    limit: usize,
+    text_index: bool,
+) -> Result<Vec<Hit>, Fail> {
     let mut keys: Vec<String> = Vec::new();
-    let title_words = words(&title, SIMILAR_TOKENS)
+    let title_words = words(title, SIMILAR_TOKENS)
         .into_iter()
         .filter(|word| word.chars().count() >= 3);
-    let body_words = words(&body, usize::MAX)
+    let body_words = words(body, usize::MAX)
         .into_iter()
         .filter(|word| word.chars().count() >= 4);
 
@@ -186,7 +199,7 @@ pub(super) fn similar(
         return Ok(Vec::new());
     }
 
-    let candidates = matching(ctx, visible(view), &keys, Some(id), SIMILAR_CANDIDATES, text_index)?;
+    let candidates = matching(ctx, visible(view), &keys, skip, SIMILAR_CANDIDATES, text_index)?;
     let needed = keys.len().min(2);
 
     let rows = candidates
@@ -223,12 +236,18 @@ pub(super) fn terms(title: &str, body: &str, tags: &[String]) -> Vec<String> {
     out
 }
 
-/// The view, kind and checkout filters of `query`.
-fn filter(query: &SearchQuery) -> Document {
+/// The view, kind, checkout and left-out ids filters of `query`.
+fn filter(query: &SearchQuery) -> Result<Document, StoreError> {
     let mut filter = visible(&query.view);
 
     if let Some(kind) = query.kind {
         filter.insert("kind", kind.as_str());
+    }
+
+    let exclude = checked_exclude(&query.exclude)?;
+
+    if !exclude.is_empty() {
+        filter.insert("_id", doc! { "$nin": exclude });
     }
 
     if let Some(root) = &query.checkout {
@@ -240,7 +259,7 @@ fn filter(query: &SearchQuery) -> Document {
         filter = doc! { "$and": [filter, same_checkout] };
     }
 
-    filter
+    Ok(filter)
 }
 
 /// The notes matching any of `words` (whole words) under `filter`, best first, at most `limit`:

@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 
 use common::mcp::{call, env, is_error, repo_with_remote, run, server, text};
 use harness_memory::Server;
-use harness_memory::backend::Place;
+use harness_memory::backend::{NotesPlace, Place};
 use harness_memory::project::ProjectResolver;
+use harness_memory::store::{HiddenScripts, ScriptSummary, SplitScripts, SqliteStore, StoreError, Target, View};
 use harness_memory::store::{Language, Provenance, SavedScript, Script, ScriptDraft, ScriptRef, ScriptStore};
-use harness_memory::store::{ScriptSummary, SqliteStore, StoreError, Target, View};
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -359,4 +359,54 @@ fn the_scripts_block_fits_however_many_notes_match() {
     assert!(reply.len() <= harness_memory::limits::LIST_REPLY_MAX, "{}", reply.len());
     assert!(reply.contains("more)\n"), "notes were cut: {reply}");
     assert_eq!(names(&reply), ["deploy"]);
+}
+
+#[test]
+fn remote_local_lists_both_runs_this_computers_by_name_and_hides_hidden_ones() {
+    let dir = TempDir::new().expect("temp");
+    let path = |file: &str| dir.path().join(file);
+    let save_into = |file: &str, name: &str| {
+        let mut store = SqliteStore::open(&path(file)).expect("store");
+        store
+            .save_script(&Target::Global, &draft(name, "Deploy the app"))
+            .expect("save")
+            .script
+            .summary
+    };
+    let team = save_into("team.sqlite3", "deploy");
+    save_into("local.sqlite3", "deploy");
+    let hidden = save_into("team.sqlite3", "deploy-staging");
+
+    let key = "team:aaaaaaaaaaaaaaaa";
+    assert!(
+        HiddenScripts::new(path("local.sqlite3"), key)
+            .hide(&hidden)
+            .expect("hide")
+    );
+
+    let scripts = SplitScripts::new(
+        Box::new(SqliteStore::open(&path("team.sqlite3")).expect("team")),
+        Box::new(SqliteStore::open(&path("local.sqlite3")).expect("local")),
+        NotesPlace::RemoteLocal,
+        Some(HiddenScripts::new(path("local.sqlite3"), key)),
+    );
+    let mut server = Server::new(
+        Box::new(SqliteStore::open(&path("notes.sqlite3")).expect("notes")),
+        Box::new(scripts),
+        Box::new(SqliteStore::open(&path("trust.sqlite3")).expect("trust")),
+        ProjectResolver::new(env(&dir.path().join("home")), Some(dir.path().to_path_buf())),
+    )
+    .with_scripts_place(NotesPlace::RemoteLocal);
+
+    // A name runs this computer's script, so the team's is run by its id; the hidden one is left out.
+    let lines = listed(&search(&mut server, "deploy"));
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines.contains(&"- deploy: Deploy the app (bash) → script_run name=deploy".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&format!("- deploy: Deploy the app (bash) → script_run id={}", team.id)),
+        "{lines:?}"
+    );
 }

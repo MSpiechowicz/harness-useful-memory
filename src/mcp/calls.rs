@@ -10,7 +10,9 @@ use super::reply::{Capped, now};
 use crate::limits::{
     DEPTH_MAX, GET_REPLY_MAX, LIST_REPLY_MAX, NEIGHBORS_LIMIT_DEFAULT, SEARCH_LIMIT_DEFAULT, SIMILAR_MAX,
 };
-use crate::store::{Forget, Link, NoteDraft, NoteKind, NotePatch, Provenance, SearchQuery, Target, View, clean};
+use crate::store::{
+    Forget, Link, NoteDraft, NoteKind, NoteOrigin, NotePatch, Provenance, SearchQuery, Target, View, clean,
+};
 
 /// Sent when a repository-scope call has no repository.
 pub(super) const NO_PROJECT: &str = "cannot tell which repository this is (the server runs outside one, or in the home folder \
@@ -168,6 +170,10 @@ fn remember(server: &mut Server, args: RememberArgs) -> Result<String, String> {
     for hit in &similar {
         text.push('\n');
         text.push_str(&similar_line(hit, now, &home));
+
+        if server.store.origin(hit.id, hit.scope) == (NoteOrigin::Team { read_only: true }) {
+            text.push_str(" (team, read-only)");
+        }
     }
 
     Ok(text)
@@ -208,6 +214,7 @@ fn search(server: &mut Server, args: SearchArgs) -> Result<String, String> {
         view,
         limit,
         checkout,
+        exclude: Vec::new(),
     };
 
     let hits = server.store.search(&query).map_err(|error| error.to_string())?;

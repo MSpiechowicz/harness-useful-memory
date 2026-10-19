@@ -63,6 +63,38 @@ impl Folders {
         self
     }
 
+    /// Routes repository and global notes as given from now on.
+    fn route(&mut self, repository: &str, global: &str) {
+        self.team.retain(|(name, _)| !name.ends_with("_NOTES"));
+        self.team
+            .push(("HARNESS_MEMORY_REPOSITORY_NOTES", repository.to_owned()));
+        self.team.push(("HARNESS_MEMORY_GLOBAL_NOTES", global.to_owned()));
+    }
+
+    /// `harness-memory <args>` with `input` on stdin.
+    fn cli_with_input(&self, args: &[&str], input: &str) -> Output {
+        use std::io::Write;
+
+        let mut command = Command::new(BINARY);
+        command
+            .args(args)
+            .current_dir(&self.work)
+            .env("HARNESS_MEMORY_DIR", &self.data)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        self.with_team(&mut command);
+        without_team_settings(&mut command);
+
+        let mut child = command.spawn().expect("the executable runs");
+        let mut stdin = child.stdin.take().expect("stdin");
+
+        // A command that stops reading early closes the pipe, so the rest of `input` is dropped.
+        let _ = stdin.write_all(input.as_bytes());
+        drop(stdin);
+        child.wait_with_output().expect("the executable ends")
+    }
+
     fn with_team(&self, command: &mut Command) {
         for (name, value) in &self.team {
             command.env(name, value);
@@ -182,7 +214,18 @@ fn lists_gets_and_deletes(folders: &Folders, repo_place: &str, global_place: &st
 
     let listing = folders.widget_list(&["--sort", "title"]);
     let keys: Vec<&String> = listing.as_object().expect("object").keys().collect();
-    assert_eq!(keys, ["total", "kinds", "scopes", "notes"]);
+
+    if folders.team.is_empty() {
+        assert_eq!(keys, ["total", "kinds", "scopes", "notes"]);
+    } else {
+        assert_eq!(
+            keys,
+            ["total", "kinds", "scopes", "notes", "hiddenCount", "localCounts"],
+            "a team database adds the hidden and local counts"
+        );
+        assert_eq!(listing["hiddenCount"], 0);
+    }
+
     assert_eq!(listing["scopes"], json!({ "repo": 2, "global": 1 }));
     assert_eq!(listing["total"], 3);
     assert_eq!(
@@ -215,6 +258,8 @@ fn lists_gets_and_deletes(folders: &Folders, repo_place: &str, global_place: &st
             "scope",
             "repo",
             "place",
+            "readOnly",
+            "hidden",
             "tags",
             "entities",
             "author",
@@ -229,6 +274,10 @@ fn lists_gets_and_deletes(folders: &Folders, repo_place: &str, global_place: &st
     assert_eq!(flaky_row["scope"], "repo");
     assert_eq!(flaky_row["repo"], "github.com/acme/widget");
     assert_eq!(flaky_row["place"], repo_place);
+    assert_eq!(
+        (flaky_row["readOnly"].clone(), flaky_row["hidden"].clone()),
+        (json!(false), json!(false))
+    );
     assert_eq!(flaky_row["tags"], json!(["ci"]));
     assert_eq!(flaky_row["entities"], json!(["runner.rs"]));
     assert_eq!(flaky_row["author"]["source"], "tests");
@@ -638,6 +687,13 @@ fn bad_usage_exits_2() {
         &["notes", "delete", "--yes"],
         &["notes", "delete", "--all", "--yes", "1"],
         &["notes", "show", "1"],
+        &["notes", "hide"],
+        &["notes", "hide", "x"],
+        &["notes", "unhide", "1", "2"],
+        &["notes", "discard-local", "--yes"],
+        &["notes", "discard-local", "--all", "3", "--yes"],
+        &["notes", "discard-local", "3,x", "--yes"],
+        &["notes", "discard-local", "--all", "--yes", "--scope", "team"],
     ] {
         let output = folders.cli(args);
         assert_eq!(output.status.code(), Some(2), "{args:?}");
@@ -655,4 +711,394 @@ fn bad_usage_exits_2() {
         stderr(&output).lines().last(),
         Some("harness-memory: query is longer than 256 characters")
     );
+}
+
+/// The URLs of the team test servers that are set.
+fn team_urls() -> Vec<(String, Box<dyn std::any::Any>)> {
+    let mut urls: Vec<(String, Box<dyn std::any::Any>)> = Vec::new();
+
+    if let Some(db) = postgres_support::database() {
+        urls.push((db.url().to_owned(), Box::new(db)));
+    }
+
+    if let Some(db) = mongo_support::TestDb::new() {
+        urls.push((db.url.clone(), Box::new(db)));
+    }
+
+    if let Some(db) = libsql_support::Database::libsql()
+        && let libsql_support::Database::Libsql(server) = &db
+    {
+        urls.push((server.url.clone(), Box::new(db)));
+    }
+
+    urls
+}
+
+/// The row of `listing` titled `title`.
+fn row<'a>(listing: &'a Value, title: &str) -> &'a Value {
+    listing["notes"]
+        .as_array()
+        .expect("notes")
+        .iter()
+        .find(|note| note["title"] == title)
+        .unwrap_or_else(|| panic!("no {title} in {listing}"))
+}
+
+/// The last line of stderr and the exit code of `output`.
+fn failure(output: &Output) -> (Option<i32>, String) {
+    let text = stderr(output);
+    (output.status.code(), text.lines().last().unwrap_or_default().to_owned())
+}
+
+#[test]
+fn remote_local_notes_are_read_only_and_team_notes_hide_on_this_computer() {
+    for (url, _db) in team_urls() {
+        reads_both_hides_and_keeps(&url);
+    }
+}
+
+fn reads_both_hides_and_keeps(url: &str) {
+    let mut folders = folders().on_team(url, Some(("remote", "remote")));
+    let project = folders.widget_project();
+
+    let mut widget = folders.server(&folders.widget);
+    let shared = remember(
+        &mut widget,
+        json!({ "title": "Team deploy", "body": "deploy with make targets", "kind": "decision" }),
+    );
+    let rule = remember(
+        &mut widget,
+        json!({ "title": "Team tabs", "body": "Four wide", "kind": "note", "scope": "global" }),
+    );
+    assert!(widget.finish().success());
+
+    folders.route("remote+local", "remote");
+    let mut widget = folders.server(&folders.widget);
+    let saved = widget.call(
+        "note_save",
+        json!({ "title": "Deploy via make", "body": "deploy with make targets locally", "kind": "fix" }),
+    );
+    assert!(
+        saved
+            .lines()
+            .any(|line| line.contains(&format!("#{shared} ")) && line.ends_with(" (team, read-only)")),
+        "{saved}"
+    );
+
+    let refused = widget.request(
+        "tools/call",
+        json!({ "name": "note_update", "arguments": { "id": shared, "append": "more" } }),
+    );
+    assert_eq!(refused["result"]["isError"], true);
+    let text = refused["result"]["content"][0]["text"].as_str().expect("text");
+    assert!(text.contains(&format!("harness-memory notes hide {shared}")), "{text}");
+    widget.call("note_update", json!({ "id": rule, "append": "Always" }));
+    assert!(widget.finish().success());
+
+    let listing = folders.widget_list(&[]);
+    assert_eq!(listing["total"], 3);
+    assert_eq!(listing["hiddenCount"], 0);
+    assert_eq!(listing["localCounts"], json!({ "repo": 1, "global": 0 }));
+
+    let team_row = row(&listing, "Team deploy");
+    assert_eq!(
+        (
+            team_row["place"].clone(),
+            team_row["readOnly"].clone(),
+            team_row["hidden"].clone()
+        ),
+        (json!("team"), json!(true), json!(false))
+    );
+    let mine = row(&listing, "Deploy via make");
+    assert_eq!(
+        (mine["place"].clone(), mine["readOnly"].clone()),
+        (json!("local"), json!(false))
+    );
+    let mine = mine["id"].as_i64().expect("id");
+    assert!(mine >= 1_000_000_000);
+    assert_eq!(
+        row(&listing, "Team tabs")["readOnly"],
+        false,
+        "a remote scope stays editable"
+    );
+
+    let shared_id = shared.to_string();
+    let hidden = folders.json(&["notes", "hide", &shared_id, "--project", &project, "--json"]);
+    assert_eq!(hidden, json!({ "hidden": shared }));
+    let again = folders.cli(&["notes", "hide", &shared_id, "--project", &project]);
+    assert_eq!(
+        stdout(&again),
+        format!("hid note {shared} Team deploy\n"),
+        "{}",
+        stderr(&again)
+    );
+
+    let listing = folders.widget_list(&[]);
+    assert_eq!(
+        (listing["total"].clone(), listing["hiddenCount"].clone()),
+        (json!(2), json!(1))
+    );
+    assert!(titles(&listing).iter().all(|title| *title != "Team deploy"));
+
+    let only_hidden = folders.widget_list(&["--hidden"]);
+    assert_eq!(titles(&only_hidden), ["Team deploy"]);
+    assert_eq!(only_hidden["total"], 1);
+    assert_eq!(
+        (
+            row(&only_hidden, "Team deploy")["hidden"].clone(),
+            row(&only_hidden, "Team deploy")["readOnly"].clone()
+        ),
+        (json!(true), json!(true))
+    );
+
+    let get = ["notes", "get", &shared_id, "--json", "--project", &project];
+    assert_eq!(
+        failure(&folders.cli(&get)),
+        (Some(1), format!("harness-memory: note {shared} not found"))
+    );
+    let shown = folders.json(&[&get[..], &["--hidden"]].concat());
+    assert_eq!(
+        (shown["note"]["hidden"].clone(), shown["note"]["body"].clone()),
+        (json!(true), json!("deploy with make targets"))
+    );
+
+    let mine_id = mine.to_string();
+    assert_eq!(
+        failure(&folders.cli(&["notes", "hide", &mine_id, "--project", &project])),
+        (
+            Some(1),
+            format!("harness-memory: note {mine} is saved on this computer, delete it instead")
+        )
+    );
+    assert_eq!(
+        failure(&folders.cli(&["notes", "hide", "999999", "--project", &project])),
+        (Some(1), "harness-memory: note 999999 not found".to_owned())
+    );
+
+    let unhidden = folders.json(&["notes", "unhide", &shared_id, "--json"]);
+    assert_eq!(unhidden, json!({ "unhidden": shared }));
+    assert_eq!(
+        failure(&folders.cli(&["notes", "unhide", &shared_id])),
+        (Some(1), format!("harness-memory: note {shared} not found"))
+    );
+    assert_eq!(folders.widget_list(&[])["hiddenCount"], 0);
+
+    let deleted = folders.json(&["notes", "delete", "--all", "--yes", "--json", "--project", &project]);
+    assert_eq!(
+        deleted,
+        json!({ "deleted": 2, "team": 1, "kept": 1 }),
+        "the team's repository note stays"
+    );
+    assert_eq!(titles(&folders.widget_list(&[])), ["Team deploy"]);
+
+    discards_what_nothing_reads(&mut folders);
+}
+
+/// Checks `notes discard-local` on notes left in the local file of `folders` (on a team
+/// database).
+fn discards_what_nothing_reads(folders: &mut Folders) {
+    let mut store = SqliteStore::open(&folders.data.join("memory.sqlite3")).expect("local file");
+    let key = harness_memory::store::ProjectKey {
+        key: "git:github.com/acme/gadget".to_owned(),
+        root: folders.gadget.clone(),
+        remote: Some("github.com/acme/gadget".to_owned()),
+    };
+    let note = |title: &str| NoteDraft {
+        title: title.to_owned(),
+        body: "Left here".to_owned(),
+        kind: NoteKind::Note,
+        tags: Vec::new(),
+        entities: Vec::new(),
+        provenance: Provenance::default(),
+    };
+    let gadget = store
+        .remember(&Target::Repo(key), &note("Gadget leftover"))
+        .expect("note")
+        .id;
+    let global = store
+        .remember(&Target::Global, &note("Global leftover"))
+        .expect("note")
+        .id;
+    let other = store
+        .remember(&Target::Global, &note("Other leftover"))
+        .expect("note")
+        .id;
+    drop(store);
+
+    let refused = folders.cli(&["notes", "discard-local", "--all", "--yes", "--scope", "repo"]);
+    assert_eq!(
+        failure(&refused).0,
+        Some(1),
+        "repository notes are read from this computer"
+    );
+    assert!(
+        failure(&refused).1.contains("repository_notes = \"remote+local\""),
+        "{}",
+        stderr(&refused)
+    );
+
+    let unconfirmed = folders.cli(&["notes", "discard-local", "--all"]);
+    assert_eq!(unconfirmed.status.code(), Some(2));
+
+    let ids = format!("{global},{gadget}");
+    let one = folders.json(&["notes", "discard-local", &ids, "--yes", "--json"]);
+    assert_eq!(one, json!({ "deleted": 1 }), "only the global scope is routed remote");
+
+    folders.route("remote", "remote");
+    let piped = folders.cli_with_input(
+        &["notes", "discard-local", "-", "--yes", "--json", "--scope", "repo"],
+        &format!("{gadget}\n{other}"),
+    );
+    assert!(piped.status.success(), "{}", stderr(&piped));
+    assert_eq!(
+        stdout(&piped),
+        "{\"deleted\":1}\n",
+        "the global note is not in --scope repo"
+    );
+
+    let all = folders.cli(&["notes", "discard-local", "--all", "--yes"]);
+    assert_eq!(stdout(&all), "deleted 1 note from this computer\n", "{}", stderr(&all));
+    assert_eq!(
+        folders.widget_list(&[])["localCounts"],
+        json!({ "repo": 0, "global": 0 })
+    );
+}
+
+#[test]
+fn hiding_and_discarding_need_a_team_database() {
+    let folders = folders();
+
+    for args in [&["notes", "hide", "1"][..], &["notes", "unhide", "1", "--json"]] {
+        let (code, last) = failure(&folders.cli(args));
+        assert_eq!(code, Some(1), "{args:?}");
+        assert!(last.contains("no team notes are read here"), "{last}");
+    }
+
+    let (code, last) = failure(&folders.cli(&["notes", "discard-local", "--all", "--yes"]));
+    assert_eq!(code, Some(1));
+    assert!(last.contains("no team database is set"), "{last}");
+
+    // Ids piped in are capped in count and in bytes.
+    let discard = ["notes", "discard-local", "-", "--yes"];
+    let many = vec!["7"; 100_001].join(",");
+    let output = folders.cli_with_input(&discard, &many);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("at most 100000 ids"), "{}", stderr(&output));
+
+    let huge = " ".repeat(2 * 1024 * 1024 + 1);
+    let output = folders.cli_with_input(&discard, &huge);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("more than 2 MiB"), "{}", stderr(&output));
+
+    let hidden = folders.json(&["notes", "list", "--json", "--hidden"]);
+    assert_eq!(
+        (hidden["total"].clone(), hidden["notes"].clone()),
+        (json!(0), json!([]))
+    );
+    assert!(hidden.get("hiddenCount").is_none());
+}
+
+#[test]
+fn the_hidden_count_leaves_out_rows_of_notes_the_team_no_longer_has() {
+    for (url, _db) in team_urls() {
+        stale_rows_leave_the_hidden_count(&url);
+    }
+}
+
+fn stale_rows_leave_the_hidden_count(url: &str) {
+    let folders = folders().on_team(url, Some(("remote", "remote")));
+    let project = folders.widget_project();
+
+    let mut widget = folders.server(&folders.widget);
+    let reused = remember(
+        &mut widget,
+        json!({ "title": "Reused id", "body": "A newer note", "kind": "note" }),
+    );
+    assert!(widget.finish().success());
+
+    let id = reused.to_string();
+    folders.json(&["notes", "hide", &id, "--project", &project, "--json"]);
+    assert_eq!(folders.widget_list(&[])["hiddenCount"], 1);
+
+    // The team database gave the hidden id to another note (SQLite and libSQL reuse ids).
+    let raw = rusqlite::Connection::open(folders.data.join("memory.sqlite3")).expect("raw local");
+    raw.execute(
+        "UPDATE hidden_team_notes SET team_created_at = team_created_at - 60",
+        [],
+    )
+    .expect("older row");
+
+    // Within the window after the last prune (the commands above pruned) the row still counts,
+    // and the note stays left out: a poll every few seconds reads the team database no more.
+    let within = folders.widget_list(&[]);
+    assert_eq!(
+        (within["total"].clone(), within["hiddenCount"].clone()),
+        (json!(0), json!(1)),
+        "{within}"
+    );
+
+    raw.execute("UPDATE hidden_team_notes_meta SET pruned_at = pruned_at - 301", [])
+        .expect("window passed");
+
+    let listing = folders.widget_list(&[]);
+    assert_eq!(
+        (listing["total"].clone(), listing["hiddenCount"].clone()),
+        (json!(1), json!(0)),
+        "{listing}"
+    );
+    assert_eq!(folders.widget_list(&["--hidden"])["total"], 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn delete_all_fails_while_the_hidden_list_cannot_be_read() {
+    for (url, _db) in team_urls() {
+        keeps_hidden_notes_when_unreadable(&url);
+    }
+}
+
+#[cfg(unix)]
+fn keeps_hidden_notes_when_unreadable(url: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let folders = folders().on_team(url, Some(("remote", "remote")));
+    let project = folders.widget_project();
+
+    let mut widget = folders.server(&folders.widget);
+    let hidden = remember(
+        &mut widget,
+        json!({ "title": "Hidden here", "body": "A teammate's note", "kind": "note" }),
+    );
+    remember(
+        &mut widget,
+        json!({ "title": "Shown here", "body": "Another note", "kind": "note" }),
+    );
+    assert!(widget.finish().success());
+
+    let id = hidden.to_string();
+    folders.json(&["notes", "hide", &id, "--project", &project, "--json"]);
+
+    let local = folders.data.join("memory.sqlite3");
+    let mode = |bits| std::fs::set_permissions(&local, std::fs::Permissions::from_mode(bits)).expect("chmod");
+    mode(0o000);
+
+    if std::fs::File::open(&local).is_ok() {
+        mode(0o600);
+        eprintln!("skipped: the file stays readable (running as root?)");
+        return;
+    }
+
+    let output = folders.cli(&["notes", "delete", "--all", "--yes", "--json", "--project", &project]);
+    mode(0o600);
+
+    let (code, last) = failure(&output);
+    assert_eq!(code, Some(1), "{}", stdout(&output));
+    assert!(
+        last.contains("cannot read the team notes hidden on this computer"),
+        "{last}"
+    );
+
+    let shown = folders.widget_list(&[]);
+    assert_eq!(titles(&shown), ["Shown here"]);
+    assert_eq!(shown["hiddenCount"], 1, "the hidden team note is still there");
 }

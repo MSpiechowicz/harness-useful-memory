@@ -7,9 +7,11 @@
 //! - [`text`]: display safety checks and the search stopword list.
 //! - [`runner`]: runs a saved script with a timeout and output caps.
 //! - [`time`]: calendar dates and timestamps from Unix time.
+//! - [`ids`]: note ids listed in an argument or on standard input, capped.
 
 pub mod env;
 pub mod git;
+pub mod ids;
 pub mod paths;
 pub mod redact;
 pub mod runner;

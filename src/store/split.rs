@@ -1,101 +1,179 @@
-//! One scope in the team database, the other on this computer.
+//! Notes read from the team database and this computer, as the routing says.
 //!
-//! [`SplitStore`] serves the MCP tools from two stores: the team database holds one scope
-//! (repository or global notes) and the local SQLite file the other, as
-//! [`crate::backend::Routing`] says. A write goes to the store of its scope; a read that covers both
-//! scopes asks both and merges the results.
+//! [`SplitStore`] serves the MCP tools and `harness-memory notes` from two stores, the team
+//! database and the local SQLite file, routed per note scope by [`NotesPlace`] (see
+//! [`crate::backend::Routing`]): `remote` reads and writes the team database, `local` the local
+//! file, `remote+local` reads both and writes the local file. A write goes to the store its scope
+//! saves to; a read that covers both stores asks both and merges the results.
+//!
+//! **Read-only team notes.** In a `remote+local` scope the team notes are read-only:
+//! `note_update`, `note_delete` and `entity_link` with a team note id are refused
+//! ([`read_only_error`]), naming `harness-memory notes hide`. In a `remote` scope they stay
+//! editable.
+//!
+//! **Hidden team notes.** With [`HiddenNotes`] (read on every call) the team notes hidden on this
+//! computer are left out of every read, in `remote` and `remote+local` scopes alike: a hidden id is
+//! not found, lists and searches leave it out of their rows and counts, similar notes and the notes
+//! around an entity skip it. Deleting every note never reaches past the store a scope writes to,
+//! nor a hidden team note: it deletes what the list shows. Saving a note in a `remote` scope under
+//! the title of a hidden team note is refused ([`hidden_title_error`]) rather than changing the
+//! note nobody sees. The hidden list is matched by id alone, so at most once per
+//! [`crate::store::hidden::PRUNE_EVERY`] (across processes) the rows of team notes that are gone,
+//! or whose id the team database gave to a newer note (SQLite and libSQL reuse ids), are dropped
+//! ([`HiddenNotes::prune_if_due`]). A read that cannot read the hidden list hides nothing, but a
+//! change to the team notes (deleting every note, changing or deleting one, linking one, saving
+//! one) fails instead ([`HiddenNotes::try_ids`]).
 //!
 //! **Note ids.** Both stores number their notes from 1, so the local store's ids are shown with
 //! [`LOCAL_ID_OFFSET`] added (local note 7 is note 1000000007) and team ids as they are, the same
 //! ids teammates see. An id at or above the offset is read as a local one, any other as a team
 //! one; a team id that reaches the offset cannot be told apart and is reported as an error rather
-//! than routed to the wrong store. Relations only point at notes of their own scope, so a note id
-//! given with a link has to belong to the store of the link's scope.
+//! than routed to the wrong store. Relations only point at notes of their own store, so a note id
+//! given with a link has to belong to the store the link's scope writes to.
 //!
-//! **Merging.** A search lists the repository notes first, as a single store does, so the
-//! repository store's hits come first and the global store's fill up to the limit. The relations
-//! around an entity list the repository store's first too (a single store orders them by
-//! distance across both scopes). Similar notes come only from the store of the note they resemble.
-//! A list of notes merges the two stores' sorted pages: a page at offset N reads the first N rows
-//! of both stores (in pages of [`LIST_PAGE_MAX`]) to find where it starts.
+//! **Merging.** A search lists the repository notes first, as a single store does: per scope, the
+//! hits of the stores reading it take turns, up to the limit. The relations around an entity list
+//! the repository store's first too (a single store orders them by distance across both scopes).
+//! Similar notes come from the store of the note they resemble, and in a `remote+local` scope from
+//! the other store too, taking turns. A list of notes merges the two stores' sorted pages: a page at
+//! offset N reads the first N rows of both stores (in pages of [`LIST_PAGE_MAX`]) to find where it
+//! starts.
 //!
-//! Each store only sees its own scope: notes of the other scope left in it (written before the
-//! routing changed) are not shown.
+//! Each store only sees the scopes it is read for: notes of another scope left in it (written
+//! before the routing changed) are not shown.
 
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 
+use crate::backend::{NotesPlace, Place};
 use crate::limits::{GET_IDS_MAX, LIST_PAGE_MAX, NEIGHBOR_NOTES_MAX, NEIGHBORS_LIMIT_MAX, SEARCH_LIMIT_MAX};
 use crate::store::listing::{compare, directed, page_limit};
 use crate::store::{
-    Edge, Forget, Forgotten, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NoteListQuery, NotePage, NotePatch,
-    NoteRow, NoteSort, Saved, Scope, SearchQuery, StoreError, Target, View,
+    Edge, Forget, Forgotten, HiddenNotes, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NoteListQuery,
+    NoteOrigin, NotePage, NotePatch, NoteRow, NoteSort, Saved, Scope, SearchQuery, StoreError, Target, View,
 };
 
 /// Added to the local store's note ids, so they never equal a team database id.
 pub const LOCAL_ID_OFFSET: i64 = 1_000_000_000;
 
-/// The team database for one scope, the local SQLite store for the other. See the module docs.
+/// The team database and the local SQLite store, routed per scope. See the module docs.
 pub struct SplitStore {
     team: Box<dyn MemoryStore>,
     local: Box<dyn MemoryStore>,
-    /// The scope kept in `local`; `team` keeps the other one.
-    local_scope: Scope,
+    repo: NotesPlace,
+    global: NotesPlace,
+    hidden: Option<HiddenNotes>,
 }
 
 impl std::fmt::Debug for SplitStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SplitStore")
-            .field("local_scope", &self.local_scope)
+            .field("repo", &self.repo)
+            .field("global", &self.global)
+            .field("hidden", &self.hidden)
             .finish_non_exhaustive()
     }
 }
 
-/// Which of the two stores.
+/// Which of the two stores (shared with [`crate::store::SplitScripts`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Side {
+pub(crate) enum Side {
     Team,
     Local,
 }
 
+/// The note similar notes are looked for next to: one of the store asked, or the title and body of
+/// a note of the other store.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Own(i64),
+    Text((&'a str, &'a str)),
+}
+
 impl SplitStore {
-    /// Keeps `local_scope` in `local` and the other scope in `team`.
+    /// Keeps `local_scope` in `local` and the other scope in `team`, hiding nothing.
     pub fn new(team: Box<dyn MemoryStore>, local: Box<dyn MemoryStore>, local_scope: Scope) -> Self {
+        let place = |scope: Scope| {
+            if scope == local_scope {
+                NotesPlace::Local
+            } else {
+                NotesPlace::Remote
+            }
+        };
+
+        Self::routed(team, local, place(Scope::Repo), place(Scope::Global), None)
+    }
+
+    /// Routes repository notes by `repo` and global notes by `global`, leaving out the team notes
+    /// `hidden` hides (none without it).
+    pub fn routed(
+        team: Box<dyn MemoryStore>,
+        local: Box<dyn MemoryStore>,
+        repo: NotesPlace,
+        global: NotesPlace,
+        hidden: Option<HiddenNotes>,
+    ) -> Self {
         Self {
             team,
             local,
-            local_scope,
+            repo,
+            global,
+            hidden,
         }
     }
 
-    fn side_of(&self, scope: Scope) -> Side {
-        if scope == self.local_scope {
-            Side::Local
-        } else {
-            Side::Team
+    fn place(&self, scope: Scope) -> NotesPlace {
+        match scope {
+            Scope::Repo => self.repo,
+            Scope::Global => self.global,
         }
     }
 
-    fn side_of_target(&self, target: &Target) -> Side {
-        match target {
-            Target::Repo(_) => self.side_of(Scope::Repo),
-            Target::Global => self.side_of(Scope::Global),
+    /// True when the store `side` is read for the notes of `scope`.
+    fn reads(&self, scope: Scope, side: Side) -> bool {
+        match side {
+            Side::Team => self.place(scope).reads_team(),
+            Side::Local => self.place(scope).reads_local(),
         }
     }
 
-    /// The store of the repository scope, then the one of the global scope.
-    fn order(&self) -> [Side; 2] {
-        [self.side_of(Scope::Repo), self.side_of(Scope::Global)]
+    /// The store new notes of `scope` go to.
+    fn write_side(&self, scope: Scope) -> Side {
+        match self.place(scope).writes() {
+            Place::Remote => Side::Team,
+            Place::Local => Side::Local,
+        }
+    }
+
+    /// The stores read for some scope, the ones of the repository scope first (this computer's
+    /// before the team's when both are).
+    fn order(&self) -> Vec<Side> {
+        let mut sides: Vec<Side> = Vec::new();
+
+        for scope in [Scope::Repo, Scope::Global] {
+            for side in [Side::Local, Side::Team] {
+                if self.reads(scope, side) && !sides.contains(&side) {
+                    sides.push(side);
+                }
+            }
+        }
+
+        sides
+    }
+
+    /// The store asked to check the arguments when no store is read for the view.
+    fn first(&self) -> Side {
+        self.order().first().copied().unwrap_or(Side::Team)
     }
 
     /// The order of `query` across both stores: by place, local before team ascending, for
     /// [`NoteSort::Place`] (each store orders its own notes by id then), else as one store orders.
-    fn compare(&self, query: &NoteListQuery, a: &NoteRow, b: &NoteRow) -> Ordering {
+    fn compare(query: &NoteListQuery, a: &NoteRow, b: &NoteRow) -> Ordering {
         if query.sort != NoteSort::Place {
             return compare(query, a, b);
         }
 
-        let team = |row: &NoteRow| self.side_of(row.scope) == Side::Team;
+        let team = |row: &NoteRow| decode(row.id).0 == Side::Team;
         directed(query, team(a).cmp(&team(b)).then(a.id.cmp(&b.id)))
     }
 
@@ -106,21 +184,94 @@ impl SplitStore {
         }
     }
 
-    /// The part of `view` the store `side` holds; `None` when it holds none of it.
+    /// The part of `view` the store `side` is read for; `None` when it is read for none of it.
     fn narrow(&self, view: &View, side: Side) -> Option<View> {
-        let repo_side = self.side_of(Scope::Repo);
+        narrow_by(view, |scope| self.reads(scope, side))
+    }
 
-        if side == repo_side {
-            view.repo.clone().map(|repo| View {
-                repo: Some(repo),
-                global: false,
-            })
-        } else {
-            view.global.then_some(View {
-                repo: None,
-                global: true,
-            })
+    /// The part of `view` whose notes the store `side` saves; `None` when it saves none of it.
+    fn narrow_writes(&self, view: &View, side: Side) -> Option<View> {
+        narrow_by(view, |scope| self.write_side(scope) == side)
+    }
+
+    /// The ids of the team notes hidden on this computer (none without [`HiddenNotes`]), the list
+    /// pruned first when it is due (see the module docs).
+    fn hidden_ids(&mut self) -> Result<Vec<i64>, StoreError> {
+        let Some(hidden) = self.hidden.as_mut() else {
+            return Ok(Vec::new());
+        };
+
+        // A team database that cannot be read fails the call itself, so a failed prune waits for
+        // the next turn.
+        let _ = hidden.prune_if_due(self.team.as_mut());
+
+        Ok(hidden.ids())
+    }
+
+    /// The ids [`Self::hidden_ids`] reads, for a change to the team notes: an error when the
+    /// hidden list cannot be read, rather than none hidden.
+    fn hidden_ids_strict(&mut self) -> Result<Vec<i64>, StoreError> {
+        let Some(hidden) = self.hidden.as_mut() else {
+            return Ok(Vec::new());
+        };
+
+        let _ = hidden.prune_if_due(self.team.as_mut());
+        hidden.try_ids()
+    }
+
+    /// Refuses to save `title` in the team scope `target` when a team note with that title is
+    /// hidden on this computer (saving would change it unseen).
+    fn check_hidden_title(&mut self, target: &Target, title: &str) -> Result<(), StoreError> {
+        let hidden = self.hidden_ids_strict()?;
+
+        if hidden.is_empty() {
+            return Ok(());
         }
+
+        match self.team.find_by_title(target, title)? {
+            Some(note) if hidden.contains(&note.id) => Err(hidden_title_error(note.id)),
+            _ => Ok(()),
+        }
+    }
+
+    /// The ids `side` leaves out of its reads: the hidden ones for the team store, and those of
+    /// `asked` (shown ids) that are its own.
+    fn excluded(&mut self, side: Side, asked: &[i64]) -> Result<Vec<i64>, StoreError> {
+        let hidden = match side {
+            Side::Team => self.hidden_ids()?,
+            Side::Local => Vec::new(),
+        };
+
+        Ok(with_asked(hidden, side, asked))
+    }
+
+    /// Refuses a change to the team note `raw` (shown as `id`) visible in `view` (the team store's
+    /// part) when it is hidden (not found) or its scope is `remote+local` (read-only).
+    fn check_team_write(&mut self, view: &View, raw: i64, id: i64) -> Result<(), StoreError> {
+        if self.hidden_ids_strict()?.contains(&raw) {
+            return Err(note_missing(id));
+        }
+
+        let (repo, global) = (self.repo, self.global);
+        let read_only = move |scope: Scope| {
+            let place = if scope == Scope::Repo { repo } else { global };
+            place == NotesPlace::RemoteLocal
+        };
+        let in_view = (view.repo.is_some() && read_only(Scope::Repo)) || (view.global && read_only(Scope::Global));
+
+        if !in_view {
+            return Ok(());
+        }
+
+        let Some(note) = self.team.peek(view, &[raw])?.into_iter().next() else {
+            return Err(note_missing(id));
+        };
+
+        if read_only(note.scope) {
+            return Err(read_only_error(id, note.scope));
+        }
+
+        Ok(())
     }
 
     /// The notes among `ids` visible in `view`, in the order asked, counting a hit on each when
@@ -130,6 +281,7 @@ impl SplitStore {
             return Err(StoreError::Invalid(format!("ids must list 1-{GET_IDS_MAX} note ids")));
         }
 
+        let hidden = self.hidden_ids()?;
         let mut found: Vec<Note> = Vec::new();
 
         for side in [Side::Team, Side::Local] {
@@ -140,7 +292,7 @@ impl SplitStore {
             let wanted: Vec<i64> = ids
                 .iter()
                 .map(|id| decode(*id))
-                .filter(|(of, _)| *of == side)
+                .filter(|(of, raw)| *of == side && !(side == Side::Team && hidden.contains(raw)))
                 .map(|(_, raw)| raw)
                 .collect();
 
@@ -178,10 +330,116 @@ impl SplitStore {
 
         Ok(ordered)
     }
+
+    /// The page of `query` the store `side` lists alone, for `view` and leaving out `exclude`, ids
+    /// shown.
+    fn page_of(
+        &mut self,
+        side: Side,
+        query: &NoteListQuery,
+        view: View,
+        exclude: Vec<i64>,
+    ) -> Result<NotePage, StoreError> {
+        let mut page = self.store(side).list_notes(&NoteListQuery {
+            view,
+            exclude,
+            ..query.clone()
+        })?;
+
+        for row in &mut page.rows {
+            row.id = encode(side, row.id)?;
+        }
+
+        Ok(page)
+    }
+
+    /// Up to `limit` hits of `side` for `query` in `view`, the hidden ones left out, ids shown.
+    fn search_side(
+        &mut self,
+        side: Side,
+        query: &SearchQuery,
+        view: View,
+        limit: usize,
+    ) -> Result<Vec<Hit>, StoreError> {
+        let part = SearchQuery {
+            view,
+            limit,
+            exclude: self.excluded(side, &query.exclude)?,
+            ..query.clone()
+        };
+
+        encode_hits(side, self.store(side).search(&part)?)
+    }
+
+    /// Up to `limit` notes in `view` of the store `side` resembling `source`, the hidden ones left
+    /// out, ids shown.
+    fn similar_side(
+        &mut self,
+        side: Side,
+        view: &View,
+        source: Source<'_>,
+        limit: usize,
+    ) -> Result<Vec<Hit>, StoreError> {
+        let excluded = self.excluded(side, &[])?;
+        let asked = limit.saturating_add(excluded.len());
+
+        let hits = match source {
+            Source::Own(raw) => self.store(side).similar(view, raw, asked)?,
+            Source::Text(text) => self.store(side).similar_text(view, text, asked)?,
+        };
+
+        let kept: Vec<Hit> = hits
+            .into_iter()
+            .filter(|hit| !excluded.contains(&hit.id))
+            .take(limit)
+            .collect();
+        encode_hits(side, kept)
+    }
+}
+
+/// `ids` (the store `side`'s own) with those of `asked` (shown ids) that are `side`'s, each once.
+fn with_asked(mut ids: Vec<i64>, side: Side, asked: &[i64]) -> Vec<i64> {
+    for (of, raw) in asked.iter().map(|id| decode(*id)) {
+        if of == side && !ids.contains(&raw) {
+            ids.push(raw);
+        }
+    }
+
+    ids
+}
+
+/// The scopes of `view` that `keep` keeps; `None` when it keeps none.
+pub(crate) fn narrow_by(view: &View, keep: impl Fn(Scope) -> bool) -> Option<View> {
+    let repo = view.repo.clone().filter(|_| keep(Scope::Repo));
+    let global = view.global && keep(Scope::Global);
+
+    (repo.is_some() || global).then_some(View { repo, global })
+}
+
+/// The scope `target` writes to.
+pub(crate) fn target_scope(target: &Target) -> Scope {
+    match target {
+        Target::Repo(_) => Scope::Repo,
+        Target::Global => Scope::Global,
+    }
+}
+
+/// The other store.
+fn other(side: Side) -> Side {
+    match side {
+        Side::Team => Side::Local,
+        Side::Local => Side::Team,
+    }
 }
 
 /// The id shown for note `raw` of the store `side`.
 fn encode(side: Side, raw: i64) -> Result<i64, StoreError> {
+    encode_as(side, raw, "note")
+}
+
+/// The id shown for the `noun` (note, script) `raw` of the store `side`: the local store's with
+/// [`LOCAL_ID_OFFSET`] added, the team's as it is (an error when it reaches the offset).
+pub(crate) fn encode_as(side: Side, raw: i64, noun: &str) -> Result<i64, StoreError> {
     let shown = match side {
         Side::Team if (..LOCAL_ID_OFFSET).contains(&raw) => Some(raw),
         Side::Team => None,
@@ -190,18 +448,24 @@ fn encode(side: Side, raw: i64) -> Result<i64, StoreError> {
 
     shown.ok_or_else(|| {
         StoreError::Backend(format!(
-            "note id {raw} is too large to tell the team database's notes from this computer's"
+            "{noun} id {raw} is too large to tell the team database's {noun}s from this computer's"
         ))
     })
 }
 
-/// The store and its own id for the shown note id `id`.
-fn decode(id: i64) -> (Side, i64) {
+/// The store and its own id for the shown id `id` (of a note or a script).
+pub(crate) fn decode(id: i64) -> (Side, i64) {
     if id >= LOCAL_ID_OFFSET {
         (Side::Local, id - LOCAL_ID_OFFSET)
     } else {
         (Side::Team, id)
     }
+}
+
+/// True when the shown note or script id `id` is one of this computer's ([`LOCAL_ID_OFFSET`] or
+/// above).
+pub fn is_local_id(id: i64) -> bool {
+    decode(id).0 == Side::Local
 }
 
 /// `error` of the store `side` with its own note ids replaced by the shown ones: a conflict's id,
@@ -224,6 +488,28 @@ fn note_missing(id: i64) -> StoreError {
     StoreError::NotFound(format!("note {id} not found in this repository or the global scope"))
 }
 
+/// The refusal to save a note under the title of the hidden team note `id`.
+pub fn hidden_title_error(id: i64) -> StoreError {
+    StoreError::Invalid(format!(
+        "a hidden team note has this title (note {id}): unhide it with harness-memory notes unhide {id}, or pick \
+         another title"
+    ))
+}
+
+/// The refusal to change team note `id` of a `remote+local` scope.
+pub fn read_only_error(id: i64, scope: Scope) -> StoreError {
+    let key = match scope {
+        Scope::Repo => "repository_notes",
+        Scope::Global => "global_notes",
+    };
+
+    StoreError::Invalid(format!(
+        "note {id} is a team note and read-only here: {key} is \"remote+local\", which reads the team's notes \
+         and saves new notes on this computer only. Save a new note instead, or stop seeing this one with \
+         harness-memory notes hide {id} (Hide on this computer in Harness Desktop)"
+    ))
+}
+
 fn encode_hits(side: Side, hits: Vec<Hit>) -> Result<Vec<Hit>, StoreError> {
     hits.into_iter()
         .map(|hit| {
@@ -235,10 +521,32 @@ fn encode_hits(side: Side, hits: Vec<Hit>) -> Result<Vec<Hit>, StoreError> {
         .collect()
 }
 
+/// `parts` taking turns (the first of each, then the second of each, …), at most `limit`.
+fn take_turns(parts: Vec<Vec<Hit>>, limit: usize) -> Vec<Hit> {
+    let mut queues: Vec<VecDeque<Hit>> = parts.into_iter().map(VecDeque::from).collect();
+    let mut merged: Vec<Hit> = Vec::new();
+
+    while merged.len() < limit && queues.iter().any(|queue| !queue.is_empty()) {
+        for queue in &mut queues {
+            if merged.len() >= limit {
+                break;
+            }
+
+            if let Some(hit) = queue.pop_front() {
+                merged.push(hit);
+            }
+        }
+    }
+
+    merged
+}
+
 /// One store's rows of a merged list: read [`LIST_PAGE_MAX`] at a time, ids shown.
 struct Cursor {
     side: Side,
     view: View,
+    /// The ids the store leaves out (the hidden ones, for the team store).
+    exclude: Vec<i64>,
     rows: VecDeque<NoteRow>,
     /// Rows read so far.
     read: usize,
@@ -247,10 +555,11 @@ struct Cursor {
 }
 
 impl Cursor {
-    fn new(side: Side, view: View) -> Self {
+    fn new(side: Side, view: View, exclude: Vec<i64>) -> Self {
         Self {
             side,
             view,
+            exclude,
             rows: VecDeque::new(),
             read: 0,
             done: false,
@@ -263,6 +572,7 @@ impl Cursor {
             view: self.view.clone(),
             offset: self.read,
             limit: LIST_PAGE_MAX,
+            exclude: self.exclude.clone(),
             ..query.clone()
         })?;
 
@@ -288,7 +598,12 @@ const NOTHING: View = View {
 
 impl MemoryStore for SplitStore {
     fn remember(&mut self, target: &Target, draft: &NoteDraft) -> Result<Saved, StoreError> {
-        let side = self.side_of_target(target);
+        let side = self.write_side(target_scope(target));
+
+        if side == Side::Team {
+            self.check_hidden_title(target, &draft.title)?;
+        }
+
         let saved = self
             .store(side)
             .remember(target, draft)
@@ -305,6 +620,10 @@ impl MemoryStore for SplitStore {
         let Some(view) = self.narrow(view, side) else {
             return Err(note_missing(id));
         };
+
+        if side == Side::Team {
+            self.check_team_write(&view, raw, id)?;
+        }
 
         let saved = self
             .store(side)
@@ -323,15 +642,22 @@ impl MemoryStore for SplitStore {
     }
 
     fn list_notes(&mut self, query: &NoteListQuery) -> Result<NotePage, StoreError> {
-        let mut cursors: Vec<Cursor> = self
-            .order()
-            .into_iter()
-            .filter_map(|side| self.narrow(&query.view, side).map(|view| Cursor::new(side, view)))
-            .collect();
+        let mut cursors: Vec<Cursor> = Vec::new();
+
+        for side in self.order() {
+            if let Some(view) = self.narrow(&query.view, side) {
+                let exclude = self.excluded(side, &query.exclude)?;
+                cursors.push(Cursor::new(side, view, exclude));
+            }
+        }
 
         if cursors.is_empty() {
-            let [first, _] = self.order();
-            cursors.push(Cursor::new(first, NOTHING));
+            cursors.push(Cursor::new(self.first(), NOTHING, Vec::new()));
+        }
+
+        // One store for the whole view pages in the database, as a single store does.
+        if let [only] = cursors.as_slice() {
+            return self.page_of(only.side, query, only.view.clone(), only.exclude.clone());
         }
 
         let mut page = NotePage::new([], query, Vec::new());
@@ -355,7 +681,7 @@ impl MemoryStore for SplitStore {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, cursor)| cursor.rows.front().map(|row| (index, row)))
-                .min_by(|(_, a), (_, b)| self.compare(query, a, b))
+                .min_by(|(_, a), (_, b)| Self::compare(query, a, b))
                 .map(|(index, _)| index);
 
             let Some(row) = next.and_then(|index| cursors[index].rows.pop_front()) else {
@@ -374,39 +700,49 @@ impl MemoryStore for SplitStore {
 
     fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
         let limit = query.limit.clamp(1, SEARCH_LIMIT_MAX);
+        let readers: Vec<(Side, View)> = self
+            .order()
+            .into_iter()
+            .filter_map(|side| self.narrow(&query.view, side).map(|view| (side, view)))
+            .collect();
+
+        // One store for the whole view ranks it as a single store does.
+        if let [(side, view)] = readers.as_slice() {
+            return self.search_side(*side, query, view.clone(), limit);
+        }
+
         let mut hits: Vec<Hit> = Vec::new();
         let mut asked = false;
 
-        for side in self.order() {
-            let Some(view) = self.narrow(&query.view, side) else {
-                continue;
-            };
-
+        for scope in [Scope::Repo, Scope::Global] {
             // A checkout search leaves the global notes out.
-            if view.global && query.checkout.is_some() {
+            if scope == Scope::Global && query.checkout.is_some() {
                 continue;
             }
+
+            let Some(view) = narrow_by(&query.view, |kept| kept == scope) else {
+                continue;
+            };
 
             if hits.len() >= limit {
                 break;
             }
 
-            let part = SearchQuery {
-                view,
-                limit: limit - hits.len(),
-                ..query.clone()
-            };
-            hits.extend(encode_hits(side, self.store(side).search(&part)?)?);
-            asked = true;
+            let room = limit - hits.len();
+            let mut parts: Vec<Vec<Hit>> = Vec::new();
+
+            for side in [Side::Local, Side::Team] {
+                if self.reads(scope, side) {
+                    parts.push(self.search_side(side, query, view.clone(), room)?);
+                    asked = true;
+                }
+            }
+
+            hits.extend(take_turns(parts, room));
         }
 
         if !asked {
-            let [first, _] = self.order();
-            let part = SearchQuery {
-                view: NOTHING,
-                ..query.clone()
-            };
-            return encode_hits(first, self.store(first).search(&part)?);
+            return self.search_side(self.first(), query, NOTHING, limit);
         }
 
         Ok(hits)
@@ -414,22 +750,47 @@ impl MemoryStore for SplitStore {
 
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {
         let (side, raw) = decode(id);
-        let Some(view) = self.narrow(view, side) else {
+
+        if side == Side::Team && self.hidden_ids()?.contains(&raw) {
+            return Ok(Vec::new());
+        }
+
+        let Some(own) = self.narrow(view, side) else {
             return Ok(Vec::new());
         };
 
-        let hits = self.store(side).similar(&view, raw, limit)?;
-        encode_hits(side, hits)
+        let mut parts = vec![self.similar_side(side, &own, Source::Own(raw), limit)?];
+
+        // In a `remote+local` scope the other store holds notes of the same scope too.
+        let shared = narrow_by(view, |scope| self.place(scope) == NotesPlace::RemoteLocal);
+
+        if let Some(shared) = shared {
+            let note = self.store(side).peek(&own, &[raw])?.into_iter().next();
+            let note = note.filter(|note| self.place(note.scope) == NotesPlace::RemoteLocal);
+
+            if let Some(note) = note {
+                let source = Source::Text((&note.title, &note.body));
+                parts.push(self.similar_side(other(side), &shared, source, limit)?);
+            }
+        }
+
+        Ok(take_turns(parts, limit))
     }
 
     fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {
-        let side = self.side_of_target(target);
+        let scope = target_scope(target);
+        let side = self.write_side(scope);
 
         let ids = match link.note_id {
             Some(id) => {
                 let (note_side, raw) = decode(id);
+                let team_note = note_side == Side::Team;
 
-                if note_side != side {
+                if note_side != side && team_note && self.reads(scope, Side::Team) {
+                    return Err(read_only_error(id, scope));
+                }
+
+                if note_side != side || (team_note && self.hidden_ids_strict()?.contains(&raw)) {
                     return Err(StoreError::NotFound(format!("note {id} not found in this scope")));
                 }
 
@@ -475,10 +836,12 @@ impl MemoryStore for SplitStore {
                 return Err(error);
             }
 
-            let [first, _] = self.order();
+            let first = self.first();
             return self.store(first).neighbors(&NOTHING, entity, depth, limit);
         }
 
+        let hidden = self.hidden_ids()?;
+        let shown = |side: Side, raw: i64| !(side == Side::Team && hidden.contains(&raw));
         let mut merged = Neighborhood::default();
         let mut total = 0usize;
 
@@ -486,14 +849,18 @@ impl MemoryStore for SplitStore {
             total += part.edges.len() + part.more_edges;
 
             for edge in part.edges {
+                let note_id = edge.note_id.filter(|raw| shown(side, *raw));
+
                 merged.edges.push(Edge {
-                    note_id: edge.note_id.map(|raw| encode(side, raw)).transpose()?,
+                    note_id: note_id.map(|raw| encode(side, raw)).transpose()?,
                     ..edge
                 });
             }
 
             for (raw, title) in part.notes {
-                merged.notes.push((encode(side, raw)?, title));
+                if shown(side, raw) {
+                    merged.notes.push((encode(side, raw)?, title));
+                }
             }
         }
 
@@ -505,7 +872,7 @@ impl MemoryStore for SplitStore {
 
     fn forget(&mut self, view: &View, target: &Target, what: &Forget) -> Result<usize, StoreError> {
         let Forget::Note(id) = what else {
-            let side = self.side_of_target(target);
+            let side = self.write_side(target_scope(target));
             return self.store(side).forget(view, target, what);
         };
 
@@ -514,28 +881,39 @@ impl MemoryStore for SplitStore {
             return Err(note_missing(*id));
         };
 
+        if side == Side::Team {
+            self.check_team_write(&view, raw, *id)?;
+        }
+
         self.store(side)
             .forget(&view, target, &Forget::Note(raw))
             .map_err(|error| reword(error, side, Some((raw, *id))))
     }
 
-    /// Each store deletes the scope it holds; a failure in the second leaves the first's deletes.
-    fn forget_notes(&mut self, view: &View) -> Result<Forgotten, StoreError> {
+    /// Each store deletes the scopes it saves (a `remote+local` scope's team notes stay), and the
+    /// team store leaves the hidden notes too (nothing is deleted there when the hidden list cannot
+    /// be read); a failure in the second leaves the first's deletes.
+    fn forget_notes(&mut self, view: &View, exclude: &[i64]) -> Result<Forgotten, StoreError> {
         let mut forgotten = Forgotten::default();
 
         for side in [Side::Team, Side::Local] {
-            let Some(view) = self.narrow(view, side) else {
+            let Some(view) = self.narrow_writes(view, side) else {
                 continue;
             };
 
-            forgotten = forgotten + self.store(side).forget_notes(&view)?;
+            let hidden = match side {
+                Side::Team => self.hidden_ids_strict()?,
+                Side::Local => Vec::new(),
+            };
+            let left = with_asked(hidden, side, exclude);
+            forgotten = forgotten + self.store(side).forget_notes(&view, &left)?;
         }
 
         Ok(forgotten)
     }
 
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
-        let side = self.side_of_target(target);
+        let side = self.write_side(target_scope(target));
 
         match self.store(side).find_by_title(target, title)? {
             Some(note) => Ok(Some(Note {
@@ -543,6 +921,15 @@ impl MemoryStore for SplitStore {
                 ..note
             })),
             None => Ok(None),
+        }
+    }
+
+    fn origin(&self, id: i64, scope: Scope) -> NoteOrigin {
+        match decode(id).0 {
+            Side::Local => NoteOrigin::Local,
+            Side::Team => NoteOrigin::Team {
+                read_only: self.place(scope) == NotesPlace::RemoteLocal,
+            },
         }
     }
 }
@@ -584,5 +971,25 @@ mod tests {
 
         let conflict = reword(StoreError::Conflict(3), Side::Local, None);
         assert!(matches!(conflict, StoreError::Conflict(1_000_000_003)));
+    }
+
+    #[test]
+    fn hits_take_turns_up_to_the_limit() {
+        let hit = |id: i64| Hit {
+            id,
+            kind: crate::store::NoteKind::Note,
+            scope: Scope::Repo,
+            title: String::new(),
+            snippet: String::new(),
+            updated_at: 0,
+            entities: Vec::new(),
+            provenance: crate::store::Provenance::default(),
+        };
+        let ids = |hits: Vec<Hit>| hits.into_iter().map(|hit| hit.id).collect::<Vec<_>>();
+
+        let parts = || vec![vec![hit(1), hit(2), hit(3)], vec![hit(10)]];
+        assert_eq!(ids(take_turns(parts(), 3)), [1, 10, 2]);
+        assert_eq!(ids(take_turns(parts(), 9)), [1, 10, 2, 3]);
+        assert!(take_turns(Vec::new(), 3).is_empty());
     }
 }

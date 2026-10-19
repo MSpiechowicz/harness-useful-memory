@@ -215,3 +215,11 @@ fn pushing_into_postgres_is_idempotent() {
 
     push_support::scenario(&mut store);
 }
+
+#[test]
+fn hidden_team_notes_are_never_written_over_in_postgres() {
+    let Some(db) = database() else { return };
+    let mut store = db.open();
+
+    push_support::hidden_scenario(&mut store);
+}

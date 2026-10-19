@@ -126,7 +126,7 @@ fn save(server: &mut Server, args: SaveArgs) -> Result<Reply, String> {
         Some("the stored version differs from what was saved".to_owned())
     } else {
         match (copied, seen) {
-            (Ok(Some(original)), _) => Some(copy_reason(&original)),
+            (Ok(Some(reason)), _) => Some(reason),
             (_, Ok(true)) => Some("its code waited for approval on this machine before".to_owned()),
             (Err(error), _) | (_, Err(error)) => Some(format!(
                 "the scripts waiting for approval could not be checked ({error})"
@@ -148,7 +148,7 @@ fn save(server: &mut Server, args: SaveArgs) -> Result<Reply, String> {
     }
 
     let sha256 = script_sha256(script.summary.language, &script.body);
-    let approval = approval_for(server, server.scripts_place, &script.summary, &sha256)?;
+    let approval = approval_for(server, &script.summary, &sha256)?;
     let shown = shown(server, &script.summary, &sha256, approval);
     Ok(Reply {
         text: format!("{}{note}", saved_line(&shown, saved.created)),
@@ -188,13 +188,15 @@ fn every_language_sha256(body: &str) -> Vec<String> {
         .collect()
 }
 
-/// Trusts `draft`, saved here into `target` as script `id`, as saved on this machine.
+/// Trusts `draft`, saved here into `target` as script `id` (as the store shows it), as saved on
+/// this machine.
 fn trust_draft(server: &mut Server, id: i64, draft: &ScriptDraft, target: &Target) -> Result<(), StoreError> {
-    let place = server.place_key(server.scripts_place);
+    let (side, raw) = server.spot(id);
+    let place = server.place_key(side);
     let (scope, project) = scope_of(target);
     let version = TrustedVersion {
         place: &place,
-        script_id: id,
+        script_id: raw,
         name: &draft.name,
         scope,
         project,
@@ -206,42 +208,58 @@ fn trust_draft(server: &mut Server, id: i64, draft: &ScriptDraft, target: &Targe
     server.trust.trust(&version)
 }
 
-/// The first script visible in `view`, in either script store, that waits for approval and has
-/// `body`: saving its code again must not trust it. Its id and name, `None` when there is none.
-fn unapproved_copy(server: &mut Server, view: &View, body: &str) -> Result<Option<(i64, String)>, String> {
-    let places = [server.scripts_place, server.other_place()];
-
-    for place in places {
-        let store = if place == server.scripts_place {
-            Some(&mut server.scripts)
-        } else {
-            server.other_scripts.as_mut()
-        };
-
-        let Some(store) = store else {
-            continue;
-        };
-
-        // The same body in any language: the hash of the body in the script's own language.
-        let candidates: Vec<ScriptSummary> = store
-            .list_scripts(view, None)
-            .map_err(|error| error.to_string())?
+/// Why saving `body` must not trust it: a script visible in `view`, in either script store, or a
+/// team script hidden on this computer, has that code and waits for approval. `None` when none
+/// does; an error when a store or the list of hidden team scripts cannot be read, so the save is
+/// not trusted.
+fn unapproved_copy(server: &mut Server, view: &View, body: &str) -> Result<Option<String>, String> {
+    // The same body in any language: the hash of the body in the script's own language.
+    let same_body = |summaries: Vec<ScriptSummary>| -> Vec<ScriptSummary> {
+        summaries
             .into_iter()
             .filter(|summary| summary.sha256 == script_sha256(summary.language, body))
-            .collect();
+            .collect()
+    };
 
-        for summary in candidates {
-            if !approval_for(server, place, &summary, &summary.sha256)?.is_trusted() {
-                return Ok(Some((summary.id, summary.name)));
+    let read = server
+        .scripts
+        .list_scripts(view, None)
+        .map_err(|error| error.to_string())?;
+
+    for summary in same_body(read) {
+        if !approval_for(server, &summary, &summary.sha256)?.is_trusted() {
+            return Ok(Some(copy_reason(summary.id, &summary.name)));
+        }
+    }
+
+    if let (Some(place), Some(other)) = (server.other_place(), server.other_scripts.as_mut()) {
+        let read = other.list_scripts(view, None).map_err(|error| error.to_string())?;
+
+        for summary in same_body(read) {
+            if !approval_at(server, place, summary.id, &summary, &summary.sha256)?.is_trusted() {
+                return Ok(Some(copy_reason(summary.id, &summary.name)));
             }
+        }
+    }
+
+    // A hidden team script waits all the same, but stays unnamed as every read leaves it out.
+    let hidden = server.scripts.hidden_scripts(view).map_err(|error| error.to_string())?;
+
+    for summary in same_body(hidden) {
+        if !approval_for(server, &summary, &summary.sha256)?.is_trusted() {
+            return Ok(Some(
+                "it is the code of a team script hidden on this computer, which is not approved on this machine"
+                    .to_owned(),
+            ));
         }
     }
 
     Ok(None)
 }
 
-/// Why a saved script was not trusted: it is the code of `original`, which waits for approval.
-fn copy_reason((id, name): &(i64, String)) -> String {
+/// Why a saved script was not trusted: it is the code of script `id` (`name`), which waits for
+/// approval.
+fn copy_reason(id: i64, name: &str) -> String {
     format!("it is the code of script {id} {name}, which is not approved on this machine")
 }
 
@@ -262,7 +280,7 @@ fn list(server: &mut Server, args: ListArgs) -> Result<Reply, String> {
     let mut objects = Vec::with_capacity(summaries.len());
 
     for summary in &summaries {
-        let approval = approval_for(server, server.scripts_place, summary, &summary.sha256)?;
+        let approval = approval_for(server, summary, &summary.sha256)?;
         let shown = shown(server, summary, &summary.sha256, approval);
         lines.push(shown.line());
         objects.push(shown.json());
@@ -284,7 +302,7 @@ fn list(server: &mut Server, args: ListArgs) -> Result<Reply, String> {
 fn get(server: &mut Server, args: RefArgs) -> Result<Reply, String> {
     let (_, script) = find(server, args.id, args.name, args.scope, args.project_path.as_deref())?;
     let sha256 = script_sha256(script.summary.language, &script.body);
-    let approval = approval_for(server, server.scripts_place, &script.summary, &sha256)?;
+    let approval = approval_for(server, &script.summary, &sha256)?;
     let home = server.projects.home();
 
     let shown = shown(server, &script.summary, &sha256, approval);
@@ -301,7 +319,7 @@ fn delete(server: &mut Server, args: RefArgs) -> Result<Reply, String> {
 
     // Remembers a version waiting for approval, so saving its code after the delete runs nothing.
     let sha256 = script_sha256(script.summary.language, &script.body);
-    approval_for(server, server.scripts_place, &script.summary, &sha256)?;
+    approval_for(server, &script.summary, &sha256)?;
 
     let deleted = server
         .scripts
@@ -347,7 +365,7 @@ fn run(server: &mut Server, args: RunArgs) -> Result<Reply, String> {
     let cwd = working_dir(server, project_path);
     let mut notes = String::new();
 
-    if !approval_for(server, server.scripts_place, &script.summary, &sha256)?.is_trusted() {
+    if !approval_for(server, &script.summary, &sha256)?.is_trusted() {
         let summary = shown(server, &script.summary, &sha256, Approval::Needed).json();
         let input = RunInput {
             args: &script_args,
@@ -504,25 +522,40 @@ fn view(server: &mut Server, scope: Option<&str>, project_path: Option<&str>) ->
     }
 }
 
-/// How this machine may run version `sha256` of `summary`, a script read from the store in
-/// `place` (a version that needs approval is remembered, see [`approval_of`]).
-fn approval_for(server: &mut Server, place: Place, summary: &ScriptSummary, sha256: &str) -> Result<Approval, String> {
+/// How this machine may run version `sha256` of `summary`, a script read from the server's script
+/// store (a version that needs approval is remembered, see [`approval_of`]).
+fn approval_for(server: &mut Server, summary: &ScriptSummary, sha256: &str) -> Result<Approval, String> {
+    let (place, raw) = server.spot(summary.id);
+    approval_at(server, place, raw, summary, sha256)
+}
+
+/// [`approval_for`] for a script kept in `place` as script `raw`.
+fn approval_at(
+    server: &mut Server,
+    place: Place,
+    raw: i64,
+    summary: &ScriptSummary,
+    sha256: &str,
+) -> Result<Approval, String> {
     let team_trusted = server.team_trusted(place);
     let key = server.place_key(place);
-    approval_of(server.trust.as_mut(), team_trusted, &key, summary, sha256)
+    approval_of(server.trust.as_mut(), team_trusted, &key, raw, summary, sha256)
 }
 
 /// Trusts the version of `script` read from the server's script store, as approved here.
 fn trust(server: &mut Server, script: &Script, origin: TrustOrigin) -> Result<(), StoreError> {
-    let place = server.place_key(server.scripts_place);
-    server.trust.trust(&TrustedVersion::of(&place, script, origin))
+    let (side, raw) = server.spot(script.summary.id);
+    let place = server.place_key(side);
+    server.trust.trust(&TrustedVersion::of(&place, raw, script, origin))
 }
 
 fn shown<'a>(server: &Server, summary: &'a ScriptSummary, sha256: &'a str, approval: Approval) -> Shown<'a> {
     Shown {
         summary,
         sha256,
-        place: server.scripts_place,
+        place: server.spot(summary.id).0,
+        read_only: server.scripts.origin(summary.id).is_read_only(),
+        hidden: false,
         approval,
     }
 }

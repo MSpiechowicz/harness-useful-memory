@@ -17,7 +17,9 @@ use crate::store::scripts::{TRUSTED_VERSIONS_KEPT, UNAPPROVED_KEPT};
 use crate::store::{
     PreviousVersion, Target, TrustOrigin, TrustRecord, TrustStore, TrustedVersion, View, checked_draft, script_sha256,
 };
-use crate::store::{Provenance, SavedScript, Script, ScriptDraft, ScriptRef, ScriptStore, ScriptSummary, StoreError};
+use crate::store::{
+    ProjectKey, Provenance, SavedScript, Script, ScriptDraft, ScriptRef, ScriptStore, ScriptSummary, StoreError,
+};
 
 /// The longest language name (`python`), with room to spare.
 const LANGUAGE_MAX: usize = 16;
@@ -280,6 +282,60 @@ fn stored_from_row(row: &Row) -> Result<Stored, StoreError> {
         last_exit_code: row.get(14)?,
         body: row.get(15)?,
     })
+}
+
+impl SqliteStore {
+    /// Every script of the file, every repository's, oldest first, with its repository (`None` for a
+    /// global script): what `scripts push` copies and `scripts discard-local` deletes.
+    pub fn every_script(&mut self) -> Result<Vec<(Script, Option<ProjectKey>)>, StoreError> {
+        self.read(|db| {
+            let sql = format!("SELECT {}, p.root_path, p.remote {FROM} ORDER BY s.id", columns());
+            let rows = db.query(&sql, &[])?;
+            let mut scripts = Vec::with_capacity(rows.len());
+
+            for row in &rows {
+                let Some(script) = script_from_row(row) else {
+                    continue;
+                };
+
+                let project = match &script.summary.project {
+                    Some(key) => {
+                        let root: Option<String> = row.get(16)?;
+
+                        Some(ProjectKey {
+                            key: key.clone(),
+                            root: PathBuf::from(root.unwrap_or_default()),
+                            remote: row.get(17)?,
+                        })
+                    }
+                    None => None,
+                };
+
+                scripts.push((script, project));
+            }
+
+            Ok(scripts)
+        })
+    }
+
+    /// How many scripts the file holds per scope, every repository's: `(repository, global)`.
+    pub fn script_scope_counts(&mut self) -> Result<(usize, usize), StoreError> {
+        let rows = self.read(|db| db.query("SELECT project_id IS NULL, count(*) FROM scripts GROUP BY 1", &[]))?;
+        let mut counts = (0, 0);
+
+        for row in &rows {
+            let is_global: i64 = row.get(0)?;
+            let count = usize::try_from(row.get::<i64>(1)?).unwrap_or(0);
+
+            if is_global == 0 {
+                counts.0 += count;
+            } else {
+                counts.1 += count;
+            }
+        }
+
+        Ok(counts)
+    }
 }
 
 impl ScriptStore for SqliteStore {

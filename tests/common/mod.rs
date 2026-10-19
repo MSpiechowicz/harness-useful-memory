@@ -83,5 +83,6 @@ pub fn query(text: &str, view: View) -> SearchQuery {
         kind: None,
         limit: 8,
         checkout: None,
+        exclude: Vec::new(),
     }
 }

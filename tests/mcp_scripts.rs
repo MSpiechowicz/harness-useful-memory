@@ -10,10 +10,14 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use common::approval::Fixture;
 use common::mcp::{call, canonical, is_error, repo_with_remote, run, server, text};
 use common::stdio::{Client, command};
 use harness_memory::Server;
+use harness_memory::backend::NotesPlace;
 use harness_memory::limits::{SCRIPT_STDERR_MAX, SCRIPT_STDOUT_MAX};
+use harness_memory::store::split::LOCAL_ID_OFFSET;
+use harness_memory::store::{ScriptStore, SqliteStore, View};
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -101,6 +105,8 @@ fn scripts_round_trip_with_their_structured_shapes() {
             "sha256",
             "timeoutSecs",
             "place",
+            "readOnly",
+            "hidden",
             "author",
             "createdAt",
             "updatedAt",
@@ -117,6 +123,7 @@ fn scripts_round_trip_with_their_structured_shapes() {
     assert_eq!(script["repo"], "github.com/acme/widget");
     assert_eq!(script["timeoutSecs"], 30);
     assert_eq!(script["place"], "local");
+    assert_eq!((&script["readOnly"], &script["hidden"]), (&json!(false), &json!(false)));
     assert_eq!(
         script["author"],
         json!({ "source": "tests", "root": root.display().to_string() })
@@ -549,4 +556,79 @@ fn the_script_file_has_no_parent_folder_other_users_can_change() {
         let mode = std::fs::metadata(folder).expect("metadata").permissions().mode();
         assert_eq!(mode & 0o002, 0, "{folder:?} is writable by every user");
     }
+}
+
+#[test]
+fn remote_local_saves_here_lists_both_and_leaves_team_scripts_read_only() {
+    const TEAM: &str = "team:aaaaaaaaaaaaaaaa";
+
+    let fixture = Fixture::new();
+    let team_id = fixture.save_into("team.sqlite3", "deploy", "printf team", Default::default());
+    let mut server = fixture.split_server(200, NotesPlace::RemoteLocal, TEAM);
+
+    let listed = ok(&mut server, "script_list", json!({}));
+    let row = &listed["scripts"][0];
+    assert_eq!(
+        (&row["id"], &row["place"], &row["readOnly"], &row["hidden"]),
+        (&json!(team_id), &json!("team"), &json!(true), &json!(false))
+    );
+
+    // Saving the same name saves this computer's own script, which a name finds first.
+    let saved = ok(
+        &mut server,
+        "script_save",
+        json!({ "scope": "global", "name": "deploy", "description": "", "language": "sh", "body": "printf mine" }),
+    );
+    let mine = saved["script"]["id"].as_i64().expect("id");
+    assert_eq!(
+        (&saved["created"], &saved["script"]["place"]),
+        (&json!(true), &json!("local"))
+    );
+    assert!(mine >= LOCAL_ID_OFFSET);
+
+    let listed = ok(&mut server, "script_list", json!({}));
+    let ids: Vec<&Value> = listed["scripts"]
+        .as_array()
+        .expect("scripts")
+        .iter()
+        .map(|row| &row["id"])
+        .collect();
+    assert_eq!(ids, [&json!(mine), &json!(team_id)]);
+    assert_eq!(
+        ok(&mut server, "script_get", json!({ "name": "deploy" }))["script"]["id"],
+        mine
+    );
+
+    let refused = tool(&mut server, "script_delete", json!({ "id": team_id }));
+    assert!(is_error(&refused));
+    assert!(
+        text(&refused).contains("read-only here")
+            && text(&refused).contains(&format!("harness-memory scripts hide {team_id}")),
+        "{}",
+        text(&refused)
+    );
+
+    ok(&mut server, "script_delete", json!({ "name": "deploy" }));
+    assert_eq!(
+        ok(&mut server, "script_get", json!({ "name": "deploy" }))["script"]["id"],
+        team_id
+    );
+
+    // A team script hidden on this computer is gone from every read.
+    let summary = SqliteStore::open(&fixture.data().join("team.sqlite3"))
+        .expect("team")
+        .list_scripts(
+            &View {
+                repo: None,
+                global: true,
+            },
+            None,
+        )
+        .expect("list")
+        .remove(0);
+    assert!(fixture.hidden_scripts(TEAM).hide(&summary).expect("hide"));
+
+    assert_eq!(ok(&mut server, "script_list", json!({}))["scripts"], json!([]));
+    assert!(is_error(&tool(&mut server, "script_get", json!({ "id": team_id }))));
+    assert!(is_error(&tool(&mut server, "script_run", json!({ "name": "deploy" }))));
 }

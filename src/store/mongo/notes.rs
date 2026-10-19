@@ -323,33 +323,43 @@ pub(super) fn forget(ctx: &mut Ctx<'_>, view: &View, id: i64) -> Result<usize, F
     Ok(1)
 }
 
-/// Deletes every note visible in `view`, one scope at a time: the notes, the note of their
-/// relations (the relations stay), then the entities of the scope that no relation uses.
-pub(super) fn forget_all(ctx: &mut Ctx<'_>, view: &View) -> Result<Forgotten, Fail> {
+/// Deletes every note visible in `view` but those `exclude` names, one scope at a time: the
+/// notes, the note of their relations (the relations stay), then the entities of the scope that no
+/// note left or relation uses.
+pub(super) fn forget_all(ctx: &mut Ctx<'_>, view: &View, exclude: &[i64]) -> Result<Forgotten, Fail> {
     let mut forgotten = Forgotten::default();
 
     if let Some(repo) = &view.repo {
-        forgotten.repo = forget_scope(ctx, Some(&repo.key))?;
+        forgotten.repo = forget_scope(ctx, Some(&repo.key), exclude)?;
     }
 
     if view.global {
-        forgotten.global = forget_scope(ctx, None)?;
+        forgotten.global = forget_scope(ctx, None, exclude)?;
     }
 
     Ok(forgotten)
 }
 
-/// Deletes the notes of the scope `project` (see [`forget_all`]); how many went.
-fn forget_scope(ctx: &mut Ctx<'_>, project: Option<&str>) -> Result<usize, Fail> {
+/// Deletes the notes of the scope `project` but `exclude` (see [`forget_all`]); how many went.
+fn forget_scope(ctx: &mut Ctx<'_>, project: Option<&str>, exclude: &[i64]) -> Result<usize, Fail> {
     let scope = scope_value(project);
-    let deleted = ctx.delete_many(NOTES, doc! { "project": scope.clone() })?;
+    let deleted = ctx.delete_many(NOTES, doc! { "project": scope.clone(), "_id": { "$nin": exclude } })?;
 
     ctx.update_many(
         RELATIONS,
-        doc! { "project": scope.clone(), "note_id": { "$ne": Bson::Null } },
+        doc! { "project": scope.clone(), "note_id": { "$ne": Bson::Null, "$nin": exclude } },
         doc! { "$set": { "note_id": Bson::Null } },
     )?;
-    graph::prune_scope(ctx, project)?;
+
+    // The notes left keep their entities.
+    let mut kept: Vec<String> = Vec::new();
+
+    if !exclude.is_empty() {
+        let left = ctx.find(NOTES, doc! { "project": scope }, doc! {}, 0, doc! { "entities": 1 })?;
+        kept = left.iter().flat_map(|note| strings(note, "entities")).collect();
+    }
+
+    graph::prune_scope(ctx, project, &kept)?;
 
     Ok(usize::try_from(deleted).unwrap_or(usize::MAX))
 }

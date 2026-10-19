@@ -6,12 +6,12 @@
 //! updated-time sorts against the rows' own times and ids, and exact orders for title sorts.
 
 use harness_memory::store::{
-    Forgotten, Link, MemoryStore, NoteDraft, NoteKind, NoteListQuery, NotePage, NoteRow, NoteSort, Scope, StoreError,
-    Target, View,
+    Forgotten, Link, MemoryStore, NoteDraft, NoteKind, NoteListQuery, NotePage, NoteRow, NoteSort, Scope, SearchQuery,
+    StoreError, Target, View,
 };
 use pretty_assertions::assert_eq;
 
-use super::{both, draft, global_only, repo, repo_only};
+use super::{both, draft, global_only, query, repo, repo_only};
 
 pub const REPO: &str = "github.com/acme/widget";
 pub const OTHER: &str = "github.com/acme/gadget";
@@ -20,8 +20,12 @@ pub const OTHER: &str = "github.com/acme/gadget";
 pub type Case = fn(&mut dyn MemoryStore);
 
 /// Every case, by name.
-pub const CASES: [(&str, Case); 10] = [
+pub const CASES: [(&str, Case); 12] = [
     ("lists_visible_notes_newest_first", lists_visible_notes_newest_first),
+    (
+        "excluded_ids_leave_lists_and_searches",
+        excluded_ids_leave_lists_and_searches,
+    ),
     ("pages_cover_the_list_once", pages_cover_the_list_once),
     ("text_and_kind_filter_and_count", text_and_kind_filter_and_count),
     ("titles_sort_both_ways", titles_sort_both_ways),
@@ -31,6 +35,10 @@ pub const CASES: [(&str, Case); 10] = [
     (
         "forget_notes_deletes_every_listed_note",
         forget_notes_deletes_every_listed_note,
+    ),
+    (
+        "forget_notes_leaves_the_excluded_notes",
+        forget_notes_leaves_the_excluded_notes,
     ),
     (
         "kinds_scopes_and_places_sort_and_page",
@@ -54,6 +62,7 @@ pub fn listing(view: View) -> NoteListQuery {
         descending: true,
         offset: 0,
         limit: 200,
+        exclude: Vec::new(),
     }
 }
 
@@ -100,6 +109,84 @@ fn assert_newest_first(rows: &[NoteRow]) {
         let later = (pair[1].updated_at, pair[1].id);
         assert!(earlier > later, "{earlier:?} before {later:?}");
     }
+}
+
+/// The ids a list or a search leaves out (the hidden team notes) are gone from its rows and its
+/// counts; more than 500 is an error.
+pub fn excluded_ids_leave_lists_and_searches(store: &mut dyn MemoryStore) {
+    let flaky = save(
+        store,
+        &repo(REPO),
+        &draft("Flaky deploy", "deploy times out", NoteKind::Problem),
+    );
+    let fix = save(
+        store,
+        &repo(REPO),
+        &draft("Deploy fix", "deploy retries", NoteKind::Fix),
+    );
+    let tabs = save(
+        store,
+        &Target::Global,
+        &draft("Deploy tabs", "deploy four wide", NoteKind::Decision),
+    );
+
+    let left_out = NoteListQuery {
+        exclude: vec![flaky, tabs],
+        ..listing(both(REPO))
+    };
+    let page = list(store, &left_out);
+    assert_eq!(titles(&page.rows), ["Deploy fix"]);
+    assert_eq!(page.total, 1);
+    assert_eq!(
+        (scope_count(&page, Scope::Repo), scope_count(&page, Scope::Global)),
+        (1, 0)
+    );
+    assert_eq!(
+        (
+            count(&page, NoteKind::Problem),
+            count(&page, NoteKind::Fix),
+            count(&page, NoteKind::Decision)
+        ),
+        (0, 1, 0)
+    );
+
+    let global = NoteListQuery {
+        scope: Some(Scope::Global),
+        ..left_out.clone()
+    };
+    assert_eq!(list(store, &global).total, 0);
+    assert_eq!(
+        list(store, &listing(both(REPO))).total,
+        3,
+        "nothing left out by default"
+    );
+
+    for text in ["deploy", ""] {
+        let searched = SearchQuery {
+            exclude: vec![flaky, tabs],
+            ..query(text, both(REPO))
+        };
+        let hits: Vec<i64> = store
+            .search(&searched)
+            .expect("search")
+            .iter()
+            .map(|hit| hit.id)
+            .collect();
+        assert_eq!(hits, [fix], "{text:?}");
+    }
+
+    let too_many: Vec<i64> = (1..=501).collect();
+    let listed = NoteListQuery {
+        exclude: too_many.clone(),
+        ..listing(both(REPO))
+    };
+    assert!(matches!(store.list_notes(&listed), Err(StoreError::Invalid(_))));
+
+    let searched = SearchQuery {
+        exclude: too_many,
+        ..query("deploy", both(REPO))
+    };
+    assert!(matches!(store.search(&searched), Err(StoreError::Invalid(_))));
 }
 
 pub fn lists_visible_notes_newest_first(store: &mut dyn MemoryStore) {
@@ -482,7 +569,7 @@ pub fn forget_notes_deletes_every_listed_note(store: &mut dyn MemoryStore) {
         )
         .expect("link");
 
-    let forgotten = store.forget_notes(&both(REPO)).expect("forget notes");
+    let forgotten = store.forget_notes(&both(REPO), &[]).expect("forget notes");
     assert_eq!(
         forgotten,
         Forgotten {
@@ -516,7 +603,75 @@ pub fn forget_notes_deletes_every_listed_note(store: &mut dyn MemoryStore) {
         "another repository's entity stays"
     );
 
-    assert_eq!(store.forget_notes(&both(REPO)).expect("again"), Forgotten::default());
+    assert_eq!(
+        store.forget_notes(&both(REPO), &[]).expect("again"),
+        Forgotten::default()
+    );
+}
+
+pub fn forget_notes_leaves_the_excluded_notes(store: &mut dyn MemoryStore) {
+    let kept = save(
+        store,
+        &repo(REPO),
+        &tagged("Kept", "Body", NoteKind::Note, &[], &["kept.rs", "note-only.md"]),
+    );
+    save(
+        store,
+        &repo(REPO),
+        &tagged("Gone", "Body", NoteKind::Fix, &[], &["gone.rs"]),
+    );
+    let rule = save(
+        store,
+        &Target::Global,
+        &tagged("Rule", "Body", NoteKind::Note, &[], &["tabs.md"]),
+    );
+    save(store, &Target::Global, &draft("Other rule", "Body", NoteKind::Note));
+
+    store
+        .link(
+            &repo(REPO),
+            &Link {
+                from: "kept.rs".to_owned(),
+                relation: "uses".to_owned(),
+                to: "lib.rs".to_owned(),
+                note_id: Some(kept),
+            },
+        )
+        .expect("link");
+
+    let forgotten = store.forget_notes(&both(REPO), &[kept, rule]).expect("forget notes");
+    assert_eq!(forgotten, Forgotten { repo: 1, global: 1 });
+
+    let mut left = titles(&list(store, &listing(both(REPO))).rows)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    left.sort();
+    assert_eq!(left, ["Kept", "Rule"]);
+
+    let mut entities = store.peek(&both(REPO), &[kept]).expect("peek").remove(0).entities;
+    entities.sort();
+    assert_eq!(
+        entities,
+        ["kept.rs", "note-only.md"],
+        "the notes left keep their entities"
+    );
+
+    let around = store.neighbors(&repo_only(REPO), "kept.rs", 1, 10).expect("neighbors");
+    assert_eq!(around.edges[0].note_id, Some(kept), "the relation keeps its note");
+    assert!(
+        matches!(
+            store.neighbors(&repo_only(REPO), "gone.rs", 1, 10),
+            Err(StoreError::NotFound(_))
+        ),
+        "the deleted note's entity goes"
+    );
+
+    let too_many: Vec<i64> = (1..=501).collect();
+    assert!(matches!(
+        store.forget_notes(&both(REPO), &too_many),
+        Err(StoreError::Invalid(_))
+    ));
 }
 
 /// The notes of `view` in `sort` order (`descending` when asked), read one row per page, so the

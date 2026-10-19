@@ -116,6 +116,7 @@ use mongodb::sync::{Client, ClientSession, Collection, Database};
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, Saved, SearchQuery};
 use super::{Forgotten, NoteListQuery, NotePage, Scope, StoreError, Target, View};
 use crate::limits::{BODY_MAX, ENTITY_MAX, TAG_MAX, TAGS_MAX, TITLE_MAX};
+use crate::store::listing::checked_exclude;
 use schema::SchemaState;
 
 /// The database used when the URL path names none.
@@ -365,6 +366,11 @@ impl MemoryStore for MongoStore {
         search::similar(&mut self.reader()?, view, id, limit, text_index).map_err(|fail| self.failed(fail))
     }
 
+    fn similar_text(&mut self, view: &View, text: (&str, &str), limit: usize) -> Result<Vec<Hit>, StoreError> {
+        let text_index = self.text_index;
+        search::resembling(&mut self.reader()?, view, text, None, limit, text_index).map_err(|fail| self.failed(fail))
+    }
+
     fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {
         let link = graph::prepare(link)?;
         self.write(|ctx| graph::link(ctx, target, &link))
@@ -384,8 +390,9 @@ impl MemoryStore for MongoStore {
         })
     }
 
-    fn forget_notes(&mut self, view: &View) -> Result<Forgotten, StoreError> {
-        self.write(|ctx| notes::forget_all(ctx, view))
+    fn forget_notes(&mut self, view: &View, exclude: &[i64]) -> Result<Forgotten, StoreError> {
+        let exclude = checked_exclude(exclude)?.to_vec();
+        self.write(|ctx| notes::forget_all(ctx, view, &exclude))
     }
 
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {

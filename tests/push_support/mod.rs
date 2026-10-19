@@ -116,8 +116,8 @@ pub fn dry() -> Options {
     }
 }
 
-/// The counts of a push, failures included: notes added, updated, overwritten, skipped, then
-/// relations added and unchanged.
+/// The counts of a push, failures included: notes added, updated, overwritten, skipped (identical
+/// and team newer), then relations added and unchanged.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Counts {
     pub notes: [usize; 4],
@@ -127,10 +127,29 @@ pub struct Counts {
 
 pub fn counts(summary: &Summary) -> Counts {
     Counts {
-        notes: [summary.added, summary.updated, summary.overwritten, summary.skipped],
+        notes: [summary.added, summary.updated, summary.overwritten, summary.skipped()],
         links: [summary.links_added, summary.links_unchanged],
-        failed: summary.failed.clone(),
+        failed: summary.failed.iter().map(|failure| failure.message.clone()).collect(),
     }
+}
+
+/// The notes a push added, updated or overwrote: their scope, title and action.
+pub fn moved(summary: &Summary) -> Vec<(String, String, Action)> {
+    summary
+        .changes
+        .iter()
+        .filter(|change| matches!(change.action, Action::Added | Action::Updated | Action::Overwritten))
+        .map(|change| (change.scope.clone(), change.title.clone(), change.action))
+        .collect()
+}
+
+/// The change a push lists for the note titled `title`.
+pub fn change_of<'a>(summary: &'a Summary, title: &str) -> &'a Change {
+    summary
+        .changes
+        .iter()
+        .find(|change| change.title == title)
+        .unwrap_or_else(|| panic!("no change for {title}: {summary:?}"))
 }
 
 fn expect(notes: [usize; 4], links: [usize; 2]) -> Counts {
@@ -141,12 +160,8 @@ fn expect(notes: [usize; 4], links: [usize; 2]) -> Counts {
     }
 }
 
-fn change(scope: &str, title: &str, action: Action) -> Change {
-    Change {
-        scope: scope.to_owned(),
-        title: title.to_owned(),
-        action,
-    }
+fn change(scope: &str, title: &str, action: Action) -> (String, String, Action) {
+    (scope.to_owned(), title.to_owned(), action)
 }
 
 fn now() -> i64 {
@@ -165,10 +180,10 @@ pub fn scenario(remote: &mut dyn MemoryStore) {
     let local = local_memory();
     let key = format!("git:{REPO}");
 
-    let listed = push(&local.path, remote, &dry()).expect("dry run");
+    let listed = push(&local.path, remote, &[], &dry()).expect("dry run");
     assert_eq!(counts(&listed), expect([3, 0, 0, 0], [2, 0]));
     assert_eq!(
-        listed.changes,
+        moved(&listed),
         vec![
             change(&key, "Build cache", Action::Added),
             change(&key, "Deploy steps", Action::Added),
@@ -178,7 +193,7 @@ pub fn scenario(remote: &mut dyn MemoryStore) {
     assert_eq!(listed.projects, BTreeSet::from([key.clone(), "global".to_owned()]));
     assert!(remote.search(&query("", both(REPO))).expect("recent").is_empty());
 
-    let first = push(&local.path, remote, &all()).expect("first push");
+    let first = push(&local.path, remote, &[], &all()).expect("first push");
     assert_eq!(counts(&first), expect([3, 0, 0, 0], [2, 0]));
 
     let hits = remote.search(&query("cache", repo_only(REPO))).expect("search");
@@ -207,21 +222,22 @@ pub fn scenario(remote: &mut dyn MemoryStore) {
         1
     );
 
-    let again = push(&local.path, remote, &all()).expect("second push");
+    let again = push(&local.path, remote, &[], &all()).expect("second push");
     assert_eq!(counts(&again), expect([0, 0, 0, 3], [0, 2]));
-    assert!(again.changes.is_empty());
+    assert!(moved(&again).is_empty());
+    assert_eq!(again.identical, 3);
     assert_eq!(remote.search(&query("", both(REPO))).expect("recent").len(), 3);
 
     // A newer local text replaces the team's one, and the push names the note.
     local.edit("Deploy steps", "Run make release", now() + 3600);
     assert_eq!(
-        counts(&push(&local.path, remote, &dry()).expect("dry overwrite")),
+        counts(&push(&local.path, remote, &[], &dry()).expect("dry overwrite")),
         expect([0, 0, 1, 2], [0, 2])
     );
 
-    let changed = push(&local.path, remote, &all()).expect("third push");
+    let changed = push(&local.path, remote, &[], &all()).expect("third push");
     assert_eq!(counts(&changed), expect([0, 0, 1, 2], [0, 2]));
-    assert_eq!(changed.changes, vec![change(&key, "Deploy steps", Action::Overwritten)]);
+    assert_eq!(moved(&changed), vec![change(&key, "Deploy steps", Action::Overwritten)]);
 
     let deploy = remote.search(&query("deploy", repo_only(REPO))).expect("deploy");
     let note = remote.get(&both(REPO), &[deploy[0].id]).expect("get").remove(0);
@@ -229,12 +245,12 @@ pub fn scenario(remote: &mut dyn MemoryStore) {
 
     // Newer local tags with the same text are an update, not an overwrite.
     local.retag("Build cache", "build cache", now() + 3600);
-    let retagged = push(&local.path, remote, &all()).expect("fourth push");
+    let retagged = push(&local.path, remote, &[], &all()).expect("fourth push");
     assert_eq!(counts(&retagged), expect([0, 1, 0, 2], [0, 2]));
-    assert_eq!(retagged.changes, vec![change(&key, "Build cache", Action::Updated)]);
+    assert_eq!(moved(&retagged), vec![change(&key, "Build cache", Action::Updated)]);
 
     assert_eq!(
-        counts(&push(&local.path, remote, &all()).expect("fifth push")),
+        counts(&push(&local.path, remote, &[], &all()).expect("fifth push")),
         expect([0, 0, 0, 3], [0, 2])
     );
 
@@ -247,10 +263,11 @@ pub fn scenario(remote: &mut dyn MemoryStore) {
     remote.update(&global_only(), tabs[0].id, &patch).expect("team edit");
     local.edit("Editor tabs", "Eight wide", 1);
 
-    assert_eq!(
-        counts(&push(&local.path, remote, &all()).expect("sixth push")),
-        expect([0, 0, 0, 3], [0, 2])
-    );
+    let sixth = push(&local.path, remote, &[], &all()).expect("sixth push");
+    assert_eq!(counts(&sixth), expect([0, 0, 0, 3], [0, 2]));
+    assert_eq!((sixth.identical, sixth.team_newer), (2, 1));
+    assert_eq!(change_of(&sixth, "Editor tabs").action, Action::TeamNewer);
+    assert!(!change_of(&sixth, "Editor tabs").conflict);
     let kept = remote.get(&global_only(), &[tabs[0].id]).expect("get").remove(0);
     assert_eq!(kept.body, "Two wide");
 }
@@ -267,7 +284,7 @@ pub fn narrowed_scenario(remote: &mut dyn MemoryStore) {
         skip_global: true,
         ..all()
     };
-    let nothing = push(&local.path, remote, &other).expect("other repository");
+    let nothing = push(&local.path, remote, &[], &other).expect("other repository");
     assert_eq!(counts(&nothing), expect([0, 0, 0, 0], [0, 0]));
     assert!(nothing.projects.is_empty());
 
@@ -276,12 +293,96 @@ pub fn narrowed_scenario(remote: &mut dyn MemoryStore) {
         skip_global: true,
         ..all()
     };
-    let pushed = push(&local.path, remote, &repo_alone).expect("repository only");
+    let pushed = push(&local.path, remote, &[], &repo_alone).expect("repository only");
     assert_eq!(counts(&pushed), expect([2, 0, 0, 0], [1, 0]));
     assert_eq!(pushed.projects, BTreeSet::from([key.clone()]));
     assert!(remote.search(&query("", global_only())).expect("global").is_empty());
 
-    let rest = push(&local.path, remote, &all()).expect("everything");
+    let rest = push(&local.path, remote, &[], &all()).expect("everything");
     assert_eq!(counts(&rest), expect([1, 0, 0, 2], [1, 1]));
-    assert_eq!(rest.changes, vec![change("global", "Editor tabs", Action::Added)]);
+    assert_eq!(moved(&rest), vec![change("global", "Editor tabs", Action::Added)]);
+}
+
+/// Pushes [`local_memory`] into `remote`, then pushes again with two of its team notes hidden on
+/// this computer: one the newer local text would overwrite, one identical. Both fail, in the dry
+/// run as in the push, naming `harness-memory notes unhide`; neither is written over, counted or
+/// deleted here, the relation of the failed note fails with it, while the rest goes as usual.
+pub fn hidden_scenario(remote: &mut dyn MemoryStore) {
+    let local = local_memory();
+    push(&local.path, remote, &[], &all()).expect("first push");
+    local.edit("Deploy steps", "Run make release", now() + 3600);
+
+    let team_id = |remote: &mut dyn MemoryStore, title: &str| {
+        remote
+            .find_by_title(&repo(REPO), title)
+            .expect("find")
+            .unwrap_or_else(|| panic!("no team note {title}"))
+            .id
+    };
+    let (cache, deploy) = (team_id(remote, "Build cache"), team_id(remote, "Deploy steps"));
+    let hidden = [cache, deploy];
+
+    let preview = push(&local.path, remote, &hidden, &dry()).expect("dry run");
+    let failed: Vec<(Option<i64>, bool)> = preview
+        .failed
+        .iter()
+        .map(|failure| (failure.local_id, failure.deleting))
+        .collect();
+    let [cache_id, deploy_id] = ["Build cache", "Deploy steps"].map(|title| Some(change_of(&preview, title).local_id));
+
+    // The relation of the failed "Build cache" fails with it, tied to that note.
+    assert_eq!(failed, [(cache_id, false), (deploy_id, false), (cache_id, false)]);
+    assert!(
+        preview.failed[2]
+            .message
+            .starts_with("relation \"Cache located_in target/\""),
+        "{}",
+        preview.failed[2].message
+    );
+    assert_eq!(
+        [preview.added, preview.updated, preview.overwritten, preview.skipped()],
+        [0, 0, 0, 1]
+    );
+    assert_eq!((preview.links_added, preview.links_unchanged), (0, 1));
+
+    for (title, id) in [("Build cache", cache), ("Deploy steps", deploy)] {
+        assert!(change_of(&preview, title).failed, "{title}");
+        let failure = preview
+            .failed
+            .iter()
+            .find(|failure| failure.local_id == Some(change_of(&preview, title).local_id))
+            .expect("a failure");
+        assert!(!failure.deleting);
+        assert!(
+            failure.message.contains(&format!("harness-memory notes unhide {id}")),
+            "{}",
+            failure.message
+        );
+    }
+
+    let options = Options {
+        delete_copied: true,
+        ..all()
+    };
+    let pushed = push(&local.path, remote, &hidden, &options).expect("push");
+    assert_eq!(counts(&pushed), counts(&preview));
+    assert_eq!(pushed.failed, preview.failed);
+    assert_eq!(pushed.deleted, Some(1));
+
+    let team = remote
+        .find_by_title(&repo(REPO), "Deploy steps")
+        .expect("find")
+        .expect("deploy");
+    assert_eq!(team.body, "Run make deploy");
+
+    let left: Vec<String> = SqliteStore::open(&local.path)
+        .expect("local store")
+        .search(&query("", both(REPO)))
+        .expect("local notes")
+        .into_iter()
+        .map(|hit| hit.title)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    assert_eq!(left, ["Build cache", "Deploy steps"]);
 }

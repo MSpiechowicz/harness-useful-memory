@@ -15,6 +15,7 @@ use std::process::{Command, Output, Stdio};
 
 use common::mcp::repo_with_remote;
 use common::stdio::{BINARY, Client, without_team_settings};
+use harness_memory::store::{Language, Provenance, ScriptDraft, ScriptStore, SqliteStore, Target};
 use postgres_support::database;
 use serde_json::json;
 use tempfile::TempDir;
@@ -182,11 +183,110 @@ fn push_refuses_unknown_or_incomplete_options() {
         &["push", "--dry-run", "--dry-run"],
         &["push", "--repo", ".", "--repo=."],
         &["push", "--everything"],
+        &["push", "--json", "--json"],
+        &["push", "--dry-run=yes"],
+        &["push", "--overwrite"],
+        &["push", "--overwrite", "some"],
+        &["push", "--overwrite", "12,x"],
+        &["push", "--overwrite", "0"],
+        &["push", "--overwrite=none", "--overwrite", "all"],
+        &["push", "--scope", "both"],
+        &["push", "--scope", "repo", "--scope", "global"],
     ] {
         let output = run(binary(&machine, args, url));
         assert_eq!(output.status.code(), Some(2), "{args:?}");
         assert!(stderr(&output).contains("usage:"), "{args:?}: {}", stderr(&output));
     }
+}
+
+#[test]
+fn push_refuses_options_that_do_not_go_together() {
+    let machine = machine();
+    let url = Some("postgres://u:hunter2@127.0.0.1:1/m");
+
+    for (args, reason) in [
+        (
+            &["push", "--dry-run", "--delete-copied"][..],
+            "does not go with --dry-run",
+        ),
+        (
+            &["push", "--json", "--delete-copied", "--dry-run"],
+            "does not go with --dry-run",
+        ),
+        (&["push", "--scope", "global", "--repo", "."], "does not go with --repo"),
+        (&["push", "--scope", "global", "--no-global"], "leave nothing to push"),
+    ] {
+        let output = run(binary(&machine, args, url));
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(stderr(&output).contains(reason), "{args:?}: {}", stderr(&output));
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
+}
+
+#[test]
+fn features_lists_what_this_build_can_do() {
+    let machine = machine();
+    let output = run(binary(&machine, &["features"], None));
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        "notes-remote-local\nnotes-hide\npush-json\nscripts-remote-local\nscripts-hide\nscripts-push-json\n"
+    );
+}
+
+/// The one JSON object `push --json` printed.
+fn push_object(output: &Output) -> serde_json::Value {
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(output));
+    serde_json::from_slice(&output.stdout).expect("one JSON object")
+}
+
+#[test]
+fn push_json_says_when_there_is_nothing_to_push() {
+    let machine = machine();
+    let url = Some("postgres://u:hunter2@127.0.0.1:1/m?connect_timeout=1");
+
+    for (routing, args, reason) in [
+        (("local", "local"), &["push", "--json"][..], "both \"local\""),
+        (
+            ("remote+local", "remote+local"),
+            &["push", "--json", "--dry-run"],
+            "only --scope repo pushes them",
+        ),
+        (
+            ("local", "remote"),
+            &["push", "--json", "--scope", "repo"],
+            "--scope repo names the repository notes, but they stay on this computer",
+        ),
+        (
+            ("remote", "remote"),
+            &["push", "--json"],
+            "no notes are saved on this computer",
+        ),
+    ] {
+        let output = run(routed(&machine, args, url, routing));
+        let object = push_object(&output);
+        let dry_run = args.contains(&"--dry-run");
+
+        assert_eq!(object["dryRun"], json!(dry_run), "{args:?}");
+        assert!(
+            object["nothing"].as_str().is_some_and(|said| said.contains(reason)),
+            "{args:?}: {object}"
+        );
+        assert_eq!(
+            object["notes"],
+            json!({ "added": 0, "updated": 0, "overwritten": 0, "kept": 0, "identical": 0, "teamNewer": 0, "failed": 0 })
+        );
+        assert_eq!(object["relations"], json!({ "added": 0, "unchanged": 0 }));
+        assert_eq!(object["deleted"], json!(null));
+        assert_eq!(object["changes"], json!([]));
+        assert_eq!(object["failed"], json!([]));
+    }
+
+    // Without --json it stays a refusal.
+    let output = run(routed(&machine, &["push"], url, ("remote+local", "remote+local")));
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("nothing to push"), "{}", stderr(&output));
 }
 
 /// git, which the server runs to find the repository, never sees the team database settings.
@@ -253,6 +353,40 @@ fn git_does_not_see_the_team_database_settings() {
 /// A server for `machine` on the team database `url`, with the handshake done.
 fn team_client(machine: &Machine, url: &str) -> Client {
     Client::start(binary(machine, &["mcp"], Some(url)))
+}
+
+/// `trust_team_scripts` trusts only scripts read from the team database: with `scripts = "local"`
+/// the team's scripts are still checked for copies, and a waiting one stays waiting there.
+#[test]
+fn trusting_team_scripts_does_not_trust_a_copy_while_scripts_stay_local() {
+    let Some(db) = database() else { return };
+    let machine = machine();
+    let body = "printf team";
+
+    let draft = ScriptDraft {
+        name: "teammate".to_owned(),
+        description: "From a teammate".to_owned(),
+        language: Language::Sh,
+        body: body.to_owned(),
+        timeout_secs: 10,
+        provenance: Provenance::default(),
+    };
+    db.open().save_script(&Target::Global, &draft).expect("team script");
+
+    let mut command = binary(&machine, &["mcp"], Some(db.url()));
+    command
+        .env("HARNESS_MEMORY_SCRIPTS", "local")
+        .env("HARNESS_MEMORY_TRUST_TEAM_SCRIPTS", "1");
+    let mut client = Client::start(command);
+
+    let arguments = json!({ "scope": "global", "name": "copied", "description": "", "language": "sh", "body": body });
+    let reply = client.request("tools/call", json!({ "name": "script_save", "arguments": arguments }));
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    assert_eq!(
+        reply["result"]["structuredContent"]["script"]["approval"], "needed",
+        "{reply}"
+    );
+    assert!(client.finish().success());
 }
 
 #[test]
@@ -456,7 +590,7 @@ fn check_refuses_unknown_settings() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         stderr(&output),
-        "harness-memory: HARNESS_MEMORY_REPOSITORY_NOTES must be \"remote\" or \"local\"\n"
+        "harness-memory: HARNESS_MEMORY_REPOSITORY_NOTES must be \"remote\", \"local\" or \"remote+local\"\n"
     );
 
     let extra = run(binary(&machine, &["check", "--verbose"], None));
@@ -675,6 +809,189 @@ fn a_split_server_shares_one_scope_and_keeps_the_other() {
     assert!(bob.finish().success());
 }
 
+/// The executable with `args` on `machine`, `input` on its stdin.
+fn run_with_input(mut command: Command, input: &str) -> Output {
+    use std::io::Write as _;
+
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("run")
+}
+
+/// The titles of the notes in `machine`'s local database, sorted.
+fn local_titles(machine: &Machine) -> Vec<String> {
+    let conn = rusqlite::Connection::open(machine.memory.join("memory.sqlite3")).expect("local");
+    let mut statement = conn.prepare("SELECT title FROM notes ORDER BY title").expect("select");
+    statement
+        .query_map([], |row| row.get(0))
+        .expect("titles")
+        .collect::<Result<_, _>>()
+        .expect("titles")
+}
+
+/// The change `object` lists for `title`.
+fn change_titled<'a>(object: &'a serde_json::Value, title: &str) -> &'a serde_json::Value {
+    object["changes"]
+        .as_array()
+        .expect("changes")
+        .iter()
+        .find(|change| change["title"] == title)
+        .unwrap_or_else(|| panic!("no change for {title}: {object}"))
+}
+
+#[test]
+fn push_json_lists_every_note_and_deletes_the_copies() {
+    let Some(db) = database() else { return };
+    let machine = machine();
+    let local = push_support::local_memory();
+    copy_into(&local.path, &machine.memory);
+
+    let listed = push_object(&run(binary(&machine, &["push", "--dry-run", "--json"], Some(db.url()))));
+    let keys: Vec<&str> = listed.as_object().expect("object").keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            "dryRun",
+            "nothing",
+            "notes",
+            "relations",
+            "entitiesCut",
+            "deleted",
+            "changes",
+            "failed"
+        ]
+    );
+    assert_eq!(listed["dryRun"], json!(true));
+    assert_eq!(listed["nothing"], json!(null));
+    assert_eq!(listed["notes"]["added"], json!(3));
+    assert_eq!(listed["relations"], json!({ "added": 2, "unchanged": 0 }));
+
+    let cache = change_titled(&listed, "Build cache");
+    let change_keys: Vec<&str> = cache.as_object().expect("change").keys().map(String::as_str).collect();
+    assert_eq!(
+        change_keys,
+        [
+            "localId",
+            "scope",
+            "repo",
+            "title",
+            "action",
+            "conflict",
+            "teamId",
+            "localUpdatedAt",
+            "teamUpdatedAt",
+            "deleted",
+            "changedSince",
+            "failed"
+        ]
+    );
+    assert!(cache["localId"].as_i64().is_some_and(|id| id > 0), "{cache}");
+    assert_eq!(cache["scope"], json!("repo"));
+    assert_eq!(cache["repo"], json!("github.com/acme/widget"));
+    assert_eq!(cache["action"], json!("add"));
+    assert_eq!(cache["conflict"], json!(false));
+    assert_eq!(cache["teamId"], json!(null));
+    assert!(
+        cache["localUpdatedAt"].as_str().is_some_and(|at| at.ends_with('Z')),
+        "{cache}"
+    );
+    assert_eq!(cache["teamUpdatedAt"], json!(null));
+    assert_eq!(cache["deleted"], json!(false));
+    assert_eq!(cache["changedSince"], json!(false));
+    assert_eq!(cache["failed"], json!(false));
+    let tabs = change_titled(&listed, "Editor tabs");
+    assert_eq!((&tabs["scope"], &tabs["repo"]), (&json!("global"), &json!(null)));
+
+    let pushed = push_object(&run(binary(&machine, &["push", "--json"], Some(db.url()))));
+    assert_eq!(pushed["dryRun"], json!(false));
+    assert!(
+        change_titled(&pushed, "Build cache")["teamId"].as_i64().is_some(),
+        "{pushed}"
+    );
+    assert_eq!(
+        local_titles(&machine).len(),
+        3,
+        "nothing deleted without --delete-copied"
+    );
+
+    // A newer local text is a conflict: kept with `none`, and the copies of the rest are deleted.
+    local.edit("Deploy steps", "Run make release", now() + 3600);
+    copy_into(&local.path, &machine.memory);
+    let kept = push_object(&run(binary(
+        &machine,
+        &["push", "--json", "--overwrite", "none", "--delete-copied"],
+        Some(db.url()),
+    )));
+    let deploy = change_titled(&kept, "Deploy steps");
+    assert_eq!((&deploy["action"], &deploy["conflict"]), (&json!("keep"), &json!(true)));
+    assert!(deploy["teamUpdatedAt"].as_str().is_some(), "{deploy}");
+    assert_eq!(deploy["deleted"], json!(false));
+    assert_eq!(change_titled(&kept, "Build cache")["action"], json!("identical"));
+    assert_eq!(change_titled(&kept, "Build cache")["deleted"], json!(true));
+    assert_eq!(kept["notes"]["kept"], json!(1));
+    assert_eq!(kept["notes"]["identical"], json!(2));
+    assert_eq!(kept["deleted"], json!(2));
+    assert_eq!(local_titles(&machine), ["Deploy steps"]);
+
+    // Ticked on stdin, it is overwritten and its copy goes too.
+    let id = deploy["localId"].to_string();
+    let command = binary(
+        &machine,
+        &["push", "--json", "--overwrite", "-", "--delete-copied"],
+        Some(db.url()),
+    );
+    let overwrote = push_object(&run_with_input(command, &format!("{id}\n")));
+    let deploy = change_titled(&overwrote, "Deploy steps");
+    assert_eq!(
+        (&deploy["action"], &deploy["conflict"]),
+        (&json!("overwrite"), &json!(true))
+    );
+    assert_eq!(overwrote["deleted"], json!(1));
+    assert!(local_titles(&machine).is_empty());
+}
+
+#[test]
+fn push_takes_a_remote_local_scope_only_when_scope_names_it() {
+    let Some(db) = database() else { return };
+    let machine = machine();
+    let local = push_support::local_memory();
+    copy_into(&local.path, &machine.memory);
+    let routing = ("remote+local", "remote");
+
+    let plain = run(routed(&machine, &["push", "--dry-run"], Some(db.url()), routing));
+    assert!(plain.status.success(), "{}", stderr(&plain));
+    let said = stdout(&plain);
+    assert!(said.contains("notes 1 added"), "{said}");
+    assert!(
+        said.contains("repository notes are \"remote+local\" (repository_notes) and were left out"),
+        "{said}"
+    );
+
+    let named = push_object(&run(routed(
+        &machine,
+        &["push", "--json", "--scope", "repo"],
+        Some(db.url()),
+        routing,
+    )));
+    let scopes: Vec<&serde_json::Value> = named["changes"]
+        .as_array()
+        .expect("changes")
+        .iter()
+        .map(|change| &change["scope"])
+        .collect();
+    assert_eq!(scopes, [&json!("repo"), &json!("repo")]);
+    assert_eq!(named["notes"]["added"], json!(2));
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -690,4 +1007,162 @@ fn now() -> i64 {
 fn copy_into(from: &Path, memory: &Path) {
     std::fs::create_dir_all(memory).expect("memory folder");
     std::fs::copy(from, memory.join("memory.sqlite3")).expect("copy");
+}
+
+/// [`binary`] with `scripts` routed as given.
+fn scripts_routed(machine: &Machine, args: &[&str], url: Option<&str>, scripts: &str) -> Command {
+    let mut command = binary(machine, args, url);
+    command.env("HARNESS_MEMORY_SCRIPTS", scripts);
+    command
+}
+
+#[test]
+fn scripts_push_json_says_when_there_is_nothing_to_push() {
+    let machine = machine();
+    let url = Some("postgres://u:hunter2@127.0.0.1:1/m?connect_timeout=1");
+
+    for (scripts, args, reason) in [
+        (
+            "local",
+            &["scripts", "push", "--json"][..],
+            "scripts stay on this computer",
+        ),
+        (
+            "remote+local",
+            &["scripts", "push", "--json", "--dry-run"],
+            "only --scope repo or --scope global pushes",
+        ),
+        (
+            "remote",
+            &["scripts", "push", "--json"],
+            "no scripts are saved on this computer",
+        ),
+    ] {
+        let output = run(scripts_routed(&machine, args, url, scripts));
+        let object = push_object(&output);
+
+        assert_eq!(object["dryRun"], json!(args.contains(&"--dry-run")), "{args:?}");
+        assert!(
+            object["nothing"].as_str().is_some_and(|said| said.contains(reason)),
+            "{args:?}: {object}"
+        );
+        assert_eq!(
+            object["scripts"],
+            json!({ "added": 0, "updated": 0, "overwritten": 0, "kept": 0, "identical": 0, "teamNewer": 0, "failed": 0 })
+        );
+        assert_eq!(
+            (&object["deleted"], &object["changes"], &object["failed"]),
+            (&json!(null), &json!([]), &json!([]))
+        );
+    }
+
+    let output = run(scripts_routed(&machine, &["scripts", "push"], url, "local"));
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("nothing to push"), "{}", stderr(&output));
+}
+
+#[test]
+fn scripts_push_json_lists_every_script() {
+    let Some(db) = database() else { return };
+    let machine = machine();
+    std::fs::create_dir_all(&machine.memory).expect("data folder");
+    let mut local = SqliteStore::open(&machine.memory.join("memory.sqlite3")).expect("local file");
+    let draft = ScriptDraft {
+        name: "open-prs".to_owned(),
+        description: "Lists open pull requests".to_owned(),
+        language: Language::Sh,
+        body: "gh pr list".to_owned(),
+        timeout_secs: 30,
+        provenance: Provenance::default(),
+    };
+    let local_id = local
+        .save_script(&common::repo(push_support::REPO), &draft)
+        .expect("saved")
+        .script
+        .summary
+        .id;
+    drop(local);
+
+    let preview = push_object(&run(binary(
+        &machine,
+        &["scripts", "push", "--dry-run", "--json"],
+        Some(db.url()),
+    )));
+    let keys: Vec<&str> = preview
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, ["dryRun", "nothing", "scripts", "deleted", "changes", "failed"]);
+    assert_eq!(preview["scripts"]["added"], 1);
+
+    let change = &preview["changes"][0];
+    let change_keys: Vec<&str> = change.as_object().expect("change").keys().map(String::as_str).collect();
+    assert_eq!(
+        change_keys,
+        [
+            "localId",
+            "scope",
+            "repo",
+            "name",
+            "action",
+            "conflict",
+            "teamId",
+            "localUpdatedAt",
+            "teamUpdatedAt",
+            "deleted",
+            "changedSince",
+            "failed",
+            "trusted"
+        ]
+    );
+    assert_eq!(
+        (&change["localId"], &change["scope"], &change["repo"], &change["action"]),
+        (
+            &json!(local_id),
+            &json!("repo"),
+            &json!("github.com/acme/widget"),
+            &json!("add")
+        )
+    );
+
+    let pushed = push_object(&run(binary(
+        &machine,
+        &["scripts", "push", "--json", "--delete-copied"],
+        Some(db.url()),
+    )));
+    assert_eq!(
+        (&pushed["scripts"]["added"], &pushed["deleted"]),
+        (&json!(1), &json!(1))
+    );
+    assert!(pushed["changes"][0]["teamId"].is_i64(), "{pushed}");
+
+    let again = push_object(&run(binary(&machine, &["scripts", "push", "--json"], Some(db.url()))));
+    assert_eq!(again["changes"], json!([]), "the copy was deleted here");
+}
+
+#[test]
+fn check_says_when_scripts_are_read_from_both() {
+    let Some(db) = database() else { return };
+    let machine = machine();
+
+    let output = run(scripts_routed(&machine, &["check"], Some(db.url()), "remote+local"));
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).ends_with(" (schema 4)\nscripts: team database and this computer\n"),
+        "{}",
+        stdout(&output)
+    );
+
+    // With every note scope on this computer the team database is still opened for the scripts.
+    let mut local_notes = routed(&machine, &["check"], Some(db.url()), ("local", "local"));
+    local_notes.env("HARNESS_MEMORY_SCRIPTS", "remote+local");
+    let output = run(local_notes);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).ends_with("\nscripts: team database and this computer\n"),
+        "{}",
+        stdout(&output)
+    );
 }

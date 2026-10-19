@@ -64,6 +64,16 @@ pub const NEIGHBORS_LIMIT_MAX: usize = 50;
 /// Notes listed by `entity_neighbors`.
 pub const NEIGHBOR_NOTES_MAX: usize = 10;
 
+/// Team notes hidden on this computer per team database (`harness-memory notes hide`), and note
+/// ids a list or a search leaves out ([`crate::store::NoteListQuery::exclude`]).
+pub const HIDDEN_MAX: usize = 500;
+
+/// Note ids one command takes in a list (`push --overwrite`, `notes discard-local`).
+pub const IDS_MAX: usize = 100_000;
+
+/// Size of the note ids read from standard input (`-`), in bytes.
+pub const STDIN_IDS_BYTES_MAX: usize = 2 * 1024 * 1024;
+
 /// Longest input line (one JSON-RPC message), in bytes.
 pub const LINE_MAX: usize = 1024 * 1024;
 

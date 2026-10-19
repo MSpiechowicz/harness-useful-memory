@@ -9,6 +9,9 @@
 #![cfg_attr(not(unix), allow(unused))]
 
 mod common;
+mod libsql_support;
+mod mongo_support;
+mod postgres_support;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -892,4 +895,328 @@ fn scripts_list_sorts_by_every_column_and_pages_in_that_order() {
 
     let unknown = cli(&data, &work, &["scripts", "list", "--json", "--sort", "size"]);
     assert_eq!(unknown.status.code(), Some(2));
+}
+
+#[test]
+fn scripts_get_shows_one_script_with_its_body() {
+    let (_dir, data, work) = folders();
+    let id = save_elsewhere(&data, &Target::Global, "beta");
+
+    let output = cli(&data, &work, &["scripts", "get", &id.to_string(), "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let shown: Value = serde_json::from_str(&stdout(&output)).expect("JSON");
+    let script = &shown["script"];
+    assert_eq!(
+        (&script["id"], &script["body"], &script["place"]),
+        (&json!(id), &json!("echo beta"), &json!("local"))
+    );
+    assert_eq!((&script["readOnly"], &script["hidden"]), (&json!(false), &json!(false)));
+    assert_eq!(script["approval"], "needed");
+
+    let missing = cli(&data, &work, &["scripts", "get", "999", "--json"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(
+        stderr(&missing).lines().last(),
+        Some("harness-memory: script 999 not found")
+    );
+
+    for bad in [&["scripts", "get", "1"][..], &["scripts", "get", "x", "--json"]] {
+        assert_eq!(cli(&data, &work, bad).status.code(), Some(2), "{bad:?}");
+    }
+}
+
+#[test]
+fn remote_script_commands_need_a_team_database() {
+    let (_dir, data, work) = folders();
+    let id = save_elsewhere(&data, &Target::Global, "beta").to_string();
+
+    // No team database: nothing to hide, discard or push, and no team counts in the list.
+    let keys: Vec<String> = listing(&data, &work, &[])
+        .as_object()
+        .expect("object")
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(keys, ["total", "groups", "scopes", "review", "scripts"]);
+
+    let hide = cli(&data, &work, &["scripts", "hide", &id]);
+    assert_eq!(hide.status.code(), Some(1));
+    assert!(stderr(&hide).contains("no team script to hide"), "{}", stderr(&hide));
+
+    let unconfirmed = cli(&data, &work, &["scripts", "discard-local", "--all"]);
+    assert_eq!(unconfirmed.status.code(), Some(2));
+
+    let discard = cli(&data, &work, &["scripts", "discard-local", "--all", "--yes"]);
+    assert_eq!(discard.status.code(), Some(1));
+    assert!(
+        stderr(&discard).contains("no team database is set"),
+        "{}",
+        stderr(&discard)
+    );
+
+    let push = cli(&data, &work, &["scripts", "push", "--json"]);
+    assert_eq!(push.status.code(), Some(2));
+
+    for bad in [
+        &["scripts", "push", "--dry-run", "--delete-copied"][..],
+        &["scripts", "push", "--overwrite", "some"],
+        &["scripts", "hide"],
+        &["scripts", "unhide", "x"],
+    ] {
+        assert_eq!(cli(&data, &work, bad).status.code(), Some(2), "{bad:?}");
+    }
+}
+
+/// The URLs of the team test servers that are set, each with what keeps its database alive.
+fn team_urls() -> Vec<(String, Box<dyn std::any::Any>)> {
+    let mut urls: Vec<(String, Box<dyn std::any::Any>)> = Vec::new();
+
+    if let Some(db) = postgres_support::database() {
+        urls.push((db.url().to_owned(), Box::new(db)));
+    }
+
+    if let Some(db) = mongo_support::TestDb::new() {
+        urls.push((db.url.clone(), Box::new(db)));
+    }
+
+    if let Some(db) = libsql_support::Database::libsql()
+        && let libsql_support::Database::Libsql(server) = &db
+    {
+        urls.push((server.url.clone(), Box::new(db)));
+    }
+
+    urls
+}
+
+/// `harness-memory <args>` on the team database `url` with `scripts = <scripts>`.
+fn on_team(data: &Path, cwd: &Path, url: &str, scripts: &str, args: &[&str]) -> Output {
+    let mut command = Command::new(BINARY);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("HARNESS_MEMORY_DIR", data)
+        .env("HARNESS_MEMORY_DATABASE_URL", url)
+        .env("HARNESS_MEMORY_SCRIPTS", scripts);
+    without_team_settings(&mut command);
+    command.output().expect("the executable runs")
+}
+
+/// The parsed stdout of a successful [`on_team`].
+fn team_json(data: &Path, cwd: &Path, url: &str, scripts: &str, args: &[&str]) -> Value {
+    let output = on_team(data, cwd, url, scripts, args);
+    assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    serde_json::from_str(&stdout(&output)).expect("JSON")
+}
+
+/// Saves global script `name` into the team database `url`, as a teammate would; its id.
+fn save_in_team(url: &str, name: &str) -> i64 {
+    let backend = harness_memory::backend::backend_for(Some(url.to_owned()), None).expect("backend");
+    let mut team = harness_memory::backend::open_scripts(&backend)
+        .expect("a team database")
+        .expect("open");
+    let draft = ScriptDraft {
+        name: name.to_owned(),
+        description: format!("The team's {name}"),
+        language: Language::Sh,
+        body: format!("echo team {name}"),
+        timeout_secs: 10,
+        provenance: Provenance::default(),
+    };
+
+    team.save_script(&Target::Global, &draft)
+        .expect("saved")
+        .script
+        .summary
+        .id
+}
+
+#[test]
+fn remote_local_scripts_list_hide_trust_and_delete_on_each_team_database() {
+    for (url, _db) in team_urls() {
+        remote_local_scripts(&url);
+    }
+}
+
+fn remote_local_scripts(url: &str) {
+    let (_dir, data, work) = folders();
+    let team = save_in_team(url, "deploy");
+    let raw = save_elsewhere(&data, &Target::Global, "deploy");
+    let mine = raw + 1_000_000_000;
+    let both = "remote+local";
+    let run = |args: &[&str]| on_team(&data, &work, url, both, args);
+    let json = |args: &[&str]| team_json(&data, &work, url, both, args);
+
+    // Both are listed, this computer's first; the team's is read-only.
+    let listing = json(&["scripts", "list", "--json"]);
+    let rows: Vec<(Value, Value, Value)> = listing["scripts"]
+        .as_array()
+        .expect("scripts")
+        .iter()
+        .map(|row| (row["id"].clone(), row["place"].clone(), row["readOnly"].clone()))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (json!(mine), json!("local"), json!(false)),
+            (json!(team), json!("team"), json!(true))
+        ]
+    );
+    assert_eq!(
+        (&listing["hiddenCount"], &listing["localCounts"]),
+        (&json!(0), &json!({ "repo": 0, "global": 1 }))
+    );
+
+    let sorted = json(&["scripts", "list", "--json", "--sort", "place", "--order", "desc"]);
+    assert_eq!(sorted["scripts"][0]["id"], team);
+
+    // A team script cannot be deleted from here, only hidden; this computer's cannot be hidden.
+    let refused = run(&["scripts", "delete", &team.to_string()]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        stderr(&refused).contains(&format!("harness-memory scripts hide {team}")),
+        "{}",
+        stderr(&refused)
+    );
+
+    let local = run(&["scripts", "hide", &mine.to_string()]);
+    assert_eq!(local.status.code(), Some(1));
+    assert_eq!(
+        stderr(&local).lines().last(),
+        Some(format!("harness-memory: script {mine} is saved on this computer, delete it instead").as_str())
+    );
+
+    assert_eq!(
+        json(&["scripts", "hide", &team.to_string(), "--json"]),
+        json!({ "hidden": team })
+    );
+    let listing = json(&["scripts", "list", "--json"]);
+    assert_eq!((&listing["total"], &listing["hiddenCount"]), (&json!(1), &json!(1)));
+
+    let hidden = json(&["scripts", "list", "--json", "--hidden"]);
+    assert_eq!(hidden["total"], 1);
+    assert_eq!(
+        (&hidden["scripts"][0]["id"], &hidden["scripts"][0]["hidden"]),
+        (&json!(team), &json!(true))
+    );
+
+    let missing = run(&["scripts", "get", &team.to_string(), "--json"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(
+        stderr(&missing).lines().last(),
+        Some(format!("harness-memory: script {team} not found").as_str())
+    );
+    let shown = json(&["scripts", "get", &team.to_string(), "--json", "--hidden"]);
+    assert_eq!(
+        (&shown["script"]["body"], &shown["script"]["hidden"]),
+        (&json!("echo team deploy"), &json!(true))
+    );
+
+    let unhid = run(&["scripts", "unhide", &team.to_string()]);
+    assert_eq!(stdout(&unhid), format!("unhid script {team}\n"));
+
+    // Approving reviewed versions by the ids the list shows.
+    let shas: Vec<String> = json(&["scripts", "list", "--json"])["scripts"]
+        .as_array()
+        .expect("scripts")
+        .iter()
+        .map(|row| format!("{}={}", row["id"], row["sha256"].as_str().expect("sha256")))
+        .collect();
+    let trusted = run(&["trust", &shas[0], &shas[1]]);
+    assert!(trusted.status.success(), "{}", stderr(&trusted));
+    assert_eq!(
+        stdout(&trusted),
+        format!("trusted script {mine} deploy\ntrusted script {team} deploy\n")
+    );
+    let approvals: Vec<Value> = json(&["scripts", "list", "--json"])["scripts"]
+        .as_array()
+        .expect("scripts")
+        .iter()
+        .map(|row| row["approval"].clone())
+        .collect();
+    assert_eq!(approvals, [json!("approved"), json!("approved")]);
+
+    // The same trust holds for each script read alone, under its own id.
+    let local_only = team_json(&data, &work, url, "local", &["scripts", "list", "--json"]);
+    assert_eq!(
+        (&local_only["scripts"][0]["id"], &local_only["scripts"][0]["approval"]),
+        (&json!(raw), &json!("approved"))
+    );
+    let team_only = team_json(&data, &work, url, "remote", &["scripts", "list", "--json"]);
+    assert_eq!(team_only["scripts"][0]["approval"], "approved");
+
+    // A plain push leaves remote+local scripts out.
+    let pushed = json(&["scripts", "push", "--json", "--dry-run"]);
+    assert!(pushed["nothing"].as_str().expect("why").contains("--scope"), "{pushed}");
+
+    // Deleting every script leaves the team's, counted as kept.
+    assert_eq!(
+        json(&["scripts", "delete", "--all", "--yes", "--json"]),
+        json!({ "deleted": 1, "team": 0, "kept": 1 })
+    );
+    assert_eq!(json(&["scripts", "list", "--json"])["total"], 1);
+}
+
+#[test]
+fn remote_scripts_push_and_discard_what_stays_on_this_computer() {
+    for (url, _db) in team_urls() {
+        push_and_discard(&url);
+    }
+}
+
+fn push_and_discard(url: &str) {
+    let (_dir, data, work) = folders();
+    let first = save_elsewhere(&data, &Target::Global, "first");
+    let second = save_elsewhere(&data, &Target::Global, "second");
+    save_in_team(url, "second");
+    let json = |scripts: &str, args: &[&str]| team_json(&data, &work, url, scripts, args);
+
+    // Read from the team database, the local ones are not listed but counted.
+    let listing = json("remote", &["scripts", "list", "--json"]);
+    assert_eq!(listing["localCounts"], json!({ "repo": 0, "global": 2 }));
+    assert_eq!(listing["total"], 1);
+
+    let preview = json("remote", &["scripts", "push", "--dry-run", "--json"]);
+    let actions: Vec<(Value, Value)> = preview["changes"]
+        .as_array()
+        .expect("changes")
+        .iter()
+        .map(|change| (change["localId"].clone(), change["action"].clone()))
+        .collect();
+    assert_eq!(
+        actions,
+        [(json!(first), json!("add")), (json!(second), json!("teamNewer"))]
+    );
+
+    let pushed = json("remote", &["scripts", "push", "--json", "--delete-copied"]);
+    assert_eq!(pushed["scripts"]["added"], 1);
+    assert_eq!(pushed["deleted"], 1);
+    let marks: Vec<(Value, Value)> = pushed["changes"]
+        .as_array()
+        .expect("changes")
+        .iter()
+        .map(|change| (change["deleted"].clone(), change["changedSince"].clone()))
+        .collect();
+    assert_eq!(marks, [(json!(true), json!(false)), (json!(false), json!(false))]);
+    assert_eq!(json("remote", &["scripts", "list", "--json"])["total"], 2);
+
+    // The one left (the team's is newer) is discarded by its local id.
+    let refused = on_team(
+        &data,
+        &work,
+        url,
+        "remote+local",
+        &["scripts", "discard-local", "--all", "--yes"],
+    );
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stderr(&refused).contains("\"remote+local\""), "{}", stderr(&refused));
+
+    let discarded = json(
+        "remote",
+        &["scripts", "discard-local", &second.to_string(), "--yes", "--json"],
+    );
+    assert_eq!(discarded, json!({ "deleted": 1 }));
+    assert_eq!(
+        json("remote", &["scripts", "list", "--json"])["localCounts"],
+        json!({ "repo": 0, "global": 0 })
+    );
 }

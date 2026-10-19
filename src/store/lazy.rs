@@ -1,8 +1,13 @@
 //! A store opened on first use, so a server whose agent never touches scripts neither connects
-//! to the team database for them nor creates the local file.
+//! to the team database for them nor creates the local file (nor, with every note scope in the
+//! team database, opens the local notes store it never reads).
 
+use super::{Edge, Forget, Forgotten, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NoteListQuery, NotePage};
+use super::{NotePatch, Saved, SearchQuery};
 use super::{PreviousVersion, TrustRecord, TrustStore, TrustedVersion, View};
-use super::{SavedScript, Script, ScriptDraft, ScriptRef, ScriptStore, ScriptSummary, StoreError, Target};
+use super::{
+    SavedScript, Script, ScriptDraft, ScriptOrigin, ScriptRef, ScriptStore, ScriptSummary, StoreError, Target,
+};
 
 /// Opens the store behind it.
 type Opener<S> = Box<dyn FnMut() -> Result<Box<S>, String> + Send>;
@@ -65,6 +70,70 @@ impl ScriptStore for Lazy<dyn ScriptStore> {
 
     fn record_run(&mut self, id: i64, exit_code: Option<i32>, at: i64) -> Result<(), StoreError> {
         self.store()?.record_run(id, exit_code, at)
+    }
+
+    fn hidden_scripts(&mut self, view: &View) -> Result<Vec<ScriptSummary>, StoreError> {
+        self.store()?.hidden_scripts(view)
+    }
+
+    fn origin(&self, id: i64) -> ScriptOrigin {
+        self.store
+            .as_ref()
+            .map_or(ScriptOrigin::Single, |store| store.origin(id))
+    }
+}
+
+impl MemoryStore for Lazy<dyn MemoryStore> {
+    fn remember(&mut self, target: &Target, draft: &NoteDraft) -> Result<Saved, StoreError> {
+        self.store()?.remember(target, draft)
+    }
+
+    fn update(&mut self, view: &View, id: i64, patch: &NotePatch) -> Result<Saved, StoreError> {
+        self.store()?.update(view, id, patch)
+    }
+
+    fn get(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
+        self.store()?.get(view, ids)
+    }
+
+    fn peek(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
+        self.store()?.peek(view, ids)
+    }
+
+    fn list_notes(&mut self, query: &NoteListQuery) -> Result<NotePage, StoreError> {
+        self.store()?.list_notes(query)
+    }
+
+    fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
+        self.store()?.search(query)
+    }
+
+    fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {
+        self.store()?.similar(view, id, limit)
+    }
+
+    fn similar_text(&mut self, view: &View, text: (&str, &str), limit: usize) -> Result<Vec<Hit>, StoreError> {
+        self.store()?.similar_text(view, text, limit)
+    }
+
+    fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {
+        self.store()?.link(target, link)
+    }
+
+    fn neighbors(&mut self, view: &View, entity: &str, depth: u8, limit: usize) -> Result<Neighborhood, StoreError> {
+        self.store()?.neighbors(view, entity, depth, limit)
+    }
+
+    fn forget(&mut self, view: &View, target: &Target, what: &Forget) -> Result<usize, StoreError> {
+        self.store()?.forget(view, target, what)
+    }
+
+    fn forget_notes(&mut self, view: &View, exclude: &[i64]) -> Result<Forgotten, StoreError> {
+        self.store()?.forget_notes(view, exclude)
+    }
+
+    fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
+        self.store()?.find_by_title(target, title)
     }
 }
 

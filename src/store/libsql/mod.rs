@@ -175,6 +175,10 @@ impl MemoryStore for LibsqlStore {
         engine::similar(self, view, id, limit)
     }
 
+    fn similar_text(&mut self, view: &View, text: (&str, &str), limit: usize) -> Result<Vec<Hit>, StoreError> {
+        engine::similar_text(self, view, text, limit)
+    }
+
     fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {
         engine::link(self, target, link)
     }
@@ -187,8 +191,8 @@ impl MemoryStore for LibsqlStore {
         engine::forget(self, view, target, what)
     }
 
-    fn forget_notes(&mut self, view: &View) -> Result<Forgotten, StoreError> {
-        engine::forget_notes(self, view)
+    fn forget_notes(&mut self, view: &View, exclude: &[i64]) -> Result<Forgotten, StoreError> {
+        engine::forget_notes(self, view, exclude)
     }
 
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {

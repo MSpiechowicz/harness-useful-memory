@@ -37,6 +37,7 @@ use postgres::{Client, GenericClient, NoTls, Row, Transaction};
 
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, ProjectKey};
 use super::{Forgotten, NoteListQuery, NotePage, Saved, SearchQuery, StoreError, Target, View, clean};
+use crate::store::listing::checked_exclude;
 pub use connect::UrlError;
 use schema::SchemaState;
 
@@ -221,6 +222,10 @@ impl MemoryStore for PostgresStore {
         self.read(|client| search::similar(client, view, id, limit))
     }
 
+    fn similar_text(&mut self, view: &View, text: (&str, &str), limit: usize) -> Result<Vec<Hit>, StoreError> {
+        self.read(|client| search::resembling(client, view, text, None, limit))
+    }
+
     fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {
         let link = clean::link(link)?;
         self.write(|tx| graph::link(tx, target, &link))
@@ -239,8 +244,9 @@ impl MemoryStore for PostgresStore {
         })
     }
 
-    fn forget_notes(&mut self, view: &View) -> Result<Forgotten, StoreError> {
-        self.write(|tx| notes::forget_all(tx, view))
+    fn forget_notes(&mut self, view: &View, exclude: &[i64]) -> Result<Forgotten, StoreError> {
+        let exclude = checked_exclude(exclude)?.to_vec();
+        self.write(|tx| notes::forget_all(tx, view, &exclude))
     }
 
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {

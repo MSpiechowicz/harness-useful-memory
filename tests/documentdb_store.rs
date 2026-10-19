@@ -401,7 +401,7 @@ fn documentdb_note_reads_and_writes_send_no_projection_expression() {
     store
         .forget(&both(REPO), &repo(REPO), &Forget::Note(second))
         .expect("forget note");
-    store.forget_notes(&both(REPO)).expect("forget all");
+    store.forget_notes(&both(REPO), &[]).expect("forget all");
 
     assert_eq!(expression_projections(&db), Vec::<Document>::new());
 }

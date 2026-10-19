@@ -1,6 +1,6 @@
 //! What the commands for a person (`scripts`, `trust`, `notes`; see [`crate::cli_trust`] and
-//! [`crate::cli_notes`]) share: their options, the settings, the repository `--project` names, and
-//! the paging options of the lists.
+//! [`crate::cli_notes`]) share: their options, the settings, the repository `--project` names, the
+//! paging options of the lists, and the reports of `delete --all` and `hide`.
 //!
 //! Usage errors exit 2, failures (settings, database) exit 1. A failure ends stderr with the line
 //! that says why (`harness-memory: …`, after any warning), so a caller may show the last line.
@@ -201,19 +201,56 @@ pub(crate) fn unconfirmed(noun: &str) -> ExitCode {
 }
 
 /// Prints what `<noun>s delete --all` did: `{"deleted": N, "team": M}` with `json` (`team`: how
-/// many were in the team database), else a line.
-pub(crate) fn deleted_all(noun: &str, deleted: usize, team: usize, json: bool) {
+/// many were in the team database), else a line; with the team entries `kept` in place (read-only
+/// here) when there can be some, `{"deleted": N, "team": M, "kept": K}` and the line says how many
+/// stay.
+pub(crate) fn deleted_all_keeping(noun: &str, (deleted, team): (usize, usize), kept: Option<usize>, json: bool) {
     if json {
-        println!("{}", serde_json::json!({ "deleted": deleted, "team": team }));
+        let mut shown = serde_json::json!({ "deleted": deleted, "team": team });
+
+        if let Some(kept) = kept {
+            shown["kept"] = serde_json::json!(kept);
+        }
+
+        println!("{shown}");
         return;
     }
 
-    let plural = if deleted == 1 { "" } else { "s" };
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    let mut line = format!("deleted {deleted} {noun}{}", plural(deleted));
 
     if team > 0 {
-        println!("deleted {deleted} {noun}{plural}, {team} from the team database");
+        line.push_str(&format!(", {team} from the team database"));
+    }
+
+    if let Some(kept) = kept.filter(|kept| *kept > 0) {
+        line.push_str(&format!(
+            ", {kept} team {noun}{} kept (read-only here, hide them instead)",
+            plural(kept)
+        ));
+    }
+
+    println!("{line}");
+}
+
+/// The options of `notes hide|unhide` and `scripts hide|unhide`: `<id> [--project PATH] [--json]`;
+/// `None` for anything else.
+pub(crate) fn id_options(args: &[Option<&str>]) -> Option<(i64, Option<String>, bool)> {
+    let parsed = Args::parse(args, &["--json"], &["--project"])?;
+
+    let [id] = parsed.positional[..] else {
+        return None;
+    };
+
+    Some((id.parse().ok()?, parsed.project().ok()?, parsed.flag("--json")))
+}
+
+/// Prints `object` with `json`, else `line`.
+pub(crate) fn print_either(json: bool, object: serde_json::Value, line: &str) {
+    if json {
+        println!("{object}");
     } else {
-        println!("deleted {deleted} {noun}{plural}");
+        println!("{line}");
     }
 }
 

@@ -7,10 +7,12 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use super::listing::not_excluded;
 use super::notes::{VISIBLE, kind_from_sql, scope_of};
 use super::sql::{Sql, Value, args};
 use super::view_params;
 use crate::limits::{QUERY_MAX, QUERY_TOKENS_MAX, SEARCH_LIMIT_MAX, SNIPPET_MAX, SNIPPET_TOKENS};
+use crate::store::listing::excluded_json;
 use crate::store::{Hit, NoteKind, Provenance, SearchQuery, StoreError, View};
 use crate::support::text::STOPWORDS;
 
@@ -23,12 +25,20 @@ const SIMILAR_TOKENS: usize = 24;
 /// The provenance columns of a row, read by [`collect`] after the body.
 const PROVENANCE: &str = "n.source, n.writer_root, n.via_override";
 
-/// Row filters besides the view: the note kind, and the checkout root of
-/// [`SearchQuery::checkout`].
+/// Row filters besides the view: the note kind, the checkout root of [`SearchQuery::checkout`] and
+/// the ids [`SearchQuery::exclude`] leaves out (a JSON array, `None` for none).
 #[derive(Default)]
 struct Filter<'a> {
     kind: Option<&'a str>,
     checkout: Option<&'a str>,
+    exclude: Option<&'a str>,
+}
+
+impl Filter<'_> {
+    /// The JSON array of the ids left out (`[]` for none).
+    fn excluded(&self) -> &str {
+        self.exclude.unwrap_or("[]")
+    }
 }
 
 /// The condition of [`Filter::checkout`] (`?7` the root): a repository note whose latest write came
@@ -57,9 +67,11 @@ pub(super) fn search(db: &mut dyn Sql, query: &SearchQuery) -> Result<Vec<Hit>, 
     let words = words(text, QUERY_TOKENS_MAX);
 
     let checkout = query.checkout.as_ref().map(|root| root.to_string_lossy().into_owned());
+    let exclude = excluded_json(&query.exclude)?;
     let filter = Filter {
         kind,
         checkout: checkout.as_deref(),
+        exclude: Some(&exclude),
     };
 
     let rows = if words.is_empty() {
@@ -80,11 +92,22 @@ pub(super) fn similar(db: &mut dyn Sql, view: &View, id: i64, limit: usize) -> R
         return Ok(Vec::new());
     };
 
+    resembling(db, view, (&title, &body), Some(id), limit)
+}
+
+/// Up to `limit` notes in `view` resembling a note of `title` and `body`, leaving out note `skip`.
+pub(super) fn resembling(
+    db: &mut dyn Sql,
+    view: &View,
+    (title, body): (&str, &str),
+    skip: Option<i64>,
+    limit: usize,
+) -> Result<Vec<Hit>, StoreError> {
     let mut keys: Vec<String> = Vec::new();
-    let title_words = words(&title, SIMILAR_TOKENS)
+    let title_words = words(title, SIMILAR_TOKENS)
         .into_iter()
         .filter(|word| word.chars().count() >= 3);
-    let body_words = words(&body, usize::MAX)
+    let body_words = words(body, usize::MAX)
         .into_iter()
         .filter(|word| word.chars().count() >= 4);
 
@@ -109,7 +132,7 @@ pub(super) fn similar(db: &mut dyn Sql, view: &View, id: i64, limit: usize) -> R
         params,
         &Filter::default(),
         SIMILAR_CANDIDATES,
-        Some(id),
+        skip,
     )?;
     let needed = keys.len().min(2);
 
@@ -162,8 +185,10 @@ fn matching(
                 n.updated_at, n.body, {PROVENANCE}
          FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid
          WHERE notes_fts MATCH ?1 AND {VISIBLE} AND (?4 IS NULL OR n.kind = ?4) AND n.id != ?6 AND {SAME_CHECKOUT}
+               AND {}
          ORDER BY n.project_id IS NULL, bm25(notes_fts, 5.0, 1.0, 3.0), n.updated_at DESC, n.hits DESC, n.id DESC
-         LIMIT ?5"
+         LIMIT ?5",
+        not_excluded(8)
     );
 
     collect(
@@ -176,7 +201,8 @@ fn matching(
             filter.kind,
             limit_param(limit),
             exclude.unwrap_or(0),
-            filter.checkout
+            filter.checkout,
+            filter.excluded()
         ],
     )
 }
@@ -191,9 +217,10 @@ fn recent(
         "SELECT n.id, n.kind, n.project_id, n.title, substr(n.body, 1, {SNIPPET_MAX}), n.updated_at, n.body,
                 {PROVENANCE}
          FROM notes n
-         WHERE ?1 IS NULL AND {VISIBLE} AND (?4 IS NULL OR n.kind = ?4) AND {SAME_CHECKOUT}
+         WHERE ?1 IS NULL AND {VISIBLE} AND (?4 IS NULL OR n.kind = ?4) AND {SAME_CHECKOUT} AND {}
          ORDER BY n.project_id IS NULL, n.updated_at DESC, n.hits DESC, n.id DESC
-         LIMIT ?5"
+         LIMIT ?5",
+        not_excluded(8)
     );
 
     collect(
@@ -206,7 +233,8 @@ fn recent(
             filter.kind,
             limit_param(limit),
             None::<i64>,
-            filter.checkout
+            filter.checkout,
+            filter.excluded()
         ],
     )
 }

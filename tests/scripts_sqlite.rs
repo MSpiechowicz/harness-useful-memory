@@ -316,7 +316,12 @@ fn a_version_is_trusted_as_the_script_it_was_then() {
         .expect("save");
     let place = "local";
     store
-        .trust(&TrustedVersion::of(place, &saved.script, TrustOrigin::Saved))
+        .trust(&TrustedVersion::of(
+            place,
+            saved.script.summary.id,
+            &saved.script,
+            TrustOrigin::Saved,
+        ))
         .expect("trust");
 
     let summary = &saved.script.summary;

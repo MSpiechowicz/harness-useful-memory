@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 
 use common::approval::{Fixture, approval, ok, refusal, tool};
 use common::mcp::{is_error, run, text};
-use harness_memory::backend::Place;
+use harness_memory::backend::{NotesPlace, Place};
 use harness_memory::mcp::ALIVE_FILE;
+use harness_memory::store::split::LOCAL_ID_OFFSET;
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 
@@ -316,4 +317,64 @@ fn emoji_bodies_are_accepted_and_bidi_controls_refused() {
             text(&reply)
         );
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn remote_local_scripts_are_approved_where_they_are_kept() {
+    const TEAM: &str = "team:aaaaaaaaaaaaaaaa";
+
+    let fixture = Fixture::new();
+    let team_id = fixture.save_into("team.sqlite3", "teammate", "printf team", Default::default());
+    let mut server = fixture.split_server(10_000, NotesPlace::RemoteLocal, TEAM);
+
+    // This computer's script runs since the agent saved it here; the team's waits for the user.
+    let mine = ok(
+        &mut server,
+        "script_save",
+        json!({ "scope": "global", "name": "mine", "description": "", "language": "sh", "body": "printf mine" }),
+    );
+    let mine_id = mine["script"]["id"].as_i64().expect("id");
+    assert!(mine_id >= LOCAL_ID_OFFSET, "{mine}");
+    assert_eq!(
+        (&mine["script"]["place"], &mine["script"]["approval"]),
+        (&json!("local"), &json!("local"))
+    );
+    assert_eq!(
+        ok(&mut server, "script_run", json!({ "id": mine_id }))["stdout"],
+        "mine"
+    );
+    refusal(&tool(&mut server, "script_run", json!({ "name": "teammate" })));
+
+    // The user allows the team's script: it is approved under the team database's key.
+    fixture.desktop_alive(Duration::ZERO);
+    let desktop = fixture.answer("allow");
+    let ran = ok(&mut server, "script_run", json!({ "id": team_id }));
+    let (request, _, _) = desktop.join().expect("desktop");
+    assert_eq!(ran["stdout"], "team");
+    assert_eq!(
+        (&request["script"]["place"], &request["script"]["readOnly"]),
+        (&json!("team"), &json!(true))
+    );
+
+    // The same approvals hold for the same scripts read one place at a time: by their own ids.
+    let mut team_only = fixture.split_server(200, NotesPlace::Remote, TEAM);
+    assert_eq!(approval(&mut team_only, "teammate"), "approved");
+    let mut local_only = fixture.server(200);
+    assert_eq!(approval(&mut local_only, "mine"), "local");
+
+    // With every team script trusted, only the team's are.
+    std::fs::remove_file(fixture.data().join(ALIVE_FILE)).expect("desktop quits");
+    fixture.save_into("team.sqlite3", "other", "printf other", Default::default());
+    let mut trusting = fixture
+        .split_server(200, NotesPlace::RemoteLocal, TEAM)
+        .with_trust_team_scripts(true);
+    assert_eq!(approval(&mut trusting, "other"), "team");
+    assert_eq!(
+        ok(&mut trusting, "script_run", json!({ "name": "other" }))["stdout"],
+        "other"
+    );
+
+    fixture.save_into("memory.sqlite3", "saved-here", "printf here", Default::default());
+    assert_eq!(approval(&mut trusting, "saved-here"), "needed", "never a local script");
 }
