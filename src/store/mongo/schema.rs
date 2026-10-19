@@ -6,16 +6,21 @@
 //!
 //! Versions: 1 the notes, entities and relations; 2 adds the scripts; 3 the team hooks; 4 the team
 //! routines.
+//!
+//! On Amazon DocumentDB version 1 has no text index (DocumentDB cannot build it, see
+//! [`super::documentdb`]); the version number is the same, as nothing else differs and no read
+//! needs the index there.
 
 use std::thread;
 use std::time::{Duration, Instant};
 
 use mongodb::IndexModel;
 use mongodb::bson::{Document, doc, oid::ObjectId};
+use mongodb::error::ErrorKind;
 use mongodb::options::IndexOptions;
 use mongodb::sync::Database;
 
-use super::{ENTITIES, META, NOTES, RELATIONS, SCRIPTS, connection, error_code, int, now, number};
+use super::{ENTITIES, META, NOTES, RELATIONS, SCRIPTS, connection, driver_error, error_code, int, now, number};
 use crate::store::StoreError;
 use crate::store::team_docs::DocKind;
 
@@ -46,32 +51,43 @@ pub enum SchemaState {
     Newer,
 }
 
-/// The stored schema version (0 for a new database).
-pub fn version(db: &Database) -> mongodb::error::Result<i64> {
-    let schema = db
-        .collection::<Document>(META)
-        .find_one(doc! { "_id": SCHEMA_ID })
-        .projection(doc! { "version": number("$version") })
-        .run()?;
+/// The stored schema version (0 for a new database). On Amazon DocumentDB (`documentdb`), whose
+/// `find` takes no expression in its projection, it is read with an aggregation.
+pub fn version(db: &Database, documentdb: bool) -> mongodb::error::Result<i64> {
+    let meta = db.collection::<Document>(META);
+    let filter = doc! { "_id": SCHEMA_ID };
+    let projection = doc! { "version": number("$version") };
+
+    let schema = if documentdb {
+        let pipeline = vec![
+            doc! { "$match": filter },
+            doc! { "$limit": 1_i64 },
+            doc! { "$project": projection },
+        ];
+        meta.aggregate(pipeline).run()?.next().transpose()?
+    } else {
+        meta.find_one(filter).projection(projection).run()?
+    };
 
     Ok(schema.as_ref().map_or(0, |schema| int(schema, "version")))
 }
 
 /// Brings the database to [`SCHEMA_VERSION`]; a newer database is reported, not changed.
-pub(super) fn migrate(db: &Database) -> Result<SchemaState, StoreError> {
-    let failed = |error: mongodb::error::Error| connection::backend(&error);
+/// Amazon DocumentDB (`documentdb`) gets no text index.
+pub(super) fn migrate(db: &Database, documentdb: bool) -> Result<SchemaState, StoreError> {
+    let failed = |error: mongodb::error::Error| driver_error(&error, documentdb);
 
-    if let Some(state) = settled(version(db).map_err(failed)?) {
+    if let Some(state) = settled(version(db, documentdb).map_err(failed)?) {
         return Ok(state);
     }
 
     let owner = ObjectId::new();
-    if !lock(db, owner)? {
+    if !lock(db, owner, documentdb)? {
         // Another server migrated while this one waited.
-        return Ok(settled(version(db).map_err(failed)?).unwrap_or(SchemaState::Current));
+        return Ok(settled(version(db, documentdb).map_err(failed)?).unwrap_or(SchemaState::Current));
     }
 
-    let migrated = apply(db).map_err(failed);
+    let migrated = apply(db, documentdb);
     let released = db
         .collection::<Document>(META)
         .delete_one(doc! { "_id": LOCK_ID, "owner": owner })
@@ -93,9 +109,9 @@ fn settled(version: i64) -> Option<SchemaState> {
 
 /// Takes the migration lock for `owner`; false when another server finished the migration while
 /// this one waited for the lock.
-fn lock(db: &Database, owner: ObjectId) -> Result<bool, StoreError> {
+fn lock(db: &Database, owner: ObjectId, documentdb: bool) -> Result<bool, StoreError> {
     let meta = db.collection::<Document>(META);
-    let failed = |error: mongodb::error::Error| connection::backend(&error);
+    let failed = |error: mongodb::error::Error| driver_error(&error, documentdb);
     let deadline = Instant::now() + LOCK_WAIT;
 
     loop {
@@ -112,11 +128,17 @@ fn lock(db: &Database, owner: ObjectId) -> Result<bool, StoreError> {
 
         // A lock whose holder stopped before releasing it is taken over once it expires. A lock
         // no server could have written (an expiry that is not a number, or further away than a
-        // lease and a lease of clock skew) counts as expired, so it cannot block migrations.
+        // lease and a lease of clock skew) counts as expired, so it cannot block migrations. The
+        // number types are named one by one, each in a plain `$type` under `$nor`: Amazon
+        // DocumentDB may not know the `number` alias or take a `$type` list under `$not`.
+        let not_a_number: Vec<Document> = ["int", "long", "double", "decimal"]
+            .into_iter()
+            .map(|kind| doc! { "expires_at": { "$type": kind } })
+            .collect();
         let expired = doc! {
             "_id": LOCK_ID,
             "$or": [
-                { "expires_at": { "$not": { "$type": "number" } } },
+                { "$nor": not_a_number },
                 { "expires_at": { "$lt": now } },
                 { "expires_at": { "$gt": now + 2 * LOCK_LEASE } },
             ],
@@ -134,7 +156,7 @@ fn lock(db: &Database, owner: ObjectId) -> Result<bool, StoreError> {
             return Ok(true);
         }
 
-        if version(db).map_err(failed)? >= SCHEMA_VERSION {
+        if version(db, documentdb).map_err(failed)? >= SCHEMA_VERSION {
             return Ok(false);
         }
 
@@ -149,27 +171,32 @@ fn lock(db: &Database, owner: ObjectId) -> Result<bool, StoreError> {
 }
 
 /// Runs the missing migrations under the lock (re-reading the version first).
-fn apply(db: &Database) -> mongodb::error::Result<SchemaState> {
-    let current = version(db)?;
+fn apply(db: &Database, documentdb: bool) -> Result<SchemaState, StoreError> {
+    let failed = |error: mongodb::error::Error| driver_error(&error, documentdb);
+    let current = version(db, documentdb).map_err(failed)?;
 
     if let Some(state) = settled(current) {
         return Ok(state);
     }
 
     if current < 1 {
-        create_v1(db)?;
+        create_v1(db).map_err(failed)?;
+
+        if !documentdb {
+            create_text_index(db)?;
+        }
     }
 
     if current < 2 {
-        create_v2(db)?;
+        create_v2(db).map_err(failed)?;
     }
 
     if current < 3 {
-        create_team_docs(db, DocKind::Hooks)?;
+        create_team_docs(db, DocKind::Hooks).map_err(failed)?;
     }
 
     if current < 4 {
-        create_team_docs(db, DocKind::Routines)?;
+        create_team_docs(db, DocKind::Routines).map_err(failed)?;
     }
 
     db.collection::<Document>(META)
@@ -178,12 +205,14 @@ fn apply(db: &Database) -> mongodb::error::Result<SchemaState> {
             doc! { "$set": { "version": SCHEMA_VERSION } },
         )
         .upsert(true)
-        .run()?;
+        .run()
+        .map_err(failed)?;
 
     Ok(SchemaState::Current)
 }
 
-/// Version 1: the collections and their indexes (creating an index creates its collection).
+/// Version 1: the collections and their indexes (creating an index creates its collection), all
+/// but the text index ([`create_text_index`]).
 fn create_v1(db: &Database) -> mongodb::error::Result<()> {
     db.collection::<Document>(NOTES)
         .create_indexes([
@@ -191,16 +220,6 @@ fn create_v1(db: &Database) -> mongodb::error::Result<()> {
             index(doc! { "project": 1, "updated_at": -1 }, "notes_recent", false),
             index(doc! { "project": 1, "entities": 1 }, "notes_entities", false),
             index(doc! { "project": 1, "terms": 1 }, "notes_terms", false),
-            IndexModel::builder()
-                .keys(doc! { "title": "text", "body": "text", "tags": "text" })
-                .options(
-                    IndexOptions::builder()
-                        .name("notes_text".to_owned())
-                        .weights(doc! { "title": 5, "body": 1, "tags": 3 })
-                        .default_language("none".to_owned())
-                        .build(),
-                )
-                .build(),
         ])
         .run()?;
 
@@ -221,6 +240,34 @@ fn create_v1(db: &Database) -> mongodb::error::Result<()> {
         .run()?;
 
     Ok(())
+}
+
+/// Version 1 on MongoDB: the text index on `title`, `body` and `tags` (weights 5 : 1 : 3, language
+/// `none`). MongoDB builds it on any database, so a failure means a server that only looks like
+/// MongoDB, such as Amazon DocumentDB (no text index on an array field such as `tags`, nor with the
+/// language `none`): the error says to pick that kind.
+fn create_text_index(db: &Database) -> Result<(), StoreError> {
+    let text = IndexModel::builder()
+        .keys(doc! { "title": "text", "body": "text", "tags": "text" })
+        .options(
+            IndexOptions::builder()
+                .name("notes_text".to_owned())
+                .weights(doc! { "title": 5, "body": 1, "tags": 3 })
+                .default_language("none".to_owned())
+                .build(),
+        )
+        .build();
+
+    match db.collection::<Document>(NOTES).create_index(text).run() {
+        Ok(_) => Ok(()),
+        Err(error) if matches!(error.kind.as_ref(), ErrorKind::Command(_)) => Err(StoreError::Backend(format!(
+            "{}. The notes text index could not be created, which happens on Amazon DocumentDB: set \
+                 database_kind = \"documentdb\" in the config file (or {}=documentdb) and try again",
+            connection::message(&error),
+            crate::backend::KIND_VAR
+        ))),
+        Err(error) => Err(connection::backend(&error)),
+    }
 }
 
 /// Version 2: the scripts. `null` is a value of its own in a MongoDB index, so the unique

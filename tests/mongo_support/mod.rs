@@ -9,17 +9,33 @@
 //! docker exec hm-mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
 //! HARNESS_MEMORY_TEST_MONGO_URL='mongodb://localhost:57017/?directConnection=true' cargo test --locked mongo_
 //! ```
+//!
+//! With `HARNESS_MEMORY_TEST_MONGO_FLAVOR=documentdb` every store these tests connect runs in its
+//! Amazon DocumentDB mode (no text index, search over the `terms`), so the MongoDB suites also
+//! check that mode against the same server. [`TestDb::connect_documentdb`] does it for one store.
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use harness_memory::store::MongoStore;
+use harness_memory::store::mongo::Flavor;
 use mongodb::bson::{Document, doc};
 use mongodb::sync::{Client, Database};
 
 /// The variable naming the test server.
 pub const URL_VARIABLE: &str = "HARNESS_MEMORY_TEST_MONGO_URL";
+
+/// The variable running every store in the Amazon DocumentDB mode (`documentdb`).
+pub const FLAVOR_VARIABLE: &str = "HARNESS_MEMORY_TEST_MONGO_FLAVOR";
+
+/// The flavor [`FLAVOR_VARIABLE`] picks: MongoDB unless it says `documentdb`.
+pub fn flavor() -> Flavor {
+    match std::env::var(FLAVOR_VARIABLE) {
+        Ok(value) if value.eq_ignore_ascii_case("documentdb") => Flavor::DocumentDb,
+        _ => Flavor::MongoDb,
+    }
+}
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
@@ -55,9 +71,26 @@ impl TestDb {
         Some(Self { url, name, client })
     }
 
-    /// A store connected to this database.
+    /// A store connected to this database, in the flavor [`FLAVOR_VARIABLE`] picks.
     pub fn connect(&self) -> MongoStore {
-        MongoStore::connect(&self.url).expect("connect to the test database")
+        MongoStore::connect_as(&self.url, &flavor()).expect("connect to the test database")
+    }
+
+    /// A store connected to this database in the Amazon DocumentDB mode.
+    pub fn connect_documentdb(&self) -> MongoStore {
+        MongoStore::connect_as(&self.url, &Flavor::DocumentDb).expect("connect to the test database as DocumentDB")
+    }
+
+    /// The names of the indexes on `collection`.
+    pub fn index_names(&self, collection: &str) -> Vec<String> {
+        let mut names = self
+            .raw()
+            .collection::<Document>(collection)
+            .list_index_names()
+            .run()
+            .expect("list indexes");
+        names.sort();
+        names
     }
 
     /// The database itself, for checks behind the store's back.
@@ -98,6 +131,13 @@ impl Drop for TestDb {
 pub fn store() -> Option<(TestDb, MongoStore)> {
     let db = TestDb::new()?;
     let store = db.connect();
+    Some((db, store))
+}
+
+/// A fresh database with a store on it in the Amazon DocumentDB mode.
+pub fn documentdb_store() -> Option<(TestDb, MongoStore)> {
+    let db = TestDb::new()?;
+    let store = db.connect_documentdb();
     Some((db, store))
 }
 

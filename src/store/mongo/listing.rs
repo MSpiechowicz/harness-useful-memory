@@ -7,9 +7,12 @@ use mongodb::bson::{Bson, Document, doc};
 use super::notes::{Stored, stored};
 use super::scripts::literal_pattern;
 use super::{Ctx, ENTITIES, ENTITY_NORM_MAX, Fail, NOTES, cut, int, note_fields, scope_value, text, visible};
-use crate::limits::ENTITY_MAX;
+use crate::limits::{ENTITY_MAX, TITLE_MAX};
 use crate::store::listing::{NoteListQuery, NotePage, NoteRow, NoteSort, page_limit, query_entity, query_text, scoped};
 use crate::store::{NoteKind, Scope, View};
+
+/// The longest normalized title read back (lowercasing can lengthen a title).
+const TITLE_NORM_MAX: usize = 4 * TITLE_MAX;
 
 pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage, Fail> {
     let text = query_text(query)?;
@@ -82,17 +85,21 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage,
         NoteSort::Place => doc! { "_id": way },
     };
 
+    // The page is sorted again at the end: Amazon DocumentDB keeps the order of a `$sort` only
+    // when it is the last stage, so the fields it sorts on stay in the projection.
     let mut fields = note_fields();
     fields.remove("body");
+    fields.insert("title_norm", cut("$title_norm", TITLE_NORM_MAX));
 
     let found = ctx.aggregate(
         NOTES,
         vec![
             doc! { "$match": page_filter },
-            doc! { "$sort": sort },
+            doc! { "$sort": sort.clone() },
             doc! { "$skip": i64::try_from(query.offset).unwrap_or(i64::MAX) },
             doc! { "$limit": i64::try_from(page_limit(query)).unwrap_or(1) },
             doc! { "$project": fields },
+            doc! { "$sort": sort },
         ],
     )?;
 

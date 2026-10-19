@@ -21,8 +21,9 @@
 //! system configuration from its default location.
 //!
 //! The team database settings (`HARNESS_MEMORY_DATABASE_URL`, `HARNESS_MEMORY_DATABASE_TOKEN`,
-//! `HARNESS_MEMORY_CONFIG`, `HARNESS_MEMORY_REPOSITORY_NOTES` and `HARNESS_MEMORY_GLOBAL_NOTES`) are
-//! dropped too: git has no use for them, and a hook or helper it runs must not see the credentials.
+//! `HARNESS_MEMORY_DATABASE_KIND`, `HARNESS_MEMORY_CONFIG`, `HARNESS_MEMORY_REPOSITORY_NOTES` and
+//! `HARNESS_MEMORY_GLOBAL_NOTES`) are dropped too: git has no use for them, and a hook or helper it
+//! runs must not see the credentials.
 
 use std::ffi::OsStr;
 use std::io::Read;
@@ -68,9 +69,10 @@ const GIT_ENV: [(&str, &str); 3] = [
 ];
 
 /// The server's team database settings (see `crate::backend`), never passed on to git.
-pub(super) const TEAM_VARS: [&str; 5] = [
+pub(super) const TEAM_VARS: [&str; 6] = [
     "HARNESS_MEMORY_DATABASE_URL",
     "HARNESS_MEMORY_DATABASE_TOKEN",
+    "HARNESS_MEMORY_DATABASE_KIND",
     "HARNESS_MEMORY_CONFIG",
     "HARNESS_MEMORY_REPOSITORY_NOTES",
     "HARNESS_MEMORY_GLOBAL_NOTES",

@@ -33,6 +33,7 @@ pub fn without_team_settings(command: &mut Command) {
     for name in [
         "HARNESS_MEMORY_DATABASE_URL",
         "HARNESS_MEMORY_DATABASE_TOKEN",
+        "HARNESS_MEMORY_DATABASE_KIND",
         "HARNESS_MEMORY_CONFIG",
         "HARNESS_MEMORY_REPOSITORY_NOTES",
         "HARNESS_MEMORY_GLOBAL_NOTES",

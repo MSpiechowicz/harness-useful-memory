@@ -8,10 +8,17 @@
 //! | --- | --- |
 //! | `postgres://`, `postgresql://` | PostgreSQL |
 //! | `libsql://`, `https://`, `http://` (`http` for this machine only) | libSQL (remote SQLite) |
-//! | `mongodb://`, `mongodb+srv://` | MongoDB |
+//! | `mongodb://`, `mongodb+srv://` | MongoDB, or Amazon DocumentDB |
 //!
 //! The scheme is matched and passed on in lowercase (`POSTGRES://…` works); the rest of the URL is
 //! kept as written.
+//!
+//! A `mongodb://` or `mongodb+srv://` URL names MongoDB or Amazon DocumentDB ([`DatabaseKind`]):
+//! [`KIND_VAR`] or `database_kind` (`"mongodb"` or `"documentdb"`) says which, read from the same
+//! place as the URL (the variable with [`URL_VAR`], the config file with `database_url`). Unset,
+//! a host under a DocumentDB domain (`<cluster>.<region>.docdb.amazonaws.com`, see
+//! [`crate::store::mongo::documentdb::is_documentdb_url`]) picks DocumentDB; `"mongodb"` turns that
+//! off. [`KINDS`] lists the kinds this harness-memory supports (`harness-memory kinds`).
 //!
 //! [`TOKEN_VAR`] or `database_token` is the libSQL auth token. With a team database the whole
 //! store is remote by default: repository and global notes are shared by everyone using it,
@@ -40,6 +47,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::store::mongo::Flavor;
 use crate::store::{
     DocKind, LibsqlStore, MemoryStore, MongoStore, PostgresStore, ScriptStore, StoreError, TeamDocStore,
 };
@@ -51,6 +59,14 @@ pub const URL_VAR: &str = "HARNESS_MEMORY_DATABASE_URL";
 
 /// Environment variable holding the libSQL auth token (empty = unset). Wins over the config file.
 pub const TOKEN_VAR: &str = "HARNESS_MEMORY_DATABASE_TOKEN";
+
+/// Environment variable saying which server a `mongodb://` or `mongodb+srv://` URL in [`URL_VAR`]
+/// names: `mongodb` or `documentdb` (empty = unset: told by the host). Only read with [`URL_VAR`];
+/// a URL from the config file goes with its `database_kind`.
+pub const KIND_VAR: &str = "HARNESS_MEMORY_DATABASE_KIND";
+
+/// The team database kinds this harness-memory supports, as `harness-memory kinds` prints them.
+pub const KINDS: [&str; 4] = ["postgres", "libsql", "mongodb", "documentdb"];
 
 /// Environment variable naming the config file instead of the default one (absolute, a leading
 /// `~` is fine).
@@ -102,6 +118,7 @@ const MASK: &str = "••••";
 struct ConfigFile {
     database_url: Option<String>,
     database_token: Option<String>,
+    database_kind: Option<String>,
     repository_notes: Option<String>,
     global_notes: Option<String>,
     scripts: Option<String>,
@@ -123,6 +140,28 @@ pub enum Backend {
     Libsql { url: String, token: Option<String> },
     /// A MongoDB team database.
     Mongo { url: String },
+    /// An Amazon DocumentDB team database, through the MongoDB store in its DocumentDB mode.
+    DocumentDb { url: String },
+}
+
+/// Which server a `mongodb://` or `mongodb+srv://` URL names (`database_kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseKind {
+    /// MongoDB (`mongodb`); also turns off telling DocumentDB by its host.
+    MongoDb,
+    /// Amazon DocumentDB (`documentdb`).
+    DocumentDb,
+}
+
+impl DatabaseKind {
+    /// Parses a setting (`mongodb` or `documentdb`, any case, surrounding blanks ignored).
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "mongodb" => Some(Self::MongoDb),
+            "documentdb" => Some(Self::DocumentDb),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Debug for Backend {
@@ -139,6 +178,7 @@ impl Backend {
             Self::Postgres { url } => format!("PostgreSQL at {}", redact_url(url)),
             Self::Libsql { url, .. } => format!("libSQL at {}", redact_url(url)),
             Self::Mongo { url } => format!("MongoDB at {}", redact_url(url)),
+            Self::DocumentDb { url } => format!("Amazon DocumentDB at {}", redact_url(url)),
         }
     }
 
@@ -147,7 +187,7 @@ impl Backend {
         match self {
             Self::Local | Self::Libsql { .. } => crate::store::sqlite::schema::SCHEMA_VERSION,
             Self::Postgres { .. } => crate::store::postgres::schema::SCHEMA_VERSION,
-            Self::Mongo { .. } => crate::store::mongo::schema::SCHEMA_VERSION,
+            Self::Mongo { .. } | Self::DocumentDb { .. } => crate::store::mongo::schema::SCHEMA_VERSION,
         }
     }
 
@@ -155,7 +195,7 @@ impl Backend {
     pub fn secrets(&self) -> Secrets {
         match self {
             Self::Local => Secrets::default(),
-            Self::Postgres { url } | Self::Mongo { url } => Secrets::of(url, None),
+            Self::Postgres { url } | Self::Mongo { url } | Self::DocumentDb { url } => Secrets::of(url, None),
             Self::Libsql { url, token } => Secrets::of(url, token.as_deref()),
         }
     }
@@ -332,14 +372,15 @@ impl Backend {
     /// (`postgres://db.example.com/memory`). The hosts are in lowercase, without the scheme's
     /// default port (PostgreSQL 5432, MongoDB 27017, libSQL over HTTPS 443, over HTTP 80) and,
     /// for MongoDB, sorted. The user, password, query and token are left out, so changing them,
-    /// or writing the same database another way, keeps the approvals.
+    /// or writing the same database another way, keeps the approvals. Amazon DocumentDB has the
+    /// identity of MongoDB at the same URL: picking the other kind does not make it another database.
     pub fn team_identity(&self) -> Option<String> {
         let (kind, url) = match self {
             Self::Local => return None,
             Self::Postgres { url } => ("postgres", url),
             Self::Libsql { url, .. } => ("libsql", url),
-            Self::Mongo { url } if url.starts_with("mongodb+srv://") => ("mongodb+srv", url),
-            Self::Mongo { url } => ("mongodb", url),
+            Self::Mongo { url } | Self::DocumentDb { url } if url.starts_with("mongodb+srv://") => ("mongodb+srv", url),
+            Self::Mongo { url } | Self::DocumentDb { url } => ("mongodb", url),
         };
 
         let (scheme, rest) = url.trim().split_once("://").unwrap_or(("", url.trim()));
@@ -349,7 +390,7 @@ impl Backend {
         let database = database.trim_end_matches('/');
 
         let database = match (self, database) {
-            (Self::Mongo { .. }, "") => crate::store::mongo::DEFAULT_DATABASE,
+            (Self::Mongo { .. } | Self::DocumentDb { .. }, "") => crate::store::mongo::DEFAULT_DATABASE,
             _ => database,
         };
 
@@ -367,7 +408,7 @@ impl Backend {
             .map(|host| without_port(&host.to_ascii_lowercase(), default_port))
             .collect();
 
-        if matches!(self, Self::Mongo { .. }) {
+        if matches!(self, Self::Mongo { .. } | Self::DocumentDb { .. }) {
             hosts.sort();
         }
 
@@ -420,6 +461,10 @@ pub enum BackendError {
     Routing(String),
     #[error("{0} must be 1 or 0")]
     Flag(String),
+    #[error("{0} must be \"mongodb\" or \"documentdb\"")]
+    Kind(String),
+    #[error("database_kind ({KIND_VAR}) only applies to a mongodb:// or mongodb+srv:// URL")]
+    KindScheme,
 }
 
 /// The config folder: `$XDG_CONFIG_HOME` (or `~/.config`) on Linux, `~/Library/Application
@@ -467,9 +512,16 @@ pub fn select(env: &Env) -> Result<Selection, BackendError> {
         }
     }
 
-    let url = env.var(URL_VAR).map(str::to_owned).or(config.database_url);
+    // The kind goes with the URL: the variable's with the variable, the file's with the file.
+    let (url, kind) = match env.var(URL_VAR) {
+        Some(url) => (Some(url.to_owned()), database_kind(env.var(KIND_VAR), KIND_VAR)?),
+        None => (
+            config.database_url,
+            database_kind(config.database_kind.as_deref(), "database_kind in the config file")?,
+        ),
+    };
     let token = env.var(TOKEN_VAR).map(str::to_owned).or(config.database_token);
-    let backend = backend_for(url, token)?;
+    let backend = backend_of_kind(url, token, kind)?;
 
     let routing = Routing {
         repository: place(
@@ -517,6 +569,18 @@ pub fn select(env: &Env) -> Result<Selection, BackendError> {
         trust_team_routines,
         warnings,
     })
+}
+
+/// The [`DatabaseKind`] a setting names (`None` when unset or blank); an error naming `origin` for
+/// another value.
+fn database_kind(raw: Option<&str>, origin: &str) -> Result<Option<DatabaseKind>, BackendError> {
+    let Some(raw) = raw.filter(|raw| !raw.trim().is_empty()) else {
+        return Ok(None);
+    };
+
+    DatabaseKind::parse(raw)
+        .map(Some)
+        .ok_or_else(|| BackendError::Kind(origin.to_owned()))
 }
 
 /// The switch from the environment variable `var` (`1`, `true`, `0` or `false`, any case), else
@@ -608,6 +672,17 @@ fn current_uid(_env: &Env) -> Option<u32> {
 
 /// The backend for a URL (none or blank: [`Backend::Local`]) and a token.
 pub fn backend_for(url: Option<String>, token: Option<String>) -> Result<Backend, BackendError> {
+    backend_of_kind(url, token, None)
+}
+
+/// [`backend_for`] with the `database_kind` of the URL: a `mongodb://` or `mongodb+srv://` URL
+/// names Amazon DocumentDB with [`DatabaseKind::DocumentDb`], or without a kind when a host is a
+/// DocumentDB endpoint; a kind with another scheme is an error.
+pub fn backend_of_kind(
+    url: Option<String>,
+    token: Option<String>,
+    kind: Option<DatabaseKind>,
+) -> Result<Backend, BackendError> {
     let Some(url) = url.map(|url| url.trim().to_owned()).filter(|url| !url.is_empty()) else {
         return Ok(Backend::Local);
     };
@@ -626,19 +701,37 @@ pub fn backend_for(url: Option<String>, token: Option<String>) -> Result<Backend
         None => (String::new(), url),
     };
 
-    match scheme.as_str() {
+    if matches!(scheme.as_str(), "mongodb" | "mongodb+srv") {
+        let documentdb = match kind {
+            Some(kind) => kind == DatabaseKind::DocumentDb,
+            None => crate::store::mongo::documentdb::is_documentdb_url(&url),
+        };
+
+        return Ok(if documentdb {
+            Backend::DocumentDb { url }
+        } else {
+            Backend::Mongo { url }
+        });
+    }
+
+    let backend = match scheme.as_str() {
         "postgres" | "postgresql" => Ok(Backend::Postgres { url }),
         "libsql" | "https" | "http" if carries_secrets(&url) => Err(BackendError::LibsqlUrlSecrets),
         "libsql" | "https" => Ok(Backend::Libsql { url, token }),
         "http" if is_local_http(&url) => Ok(Backend::Libsql { url, token }),
         "http" => Err(BackendError::PlainHttp),
-        "mongodb" | "mongodb+srv" => Ok(Backend::Mongo { url }),
         "" => Err(BackendError::Scheme(String::new())),
         other if other.len() <= 16 && other.chars().all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c)) => {
             Err(BackendError::Scheme(format!(" (got {other}://)")))
         }
         _ => Err(BackendError::Scheme(String::new())),
+    }?;
+
+    if kind.is_some() {
+        return Err(BackendError::KindScheme);
     }
+
+    Ok(backend)
 }
 
 /// A store opened for a team backend, and whether its database was written by a newer server.
@@ -665,7 +758,7 @@ pub fn open(backend: &Backend) -> Option<Result<Opened, String>> {
             store: Box::new(store),
         }),
         Backend::Libsql { url, token } => open_libsql(url, token.as_deref()),
-        Backend::Mongo { url } => open_mongo(url),
+        Backend::Mongo { .. } | Backend::DocumentDb { .. } => open_mongo(backend),
     };
 
     Some(opened.map_err(|error| open_failed(backend, &error)))
@@ -679,7 +772,9 @@ pub fn open_scripts(backend: &Backend) -> Option<Result<Box<dyn ScriptStore>, St
         Backend::Libsql { url, token } => {
             LibsqlStore::connect(url, token.as_deref()).map(|store| Box::new(store) as Box<dyn ScriptStore>)
         }
-        Backend::Mongo { url } => MongoStore::connect(url).map(|store| Box::new(store) as Box<dyn ScriptStore>),
+        Backend::Mongo { .. } | Backend::DocumentDb { .. } => {
+            connect_mongo(backend).map(|store| Box::new(store) as Box<dyn ScriptStore>)
+        }
     };
 
     Some(opened.map_err(|error| open_failed(backend, &error)))
@@ -693,7 +788,9 @@ pub fn open_team_docs(backend: &Backend) -> Option<Result<Box<dyn TeamDocStore>,
         Backend::Libsql { url, token } => {
             LibsqlStore::connect(url, token.as_deref()).map(|store| Box::new(store) as Box<dyn TeamDocStore>)
         }
-        Backend::Mongo { url } => MongoStore::connect(url).map(|store| Box::new(store) as Box<dyn TeamDocStore>),
+        Backend::Mongo { .. } | Backend::DocumentDb { .. } => {
+            connect_mongo(backend).map(|store| Box::new(store) as Box<dyn TeamDocStore>)
+        }
     };
 
     Some(opened.map_err(|error| open_failed(backend, &error)))
@@ -712,11 +809,22 @@ fn open_libsql(url: &str, token: Option<&str>) -> Result<Opened, StoreError> {
     })
 }
 
-fn open_mongo(url: &str) -> Result<Opened, StoreError> {
-    MongoStore::connect(url).map(|store| Opened {
+fn open_mongo(backend: &Backend) -> Result<Opened, StoreError> {
+    connect_mongo(backend).map(|store| Opened {
         newer: store.is_newer(),
         store: Box::new(store),
     })
+}
+
+/// The MongoDB store for a MongoDB or an Amazon DocumentDB backend.
+fn connect_mongo(backend: &Backend) -> Result<MongoStore, StoreError> {
+    match backend {
+        Backend::DocumentDb { url } => MongoStore::connect_as(url, &Flavor::DocumentDb),
+        Backend::Mongo { url } => MongoStore::connect(url),
+        _ => Err(StoreError::Invalid(
+            "not a MongoDB or Amazon DocumentDB backend".to_owned(),
+        )),
+    }
 }
 
 /// `url` without its password and query: `scheme://user@host:port/path`, with `?…` when the URL
@@ -1013,6 +1121,154 @@ mod tests {
             pick("host=db user=u password=p"),
             Err(BackendError::Scheme(_))
         ));
+    }
+
+    const DOCDB: &str =
+        "mongodb://u:p@docs.cluster-abc.eu-central-1.docdb.amazonaws.com:27017/?tls=true&replicaSet=rs0";
+
+    fn kind_of(url: &str, kind: Option<DatabaseKind>) -> Result<Backend, BackendError> {
+        backend_of_kind(Some(url.to_owned()), None, kind)
+    }
+
+    #[test]
+    fn documentdb_is_told_by_the_host_unless_the_kind_says_otherwise() {
+        assert!(matches!(pick(DOCDB), Ok(Backend::DocumentDb { .. })));
+        assert!(matches!(
+            pick("mongodb+srv://u:p@docs-1234.us-east-1.docdb-elastic.amazonaws.com/"),
+            Ok(Backend::DocumentDb { .. })
+        ));
+        assert!(matches!(
+            kind_of(DOCDB, Some(DatabaseKind::MongoDb)),
+            Ok(Backend::Mongo { .. })
+        ));
+
+        let elsewhere = "mongodb://u:p@localhost:27017/?directConnection=true&tls=true";
+        assert!(matches!(pick(elsewhere), Ok(Backend::Mongo { .. })));
+        assert!(matches!(
+            kind_of(elsewhere, Some(DatabaseKind::DocumentDb)),
+            Ok(Backend::DocumentDb { .. })
+        ));
+
+        for url in ["postgres://db/m", "libsql://team.turso.io"] {
+            for kind in [DatabaseKind::MongoDb, DatabaseKind::DocumentDb] {
+                assert!(
+                    matches!(kind_of(url, Some(kind)), Err(BackendError::KindScheme)),
+                    "{url}"
+                );
+            }
+        }
+
+        assert!(
+            matches!(
+                kind_of("mysql://db/m", Some(DatabaseKind::MongoDb)),
+                Err(BackendError::Scheme(_))
+            ),
+            "a wrong scheme is reported as such first"
+        );
+        assert_eq!(
+            backend_of_kind(None, None, Some(DatabaseKind::DocumentDb)).ok(),
+            Some(Backend::Local)
+        );
+    }
+
+    #[test]
+    fn documentdb_is_the_same_team_database_as_mongodb_at_its_url() {
+        let documentdb = pick(DOCDB).expect("documentdb");
+        let mongodb = kind_of(DOCDB, Some(DatabaseKind::MongoDb)).expect("mongodb");
+
+        assert_eq!(documentdb.team_identity(), mongodb.team_identity());
+        assert_eq!(
+            documentdb.team_identity().as_deref(),
+            Some("mongodb://docs.cluster-abc.eu-central-1.docdb.amazonaws.com/harness_memory")
+        );
+        assert_eq!(documentdb.team_key(), mongodb.team_key());
+        assert_eq!(documentdb.schema_version(), mongodb.schema_version());
+        assert_eq!(documentdb.secrets(), mongodb.secrets());
+        assert_eq!(
+            documentdb.describe(),
+            "Amazon DocumentDB at mongodb://u@docs.cluster-abc.eu-central-1.docdb.amazonaws.com:27017/?…"
+        );
+        assert!(!format!("{documentdb:?}").contains(":p@"));
+    }
+
+    #[test]
+    fn the_kind_comes_from_where_the_url_comes_from() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "database_url = \"mongodb://file.example.com/m\"\ndatabase_kind = \" DocumentDB \"\n",
+        )
+        .expect("write");
+
+        let file = Env::for_tests("/home/u").with_var(CONFIG_VAR, path.to_string_lossy());
+        assert_eq!(
+            select(&file).expect("file").backend,
+            Backend::DocumentDb {
+                url: "mongodb://file.example.com/m".to_owned(),
+            },
+            "the file's kind goes with the file's URL"
+        );
+
+        let ignored = file.clone().with_var(KIND_VAR, "mongodb");
+        assert!(
+            matches!(select(&ignored).expect("file").backend, Backend::DocumentDb { .. }),
+            "the variable's kind is not used with the file's URL"
+        );
+
+        let env_url = file.clone().with_var(URL_VAR, "mongodb://env.example.com/m");
+        assert_eq!(
+            select(&env_url).expect("env").backend,
+            Backend::Mongo {
+                url: "mongodb://env.example.com/m".to_owned()
+            },
+            "the file's kind is not used with the variable's URL"
+        );
+
+        let env_kind = env_url.clone().with_var(KIND_VAR, "DOCUMENTDB");
+        assert!(matches!(
+            select(&env_kind).expect("env").backend,
+            Backend::DocumentDb { .. }
+        ));
+        let empty = env_url.with_var(KIND_VAR, "");
+        assert!(matches!(
+            select(&empty).expect("empty is unset").backend,
+            Backend::Mongo { .. }
+        ));
+    }
+
+    #[test]
+    fn unknown_kinds_and_kinds_for_other_schemes_are_errors() {
+        let env = Env::for_tests("/home/u").with_var(URL_VAR, "mongodb://u:hunter2@db.example.com/m");
+        let error = select(&env.clone().with_var(KIND_VAR, "cosmosdb"))
+            .expect_err("unknown kind")
+            .to_string();
+        assert_eq!(
+            error,
+            "HARNESS_MEMORY_DATABASE_KIND must be \"mongodb\" or \"documentdb\""
+        );
+
+        let postgres = Env::for_tests("/home/u")
+            .with_var(URL_VAR, "postgres://u:hunter2@db/m")
+            .with_var(KIND_VAR, "documentdb");
+        let error = select(&postgres).expect_err("kind for postgres").to_string();
+        assert_eq!(
+            error,
+            "database_kind (HARNESS_MEMORY_DATABASE_KIND) only applies to a mongodb:// or mongodb+srv:// URL"
+        );
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "database_url = \"mongodb://db/m\"\ndatabase_kind = \"docdb\"\n").expect("write");
+        let file = Env::for_tests("/home/u").with_var(CONFIG_VAR, path.to_string_lossy());
+        let error = select(&file).expect_err("unknown kind").to_string();
+        assert_eq!(
+            error,
+            "database_kind in the config file must be \"mongodb\" or \"documentdb\""
+        );
+
+        std::fs::write(&path, "database_kind = 1\n").expect("write");
+        assert!(matches!(select(&file), Err(BackendError::ConfigInvalid { .. })));
     }
 
     #[test]

@@ -8,7 +8,8 @@
 #   chmod 600 ~/.config/harness-memory/config.toml
 #
 # HARNESS_MEMORY_DATABASE_URL and HARNESS_MEMORY_DATABASE_TOKEN override the values below. Without a database_url the
-# server uses its local SQLite file.
+# server uses its local SQLite file. HARNESS_MEMORY_DATABASE_KIND goes with HARNESS_MEMORY_DATABASE_URL only, and
+# database_kind below with database_url only.
 
 # Pick one URL.
 
@@ -21,6 +22,14 @@ database_url = "postgres://harness_memory:CHANGE-ME@db.example.com:5432/harness_
 
 # MongoDB. The database is the URL path (harness_memory when there is none). Transactions need a replica set.
 # database_url = "mongodb+srv://harness_memory:CHANGE-ME@cluster.example.com/harness_memory?retryWrites=true"
+
+# Amazon DocumentDB: the connection string the AWS console shows, as it is (connect to your VPN first). A host under
+# docdb.amazonaws.com is taken for DocumentDB by itself, tlsCAFile=global-bundle.pem means the Amazon certificate bundle
+# built into harness-memory, and the notes go to the harness_memory database.
+# database_url = "mongodb://harness_memory:CHANGE-ME@docs.cluster-abc123.eu-central-1.docdb.amazonaws.com:27017/?tls=true&tlsCAFile=global-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false"
+# Which server a mongodb:// URL names: "mongodb" or "documentdb". Only needed for DocumentDB under another host name,
+# or "mongodb" to turn the detection off.
+# database_kind = "documentdb"
 
 # Which notes go to the team database: "remote" (the default) or "local" to keep that kind on this computer.
 # HARNESS_MEMORY_REPOSITORY_NOTES and HARNESS_MEMORY_GLOBAL_NOTES override them.

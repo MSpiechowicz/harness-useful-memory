@@ -1,7 +1,8 @@
 //! The `harness-memory` executable: `harness-memory [mcp]` serves MCP over stdio,
 //! `harness-memory push [--dry-run] [--repo <key|.>] [--no-global]` copies the local memory into
 //! the team database, `harness-memory check` opens the configured database and says which it is
-//! and where scripts are, `harness-memory scripts list|delete` and `harness-memory trust` list,
+//! and where scripts are, `harness-memory kinds` lists the team database kinds this build supports,
+//! `harness-memory scripts list|delete` and `harness-memory trust` list,
 //! delete and approve scripts ([`harness_memory::cli_trust`]), `harness-memory notes list|get|delete` browse and
 //! delete notes ([`harness_memory::cli_notes`]), `harness-memory hooks config|list|get|put|delete` and
 //! `harness-memory routines config|list|get|put|delete` share Harness Desktop hooks and routines with the team
@@ -21,7 +22,7 @@ use harness_memory::support::runner::Stop;
 use harness_memory::{Server, database_path, serve};
 use harness_memory::{cli_notes, cli_team_docs, cli_trust};
 
-const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--repo <key|.>] [--no-global] | check | scripts list \
+const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--repo <key|.>] [--no-global] | check | kinds | scripts list \
                      --json [--project PATH] [--group needsReview|repo|global] [--scope repo|global] [--review \
                      needed|trusted] [--query TEXT] [--sort name|language|scope|place|runs|lastRun|updated] \
                      [--order asc|desc] [--offset N] [--limit N] | scripts delete <id> [--project PATH] | scripts \
@@ -51,6 +52,14 @@ fn main() -> ExitCode {
             }
         },
         [Some("check")] => run_check(),
+        [Some("kinds")] => {
+            // One kind per line, for Harness Desktop to tell which kinds it can offer.
+            for kind in backend::KINDS {
+                println!("{kind}");
+            }
+
+            ExitCode::SUCCESS
+        }
         [Some("scripts"), rest @ ..] => cli_trust::scripts(rest),
         [Some("trust"), rest @ ..] => cli_trust::trust(rest),
         [Some("notes"), rest @ ..] => cli_notes::notes(rest),

@@ -1,11 +1,14 @@
-//! The connection URL: the scheme, where the servers are, the TLS rules, and error messages that
-//! never carry the credentials of the URL.
+//! The connection URL: the scheme, where the servers are, the TLS rules, the TLS files, and error
+//! messages that never carry the credentials of the URL.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::Path;
 
 use mongodb::error::{Error, ErrorKind, WriteFailure};
 use mongodb::options::{ClientOptions, ServerAddress, Tls};
+use tempfile::NamedTempFile;
 
+use super::documentdb;
 use crate::store::StoreError;
 use crate::support::redact::redact_text;
 
@@ -16,7 +19,8 @@ pub(super) struct Checked {
 }
 
 /// Checks the scheme and the TLS options of `url` before the driver reads it (so a refused URL
-/// costs no DNS lookup). A server that is not on this machine must use TLS with certificate checks.
+/// costs no DNS lookup). A server that is not on this machine must use TLS with certificate checks,
+/// and no server gets a relative TLS file (see [`check_tls_file`]).
 pub(super) fn check(url: &str) -> Result<Checked, StoreError> {
     let (srv, rest) = if let Some(rest) = url.strip_prefix("mongodb+srv://") {
         (true, rest)
@@ -41,6 +45,10 @@ pub(super) fn check(url: &str) -> Result<Checked, StoreError> {
     let single_server = options
         .iter()
         .any(|(key, value)| matches!(key.as_str(), "directconnection" | "loadbalanced") && value == "true");
+
+    for (key, value) in query.split('&').filter_map(|pair| pair.split_once('=')) {
+        check_tls_file(&key.to_ascii_lowercase(), Path::new(&percent_decode(value)))?;
+    }
 
     let local = !srv && local_seeds(hosts, single_server);
 
@@ -106,6 +114,86 @@ pub(super) fn enforce_tls(options: &mut ClientOptions, checked: &Checked) -> Res
             Ok(())
         }
     }
+}
+
+/// Applies the TLS file rules to the parsed options (the authoritative check after [`check`]), for
+/// every server, this machine included. Returns the file holding the Amazon certificate bundle
+/// built into harness-memory when the connection uses it: the caller keeps it until
+/// `Client::with_options` has returned, which is when the driver reads it.
+///
+/// - `tlsCertificateKeyFile` must be an absolute path ([`check_tls_file`]).
+/// - A `tlsCAFile` naming an existing file by an absolute path is used as it is. An AWS name of the
+///   bundle (`global-bundle.pem`, `rds-combined-ca-bundle.pem`) that is relative or missing stands
+///   for the built-in bundle, which only narrows what is trusted. Any other relative or missing
+///   CA file is refused.
+/// - Without a `tlsCAFile`, Amazon DocumentDB (`documentdb`) uses the built-in bundle, and MongoDB
+///   the Mozilla roots compiled into the driver (`webpki-roots`, not the system store).
+pub(super) fn tls_files(options: &mut ClientOptions, documentdb: bool) -> Result<Option<NamedTempFile>, StoreError> {
+    let Some(Tls::Enabled(tls)) = options.tls.as_mut() else {
+        return Ok(None);
+    };
+
+    if let Some(key_file) = &tls.cert_key_file_path {
+        check_tls_file("tlscertificatekeyfile", key_file)?;
+    }
+
+    let built_in = match tls.ca_file_path.as_deref() {
+        None => documentdb,
+        Some(named) => wants_built_in(named, documentdb)?,
+    };
+
+    if !built_in {
+        return Ok(None);
+    }
+
+    let bundle = documentdb::write_bundle()?;
+    tls.ca_file_path = Some(documentdb::bundle_path(&bundle));
+
+    Ok(Some(bundle))
+}
+
+/// Refuses a relative `tlsCertificateKeyFile` or `tlsCAFile` (`key`, lowercase), except for an
+/// AWS name of the Amazon bundle, which [`tls_files`] replaces. The server runs inside the project,
+/// so a relative path would read a file the repository could have planted there.
+fn check_tls_file(key: &str, path: &Path) -> Result<(), StoreError> {
+    let option = match key {
+        "tlscafile" if !documentdb::is_aws_bundle_name(path) => "tlsCAFile",
+        "tlscertificatekeyfile" => "tlsCertificateKeyFile",
+        _ => return Ok(()),
+    };
+
+    if path.is_absolute() {
+        return Ok(());
+    }
+
+    Err(StoreError::Invalid(format!(
+        "{option} in the URL must be an absolute path, not {}, because the server runs inside the project",
+        path.display()
+    )))
+}
+
+/// Whether the `tlsCAFile` of the URL stands for the built-in Amazon bundle (see [`tls_files`]).
+fn wants_built_in(named: &Path, documentdb: bool) -> Result<bool, StoreError> {
+    if named.is_absolute() && named.is_file() {
+        return Ok(false);
+    }
+
+    if documentdb::is_aws_bundle_name(named) {
+        return Ok(true);
+    }
+
+    check_tls_file("tlscafile", named)?;
+
+    let hint = if documentdb {
+        ", or leave tlsCAFile out to use the Amazon certificate bundle built into harness-memory"
+    } else {
+        ""
+    };
+
+    Err(StoreError::Invalid(format!(
+        "the CA file {} that tlsCAFile names does not exist: fix the path{hint}",
+        named.display()
+    )))
 }
 
 /// True when the parsed options keep the driver on the seeds: a direct or load-balanced
@@ -193,7 +281,12 @@ pub(super) fn connect_error(error: &Error, url: &str) -> StoreError {
 /// A driver error as a short message: its kind and server error code (with the code name when it
 /// is a plain word), never server text or the URL.
 pub(super) fn backend(error: &Error) -> StoreError {
-    let message = match error.kind.as_ref() {
+    StoreError::Backend(message(error))
+}
+
+/// The message of [`backend`].
+pub(super) fn message(error: &Error) -> String {
+    match error.kind.as_ref() {
         ErrorKind::Authentication { .. } => {
             "authentication failed (check the user, the password and authSource)".to_owned()
         }
@@ -213,9 +306,7 @@ pub(super) fn backend(error: &Error) -> StoreError {
         ErrorKind::IncompatibleServer { .. } => "the MongoDB server version is not supported".to_owned(),
         ErrorKind::SessionsNotSupported => "the MongoDB server does not support sessions".to_owned(),
         _ => "MongoDB request failed".to_owned(),
-    };
-
-    StoreError::Backend(message)
+    }
 }
 
 /// `what` with the server's error code, and its code name when that is 1 to 40 ASCII letters
@@ -380,6 +471,109 @@ mod tests {
         let mut unset = parse("mongodb://127.0.0.1:27017/");
         enforce_tls(&mut unset, &local).expect("TLS turned on");
         assert!(matches!(unset.tls, Some(Tls::Enabled(_))));
+    }
+
+    fn parse(url: &str) -> ClientOptions {
+        ClientOptions::parse(url)
+            .run()
+            .unwrap_or_else(|error| panic!("{url}: {error:?}"))
+    }
+
+    fn ca_of(options: &ClientOptions) -> Option<std::path::PathBuf> {
+        match &options.tls {
+            Some(Tls::Enabled(tls)) => tls.ca_file_path.clone(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn relative_tls_files_are_refused_for_every_server() {
+        // A relative path is read from the working directory, the project: these files exist there.
+        let urls = [
+            "mongodb://localhost/?directConnection=true&tls=true&tlsCAFile=assets%2Faws-rds-global-bundle.pem",
+            "mongodb://localhost/?directConnection=true&tls=true&tlsCAFile=.%2FCargo.toml",
+            "mongodb://localhost/?directConnection=true&tls=true&tlsCertificateKeyFile=Cargo.toml",
+            "mongodb://db.example.com/?tlsCAFile=ca.pem",
+            "mongodb+srv://cluster.example.com/?TLSCERTIFICATEKEYFILE=certs%2Fme.pem",
+            "mongodb://docs.cluster-abc.eu-central-1.docdb.amazonaws.com/?tlsCertificateKeyFile=me.pem",
+        ];
+
+        for url in urls {
+            let error = check(url).err().unwrap_or_else(|| panic!("{url}: accepted"));
+            assert!(matches!(error, StoreError::Invalid(_)), "{url}: {error:?}");
+            assert!(error.to_string().contains("absolute path"), "{error}");
+            assert!(!error.to_string().contains(';'), "{error}");
+        }
+
+        // The parsed options are checked too, whatever `check` let through.
+        for documentdb in [false, true] {
+            for url in &urls[..3] {
+                let mut options = parse(url);
+                let error = tls_files(&mut options, documentdb).expect_err("refused");
+                assert!(matches!(error, StoreError::Invalid(_)), "{url}: {error:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn aws_bundle_names_stand_for_the_built_in_bundle_in_either_mode() {
+        for documentdb in [false, true] {
+            for named in [
+                "global-bundle.pem",
+                "GLOBAL-BUNDLE.PEM",
+                "certs%2Frds-combined-ca-bundle.pem",
+                "%2Fnowhere%2Fglobal-bundle.pem",
+            ] {
+                let url = format!("mongodb://localhost/?directConnection=true&tls=true&tlsCAFile={named}");
+                check(&url).expect("an AWS name passes the early check");
+
+                let mut options = parse(&url);
+                let bundle = tls_files(&mut options, documentdb)
+                    .expect("replaced")
+                    .expect("a bundle file");
+
+                assert_eq!(ca_of(&options), Some(documentdb::bundle_path(&bundle)), "{named}");
+                assert_eq!(
+                    std::fs::read_to_string(bundle.path()).expect("written"),
+                    documentdb::BUNDLE
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_existing_absolute_ca_file_is_used_and_a_missing_one_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let own = dir.path().join("global-bundle.pem");
+        std::fs::write(&own, "own bundle").expect("write");
+        let encoded = own.to_string_lossy().replace('/', "%2F");
+
+        for documentdb in [false, true] {
+            let mut options = parse(&format!("mongodb://db.example.com/?tls=true&tlsCAFile={encoded}"));
+            assert!(tls_files(&mut options, documentdb).expect("own file").is_none());
+            assert_eq!(ca_of(&options), Some(own.clone()));
+
+            let mut missing = parse("mongodb://db.example.com/?tlsCAFile=%2Fnowhere%2Fmy-ca.pem");
+            let error = tls_files(&mut missing, documentdb).expect_err("missing");
+            assert!(matches!(error, StoreError::Invalid(_)), "{error:?}");
+            assert!(error.to_string().contains("does not exist"), "{error}");
+        }
+    }
+
+    #[test]
+    fn without_a_ca_file_only_documentdb_gets_the_built_in_bundle() {
+        let mut documentdb = parse("mongodb://docs.cluster-abc.eu-central-1.docdb.amazonaws.com/?tls=true");
+        let bundle = tls_files(&mut documentdb, true)
+            .expect("bundle")
+            .expect("a bundle file");
+        assert_eq!(ca_of(&documentdb), Some(documentdb::bundle_path(&bundle)));
+
+        let mut mongodb = parse("mongodb://db.example.com/?tls=true");
+        assert!(tls_files(&mut mongodb, false).expect("roots").is_none());
+        assert_eq!(ca_of(&mongodb), None);
+
+        let mut plain = parse("mongodb://localhost:27017/?directConnection=true&tls=false");
+        assert!(tls_files(&mut plain, true).expect("no TLS").is_none());
     }
 
     #[test]

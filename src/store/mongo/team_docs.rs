@@ -36,11 +36,11 @@ impl TeamDocStore for MongoStore {
         offset: usize,
         limit: usize,
     ) -> Result<DocPage, StoreError> {
-        list(&mut self.reader()?, kind, repo, offset, limit).map_err(Fail::into_store)
+        list(&mut self.reader()?, kind, repo, offset, limit).map_err(|fail| self.failed(fail))
     }
 
     fn get_doc(&mut self, kind: DocKind, id: &str) -> Result<Option<TeamDoc>, StoreError> {
-        load(&mut self.reader()?, kind, id).map_err(Fail::into_store)
+        load(&mut self.reader()?, kind, id).map_err(|fail| self.failed(fail))
     }
 
     fn put_doc(&mut self, kind: DocKind, draft: &DocDraft, expect: Option<&str>) -> Result<DocPut, StoreError> {
@@ -97,15 +97,14 @@ fn list(ctx: &mut Ctx<'_>, kind: DocKind, repo: Option<&str>, offset: usize, lim
     let filter = listed(repo);
     let total = ctx.count(kind.table(), filter.clone())?;
 
-    let found = ctx
-        .collection(kind.table())
-        .find(filter)
-        .sort(doc! { "repo": 1, "created_at": 1, "_id": 1 })
-        .skip(u64::try_from(offset).unwrap_or(u64::MAX))
-        .limit(i64::try_from(limit).unwrap_or(i64::MAX))
-        .projection(doc_fields())
-        .run()?
-        .collect::<Result<Vec<_>, _>>()?;
+    let found = ctx.find_page(
+        kind.table(),
+        filter,
+        doc! { "repo": 1, "created_at": 1, "_id": 1 },
+        u64::try_from(offset).unwrap_or(u64::MAX),
+        i64::try_from(limit).unwrap_or(i64::MAX),
+        doc_fields(),
+    )?;
 
     let docs = found.iter().filter_map(|document| doc_of(kind, document)).collect();
 

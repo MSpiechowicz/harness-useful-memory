@@ -390,6 +390,7 @@ keep one of the two on your own computer, see [Which notes are shared](#which-no
 | PostgreSQL | `postgres://`, `postgresql://` | You have a Postgres server or a managed one (RDS, Neon, Supabase, Cloud SQL) |
 | libSQL | `libsql://`, `https://`, `http://` (localhost only) | You want the lightest option: one `sqld` container, or a hosted [Turso](https://turso.tech) database |
 | MongoDB | `mongodb://`, `mongodb+srv://` | You already run MongoDB or Atlas. A replica set (Atlas always is one) gives transactions; a standalone server works too |
+| Amazon DocumentDB | `mongodb://`, `mongodb+srv://` | Your company runs DocumentDB in AWS. See [Amazon DocumentDB](#amazon-documentdb) |
 
 Every remote host uses TLS with certificate checks, unless the host is this machine (`localhost` or a loopback address):
 for PostgreSQL a missing, `allow` or `prefer` `sslmode` becomes `require` and `disable` is refused; for libSQL plain
@@ -451,7 +452,66 @@ looked up in that database too. With a replica set or a sharded cluster every wr
 its entities and its relations change together. A standalone server works as well: no update is lost (a note is only
 replaced at the revision it was read at), but a write that touches several documents is not atomic as a whole. Search
 ranks by MongoDB's text score, which ignores how rare a word is, so close results can order differently than with
-SQLite or PostgreSQL. For a private CA add `tlsCAFile=/path/to/ca.pem`.
+SQLite or PostgreSQL. For a private CA add `tlsCAFile=/path/to/ca.pem`. `tlsCAFile` and `tlsCertificateKeyFile` must be
+absolute paths, for a server on this machine too: the server runs inside your project, so a relative path is refused
+rather than read from there. `tlsCAFile=global-bundle.pem` (or `rds-combined-ca-bundle.pem`), relative or at a path
+that does not exist, means the Amazon RDS bundle built into harness-memory (see [Amazon DocumentDB](#amazon-documentdb)).
+
+### Amazon DocumentDB
+
+[Amazon DocumentDB](https://aws.amazon.com/documentdb/) speaks the MongoDB protocol, so it takes a `mongodb://` URL and
+works like MongoDB above. It is built for instance-based clusters on engine 4.0 or newer, checked against the AWS compatibility lists and a MongoDB server in DocumentDB mode but not yet against a real cluster. Elastic clusters are detected
+by their host name too, but they have no transactions, so writes run without them (as on a standalone MongoDB server),
+and they are untested. The server says so on stderr when it connects to one.
+
+DocumentDB keeps every user in the `admin` database. Create the team's user there, with `readWrite` on the notes
+database only (in `mongosh`, connected as the cluster's admin user):
+
+```js
+db.getSiblingDB("admin").createUser({
+  user: "harness_memory",
+  pwd: "a-long-random-password",
+  roles: [{ role: "readWrite", db: "harness_memory" }],
+})
+```
+
+The connection string the AWS console shows works as it is, with this user and password in it. Without a database in
+the path the notes go to `harness_memory`. A user and password log in against `admin`, where DocumentDB keeps its
+users, unless the URL sets `authSource`.
+
+- **Which kind.** A URL whose host ends in `.docdb.amazonaws.com` (or `.docdb-elastic.amazonaws.com`, and the
+  `.amazonaws.com.cn` variants) is taken for DocumentDB. For any other host name, set
+  `database_kind = "documentdb"` in the config file, or `HARNESS_MEMORY_DATABASE_KIND=documentdb` next to
+  `HARNESS_MEMORY_DATABASE_URL`. The kind is read from the same place as the URL: the variable only goes with the
+  variable's URL, the key only with the file's. `database_kind = "mongodb"` turns the detection off. Any other value,
+  or a kind with a URL that is not `mongodb://` or `mongodb+srv://`, is an error. Switching the kind of one URL keeps it
+  the same team database (script approvals included).
+- **Certificates.** DocumentDB's certificates are signed by the Amazon RDS certificate authorities, which are not in
+  your system's trusted roots. harness-memory has [their bundle](https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem)
+  built in and hands it to each new connection in a private temporary file, removed once the connection has read it,
+  so you need no file of your own. The connection string the AWS console shows works as it is: its
+  `tlsCAFile=global-bundle.pem` (or `rds-combined-ca-bundle.pem`) means the built-in bundle. Any other `tlsCAFile`
+  must be an absolute path to an existing file. TLS stays required, with certificate checks.
+- **Retryable writes** are off unless the URL sets `retryWrites` (DocumentDB before engine 8.0.2 refuses them).
+- **Reads from the primary.** Every read goes to the cluster's primary instance, whatever `readPreference` the URL
+  sets (the AWS console string's `secondaryPreferred` included). Writes run in transactions, which only the primary
+  runs, and a replica can lag behind it, so a read there could miss a note saved a moment earlier.
+- **VPN.** A cluster only accepts connections from inside its AWS network (its VPC). Connect to your company VPN
+  first. When the cluster cannot be reached, at startup or later in a session, the error says to connect to the VPN.
+  When the cluster answers but its certificate cannot be verified, the error says that instead.
+- **Search.** DocumentDB cannot build MongoDB's text index (none before engine 5.0, and none on the tags array or
+  without a language after it), so on DocumentDB the database gets no text index and search matches the words each
+  note was saved with. Notes rank with the same title, body and tag weights and the same formula as MongoDB's text
+  score, computed by harness-memory, but from the 100 most recently updated matching notes rather than the 100 best,
+  which only matters when more than 100 notes match.
+
+```toml
+database_url = "mongodb://harness_memory:...@docs.cluster-abc123.eu-central-1.docdb.amazonaws.com:27017/?tls=true&tlsCAFile=global-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false"
+# database_kind = "documentdb"   # only needed when the host is not a docdb.amazonaws.com name
+```
+
+If `harness-memory check` against DocumentDB says the notes text index could not be created, the URL was taken for
+MongoDB: set `database_kind = "documentdb"`.
 
 ### Configure each teammate
 
@@ -483,7 +543,8 @@ and macOS the server also refuses a config file (the default one or `HARNESS_MEM
 users can change, or that another user owns, since whoever can change it can point your agents at their database; it
 warns when others can read it.
 
-**Environment variables**: `HARNESS_MEMORY_DATABASE_URL` and, for libSQL, `HARNESS_MEMORY_DATABASE_TOKEN`. Like
+**Environment variables**: `HARNESS_MEMORY_DATABASE_URL` and, for libSQL, `HARNESS_MEMORY_DATABASE_TOKEN` (and, for
+[Amazon DocumentDB](#amazon-documentdb) on another host name, `HARNESS_MEMORY_DATABASE_KIND`). Like
 `HARNESS_MEMORY_DIR`, they must be in the environment the harness starts the server with, and an app started from a
 launcher does not see your shell's variables. Hand them to the server in the harness's own entry, which stores the
 secret in that harness's settings file:
@@ -512,6 +573,9 @@ It exits with 0 when the database opens (the first line then ends with `update i
 (`ok: local database at …`, with `(not created yet)` before the first note); that file is only looked at, never
 created. With both kinds of notes kept on this computer and scripts in the team database, it opens the team database
 for the scripts and fails the same way when it cannot. Run it with the same variables as the harness's entry when the settings live there.
+
+`harness-memory kinds` prints the team database kinds this `harness-memory` supports, one per line (`postgres`,
+`libsql`, `mongodb`, `documentdb`), and exits with 0. Older versions do not know the command.
 
 The server checks the same at startup: a wrong URL, a refused plain connection or an unreachable database stops it with
 the reason on stderr, so the harness shows `harness-memory` as failed to start (its MCP log or status view has the

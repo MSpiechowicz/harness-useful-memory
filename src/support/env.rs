@@ -10,7 +10,8 @@ use super::Error;
 
 /// Environment variables captured by [`Env::from_process`]: the only ones the server's own logic
 /// reads. Libraries and children read their own standard ones: the TLS setup of the team database
-/// drivers may read `SSL_CERT_FILE` and `SSL_CERT_DIR` for the trusted CA certificates, the
+/// drivers may read `SSL_CERT_FILE` and `SSL_CERT_DIR` for the trusted CA certificates (not the
+/// MongoDB driver, which trusts the Mozilla roots compiled into it or the `tlsCAFile`), the
 /// libSQL client ignores proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`), and
 /// `git` gets the process environment without `GIT_*` and the team database settings (see
 /// [`super::git`]).
@@ -29,6 +30,9 @@ pub const CAPTURED_VARS: &[&str] = &[
     "HARNESS_MEMORY_DATABASE_URL",
     "HARNESS_MEMORY_DATABASE_TOKEN",
     "HARNESS_MEMORY_CONFIG",
+    // Which server a `mongodb://` URL names: MongoDB or Amazon DocumentDB (see
+    // `crate::backend::KIND_VAR`).
+    "HARNESS_MEMORY_DATABASE_KIND",
     // Which scopes stay on this computer with a team database (see `crate::backend::Routing`).
     "HARNESS_MEMORY_REPOSITORY_NOTES",
     "HARNESS_MEMORY_GLOBAL_NOTES",

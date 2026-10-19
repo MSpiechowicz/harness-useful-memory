@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use mongodb::bson::{Bson, Document, doc, oid::ObjectId};
 
-use super::{Ctx, ENTITIES, ENTITY_NORM_MAX, Fail, NOTES, PATH_MAX, RELATIONS, cut, id_only, int, now, number};
+use super::{
+    Ctx, ENTITIES, ENTITY_NORM_MAX, Fail, NOTES, PATH_MAX, RELATIONS, cut, id_only, int, is_number, now, number,
+};
 use super::{project_of, scope_of, scope_value, text, visible};
 use crate::limits::{DEPTH_MAX, ENTITY_MAX, NEIGHBOR_NOTES_MAX, NEIGHBORS_LIMIT_MAX, RELATION_MAX, TITLE_MAX};
 use crate::store::{Edge, Forget, Link, Neighborhood, StoreError, Target, View, clean};
@@ -431,7 +433,7 @@ fn relation_fields() -> Document {
         "dst": cut("$dst", ENTITY_NORM_MAX),
         "src_name": cut("$src_name", ENTITY_MAX),
         "dst_name": cut("$dst_name", ENTITY_MAX),
-        "note_id": { "$cond": [{ "$isNumber": "$note_id" }, "$note_id", Bson::Null] },
+        "note_id": { "$cond": [is_number("$note_id"), "$note_id", Bson::Null] },
         "updated_at": number("$updated_at"),
     }
 }

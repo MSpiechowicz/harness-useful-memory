@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{both, draft, global_only, query, repo};
+use harness_memory::store::mongo::Flavor;
 use harness_memory::store::mongo::schema::SCHEMA_VERSION;
 use harness_memory::store::{MemoryStore, MongoStore, NoteKind, NotePatch, StoreError, Target};
 use mongo_support::TestDb;
@@ -34,7 +35,7 @@ fn together<T: Send + 'static>(
             let work = Arc::clone(&work);
 
             thread::spawn(move || {
-                let mut store = MongoStore::connect(&url).expect("connect");
+                let mut store = MongoStore::connect_as(&url, &mongo_support::flavor()).expect("connect");
                 barrier.wait();
                 work(index, &mut store)
             })
@@ -59,7 +60,7 @@ fn mongo_servers_starting_at_once_migrate_once() {
 
             thread::spawn(move || {
                 barrier.wait();
-                MongoStore::connect(&url).map(|store| store.is_newer())
+                MongoStore::connect_as(&url, &mongo_support::flavor()).map(|store| store.is_newer())
             })
         })
         .collect();
@@ -82,29 +83,48 @@ fn mongo_servers_starting_at_once_migrate_once() {
         .list_index_names()
         .run()
         .expect("indexes");
-    for name in ["notes_title", "notes_text", "notes_terms"] {
+    for name in ["notes_title", "notes_terms"] {
         assert!(indexes.iter().any(|index| index == name), "{name}: {indexes:?}");
     }
+
+    // Amazon DocumentDB gets no text index.
+    let text_index = mongo_support::flavor() == Flavor::MongoDb;
+    assert_eq!(
+        indexes.iter().any(|index| index == "notes_text"),
+        text_index,
+        "{indexes:?}"
+    );
 }
 
 #[test]
-fn mongo_a_migration_lock_with_an_invalid_expiry_is_taken_over() {
+fn mongo_a_migration_lock_that_expired_or_has_an_invalid_expiry_is_taken_over() {
     let invalid = [
         mongodb::bson::Bson::String("never".to_owned()),
         mongodb::bson::Bson::Null,
         mongodb::bson::Bson::Int64(i64::MAX),
+        mongodb::bson::Bson::Int32(1),
+        mongodb::bson::Bson::Double(1.5),
+        mongodb::bson::Bson::Array(vec![]),
+        mongodb::bson::Bson::Document(doc! { "at": 1 }),
     ];
 
-    for expires_at in invalid {
+    // `None`: a lock without an expiry.
+    for expires_at in invalid.into_iter().map(Some).chain([None]) {
         let Some(db) = TestDb::new() else { return };
+        let mut lock = doc! { "_id": "migration_lock", "owner": "gone" };
+        if let Some(expires_at) = &expires_at {
+            lock.insert("expires_at", expires_at.clone());
+        }
+
         db.raw()
             .collection::<Document>("meta")
-            .insert_one(doc! { "_id": "migration_lock", "owner": "gone", "expires_at": expires_at.clone() })
+            .insert_one(lock)
             .run()
             .expect("plant the lock");
 
         let started = Instant::now();
-        let store = MongoStore::connect(&db.url).unwrap_or_else(|error| panic!("{expires_at:?}: {error}"));
+        let store = MongoStore::connect_as(&db.url, &mongo_support::flavor())
+            .unwrap_or_else(|error| panic!("{expires_at:?}: {error}"));
 
         assert!(!store.is_newer());
         assert!(
@@ -299,6 +319,32 @@ fn mongo_other_schemes_are_refused() {
     ] {
         let error = MongoStore::connect(url).expect_err("refused");
         assert!(matches!(error, StoreError::Invalid(_)), "{url}: {error:?}");
+    }
+}
+
+#[test]
+fn mongo_relative_tls_files_are_refused_even_on_this_machine() {
+    // Cargo runs integration tests in the package folder, which holds these files (the first a
+    // real CA bundle): a relative path would be read from the project the server runs in.
+    for file in ["assets/aws-rds-global-bundle.pem", "Cargo.toml"] {
+        assert!(
+            std::path::Path::new(file).is_file(),
+            "{file} is in the working directory"
+        );
+    }
+
+    let urls = [
+        "mongodb://localhost/?directConnection=true&tls=true&tlsCAFile=assets%2Faws-rds-global-bundle.pem",
+        "mongodb://localhost/?directConnection=true&tls=true&tlsCertificateKeyFile=Cargo.toml",
+        "mongodb://db.example.com/?tlsCAFile=Cargo.toml",
+    ];
+
+    for url in urls {
+        for flavor in [Flavor::MongoDb, Flavor::DocumentDb] {
+            let error = MongoStore::connect_as(url, &flavor).expect_err("refused");
+            assert!(matches!(error, StoreError::Invalid(_)), "{url} {flavor:?}: {error:?}");
+            assert!(error.to_string().contains("must be an absolute path"), "{error}");
+        }
     }
 }
 

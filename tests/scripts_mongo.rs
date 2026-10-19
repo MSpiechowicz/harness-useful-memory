@@ -164,7 +164,7 @@ fn mongo_concurrent_first_saves_of_one_name_create_one_script() {
             let barrier = Arc::clone(&barrier);
 
             thread::spawn(move || {
-                let mut store = MongoStore::connect(&url).expect("connect");
+                let mut store = MongoStore::connect_as(&url, &mongo_support::flavor()).expect("connect");
                 let draft = script("shared", "", &format!("echo {writer}\n"));
                 barrier.wait();
                 store.save_script(&Target::Global, &draft).expect("save")

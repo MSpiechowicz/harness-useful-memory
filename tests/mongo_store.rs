@@ -1017,7 +1017,8 @@ fn mongo_oversized_fields_written_by_hand_are_cut_by_the_server() {
         )
         .expect("other");
 
-    // About 12 MB, as a teammate with write access could store it directly.
+    // About 12 MB, as a teammate with write access could store it directly (with the words the
+    // search without a text index, as on Amazon DocumentDB, matches).
     let body = format!("needle haystack {}", "straw ".repeat(2 * 1024 * 1024));
     let title = format!("Huge {}", "t".repeat(512 * 1024));
     let tags: Vec<String> = (0..1000).map(|index| format!("tag{index}")).collect();
@@ -1025,7 +1026,14 @@ fn mongo_oversized_fields_written_by_hand_are_cut_by_the_server() {
         .collection::<Document>("notes")
         .update_one(
             doc! { "_id": huge.id },
-            doc! { "$set": { "body": body, "title": title, "tags": tags, "kind": 7, "source": "s".repeat(100_000) } },
+            doc! { "$set": {
+                "body": body,
+                "title": title,
+                "tags": tags,
+                "kind": 7,
+                "source": "s".repeat(100_000),
+                "terms": ["huge", "needle", "haystack", "straw"],
+            } },
         )
         .run()
         .expect("write by hand");

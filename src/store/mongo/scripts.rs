@@ -13,8 +13,8 @@ use mongodb::bson::{Bson, Document, doc};
 use mongodb::options::ReturnDocument;
 
 use super::notes::provenance_of;
-use super::{Ctx, Fail, META, MongoStore, PATH_MAX, SCRIPTS, SOURCE_MAX, cut, flag, int, now, number};
-use super::{project_of, scope_of, scope_value, text, visible};
+use super::{Ctx, Fail, META, MongoStore, PATH_MAX, SCRIPTS, SOURCE_MAX, counter_value, cut, flag, int, is_number};
+use super::{now, number, project_of, scope_of, scope_value, text, visible};
 use crate::limits::{SCRIPT_BODY_MAX, SCRIPT_DESCRIPTION_MAX, SCRIPT_NAME_MAX};
 use crate::store::scripts::{Stored, read_back};
 use crate::store::{Language, Provenance, SavedScript, Script, ScriptDraft, ScriptRef, ScriptStore, ScriptSummary};
@@ -50,7 +50,7 @@ impl ScriptStore for MongoStore {
         let found = self
             .reader()?
             .find(SCRIPTS, filter, repo_first(), 0, script_fields())
-            .map_err(Fail::into_store)?;
+            .map_err(|fail| self.failed(fail))?;
 
         Ok(found
             .iter()
@@ -61,7 +61,7 @@ impl ScriptStore for MongoStore {
 
     /// A document [`read_back`] leaves out counts as missing (a name then finds the global script).
     fn get_script(&mut self, view: &View, script: &ScriptRef) -> Result<Option<Script>, StoreError> {
-        let found = find(&mut self.reader()?, view, script, 2, script_fields()).map_err(Fail::into_store)?;
+        let found = find(&mut self.reader()?, view, script, 2, script_fields()).map_err(|fail| self.failed(fail))?;
 
         Ok(found.iter().find_map(script_of))
     }
@@ -168,7 +168,7 @@ fn next_script_id(ctx: &mut Ctx<'_>) -> Result<i64, Fail> {
         .find_one_and_update(doc! { "_id": SCRIPT_IDS }, doc! { "$inc": { "value": 1_i64 } })
         .upsert(true)
         .return_document(ReturnDocument::After)
-        .projection(doc! { "value": number("$value") })
+        .projection(counter_value())
         .run()?;
 
     Ok(counter.as_ref().map_or(1, |counter| int(counter, "value")))
@@ -261,7 +261,7 @@ fn script_fields() -> Document {
 
 /// The number at `path`; `null` when it is not a number.
 fn number_or_null(path: &str) -> Bson {
-    Bson::Document(doc! { "$cond": [{ "$isNumber": path }, path, Bson::Null] })
+    Bson::Document(doc! { "$cond": [is_number(path), path, Bson::Null] })
 }
 
 /// An integer field, `None` when it is missing or not a number.
