@@ -11,7 +11,7 @@ use super::{backend, column};
 use crate::store::StoreError;
 
 /// The schema version this server writes.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// The advisory lock migrations take (database-wide; "harness-memory migrate"). Writes hold it
 /// shared, so a migration waits for running writes and later writes see its version.
@@ -153,6 +153,23 @@ CREATE TABLE hooks (
 CREATE INDEX hooks_repo ON hooks (repo, created_at, id);
 ";
 
+/// Version 4: the routines a team shares (see [`crate::store::routines`]), with the columns and
+/// index of `hooks`. Only adds a table, so the rows of version 3 are untouched. `IF NOT EXISTS`,
+/// so a database whose version was set back by hand without dropping the table still migrates.
+const V4: &str = "
+CREATE TABLE IF NOT EXISTS routines (
+    id TEXT PRIMARY KEY,
+    repo TEXT,
+    body TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    author TEXT NOT NULL,
+    written_by TEXT NOT NULL DEFAULT current_user,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS routines_repo ON routines (repo, created_at, id);
+";
+
 /// Brings the database to [`SCHEMA_VERSION`]; a newer database is reported, not changed. A
 /// database already at the version is only read, so roles without `CREATE` can use it.
 pub fn migrate(client: &mut Client) -> Result<SchemaState, StoreError> {
@@ -184,6 +201,10 @@ pub fn migrate(client: &mut Client) -> Result<SchemaState, StoreError> {
 
     if found < 3 {
         tx.batch_execute(V3).map_err(backend)?;
+    }
+
+    if found < 4 {
+        tx.batch_execute(V4).map_err(backend)?;
     }
 
     tx.execute(

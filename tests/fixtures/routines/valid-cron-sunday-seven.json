@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "id": "3f2a9c1e7b4d4a60b8d5e1c2a9f00006",
+  "name": "Weekend cleanup",
+  "description": null,
+  "scope": "global",
+  "project": null,
+  "when": {
+    "type": "cron",
+    "expression": "0 3 * * 5-7"
+  },
+  "action": {
+    "type": "command",
+    "command": "git gc --auto",
+    "timeoutSecs": 120
+  },
+  "enabled": true,
+  "createdAt": "2026-10-17T10:00:00Z",
+  "createdBy": "desktop",
+  "updatedAt": "2026-10-17T10:00:00Z",
+  "updatedBy": "desktop"
+}

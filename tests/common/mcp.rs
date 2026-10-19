@@ -54,9 +54,13 @@ pub fn run_raw(server: &mut Server, input: &[u8]) -> Vec<Value> {
         .collect()
 }
 
+/// Answers `messages` one after the other, the way a client that waits for each answer sends
+/// them (a server stops a running script once its input ends, so [`run_raw`] does not fit a run).
 pub fn run(server: &mut Server, messages: &[Value]) -> Vec<Value> {
-    let input: String = messages.iter().map(|message| format!("{message}\n")).collect();
-    run_raw(server, input.as_bytes())
+    messages
+        .iter()
+        .filter_map(|message| server.handle(message.clone()))
+        .collect()
 }
 
 pub fn call(id: i64, name: &str, arguments: Value) -> Value {

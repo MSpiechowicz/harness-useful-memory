@@ -184,7 +184,9 @@ paths, or run the repository's own tools from the working directory (`./scripts/
 
 A run ends when the script exits. Processes it left in the background that still hold its output get 1 s, then they
 are killed (Linux and macOS). A run is killed after the script's timeout (60 s unless it names one, at most 600 s),
-with everything it started on Linux and macOS; on Windows only the interpreter is killed. The reply keeps 32 KiB of
+with everything it started on Linux and macOS; on Windows only the interpreter is killed. A run is killed the same
+way, and its temporary file removed, when the client cancels the request (`notifications/cancelled`, which then gets no
+answer), closes the server's input, or (Linux and macOS) sends the server SIGTERM. The reply keeps 32 KiB of
 stdout and 8 KiB of stderr, masked before the cut so a secret crossing it is masked whole: credential formats, secret
 assignments and URL secrets (random-looking words are kept, so JSON output stays intact).
 
@@ -242,7 +244,8 @@ A script a teammate saved in the team database, or one whose body or language ch
 
   45 s is longer than some clients wait for a tool. If the client stopped waiting, Run still runs the script, but the
   agent does not see the result: it should call `script_run` again once you approved (which runs the script again).
-  Without your answer nothing runs, also when the client hung up.
+  Without your answer nothing runs, also when the client hung up. A cancel of the request, the end of the server's
+  input or SIGTERM ends the wait at once, and nothing runs.
 - **In a terminal.** Without Harness Desktop the run is refused at once, and the agent is told to ask you. Review and
   approve from a terminal (`--project` picks the repository whose scripts are shown, the working directory's by
   default):
@@ -300,7 +303,7 @@ a language this server cannot run, an invalid name, or a description or body ove
 on the server's stderr), as if it did not exist.
 
 Scripts need team database schema 2 (PostgreSQL, MongoDB) or 3 (libSQL), [team hooks](#sharing-hooks) schema 3
-(PostgreSQL, MongoDB) or 4 (libSQL). A release that raises the schema migrates the team database on first use (it only
+(PostgreSQL, MongoDB) or 4 (libSQL), [team routines](#sharing-routines) schema 4 (PostgreSQL, MongoDB) or 5 (libSQL). A release that raises the schema migrates the team database on first use (it only
 adds tables and collections), and from then on every tool of an older `harness-memory` fails on it, notes included
 (`check` says `update it`): when you upgrade, the whole team upgrades together.
 
@@ -500,7 +503,7 @@ and prints one line, without the credentials, then where scripts are kept (`scri
 scripts are kept in the team database):
 
 ```text
-ok: PostgreSQL at postgres://harness_memory@db.example.com:5432/harness_memory?… (schema 3)
+ok: PostgreSQL at postgres://harness_memory@db.example.com:5432/harness_memory?… (schema 4)
 scripts: team database
 ```
 
@@ -614,6 +617,56 @@ with 2. A row changed by hand that this server never writes is left out of the l
 one `put` would refuse (an id that is no hook id, a repository that is no `git:` key, a bad author, a body that breaks
 the rules above or names another id or scope than its row). `total` still counts it.
 
+### Sharing routines
+
+Harness Desktop routines (JSON files that run an agent prompt, a command or a saved script on a schedule) are shared the
+same way as [hooks](#sharing-hooks): Harness Desktop's Settings turn sharing on, its Routines view shares a routine and
+lists the team's as a catalogue, each routine arriving turned off until you turn it on on your computer. It reads and
+writes them with the commands below. This server never runs a routine.
+
+| Key | Environment variable | Values | Default |
+| --- | --- | --- | --- |
+| `routines` | `HARNESS_MEMORY_ROUTINES` | `"remote"` (share through the team database) or `"local"` (share none) | `"local"` |
+| `trust_team_routines` | `HARNESS_MEMORY_TRUST_TEAM_ROUTINES` | `true` (`1`) or `false` (`0`) | `false` |
+
+```toml
+database_url = "postgres://..."
+routines = "remote"
+# trust_team_routines = true   # team routines you turned on run without your approval in Harness Desktop
+```
+
+`routines = "remote"` only counts with a team database, and `trust_team_routines` only while routines are shared. With
+it on, every team routine you turned on runs in Harness Desktop without your approval of that version, commands and
+agent routines that run tools without asking included. Anyone who can write to the team database, and any agent of a teammate
+that can run `harness-memory`, can then run commands and agents on your computer once you turned their routine on.
+
+The team database keeps one row per routine in `routines` (a collection in MongoDB), with the columns of `hooks` and the
+same limits: a 32 hex `id`, `repo` (a `git:` repository key, `null` for a global routine), `body` (at most 16384
+bytes), `sha256`, `author`, `created_at` and `updated_at`, at most 64 routines per scope. The body is a version 1
+routine file of Harness Desktop (`docs/routines-format.md` there): its schedule (`when`, a cron expression included,
+which must be able to run), its action, and the shared rules of every file. `seed` and `requires` are never set, a
+project routine's `project` holds the repository key instead of a local path, and a body that holds a credential is
+refused.
+
+```sh
+harness-memory routines config --json
+harness-memory routines list --json --project ~/src/widget --offset 0 --limit 50
+harness-memory routines get 1a2b3c4d5e6f70818293a4b5c6d7000b --json
+harness-memory routines put --json --project ~/src/widget < routine.json
+harness-memory routines put --json --project ~/src/widget --expect-sha <sha256> --author "Ada" < routine.json
+harness-memory routines delete 1a2b3c4d5e6f70818293a4b5c6d7000b --expect-sha <sha256> --json
+harness-memory routines delete --mine --json
+```
+
+The commands, their replies and refusals are those of `hooks`, with `routines` for `hooks`:
+`routines config --json` prints `{"routines": "remote"|"local", "trustTeamRoutines": bool}`, `routines list --json`
+prints `{"total", "nextOffset", "project", "routines"}`, and a refusal for a body that breaks the routine file format is
+`invalid`. One command is added: `routines delete --mine [--author NAME] --json` deletes every team routine whose author
+is `--author`, else the user name `put` records for you (`USER`, else `USERNAME`), in every scope, and prints
+`{"deleted": N, "ids": [...]}` (`local` when routines are not shared). Without `--author` and without a usable user
+name it is `refused`: it never deletes the routines `put` recorded as `unknown`, which may be anyone's. The author is a label anyone can write, so this
+is a way to clean up after yourself, not a permission.
+
 ### Seed it from existing notes
 
 Notes people already have in their local SQLite file can be uploaded once. `push` copies the local notes and relations into
@@ -679,6 +732,10 @@ one first.
   then run commands on your computer. No MCP tool shares a hook, but an agent with a shell can run `harness-memory hooks
   put`, so keep `trust_team_hooks` off unless you trust everyone with access to the team database. A shared hook
   carries the repository key, never a local path.
+- **Team routines are remote code too.** With `routines = "remote"`, a routine a teammate shared runs on your computer
+  only after you turn it on, and then only after you approve that version, or straight away with
+  `trust_team_routines = true`, which covers every team routine, commands and agents that run tools without asking
+  included. Keep `trust_team_routines` off unless you trust everyone with access to the team database.
 - **Secrets are redacted on write.** Titles, bodies, tags, entity names and relation labels pass a secret filter before
   they are stored. It is a heuristic and does not catch everything, so do not rely on it. Agents are also told never to
   store secrets or personal data.

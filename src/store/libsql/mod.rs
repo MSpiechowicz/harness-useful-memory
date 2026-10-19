@@ -17,9 +17,9 @@
 //! ([`hrana`]).
 
 mod endpoint;
-mod hooks;
 mod hrana;
 mod scripts;
+mod team_docs;
 
 use std::thread;
 use std::time::{Duration, Instant};

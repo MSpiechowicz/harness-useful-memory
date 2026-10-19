@@ -22,12 +22,12 @@
 
 mod connect;
 mod graph;
-mod hooks;
 mod listing;
 mod notes;
 pub mod schema;
 mod scripts;
 mod search;
+mod team_docs;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

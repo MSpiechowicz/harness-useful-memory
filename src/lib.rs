@@ -15,7 +15,8 @@
 //! - [`cli_trust`]: the `scripts list` and `trust` commands, where a person approves scripts.
 //! - [`cli_notes`]: the `notes list`, `notes get` and `notes delete` commands, where a person
 //!   browses and deletes notes.
-//! - [`cli_hooks`]: the `hooks` commands, through which Harness Desktop shares hooks with the team.
+//! - [`cli_team_docs`]: the `hooks` and `routines` commands, through which Harness Desktop shares
+//!   hooks and routines with the team.
 //! - [`location`]: where the database lives, and the one-time move from Harness Desktop's folder.
 //! - [`support`]: the environment, git runner, secret masking and text checks the rest uses.
 //!
@@ -24,8 +25,8 @@
 
 pub mod backend;
 mod cli;
-pub mod cli_hooks;
 pub mod cli_notes;
+pub mod cli_team_docs;
 pub mod cli_trust;
 pub mod limits;
 pub mod location;

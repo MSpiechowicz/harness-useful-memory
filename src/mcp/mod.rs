@@ -7,11 +7,14 @@
 //! - Notifications are never answered; answers from the client are ignored.
 //! - Tool validation and store failures are tool results with `isError: true`.
 //! - Nothing a client sends is written to stderr.
+//! - A running script stops when the client cancels its request, closes the input, or the server
+//!   gets SIGTERM ([`input`]).
 
 mod approval;
 mod blocks;
 mod calls;
 mod calls_scripts;
+mod input;
 pub mod protocol;
 mod reply;
 mod script_blocks;
@@ -21,9 +24,12 @@ mod tools_scripts;
 
 pub(crate) use approval::approval_of;
 pub use approval::{ALIVE_FILE, APPROVAL_WAIT_VAR, REQUESTS_FOLDER, SCRIPT_APPROVAL_WAIT};
+pub use input::stop_on_sigterm;
 pub(crate) use script_blocks::{Approval, Shown, author_json, place_label, repo_label};
 
 use std::io::{self, BufRead, Write};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -31,7 +37,12 @@ use crate::backend::Place;
 use crate::limits::LINE_MAX;
 use crate::project::ProjectResolver;
 use crate::store::{MemoryStore, ScriptStore, TrustStore};
+use crate::support::runner::Stop;
+use input::Watch;
 use protocol::{INVALID_PARAMS, INVALID_REQUEST, Line, METHOD_NOT_FOUND, PARSE_ERROR};
+
+/// How often the serving loop looks whether the server got SIGTERM while no input comes.
+const TERMINATE_POLL: Duration = Duration::from_millis(100);
 
 /// The state one server process keeps: the note store, the script store and where it is, the
 /// other script store (see [`Self::with_other_scripts`]), this machine's script trust (and whether
@@ -47,6 +58,8 @@ pub struct Server {
     trust_team_scripts: bool,
     projects: ProjectResolver,
     client: Option<String>,
+    /// Stops the script running now ([`input`]).
+    stop: Stop,
 }
 
 impl std::fmt::Debug for Server {
@@ -77,7 +90,15 @@ impl Server {
             trust_team_scripts: false,
             projects,
             client: None,
+            stop: Stop::default(),
         }
+    }
+
+    /// The server whose running script `stop` stops (see [`stop_on_sigterm`]); [`serve`] also
+    /// fires it when the client cancels the request or closes the input.
+    pub fn with_stop(mut self, stop: Stop) -> Self {
+        self.stop = stop;
+        self
     }
 
     /// The server with its scripts kept in `place` (see [`crate::backend::Selection::scripts_place`]),
@@ -204,12 +225,26 @@ fn tool_result(reply: calls::Reply) -> Value {
     result
 }
 
-/// Serves messages from `reader` until end of input; fails only when reading or writing fails.
-pub fn serve<R: BufRead, W: Write>(mut reader: R, mut writer: W, server: &mut Server) -> io::Result<()> {
-    let mut buffer = Vec::new();
+/// Serves messages from `reader` until end of input or SIGTERM ([`stop_on_sigterm`]); fails only
+/// when reading or writing fails. `reader` is read on a thread of its own ([`input`]).
+pub fn serve<R: BufRead + Send + 'static, W: Write>(reader: R, mut writer: W, server: &mut Server) -> io::Result<()> {
+    let watch = Watch::new(server.stop.clone());
+    let (sender, lines) = mpsc::channel();
+    input::spawn_reader(reader, watch.clone(), sender);
 
     loop {
-        let reply = match protocol::read_line(&mut reader, &mut buffer, LINE_MAX)? {
+        let line = match lines.recv_timeout(TERMINATE_POLL) {
+            Ok(line) => line?,
+            Err(RecvTimeoutError::Timeout) if server.stop.is_terminated() => return Ok(()),
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+        };
+
+        if server.stop.is_terminated() {
+            return Ok(());
+        }
+
+        let reply = match line {
             Line::End => return Ok(()),
             Line::TooLong => Some(protocol::error(
                 &Value::Null,
@@ -218,7 +253,7 @@ pub fn serve<R: BufRead, W: Write>(mut reader: R, mut writer: W, server: &mut Se
             )),
             Line::Text(line) if line.iter().all(u8::is_ascii_whitespace) => None,
             Line::Text(line) => match serde_json::from_slice::<Value>(&line) {
-                Ok(message) => server.handle(message),
+                Ok(message) => answer(server, &watch, message),
                 Err(_) => Some(protocol::error(&Value::Null, PARSE_ERROR, "Parse error")),
             },
         };
@@ -227,6 +262,17 @@ pub fn serve<R: BufRead, W: Write>(mut reader: R, mut writer: W, server: &mut Se
             protocol::write_message(&mut writer, &reply)?;
         }
     }
+}
+
+/// The answer to `message`, none when the client cancelled it while it ran.
+fn answer(server: &mut Server, watch: &Watch, message: Value) -> Option<Value> {
+    let request = message.get("method").and_then(|_| message.get("id")).cloned();
+
+    watch.begin(request.as_ref());
+    let reply = server.handle(message);
+    let cancelled = watch.finish();
+
+    reply.filter(|_| !cancelled)
 }
 
 /// At most 64 characters of agent text, for error messages.

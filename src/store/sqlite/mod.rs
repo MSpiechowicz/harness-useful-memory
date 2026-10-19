@@ -10,7 +10,6 @@
 
 pub(crate) mod engine;
 mod graph;
-pub(crate) mod hooks;
 mod listing;
 mod local;
 mod notes;
@@ -18,6 +17,7 @@ pub mod schema;
 pub(crate) mod scripts;
 mod search;
 pub(crate) mod sql;
+pub(crate) mod team_docs;
 
 use std::path::Path;
 use std::thread;

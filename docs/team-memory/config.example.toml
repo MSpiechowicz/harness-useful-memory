@@ -34,3 +34,11 @@ database_url = "postgres://harness_memory:CHANGE-ME@db.example.com:5432/harness_
 # HARNESS_MEMORY_HOOKS and HARNESS_MEMORY_TRUST_TEAM_HOOKS override them.
 # hooks = "remote"
 # trust_team_hooks = false
+
+# Whether Harness Desktop routines are shared through the team database: "remote", or "local" (the default) to share
+# none. A team routine arrives turned off: it runs only on computers where someone turned it on. trust_team_routines =
+# true then runs it without approving each version: whoever can write to the team database can then run commands and
+# agents on your computer, so leave it off unless you trust everyone with access to the team database.
+# HARNESS_MEMORY_ROUTINES and HARNESS_MEMORY_TRUST_TEAM_ROUTINES override them.
+# routines = "remote"
+# trust_team_routines = false

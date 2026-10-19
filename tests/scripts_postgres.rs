@@ -115,7 +115,7 @@ fn a_schema_1_database_migrates_to_the_current_schema_and_keeps_its_notes() {
         )
         .expect("version")
         .get(0);
-    assert_eq!((version, SCHEMA_VERSION), (3, 3));
+    assert_eq!((version, SCHEMA_VERSION), (4, 4));
 
     let notes = store.get(&both(REPO), &[note.id]).expect("get");
     assert_eq!(notes.len(), 1);

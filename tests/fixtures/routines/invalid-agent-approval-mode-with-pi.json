@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "id": "3f2a9c1e7b4d4a60b8d5e1c2a9f00071",
+  "name": "Morning review",
+  "description": null,
+  "scope": "global",
+  "project": null,
+  "when": {
+    "type": "daily",
+    "at": "09:00"
+  },
+  "action": {
+    "type": "agent",
+    "harness": "pi",
+    "model": null,
+    "prompt": "Summarize the open pull requests and list the ones that wait for my review.",
+    "approvalMode": "write"
+  },
+  "enabled": true,
+  "createdAt": "2026-10-17T10:00:00Z",
+  "createdBy": "desktop",
+  "updatedAt": "2026-10-17T10:00:00Z",
+  "updatedBy": "desktop"
+}

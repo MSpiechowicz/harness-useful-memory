@@ -15,6 +15,10 @@
 //! A run ends when the script exits. Processes it left in the background that still hold its
 //! output get [`DRAIN_GRACE`], then (on Unix) its process group is killed.
 //!
+//! A [`Stop`] ends a run early (the MCP client cancelled its request, closed its input, or the
+//! server got SIGTERM): the script and (on Unix) its process group are killed within a few
+//! milliseconds, the run is an error, and its private folder with the script file is removed.
+//!
 //! The script inherits the server's environment, `GH_TOKEN`, `PATH` and the rest included, except
 //! the team database settings and the script settings (`HARNESS_MEMORY_SCRIPTS`,
 //! `HARNESS_MEMORY_TRUST_TEAM_SCRIPTS`): a script has no use for them and must not see the
@@ -25,6 +29,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -56,6 +61,61 @@ const MASK_LOOKAHEAD: usize = 16 * 1024;
 /// The folder next to the database that holds the private run folders.
 const RUN_FOLDER: &str = "run";
 
+/// The error of a run a [`Stop`] ended.
+pub const STOPPED: &str = "the script was stopped: the client cancelled the request or went away";
+
+/// Ends running scripts early (see the module docs). Every clone sees the same state.
+#[derive(Debug, Clone, Default)]
+pub struct Stop(Arc<StopState>);
+
+#[derive(Debug, Default)]
+struct StopState {
+    /// The request running now was cancelled.
+    cancelled: AtomicBool,
+    /// The input ended or the server got SIGTERM: whatever runs now or later is stopped.
+    ended: AtomicBool,
+    /// The server got SIGTERM: it stops serving too.
+    terminated: AtomicBool,
+}
+
+impl Stop {
+    /// A new request starts: the cancel of the one before no longer counts.
+    pub fn begin(&self) {
+        self.0.cancelled.store(false, Ordering::SeqCst);
+    }
+
+    /// Stops the request running now.
+    pub fn cancel(&self) {
+        self.0.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// Stops what runs now and every run after it: the input ended.
+    pub fn end(&self) {
+        self.0.ended.store(true, Ordering::SeqCst);
+    }
+
+    /// Stops what runs now and every run after it, and the server: it got SIGTERM.
+    pub fn terminate(&self) {
+        self.0.terminated.store(true, Ordering::SeqCst);
+        self.end();
+    }
+
+    /// True when the request running now was cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// True once the server got SIGTERM.
+    pub fn is_terminated(&self) -> bool {
+        self.0.terminated.load(Ordering::SeqCst)
+    }
+
+    /// True when a script running now is to stop.
+    pub fn is_stopped(&self) -> bool {
+        self.is_cancelled() || self.0.ended.load(Ordering::SeqCst)
+    }
+}
+
 /// How to run one script.
 #[derive(Debug, Clone)]
 pub struct Run<'a> {
@@ -76,6 +136,8 @@ pub struct Run<'a> {
     pub stdout_max: usize,
     /// Bytes of stderr kept.
     pub stderr_max: usize,
+    /// Ends the run early when it fires (`None`: only the timeout does).
+    pub stop: Option<&'a Stop>,
 }
 
 /// One captured output stream.
@@ -122,6 +184,11 @@ pub fn run(env: &Env, run: &Run) -> Result<Finished, String> {
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
 
+    // A stop that came while the script was being approved or written: it never starts.
+    if run.stop.is_some_and(Stop::is_stopped) {
+        return Err(STOPPED.to_owned());
+    }
+
     let started = Instant::now();
     let name = program.file_name().unwrap_or_default().to_string_lossy().into_owned();
     let mut child = command
@@ -133,7 +200,12 @@ pub fn run(env: &Env, run: &Run) -> Result<Finished, String> {
     let stdout = child.stdout.take().map(|pipe| Reader::spawn(pipe, run.stdout_max));
     let stderr = child.stderr.take().map(|pipe| Reader::spawn(pipe, run.stderr_max));
     let deadline = started.checked_add(run.timeout);
-    let (exit_code, timed_out) = wait(&mut child, deadline, [&stdout, &stderr]);
+    let (exit_code, timed_out) = match wait(&mut child, deadline, run.stop, [&stdout, &stderr]) {
+        Exit::Code(code) => (code, false),
+        Exit::TimedOut => (None, true),
+        // The folder (and the script file in it) goes when `folder` is dropped on the way out.
+        Exit::Stopped => return Err(STOPPED.to_owned()),
+    };
 
     Ok(Finished {
         exit_code,
@@ -144,13 +216,23 @@ pub fn run(env: &Env, run: &Run) -> Result<Finished, String> {
     })
 }
 
-/// Waits until the script exits or `deadline` passes (`None`: no deadline), when the script and
-/// (on Unix) its process group are killed. Returns the exit code and whether the deadline passed.
+/// How [`wait`] ended.
+enum Exit {
+    /// The script exited (`None`: by a signal, or it could not be waited for).
+    Code(Option<i32>),
+    /// The deadline passed.
+    TimedOut,
+    /// `stop` fired.
+    Stopped,
+}
+
+/// Waits until the script exits, `deadline` passes (`None`: no deadline) or `stop` fires, when the
+/// script and (on Unix) its process group are killed.
 /// After the exit, processes the script started that still hold its output get [`DRAIN_GRACE`],
 /// then (on Unix) the group is killed: a group outlives its leader while a member runs, and the
 /// system hands out no process id still in use as a group id, so this reaches only what the script
 /// started.
-fn wait(child: &mut Child, deadline: Option<Instant>, readers: [&Option<Reader>; 2]) -> (Option<i32>, bool) {
+fn wait(child: &mut Child, deadline: Option<Instant>, stop: Option<&Stop>, readers: [&Option<Reader>; 2]) -> Exit {
     let drained = || readers.iter().all(|reader| reader.as_ref().is_none_or(Reader::is_done));
 
     loop {
@@ -166,18 +248,23 @@ fn wait(child: &mut Child, deadline: Option<Instant>, readers: [&Option<Reader>;
                     super::git::kill_group(child.id());
                 }
 
-                return (status.code(), false);
+                return Exit::Code(status.code());
             }
             Ok(None) => {}
             Err(_) => {
                 kill_tree(child);
-                return (None, false);
+                return Exit::Code(None);
             }
+        }
+
+        if stop.is_some_and(Stop::is_stopped) {
+            kill_tree(child);
+            return Exit::Stopped;
         }
 
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             kill_tree(child);
-            return (None, true);
+            return Exit::TimedOut;
         }
 
         thread::sleep(POLL);
@@ -386,6 +473,7 @@ mod tests {
                 timeout,
                 stdout_max: 16,
                 stderr_max: 8,
+                stop: None,
             },
         )
         .expect("sh runs")
@@ -467,6 +555,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             stdout_max: 4096,
             stderr_max: 4096,
+            stop: None,
         };
 
         let finished = run(&env, &request).expect("sh runs");
@@ -488,6 +577,90 @@ mod tests {
     }
 
     #[test]
+    fn a_script_stopped_before_it_starts_never_runs() {
+        let home = tempfile::tempdir().expect("temp");
+        let env = Env::for_tests(home.path()).with_var("PATH", std::env::var("PATH").unwrap_or_default());
+        let marker = home.path().join("ran");
+        let body = format!("touch '{}'\n", marker.display());
+        let stop = Stop::default();
+        stop.end();
+
+        let request = Run {
+            interpreters: &["sh"],
+            file_name: "script.sh",
+            body: &body,
+            bom: false,
+            args: &[],
+            stdin: "",
+            cwd: home.path(),
+            timeout: Duration::from_secs(60),
+            stdout_max: 64,
+            stderr_max: 64,
+            stop: Some(&stop),
+        };
+
+        assert_eq!(run(&env, &request), Err(STOPPED.to_owned()));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!marker.exists(), "the script ran");
+    }
+
+    #[test]
+    fn a_stop_kills_the_script_and_its_group_and_removes_the_script_file() {
+        let home = tempfile::tempdir().expect("temp");
+        let env = Env::for_tests(home.path()).with_var("PATH", std::env::var("PATH").unwrap_or_default());
+        let (pid_file, path_file) = (home.path().join("pid"), home.path().join("path"));
+        let body = format!(
+            "sleep 30 &\necho $! > '{}'\nprintf '%s' \"$0\" > '{}'\nwait\n",
+            pid_file.display(),
+            path_file.display()
+        );
+        let stop = Stop::default();
+        let request = Run {
+            interpreters: &["sh"],
+            file_name: "script.sh",
+            body: &body,
+            bom: false,
+            args: &[],
+            stdin: "",
+            cwd: home.path(),
+            timeout: Duration::from_secs(60),
+            stdout_max: 64,
+            stderr_max: 64,
+            stop: Some(&stop),
+        };
+
+        let stopper = stop.clone();
+        let written = pid_file.clone();
+        thread::spawn(move || {
+            while std::fs::read_to_string(&written).unwrap_or_default().trim().is_empty() {
+                thread::sleep(POLL);
+            }
+            stopper.cancel();
+        });
+
+        let started = Instant::now();
+        assert_eq!(run(&env, &request), Err(STOPPED.to_owned()));
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+
+        let script = std::fs::read_to_string(&path_file).expect("the script wrote its path");
+        assert!(!Path::new(&script).exists(), "the script file is removed");
+
+        let pid = std::fs::read_to_string(&pid_file).expect("pid");
+        let alive = || {
+            std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        while alive() && Instant::now() < until {
+            thread::sleep(POLL);
+        }
+        assert!(!alive(), "the script's background child was killed");
+    }
+
+    #[test]
     fn a_missing_interpreter_is_named() {
         let home = tempfile::tempdir().expect("temp");
         let env = Env::for_tests(home.path()).with_var("PATH", home.path().to_string_lossy());
@@ -503,6 +676,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             stdout_max: 1,
             stderr_max: 1,
+            stop: None,
         };
 
         let error = run(&env, &request).expect_err("not installed");

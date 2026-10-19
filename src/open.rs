@@ -54,6 +54,8 @@ pub fn open_other_scripts(env: &Env, selection: &Selection) -> Option<Box<dyn Sc
         trust_team_scripts: selection.trust_team_scripts,
         hooks: selection.hooks,
         trust_team_hooks: selection.trust_team_hooks,
+        routines: selection.routines,
+        trust_team_routines: selection.trust_team_routines,
         warnings: Vec::new(),
     };
 

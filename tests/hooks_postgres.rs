@@ -78,7 +78,7 @@ fn a_schema_2_database_migrates_to_schema_3_and_keeps_its_scripts() {
         )
         .expect("version")
         .get(0);
-    assert_eq!((version, SCHEMA_VERSION), (3, 3));
+    assert_eq!((version, SCHEMA_VERSION), (4, 4));
 
     let scripts: i64 = db
         .admin()

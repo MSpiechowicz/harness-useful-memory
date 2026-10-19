@@ -124,7 +124,43 @@ impl Client {
         self.child.wait().expect("the server exits")
     }
 
-    fn send(&mut self, message: &Value) {
+    /// The server's process id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Reads the next answer.
+    pub fn reply(&mut self) -> Value {
+        let mut line = String::new();
+        let read = self.stdout.read_line(&mut line).expect("read reply");
+        assert!(read > 0, "the server closed stdout");
+
+        serde_json::from_str(&line).expect("each reply is one JSON line")
+    }
+
+    /// Closes stdin without waiting for the server.
+    pub fn close_input(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    /// Waits up to `limit` for the server to exit; `None` when it still runs (it is then killed).
+    pub fn exit_within(&mut self, limit: std::time::Duration) -> Option<ExitStatus> {
+        let until = std::time::Instant::now() + limit;
+
+        while std::time::Instant::now() < until {
+            if let Some(status) = self.child.try_wait().expect("wait") {
+                return Some(status);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        self.child.kill().ok();
+        self.child.wait().ok();
+        None
+    }
+
+    /// Sends one message.
+    pub fn send(&mut self, message: &Value) {
         let stdin = self.stdin.as_mut().expect("stdin is open");
         writeln!(stdin, "{message}").expect("write request");
         stdin.flush().expect("flush request");

@@ -3,21 +3,23 @@
 //! the team database, `harness-memory check` opens the configured database and says which it is
 //! and where scripts are, `harness-memory scripts list|delete` and `harness-memory trust` list,
 //! delete and approve scripts ([`harness_memory::cli_trust`]), `harness-memory notes list|get|delete` browse and
-//! delete notes ([`harness_memory::cli_notes`]), `harness-memory hooks config|list|get|put|delete` share
-//! Harness Desktop hooks with the team ([`harness_memory::cli_hooks`]), `harness-memory --version` prints the
-//! version.
+//! delete notes ([`harness_memory::cli_notes`]), `harness-memory hooks config|list|get|put|delete` and
+//! `harness-memory routines config|list|get|put|delete` share Harness Desktop hooks and routines with the team
+//! ([`harness_memory::cli_team_docs`]), `harness-memory --version` prints the version.
 
 use std::io::{BufReader, Write};
 use std::process::ExitCode;
 
 use harness_memory::backend::{self, Backend, CONFIG_VAR, Place, Routing, Selection, URL_VAR};
 use harness_memory::location::{DIR_VAR, override_is_relative};
+use harness_memory::mcp::stop_on_sigterm;
 use harness_memory::open::{open_notes, open_other_scripts, open_scripts, open_trust};
 use harness_memory::project::{ProjectResolver, normalize_remote};
 use harness_memory::push::{Action, GLOBAL, Options, Summary, push};
 use harness_memory::support::Env;
+use harness_memory::support::runner::Stop;
 use harness_memory::{Server, database_path, serve};
-use harness_memory::{cli_hooks, cli_notes, cli_trust};
+use harness_memory::{cli_notes, cli_team_docs, cli_trust};
 
 const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--repo <key|.>] [--no-global] | check | scripts list \
                      --json [--project PATH] [--group needsReview|repo|global] [--scope repo|global] [--review \
@@ -30,7 +32,10 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--repo <key|
                      [--project PATH] [--json] | hooks config --json | hooks list --json [--project PATH] \
                      [--offset N] [--limit N] | hooks get <id> --json | hooks put --json [--project PATH] \
                      [--expect-sha SHA256] [--author NAME] < hook.json | hooks delete <id> [--expect-sha SHA256] \
-                     --json | --version]";
+                     --json | routines config --json | routines list --json [--project PATH] [--offset N] [--limit \
+                     N] | routines get <id> --json | routines put --json [--project PATH] [--expect-sha SHA256] \
+                     [--author NAME] < routine.json | routines delete <id> [--expect-sha SHA256] --json | routines \
+                     delete --mine [--author NAME] --json | --version]";
 
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -49,7 +54,8 @@ fn main() -> ExitCode {
         [Some("scripts"), rest @ ..] => cli_trust::scripts(rest),
         [Some("trust"), rest @ ..] => cli_trust::trust(rest),
         [Some("notes"), rest @ ..] => cli_notes::notes(rest),
-        [Some("hooks"), rest @ ..] => cli_hooks::hooks(rest),
+        [Some("hooks"), rest @ ..] => cli_team_docs::hooks(rest),
+        [Some("routines"), rest @ ..] => cli_team_docs::routines(rest),
         [Some("--version")] => {
             println!("harness-memory {}", env!("HARNESS_MEMORY_VERSION"));
             ExitCode::SUCCESS
@@ -62,6 +68,10 @@ fn main() -> ExitCode {
 }
 
 fn run() -> ExitCode {
+    // Before anything starts a thread: SIGTERM then stops a running script before the server ends.
+    let stop = Stop::default();
+    stop_on_sigterm(&stop);
+
     let Ok(env) = Env::from_process() else {
         eprintln!("harness-memory: the home folder is unknown");
         return ExitCode::FAILURE;
@@ -82,13 +92,14 @@ fn run() -> ExitCode {
     let mut server = Server::new(store, scripts, trust, projects)
         .with_scripts_place(selection.scripts_place())
         .with_team_key(selection.backend.team_key())
-        .with_trust_team_scripts(selection.trust_team_scripts);
+        .with_trust_team_scripts(selection.trust_team_scripts)
+        .with_stop(stop);
 
     if let Some(other) = other_scripts {
         server = server.with_other_scripts(other);
     }
 
-    let stdin = BufReader::new(std::io::stdin().lock());
+    let stdin = BufReader::new(std::io::stdin());
     let mut stdout = std::io::stdout().lock();
     let served = serve(stdin, &mut stdout, &mut server);
     stdout.flush().ok();

@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "id": "3f2a9c1e7b4d4a60b8d5e1c2a9f00002",
+  "name": "Weekday standup notes",
+  "description": null,
+  "scope": "global",
+  "project": null,
+  "when": {
+    "type": "weekdays",
+    "at": "08:30"
+  },
+  "action": {
+    "type": "agent",
+    "harness": "pi",
+    "model": {
+      "provider": "anthropic",
+      "id": "claude-sonnet-4-5"
+    },
+    "prompt": "Summarize the open pull requests and list the ones that wait for my review.",
+    "maxMinutes": 45
+  },
+  "enabled": true,
+  "createdAt": "2026-10-17T10:00:00Z",
+  "createdBy": "desktop",
+  "updatedAt": "2026-10-17T10:00:00Z",
+  "updatedBy": "desktop"
+}

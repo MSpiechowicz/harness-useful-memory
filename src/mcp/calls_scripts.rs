@@ -387,6 +387,7 @@ fn run(server: &mut Server, args: RunArgs) -> Result<Reply, String> {
             timeout: Duration::from_secs(timeout_secs),
             stdout_max: SCRIPT_STDOUT_MAX,
             stderr_max: SCRIPT_STDERR_MAX,
+            stop: Some(&server.stop),
         },
     )?;
 

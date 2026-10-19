@@ -4,7 +4,8 @@
 //! [`LOCK_LEASE`] seconds, taken over once expired or invalid), so two servers starting at once do
 //! not both migrate; the one that waits sees the version the other wrote.
 //!
-//! Versions: 1 the notes, entities and relations; 2 adds the scripts; 3 the team hooks.
+//! Versions: 1 the notes, entities and relations; 2 adds the scripts; 3 the team hooks; 4 the team
+//! routines.
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,11 +15,12 @@ use mongodb::bson::{Document, doc, oid::ObjectId};
 use mongodb::options::IndexOptions;
 use mongodb::sync::Database;
 
-use super::{ENTITIES, HOOKS, META, NOTES, RELATIONS, SCRIPTS, connection, error_code, int, now, number};
+use super::{ENTITIES, META, NOTES, RELATIONS, SCRIPTS, connection, error_code, int, now, number};
 use crate::store::StoreError;
+use crate::store::team_docs::DocKind;
 
 /// The schema version this server writes (independent of the SQLite schema version).
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// The `_id` of the schema document in `meta`; its `version` field holds the version.
 pub const SCHEMA_ID: &str = "schema";
@@ -163,7 +165,11 @@ fn apply(db: &Database) -> mongodb::error::Result<SchemaState> {
     }
 
     if current < 3 {
-        create_v3(db)?;
+        create_team_docs(db, DocKind::Hooks)?;
+    }
+
+    if current < 4 {
+        create_team_docs(db, DocKind::Routines)?;
     }
 
     db.collection::<Document>(META)
@@ -228,14 +234,16 @@ fn create_v2(db: &Database) -> mongodb::error::Result<()> {
     Ok(())
 }
 
-/// Version 3: the team hooks, `_id` the hook id (so it is unique), listed per scope (`repo`,
-/// `null` for global hooks) by `created_at`. Only adds a collection, so the documents of version
-/// 2 are untouched.
-fn create_v3(db: &Database) -> mongodb::error::Result<()> {
-    db.collection::<Document>(HOOKS)
+/// Version 3 the team hooks, version 4 the team routines: one collection per [`DocKind`], `_id`
+/// the document id (so it is unique), listed per scope (`repo`, `null` for global ones) by
+/// `created_at` (index `hooks_repo`, `routines_repo`). Each only adds a collection, so the
+/// documents of the version before are untouched, and creating an existing index again is a
+/// no-op.
+fn create_team_docs(db: &Database, kind: DocKind) -> mongodb::error::Result<()> {
+    db.collection::<Document>(kind.table())
         .create_index(index(
             doc! { "repo": 1, "created_at": 1, "_id": 1 },
-            "hooks_repo",
+            &format!("{}_repo", kind.table()),
             false,
         ))
         .run()?;

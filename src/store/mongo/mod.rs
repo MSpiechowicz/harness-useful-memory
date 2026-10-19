@@ -3,7 +3,7 @@
 //! # Layout
 //!
 //! The database is the one in the URL path (`harness_memory` when the URL names none) and holds
-//! six collections:
+//! seven collections:
 //!
 //! - `notes`: one document per note, `_id` the note id (an `i64` from the `note_ids` counter in
 //!   `meta`), `project` the repository key (`null` for global notes), the linked entity names
@@ -18,6 +18,8 @@
 //!   `project` as for notes; unique `(project, name)`.
 //! - `hooks` (schema 3): one document per team hook, `_id` the hook id, `repo` the repository
 //!   key (`null` for global hooks), the file bytes in `body`; index `(repo, created_at, _id)`.
+//! - `routines` (schema 4): the team routines, laid out like `hooks`; index
+//!   `(repo, created_at, _id)`.
 //! - `meta`: the schema version (`_id: "schema"`), the note and script id counters and the
 //!   migration lock.
 //!
@@ -67,12 +69,12 @@
 
 mod connection;
 mod graph;
-mod hooks;
 mod listing;
 mod notes;
 pub mod schema;
 mod scripts;
 mod search;
+mod team_docs;
 
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -96,7 +98,6 @@ const NOTES: &str = "notes";
 const ENTITIES: &str = "entities";
 const RELATIONS: &str = "relations";
 const SCRIPTS: &str = "scripts";
-const HOOKS: &str = "hooks";
 const META: &str = "meta";
 
 /// How long the driver looks for a usable server when the URL does not say.

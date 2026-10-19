@@ -13,9 +13,11 @@
 //! killed server) before each new request. Without a live desktop the run is refused at once, and
 //! the reply tells the agent to ask the user. No reply about an unapproved version names its hash.
 //!
-//! The server reads no message while it waits: a client that stops waiting or hangs up meanwhile
-//! changes nothing. Without an answer nothing runs; after `allow` the approved version still runs
-//! with no one to read its reply, and the agent's next `script_run` runs it again.
+//! A stop ([`Stop`]: the client cancels the request, its input ends, or the server gets SIGTERM)
+//! before the request is written or while the server waits ends the wait at once, and nothing
+//! runs (the reply is [`STOPPED`]). Without an answer nothing runs. A client that only stops
+//! waiting changes nothing: after `allow` the approved version still runs with no one to read its
+//! reply, and the agent's next `script_run` runs it again.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -29,6 +31,7 @@ use super::reply::now;
 use super::script_blocks::{Approval, shown_text};
 use crate::store::{PreviousVersion, Script, ScriptSummary, TrustOrigin, TrustStore, clean};
 use crate::support::Env;
+use crate::support::runner::{STOPPED, Stop};
 use crate::support::time::rfc3339;
 
 /// How long `script_run` waits for the user's answer in Harness Desktop.
@@ -70,6 +73,8 @@ pub(super) enum Answer {
     Allowed,
     Declined,
     TimedOut,
+    /// The request was cancelled, the input ended or the server got SIGTERM before an answer.
+    Stopped,
     /// Not asked: the desktop is not running, or (the reason) the request could not be made.
     Unasked(Option<String>),
 }
@@ -118,6 +123,10 @@ pub(super) struct RunInput<'a> {
 /// Asks Harness Desktop whether `script`, shown as `summary` (its list object), may run with
 /// `input`, and waits for the answer (see the module docs).
 pub(super) fn ask(server: &mut Server, script: &Script, summary: Value, input: &RunInput) -> Answer {
+    if server.stop.is_stopped() {
+        return Answer::Stopped;
+    }
+
     let env = server.projects.env().clone();
     let Some(folder) = data_folder(&env) else {
         return Answer::Unasked(None);
@@ -166,7 +175,7 @@ pub(super) fn ask(server: &mut Server, script: &Script, summary: Value, input: &
         return Answer::Unasked(Some(reason));
     }
 
-    wait_for(&pending.decision, wait_time(&env))
+    wait_for(&pending.decision, wait_time(&env), &server.stop)
 }
 
 /// The refusal for `summary` after `answer`; `None` when the run was allowed.
@@ -175,6 +184,13 @@ pub(super) fn refusal(summary: &ScriptSummary, answer: &Answer) -> Option<Reply>
 
     let (text, pending) = match answer {
         Answer::Allowed => return None,
+        Answer::Stopped => {
+            return Some(Reply {
+                text: STOPPED.to_owned(),
+                is_error: true,
+                structured: None,
+            });
+        }
         Answer::Declined => (format!("the user declined to run script {name}"), json!("declined")),
         Answer::TimedOut => (
             format!(
@@ -286,11 +302,15 @@ fn wait_time(env: &Env) -> Duration {
         .map_or(SCRIPT_APPROVAL_WAIT, |wait| wait.min(SCRIPT_APPROVAL_WAIT))
 }
 
-/// Looks for the answer every [`POLL`] until `wait` has passed.
-fn wait_for(decision: &Path, wait: Duration) -> Answer {
+/// Looks for the answer every [`POLL`] until `wait` has passed or `stop` fires.
+fn wait_for(decision: &Path, wait: Duration, stop: &Stop) -> Answer {
     let started = Instant::now();
 
     loop {
+        if stop.is_stopped() {
+            return Answer::Stopped;
+        }
+
         if let Some(answer) = read_decision(decision) {
             return answer;
         }

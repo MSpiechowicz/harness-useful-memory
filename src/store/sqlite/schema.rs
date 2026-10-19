@@ -7,7 +7,7 @@ use super::sql::{Sql, args};
 use crate::store::StoreError;
 
 /// The schema version this server writes.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// The state of a database after [`migrate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,8 +162,9 @@ CREATE INDEX script_seen_unapproved_age ON script_seen_unapproved (seen_at);
 /// repository key they apply to (`NULL` for global hooks; a key, not a `projects` row, so no
 /// local path goes with it), listed per scope by `created_at` (used in a libSQL team database
 /// only; the local file gets the table but never fills it). Only adds a table, so the rows of
-/// version 3 are untouched.
-const V4: &str = "
+/// version 3 are untouched. Public so tests can build a version 4 database and check the
+/// migration.
+pub const V4: &str = "
 CREATE TABLE hooks (
     id TEXT PRIMARY KEY,
     repo TEXT,
@@ -176,8 +177,25 @@ CREATE TABLE hooks (
 CREATE INDEX hooks_repo ON hooks (repo, created_at, id);
 ";
 
+/// Version 5: the routines a team shares (see [`crate::store::routines`]), with the columns and
+/// index of `hooks` (used in a libSQL team database only, like `hooks`). Only adds a table, so
+/// the rows of version 4 are untouched. `IF NOT EXISTS`, so a database whose version was set back
+/// by hand without dropping the table still migrates.
+const V5: &str = "
+CREATE TABLE IF NOT EXISTS routines (
+    id TEXT PRIMARY KEY,
+    repo TEXT,
+    body TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    author TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS routines_repo ON routines (repo, created_at, id);
+";
+
 /// The migrations in order, each with the version it brings the database to.
-const STEPS: [(i64, &str); 4] = [(1, V1), (2, V2), (3, V3), (4, V4)];
+const STEPS: [(i64, &str); 5] = [(1, V1), (2, V2), (3, V3), (4, V4), (5, V5)];
 
 /// Brings the database to [`SCHEMA_VERSION`]; a newer database is reported, not changed.
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<SchemaState> {

@@ -7,8 +7,10 @@
 //! `redact_text` before anything is stored (the helpers in [`clean`] do both), so callers may pass
 //! raw agent text.
 //!
-//! [`ScriptStore`] and [`TrustStore`] (in [`scripts`]) are the script contract, [`HookStore`] (in
-//! [`hooks`]) the team hook contract; [`Lazy`] opens a store on first use. [`listing`] holds the
+//! [`ScriptStore`] and [`TrustStore`] (in [`scripts`]) are the script contract, [`TeamDocStore`]
+//! (in [`team_docs`]) the contract of the files a team shares through the team database, with
+//! [`HookStore`] (in [`hooks`]) and [`RoutineStore`] (in [`routines`]) for each kind; [`Lazy`]
+//! opens a store on first use. [`listing`] holds the
 //! types of [`MemoryStore::list_notes`].
 
 pub mod clean;
@@ -18,9 +20,11 @@ pub mod libsql;
 pub mod listing;
 pub mod mongo;
 pub mod postgres;
+pub mod routines;
 pub mod scripts;
 pub mod split;
 pub mod sqlite;
+pub mod team_docs;
 
 use std::path::PathBuf;
 
@@ -30,6 +34,7 @@ pub use libsql::LibsqlStore;
 pub use listing::{NoteListQuery, NotePage, NoteRow, NoteSort};
 pub use mongo::MongoStore;
 pub use postgres::PostgresStore;
+pub use routines::{RoutineDelete, RoutineDraft, RoutinePage, RoutinePut, RoutineStore, TeamRoutine, checked_routine};
 pub use scripts::{
     Language, PreviousVersion, SavedScript, Script, ScriptDraft, ScriptRef, ScriptStore, ScriptSummary, TrustOrigin,
     TrustRecord, TrustStore, TrustedVersion, checked_draft, declares_encoding, foreign_encoding,
@@ -38,6 +43,7 @@ pub use scripts::{
 pub use split::SplitStore;
 pub use sqlite::SqliteStore;
 pub(crate) use sqlite::prepare_new_file;
+pub use team_docs::{DocDelete, DocDraft, DocKind, DocPage, DocPut, TeamDoc, TeamDocStore, checked_doc, doc_sha256};
 
 /// Where a note, an entity or a relation lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

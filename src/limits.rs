@@ -103,11 +103,23 @@ pub const SCRIPT_STDOUT_MAX: usize = 32 * 1024;
 /// Script standard error kept in the reply, in bytes.
 pub const SCRIPT_STDERR_MAX: usize = 8 * 1024;
 
+/// Size of one team document body (a Harness Desktop hook or routine file), in bytes.
+pub const TEAM_DOC_BODY_MAX: usize = 16 * 1024;
+
+/// Length of a team document's author label, in characters.
+pub const TEAM_DOC_AUTHOR_MAX: usize = 80;
+
 /// Size of one team hook body (a Harness Desktop hook file), in bytes.
-pub const HOOK_BODY_MAX: usize = 16 * 1024;
+pub const HOOK_BODY_MAX: usize = TEAM_DOC_BODY_MAX;
 
 /// Team hooks per scope: the global scope, and each repository.
 pub const HOOKS_PER_SCOPE: usize = 64;
 
 /// Length of a team hook's author label, in characters.
-pub const HOOK_AUTHOR_MAX: usize = 80;
+pub const HOOK_AUTHOR_MAX: usize = TEAM_DOC_AUTHOR_MAX;
+
+/// Size of one team routine body (a Harness Desktop routine file), in bytes.
+pub const ROUTINE_BODY_MAX: usize = TEAM_DOC_BODY_MAX;
+
+/// Team routines per scope: the global scope, and each repository.
+pub const ROUTINES_PER_SCOPE: usize = 64;

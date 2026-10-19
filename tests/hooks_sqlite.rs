@@ -86,7 +86,7 @@ fn a_version_3_database_is_migrated_and_keeps_its_scripts() {
 
     let conn = rusqlite::Connection::open(&path).expect("raw");
     assert_eq!(user_version(&conn).expect("version"), SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 4);
+    assert_eq!(SCHEMA_VERSION, 5);
     let rows: i64 = conn
         .query_row("SELECT count(*) FROM hooks WHERE repo = ?1", [WIDGET], |row| row.get(0))
         .expect("count");

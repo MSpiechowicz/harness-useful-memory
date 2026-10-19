@@ -40,7 +40,11 @@ pub const CAPTURED_VARS: &[&str] = &[
     // `crate::backend::HOOKS_VAR`).
     "HARNESS_MEMORY_HOOKS",
     "HARNESS_MEMORY_TRUST_TEAM_HOOKS",
-    // The user name, the default author of a team hook (`hooks put`).
+    // The same for team routines (see `crate::backend::ROUTINES_VAR`).
+    "HARNESS_MEMORY_ROUTINES",
+    "HARNESS_MEMORY_TRUST_TEAM_ROUTINES",
+    // The user name, the default author of a team hook or routine (`hooks put`, `routines put`,
+    // `routines delete --mine`).
     "USER",
     "USERNAME",
     // How long `script_run` waits for Harness Desktop's answer, in milliseconds (for tests).
