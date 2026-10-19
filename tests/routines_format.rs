@@ -165,6 +165,8 @@ fn every_action_kind_has_its_rules() {
         json!({ "type": "agent", "harness": "omp", "prompt": "Hi", "approvalMode": "yolo", "maxMinutes": 240 }),
         json!({ "type": "agent", "harness": "pi", "prompt": "Hi", "trustOnce": true, "model": { "provider": "anthropic", "id": "claude" } }),
         json!({ "type": "agent", "harness": "pi", "prompt": "Line\n\tTwo\r\n", "trustOnce": false }),
+        json!({ "type": "agent", "harness": "opencode", "prompt": "Hi" }),
+        json!({ "type": "agent", "harness": "opencode", "prompt": "Hi", "approvalMode": "alwaysAsk", "trustOnce": false }),
         json!({ "type": "command", "command": "make check", "timeoutSecs": 3600 }),
         json!({ "type": "script", "name": "open-prs", "scope": "global" }),
     ] {
@@ -172,8 +174,10 @@ fn every_action_kind_has_its_rules() {
     }
 
     for bad in [
-        json!({ "type": "agent", "harness": "opencode", "prompt": "Hi" }),
+        json!({ "type": "agent", "harness": "claude", "prompt": "Hi" }),
         json!({ "type": "agent", "harness": "pi", "prompt": "Hi", "approvalMode": "write" }),
+        json!({ "type": "agent", "harness": "opencode", "prompt": "Hi", "approvalMode": "always-ask" }),
+        json!({ "type": "agent", "harness": "opencode", "prompt": "Hi", "trustOnce": true }),
         json!({ "type": "agent", "harness": "omp", "prompt": "Hi", "approvalMode": "always-ask" }),
         json!({ "type": "agent", "harness": "omp", "prompt": "Hi", "trustOnce": true }),
         json!({ "type": "agent", "harness": "omp", "prompt": "Hi", "maxMinutes": 241 }),

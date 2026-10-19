@@ -47,9 +47,9 @@ const COMMAND_MAX: usize = 2048;
 const TIMEOUT_MAX: u64 = 3600;
 
 /// The harnesses an agent routine runs in.
-const HARNESSES: [&str; 2] = ["omp", "pi"];
+const HARNESSES: [&str; 3] = ["omp", "opencode", "pi"];
 
-/// The approval modes of an OMP agent routine (the desktop's `ApprovalMode`).
+/// The approval modes of an OMP or OpenCode agent routine (the desktop's `ApprovalMode`).
 const APPROVAL_MODES: [&str; 3] = ["alwaysAsk", "write", "yolo"];
 
 /// The routine in `body` when it is a valid version 1 routine file (its `project` aside, see
@@ -171,13 +171,15 @@ fn check_action(action: &Map<String, Value>, in_project: bool) -> Result<(), Str
     }
 }
 
-/// An agent action: `harness`, `model`, `prompt`, `approvalMode` (OMP only), `trustOnce` (PI
-/// only) and `maxMinutes`.
+/// An agent action: `harness` (`omp`, `opencode` or `pi`), `model`, `prompt`, `approvalMode` (OMP
+/// and OpenCode only), `trustOnce` (PI only) and `maxMinutes`.
 fn check_agent(action: &Map<String, Value>) -> Result<(), String> {
     let harness = field_str(action, "action", "harness")?;
 
     if !HARNESSES.contains(&harness) {
-        return Err(format!("action.harness must be \"omp\" or \"pi\", not {harness:?}"));
+        return Err(format!(
+            "action.harness must be \"omp\", \"opencode\" or \"pi\", not {harness:?}"
+        ));
     }
 
     check_model(action.get("model"))?;
@@ -190,7 +192,9 @@ fn check_agent(action: &Map<String, Value>) -> Result<(), String> {
         Some(mode) if !APPROVAL_MODES.contains(&mode) => {
             return Err(format!("unknown action.approvalMode {mode:?}"));
         }
-        Some(_) if harness != "omp" => return Err("only an omp agent routine has an approvalMode".to_owned()),
+        Some(_) if harness == "pi" => {
+            return Err("only an omp or opencode agent routine has an approvalMode".to_owned());
+        }
         Some(_) => {}
     }
 
