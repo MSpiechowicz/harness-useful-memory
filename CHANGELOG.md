@@ -1,3 +1,10 @@
+# [2.3.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.2.0...v2.3.0) (2026-10-19)
+
+
+### Features
+
+* **routing:** remote+local notes and scripts, hide on this computer, push --json ([f37a30e](https://github.com/MSpiechowicz/harness-useful-memory/commit/f37a30e0e8eb7c48a4a36a1d8f9cd4c8ebcbf7c3))
+
 # [2.2.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.1.0...v2.2.0) (2026-10-19)
 
 
