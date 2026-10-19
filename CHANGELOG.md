@@ -1,3 +1,10 @@
+# [2.1.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.0.0...v2.1.0) (2026-10-19)
+
+
+### Features
+
+* **routines:** share routines through the team database ([23a650d](https://github.com/MSpiechowicz/harness-useful-memory/commit/23a650d5782b2553a5927e2cbaed3f541c2946e0))
+
 # [2.0.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v1.4.0...v2.0.0) (2026-10-18)
 
 
