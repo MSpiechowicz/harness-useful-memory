@@ -1,3 +1,10 @@
+# [2.5.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.4.0...v2.5.0) (2026-10-20)
+
+
+### Features
+
+* **routines:** accept OpenCode agent routines ([37b53d7](https://github.com/MSpiechowicz/harness-useful-memory/commit/37b53d7e04de459a5a97892be763d0752df27b7c))
+
 # [2.4.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.3.0...v2.4.0) (2026-10-20)
 
 
