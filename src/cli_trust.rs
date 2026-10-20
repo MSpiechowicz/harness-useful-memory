@@ -5,7 +5,7 @@
 //! scripts and this computer's (shown past [`crate::store::split::LOCAL_ID_OFFSET`]), and never a
 //! team script hidden on this computer (see [`crate::store::SplitScripts`]).
 //!
-//! - `harness-memory scripts list --json [--project PATH] [--group needsReview|repo|global]
+//! - `harness-memory scripts list --json [--project PATH | --repo KEY | --all-repos] [--group needsReview|repo|global]
 //!   [--scope repo|global] [--review needed|trusted] [--query TEXT]
 //!   [--sort name|language|scope|place|runs|lastRun|updated] [--order asc|desc] [--offset N]
 //!   [--limit N] [--hidden]` prints `{"total": N, "groups": {"needsReview": N, "repo": N,
@@ -30,17 +30,17 @@
 //!   scope, every repository's, 0 without the file). `--hidden` lists only the hidden team scripts
 //!   of the view instead (the filters, the order and the paging apply to them, `total` counts
 //!   them); a hidden script the team database no longer has is dropped from the hidden list.
-//! - `harness-memory scripts get <id> --json [--project PATH] [--hidden]` prints
+//! - `harness-memory scripts get <id> --json [--project PATH | --repo KEY | --all-repos] [--hidden]` prints
 //!   `{"script": {... "body"}}`: the list object with the body. A hidden team script is not found
 //!   unless `--hidden` is given.
 //! - `harness-memory scripts hide|unhide <id> [--project PATH] [--json]` hide a team script on this
 //!   computer or show it again (see [`crate::cli_scripts::hidden`]).
-//! - `harness-memory scripts delete <id> [--project PATH]` deletes a visible script as
+//! - `harness-memory scripts delete <id> [--project PATH | --repo KEY | --all-repos]` deletes a visible script as
 //!   `script_delete` does (a version that needs approval is remembered first, so saving its code
 //!   again trusts nothing) and prints `deleted script <id> <name>`; a script that is not visible
 //!   exits 1 with `harness-memory: script <id> not found`, a read-only team script exits 1 naming
 //!   `harness-memory scripts hide`.
-//! - `harness-memory scripts delete --all --yes [--project PATH] [--json]` does that for every
+//! - `harness-memory scripts delete --all --yes [--project PATH | --repo KEY] [--json]` does that for every
 //!   script `scripts list` shows without filters (all groups, all pages), deleted in one write per
 //!   store, and prints `deleted N scripts` (and how many came from the team database), or
 //!   `{"deleted": N, "team": M}` with `--json` (`team`: how many were kept in the team database).
@@ -52,7 +52,7 @@
 //!   [`crate::cli_scripts::discard`]).
 //! - `harness-memory scripts push [...]` copies the scripts saved on this computer into the team
 //!   database (see [`crate::cli_scripts::push`]).
-//! - `harness-memory trust <id>=<sha256>... [--project PATH]` approves those scripts on this
+//! - `harness-memory trust <id>=<sha256>... [--project PATH | --repo KEY | --all-repos]` approves those scripts on this
 //!   machine when each still has the `sha256` that was reviewed (the `id` and `sha256` of
 //!   `scripts list`); a script changed since is not approved. `harness-memory trust <id>...` and
 //!   `harness-memory trust --all [--project PATH]` (every visible script that needs it) approve the
@@ -70,18 +70,18 @@ use std::process::ExitCode;
 use serde_json::{Value, json};
 
 use crate::backend::{NotesPlace, Place, Selection};
-use crate::cli::{self, Args, Delete};
+use crate::cli::{self, Args, Delete, PICK_VALUED, Repos};
 use crate::cli_scripts::{Opened, discard, hidden, list, not_found, push};
-use crate::store::{Script, ScriptRef, TrustOrigin, TrustedVersion};
+use crate::store::{Scope, Script, ScriptRef, TrustOrigin, TrustedVersion};
 use crate::store::{foreign_encoding, foreign_encoding_error, hidden_character, hidden_character_error};
 
 /// The usage of these commands, for the executable's usage line.
-pub const USAGE: &str = "scripts list --json [--project PATH] [--group needsReview|repo|global] [--scope \
+pub const USAGE: &str = "scripts list --json [--project PATH | --repo KEY | --all-repos] [--group needsReview|repo|global] [--scope \
                          repo|global] [--review needed|trusted] [--query TEXT] [--sort \
                          name|language|scope|place|runs|lastRun|updated] [--order asc|desc] [--offset N] [--limit N] \
-                         [--hidden] | scripts get <id> --json [--project PATH] [--hidden] | scripts hide <id> \
-                         [--project PATH] [--json] | scripts unhide <id> [--project PATH] [--json] | scripts delete \
-                         <id> [--project PATH] | scripts delete --all --yes [--project PATH] [--json] | scripts \
+                         [--hidden] | scripts repos --json | scripts get <id> --json [--project PATH | --repo KEY | --all-repos] [--hidden] | scripts hide <id> \
+                         [--project PATH | --repo KEY | --all-repos] [--json] | scripts unhide <id> [--project PATH | --repo KEY | --all-repos] [--json] | scripts delete \
+                         <id> [--project PATH | --repo KEY | --all-repos] | scripts delete --all --yes [--project PATH | --repo KEY] [--json] | scripts \
                          discard-local (--all | ID[,ID...] | -) [--scope repo|global] --yes [--json] | scripts push \
                          [--dry-run] [--json] [--overwrite none|all|ID[,ID...]|-] [--delete-copied] [--scope \
                          repo|global] [--repo <key|.>] [--no-global] | trust <id>[=<sha256>]... | --all [--project \
@@ -98,6 +98,7 @@ pub fn check_line(selection: &Selection) -> Option<&'static str> {
 pub fn scripts(args: &[Option<&str>]) -> ExitCode {
     match args {
         [Some("get"), rest @ ..] => get(rest),
+        [Some("repos"), rest @ ..] => repos(rest),
         [Some("hide"), rest @ ..] => hidden::hide(rest),
         [Some("unhide"), rest @ ..] => hidden::unhide(rest),
         [Some("delete"), rest @ ..] => delete(rest),
@@ -107,13 +108,48 @@ pub fn scripts(args: &[Option<&str>]) -> ExitCode {
     }
 }
 
+/// `scripts repos --json`: the repositories that have scripts, each with its key, the label
+/// scripts show it by and how many scripts it has, by label, and how many global scripts there are.
+fn repos(args: &[Option<&str>]) -> ExitCode {
+    match Args::parse(args, &["--json"], &[]) {
+        Some(parsed) if parsed.flag("--json") && parsed.positional.is_empty() => {}
+        _ => return usage(),
+    }
+
+    let Some(mut opened) = Opened::open(&Repos::Every) else {
+        return ExitCode::FAILURE;
+    };
+
+    let listed = match opened.scripts.list_scripts(&opened.view, None) {
+        Ok(listed) => listed,
+        Err(error) => return opened.failed(&error.to_string()),
+    };
+
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+
+    let mut global = 0_usize;
+
+    for summary in &listed {
+        match summary.project.as_deref() {
+            Some(key) => *counts.entry(key.to_owned()).or_default() += 1,
+            None => global += 1,
+        }
+    }
+
+    println!(
+        "{}",
+        serde_json::json!({ "repos": cli::repos_json(counts), "global": global })
+    );
+    ExitCode::SUCCESS
+}
+
 /// `scripts get`.
 fn get(args: &[Option<&str>]) -> ExitCode {
-    let Some((id, project, show_hidden)) = parse_get(args) else {
+    let Some((id, repos, show_hidden)) = parse_get(args) else {
         return usage();
     };
 
-    let Some(mut opened) = Opened::open(project.as_deref()) else {
+    let Some(mut opened) = Opened::open(&repos) else {
         return ExitCode::FAILURE;
     };
 
@@ -144,8 +180,8 @@ fn get(args: &[Option<&str>]) -> ExitCode {
 
 /// The script id, `--project` and `--hidden` after `scripts get`, which needs `--json`; `None` for
 /// anything else.
-fn parse_get(args: &[Option<&str>]) -> Option<(i64, Option<String>, bool)> {
-    let parsed = Args::parse(args, &["--json", "--hidden"], &["--project"])?;
+fn parse_get(args: &[Option<&str>]) -> Option<(i64, Repos, bool)> {
+    let parsed = Args::parse(args, &["--json", "--hidden", "--all-repos"], &PICK_VALUED)?;
 
     let [id] = parsed.positional[..] else {
         return None;
@@ -155,14 +191,14 @@ fn parse_get(args: &[Option<&str>]) -> Option<(i64, Option<String>, bool)> {
         return None;
     }
 
-    Some((id.parse().ok()?, parsed.project().ok()?, parsed.flag("--hidden")))
+    Some((id.parse().ok()?, parsed.repos().ok()?, parsed.flag("--hidden")))
 }
 
 /// `scripts delete`.
 fn delete(args: &[Option<&str>]) -> ExitCode {
     match Delete::parse(args) {
-        Some(Delete::One { id, project }) => delete_one(id, project.as_deref()),
-        Some(Delete::All { project, json }) => delete_all(project.as_deref(), json),
+        Some(Delete::One { id, pick }) => delete_one(id, &pick),
+        Some(Delete::All { pick, scope, json }) => delete_all(&pick, scope, json),
         Some(Delete::Unconfirmed) => cli::unconfirmed("script"),
         None => usage(),
     }
@@ -170,8 +206,8 @@ fn delete(args: &[Option<&str>]) -> ExitCode {
 
 /// `scripts delete <id>`: deletes the visible script `id` as `script_delete` does, after deciding
 /// its approval (which remembers a version that needs it).
-fn delete_one(id: i64, project: Option<&str>) -> ExitCode {
-    let Some(mut opened) = Opened::open(project) else {
+fn delete_one(id: i64, repos: &Repos) -> ExitCode {
+    let Some(mut opened) = Opened::open(repos) else {
         return ExitCode::FAILURE;
     };
 
@@ -199,10 +235,12 @@ fn delete_one(id: i64, project: Option<&str>) -> ExitCode {
 }
 
 /// `scripts delete --all --yes`.
-fn delete_all(project: Option<&str>, json: bool) -> ExitCode {
-    let Some(mut opened) = Opened::open(project) else {
+fn delete_all(repos: &Repos, scope: Option<Scope>, json: bool) -> ExitCode {
+    let Some(mut opened) = Opened::open(repos) else {
         return ExitCode::FAILURE;
     };
+
+    opened.view = cli::narrowed(opened.view, scope);
 
     // Listing decides each script's approval, which remembers the versions that need it.
     let listed: Vec<(i64, Place)> = match opened.list(None) {
@@ -245,7 +283,7 @@ pub fn trust(args: &[Option<&str>]) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let Some(mut opened) = Opened::open(options.project.as_deref()) else {
+    let Some(mut opened) = Opened::open(&options.repos) else {
         return ExitCode::FAILURE;
     };
 
@@ -351,10 +389,10 @@ fn approve(opened: &mut Opened, pick: &Pick) -> Result<Approved, String> {
 }
 
 /// The options of `trust`: the scripts, or `None` for `--all`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct TrustOptions {
     picks: Option<Vec<Pick>>,
-    project: Option<String>,
+    repos: Repos,
 }
 
 impl TrustOptions {
@@ -403,8 +441,8 @@ enum Approved {
 
 /// The options after `trust`; `None` unless they name scripts or `--all` (not both).
 fn parse_trust(args: &[Option<&str>]) -> Option<TrustOptions> {
-    let parsed = Args::parse(args, &["--all"], &["--project"])?;
-    let project = parsed.project().ok()?;
+    let parsed = Args::parse(args, &["--all", "--all-repos"], &PICK_VALUED)?;
+    let repos = parsed.repos().ok()?;
     let picks = parsed
         .positional
         .iter()
@@ -412,10 +450,10 @@ fn parse_trust(args: &[Option<&str>]) -> Option<TrustOptions> {
         .collect::<Option<Vec<_>>>()?;
 
     match (parsed.flag("--all"), picks.is_empty()) {
-        (true, true) => Some(TrustOptions { picks: None, project }),
+        (true, true) if repos != Repos::Every => Some(TrustOptions { picks: None, repos }),
         (false, false) => Some(TrustOptions {
             picks: Some(picks),
-            project,
+            repos,
         }),
         _ => None,
     }
@@ -481,7 +519,7 @@ mod tests {
                 }
             ])
         );
-        assert_eq!(ids.project.as_deref(), Some("/w"));
+        assert_eq!(ids.repos, Repos::Project(Some("/w".to_owned())));
         assert_eq!(parse_trust(&args(&["--all"])).expect("all").picks, None);
 
         let short = format!("3={}", "a".repeat(63));

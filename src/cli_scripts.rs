@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use serde_json::{Value, json};
 
 use crate::backend::{Backend, Place, Secrets, Selection};
-use crate::cli;
+use crate::cli::{self, Repos};
 use crate::mcp::{Approval, Shown, approval_of};
 use crate::open::{open_hidden_scripts, open_scripts, open_trust};
 use crate::store::{HiddenScripts, ScriptStore, ScriptSummary, SqliteStore, StoreError, TrustStore, View};
@@ -36,15 +36,15 @@ pub(crate) struct Opened {
 impl Opened {
     /// Opens the stores for the scripts visible from `project` (else the working directory);
     /// `None`, with the reason printed, when the settings or the project are wrong.
-    pub fn open(project: Option<&str>) -> Option<Self> {
+    pub fn open(pick: &Repos) -> Option<Self> {
         let (env, selection) = cli::settings()?;
-        let repo = cli::repository(&env, project)?;
+        let view = pick.view(&env)?;
 
         Some(Self {
             scripts: open_scripts(&env, &selection),
             trust: open_trust(&env),
             hidden: open_hidden_scripts(&env, &selection),
-            view: View { repo, global: true },
+            view,
             secrets: selection.backend.secrets(),
             env,
             selection,

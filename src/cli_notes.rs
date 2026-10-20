@@ -5,7 +5,7 @@
 //! opens (the local file, the team database, or both as the routing says), so the team notes
 //! hidden on this computer are left out as they are for the agent.
 //!
-//! - `harness-memory notes list --json [--project PATH] [--kind KIND] [--scope repo|global]
+//! - `harness-memory notes list --json [--project PATH | --repo KEY | --all-repos] [--kind KIND] [--scope repo|global]
 //!   [--query TEXT] [--sort updated|title|kind|scope|place] [--order asc|desc] [--offset N]
 //!   [--limit N]` prints `{"total": N, "kinds": [{"kind", "count"}], "scopes": {"repo": N,
 //!   "global": N}, "notes": [...]}`: one page of the notes (see [`crate::store::listing`] for the
@@ -27,21 +27,21 @@
 //!   repository's, 0 without the file). `--hidden` lists only the hidden team notes of the view
 //!   instead (the filters, the order and the paging apply to them, `total` counts them); a hidden
 //!   note the team database no longer has is dropped from the hidden list.
-//! - `harness-memory notes get <id> --json [--project PATH] [--hidden]` prints
+//! - `harness-memory notes get <id> --json [--project PATH | --repo KEY | --all-repos] [--hidden]` prints
 //!   `{"note": {... "body"}, "links": [{"id", "title", "kind", "relation", "direction"}]}`: the
 //!   note object with its body, and up to 50 notes linked through the graph: the notes linked to
 //!   the entity at the other end of a relation that touches one of this note's entities
 //!   (`direction` `out` when this note's entity is the relation's source, `in` when it is the
 //!   target). Showing the note counts no hit (`note_get` does count one). A hidden team note is
 //!   not found unless `--hidden` is given.
-//! - `harness-memory notes hide <id> [--project PATH] [--json]` hides a team note on this computer
+//! - `harness-memory notes hide <id> [--project PATH | --repo KEY | --all-repos] [--json]` hides a team note on this computer
 //!   (the team database is not changed) and prints `hid note <id> <title>`, or `{"hidden": <id>}`;
-//!   `notes unhide <id> [--project PATH] [--json]` shows it again (`unhid note <id>`, or
+//!   `notes unhide <id> [--project PATH | --repo KEY | --all-repos] [--json]` shows it again (`unhid note <id>`, or
 //!   `{"unhidden": <id>}`). A note saved on this computer is refused (delete it instead), and
 //!   without a team database read for notes there is nothing to hide (exit 1).
-//! - `harness-memory notes delete <id> [--project PATH]` deletes the note as `note_delete` does
+//! - `harness-memory notes delete <id> [--project PATH | --repo KEY | --all-repos]` deletes the note as `note_delete` does
 //!   and prints `deleted note <id> <title>`.
-//! - `harness-memory notes delete --all --yes [--project PATH] [--json]` deletes every note
+//! - `harness-memory notes delete --all --yes [--project PATH | --repo KEY] [--json]` deletes every note
 //!   `notes list` shows without filters (all pages) in one write per store, as `note_delete`
 //!   deletes one, and prints `deleted N notes` (and how many came from the team database), or
 //!   `{"deleted": N, "team": M}` with `--json` (`team`: how many were kept in the team database).
@@ -56,6 +56,7 @@
 //! A note that is not visible exits 1 with `harness-memory: note <id> not found` as the last line
 //! of stderr. Other exit codes and errors as in [`crate::cli`].
 
+use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 use serde_json::{Map, Value, json};
@@ -64,21 +65,21 @@ mod discard;
 mod hidden;
 
 use crate::backend::{Backend, NotesPlace, Place, Secrets, Selection};
-use crate::cli::{self, Args, Delete, PAGE_OPTIONS, Page};
-use crate::limits::NEIGHBORS_LIMIT_MAX;
+use crate::cli::{self, Args, Delete, PAGE_OPTIONS, PICK_VALUED, Page, Repos};
+use crate::limits::{LIST_PAGE_MAX, NEIGHBORS_LIMIT_MAX};
 use crate::mcp::{author_json, place_label, repo_label};
 use crate::open::{notes_place, open_hidden, open_notes};
 use crate::store::{Forget, HiddenNotes, MemoryStore, Note, NoteKind, NoteListQuery, NoteOrigin, NoteRow, NoteSort};
-use crate::store::{Scope, SqliteStore, StoreError, Target, View, clean};
+use crate::store::{ProjectKey, Scope, SqliteStore, StoreError, Target, View, clean};
 use crate::support::Env;
 use crate::support::time::rfc3339;
 
 /// The usage of these commands, for the executable's usage line.
-pub const USAGE: &str = "notes list --json [--project PATH] [--kind KIND] [--scope repo|global] [--query TEXT] \
+pub const USAGE: &str = "notes list --json [--project PATH | --repo KEY | --all-repos] [--kind KIND] [--scope repo|global] [--query TEXT] \
                          [--sort updated|title|kind|scope|place] [--order asc|desc] [--offset N] [--limit N] \
-                         [--hidden] | notes get <id> --json [--project PATH] [--hidden] | notes hide <id> \
-                         [--project PATH] [--json] | notes unhide <id> [--project PATH] [--json] | notes delete \
-                         <id> [--project PATH] | notes delete --all --yes [--project PATH] [--json] | notes \
+                         [--hidden] | notes repos --json | notes repos --json | notes get <id> --json [--project PATH | --repo KEY | --all-repos] [--hidden] | notes hide <id> \
+                         [--project PATH | --repo KEY | --all-repos] [--json] | notes unhide <id> [--project PATH | --repo KEY | --all-repos] [--json] | notes delete \
+                         <id> [--project PATH | --repo KEY | --all-repos] | notes delete --all --yes [--project PATH | --repo KEY] [--json] | notes \
                          discard-local (--all | ID[,ID...] | -) [--scope repo|global] --yes [--json]";
 
 /// The most linked notes `notes get` lists.
@@ -89,6 +90,7 @@ pub fn notes(args: &[Option<&str>]) -> ExitCode {
     match args {
         [Some("list"), rest @ ..] => list(rest),
         [Some("get"), rest @ ..] => get(rest),
+        [Some("repos"), rest @ ..] => repos(rest),
         [Some("delete"), rest @ ..] => delete(rest),
         [Some("hide"), rest @ ..] => hidden::hide(rest),
         [Some("unhide"), rest @ ..] => hidden::unhide(rest),
@@ -103,11 +105,11 @@ fn usage() -> ExitCode {
 
 /// `notes list`.
 fn list(args: &[Option<&str>]) -> ExitCode {
-    let Some((project, query, show_hidden)) = parse_list(args) else {
+    let Some((pick, query, show_hidden)) = parse_list(args) else {
         return usage();
     };
 
-    let Some(mut opened) = Opened::open(project.as_deref()) else {
+    let Some(mut opened) = Opened::open(&pick) else {
         return ExitCode::FAILURE;
     };
 
@@ -149,13 +151,66 @@ fn list(args: &[Option<&str>]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `notes repos --json`: the repositories that have notes, each with its key, the label notes
+/// show it by and how many notes it has, by label, and how many global notes there are.
+fn repos(args: &[Option<&str>]) -> ExitCode {
+    match Args::parse(args, &["--json"], &[]) {
+        Some(parsed) if parsed.flag("--json") && parsed.positional.is_empty() => {}
+        _ => return usage(),
+    }
+
+    let Some(mut opened) = Opened::open(&Repos::Every) else {
+        return ExitCode::FAILURE;
+    };
+
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut global = 0_usize;
+    let mut offset = 0;
+
+    loop {
+        let page = opened.store.list_notes(&NoteListQuery {
+            view: opened.view.clone(),
+            text: String::new(),
+            kind: None,
+            scope: None,
+            entity: None,
+            sort: NoteSort::Updated,
+            descending: true,
+            offset,
+            limit: LIST_PAGE_MAX,
+            exclude: Vec::new(),
+        });
+
+        let page = match page {
+            Ok(page) => page,
+            Err(error) => return opened.failed(&error),
+        };
+
+        for row in &page.rows {
+            match row.project.as_deref() {
+                Some(key) => *counts.entry(key.to_owned()).or_default() += 1,
+                None => global += 1,
+            }
+        }
+
+        offset += page.rows.len();
+
+        if page.rows.is_empty() || offset >= page.total {
+            break;
+        }
+    }
+
+    println!("{}", json!({ "repos": cli::repos_json(counts), "global": global }));
+    ExitCode::SUCCESS
+}
+
 /// `notes get`.
 fn get(args: &[Option<&str>]) -> ExitCode {
-    let Some((id, project, show_hidden)) = parse_get(args) else {
+    let Some((id, pick, show_hidden)) = parse_get(args) else {
         return usage();
     };
 
-    let Some(mut opened) = Opened::open(project.as_deref()) else {
+    let Some(mut opened) = Opened::open(&pick) else {
         return ExitCode::FAILURE;
     };
 
@@ -172,6 +227,18 @@ fn get(args: &[Option<&str>]) -> ExitCode {
         Err(error) => return opened.failed(&error),
     };
 
+    // Links are looked up where the note lives: the repository of a note read among every repository.
+    if opened.view.sees_every_repo() {
+        opened.view = View {
+            repo: note.project.as_ref().map(|key| ProjectKey {
+                key: key.clone(),
+                root: std::path::PathBuf::new(),
+                remote: None,
+            }),
+            global: true,
+        };
+    }
+
     let links = match opened.links(&note) {
         Ok(links) => links,
         Err(error) => return opened.failed(&error),
@@ -187,16 +254,16 @@ fn get(args: &[Option<&str>]) -> ExitCode {
 /// `notes delete`.
 fn delete(args: &[Option<&str>]) -> ExitCode {
     match Delete::parse(args) {
-        Some(Delete::One { id, project }) => delete_one(id, project.as_deref()),
-        Some(Delete::All { project, json }) => delete_all(project.as_deref(), json),
+        Some(Delete::One { id, pick }) => delete_one(id, &pick),
+        Some(Delete::All { pick, scope, json }) => delete_all(&pick, scope, json),
         Some(Delete::Unconfirmed) => cli::unconfirmed("note"),
         None => usage(),
     }
 }
 
 /// `notes delete <id>`.
-fn delete_one(id: i64, project: Option<&str>) -> ExitCode {
-    let Some(mut opened) = Opened::open(project) else {
+fn delete_one(id: i64, pick: &Repos) -> ExitCode {
+    let Some(mut opened) = Opened::open(pick) else {
         return ExitCode::FAILURE;
     };
 
@@ -217,10 +284,12 @@ fn delete_one(id: i64, project: Option<&str>) -> ExitCode {
 }
 
 /// `notes delete --all --yes`.
-fn delete_all(project: Option<&str>, json: bool) -> ExitCode {
-    let Some(mut opened) = Opened::open(project) else {
+fn delete_all(pick: &Repos, scope: Option<Scope>, json: bool) -> ExitCode {
+    let Some(mut opened) = Opened::open(pick) else {
         return ExitCode::FAILURE;
     };
+
+    opened.view = cli::narrowed(opened.view, scope);
 
     let forgotten = match opened.store.forget_notes(&opened.view, &[]) {
         Ok(forgotten) => forgotten,
@@ -260,9 +329,9 @@ fn local_counts(env: &Env) -> Result<(usize, usize), StoreError> {
 /// The options after `notes list`: `--project`, the query (its view still empty) and
 /// `--hidden`; `None` without `--json`, for an unknown or repeated option, or a value that is not
 /// valid.
-fn parse_list(args: &[Option<&str>]) -> Option<(Option<String>, NoteListQuery, bool)> {
-    let valued = [&PAGE_OPTIONS[..], &["--project", "--kind", "--scope", "--sort"]].concat();
-    let parsed = Args::parse(args, &["--json", "--hidden"], &valued)?;
+fn parse_list(args: &[Option<&str>]) -> Option<(Repos, NoteListQuery, bool)> {
+    let valued = [&PAGE_OPTIONS[..], &PICK_VALUED[..], &["--kind", "--scope", "--sort"]].concat();
+    let parsed = Args::parse(args, &["--json", "--hidden", "--all-repos"], &valued)?;
 
     if !parsed.positional.is_empty() || !parsed.flag("--json") {
         return None;
@@ -307,13 +376,13 @@ fn parse_list(args: &[Option<&str>]) -> Option<(Option<String>, NoteListQuery, b
         exclude: Vec::new(),
     };
 
-    Some((parsed.project().ok()?, query, parsed.flag("--hidden")))
+    Some((parsed.repos().ok()?, query, parsed.flag("--hidden")))
 }
 
 /// The note id, `--project` and `--hidden` after `notes get`, which needs `--json`; `None` for
 /// anything else.
-fn parse_get(args: &[Option<&str>]) -> Option<(i64, Option<String>, bool)> {
-    let parsed = Args::parse(args, &["--json", "--hidden"], &["--project"])?;
+fn parse_get(args: &[Option<&str>]) -> Option<(i64, Repos, bool)> {
+    let parsed = Args::parse(args, &["--json", "--hidden", "--all-repos"], &PICK_VALUED)?;
 
     let [id] = parsed.positional[..] else {
         return None;
@@ -323,7 +392,7 @@ fn parse_get(args: &[Option<&str>]) -> Option<(i64, Option<String>, bool)> {
         return None;
     }
 
-    Some((id.parse().ok()?, parsed.project().ok()?, parsed.flag("--hidden")))
+    Some((id.parse().ok()?, parsed.repos().ok()?, parsed.flag("--hidden")))
 }
 
 /// The notes store and the view of the notes `--project` makes visible, opened like the server,
@@ -338,14 +407,17 @@ struct Opened {
 }
 
 impl Opened {
-    /// Opens the store for the notes visible from `project` (only the global ones without it);
+    /// Opens the store for the notes `pick` makes visible (only the global ones without any);
     /// `None`, with the reason printed, when the settings, the project or the store are wrong.
-    fn open(project: Option<&str>) -> Option<Self> {
+    fn open(pick: &Repos) -> Option<Self> {
         let (env, selection) = cli::settings()?;
 
-        let repo = match project {
-            Some(path) => cli::repository(&env, Some(path))?,
-            None => None,
+        let view = match pick {
+            Repos::Project(None) => View {
+                repo: None,
+                global: true,
+            },
+            pick => pick.view(&env)?,
         };
 
         let store = open_notes(&env, &selection)?;
@@ -353,7 +425,7 @@ impl Opened {
         Some(Self {
             store,
             hidden: open_hidden(&env, &selection),
-            view: View { repo, global: true },
+            view,
             secrets: selection.backend.secrets(),
             env,
             selection,
@@ -420,6 +492,7 @@ impl Opened {
             "title": row.title,
             "scope": row.scope.as_str(),
             "repo": row.project.as_deref().map(repo_label),
+            "repoKey": row.project,
             "place": place,
             "readOnly": read_only,
             "hidden": hidden,
@@ -535,7 +608,7 @@ mod tests {
     #[test]
     fn list_options_default_to_the_newest_page_and_check_their_values() {
         let (project, query, hidden) = parse_list(&args(&["--json"])).expect("valid");
-        assert_eq!((project, hidden), (None, false));
+        assert_eq!((project, hidden), (Repos::Project(None), false));
         assert!(parse_list(&args(&["--json", "--hidden"])).expect("valid").2);
         assert_eq!(
             (query.sort, query.descending, query.offset, query.limit, query.kind),
@@ -553,7 +626,7 @@ mod tests {
             "3",
         ]);
         let (project, query, _) = parse_list(&raw).expect("valid");
-        assert_eq!(project.as_deref(), Some("/w"));
+        assert_eq!(project, Repos::Project(Some("/w".to_owned())));
         assert_eq!(
             (query.sort, query.descending, query.offset, query.kind),
             (NoteSort::Title, false, 3, Some(NoteKind::Optimisation))
@@ -591,12 +664,18 @@ mod tests {
 
     #[test]
     fn get_needs_json_and_one_id() {
-        assert_eq!(parse_get(&args(&["7", "--json"])), Some((7, None, false)));
+        assert_eq!(
+            parse_get(&args(&["7", "--json"])),
+            Some((7, Repos::Project(None), false))
+        );
         assert_eq!(
             parse_get(&args(&["7", "--json", "--project", "/w"])),
-            Some((7, Some("/w".to_owned()), false))
+            Some((7, Repos::Project(Some("/w".to_owned())), false))
         );
-        assert_eq!(parse_get(&args(&["--hidden", "7", "--json"])), Some((7, None, true)));
+        assert_eq!(
+            parse_get(&args(&["--hidden", "7", "--json"])),
+            Some((7, Repos::Project(None), true))
+        );
 
         assert!(parse_get(&args(&["7"])).is_none());
         assert!(parse_get(&args(&["7", "8", "--json"])).is_none());

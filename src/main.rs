@@ -33,19 +33,19 @@ use serde_json::{Value, json};
 
 const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--overwrite none|all|ID[,ID...]|-] \
                      [--delete-copied] [--scope repo|global] [--repo <key|.>] [--no-global] | check | kinds | features \
-                     | scripts list --json [--project PATH] [--group needsReview|repo|global] [--scope repo|global] \
+                     | scripts list --json [--project PATH | --repo KEY | --all-repos] [--group needsReview|repo|global] [--scope repo|global] \
                      [--review needed|trusted] [--query TEXT] [--sort name|language|scope|place|runs|lastRun|updated] \
-                     [--order asc|desc] [--offset N] [--limit N] [--hidden] | scripts get <id> --json [--project PATH] \
-                     [--hidden] | scripts hide <id> [--project PATH] [--json] | scripts unhide <id> [--project PATH] \
-                     [--json] | scripts delete <id> [--project PATH] | scripts delete --all --yes [--project PATH] \
+                     [--order asc|desc] [--offset N] [--limit N] [--hidden] | scripts get <id> --json [--project PATH | --repo KEY | --all-repos] \
+                     [--hidden] | scripts hide <id> [--project PATH | --repo KEY | --all-repos] [--json] | scripts unhide <id> [--project PATH | --repo KEY | --all-repos] \
+                     [--json] | scripts delete <id> [--project PATH | --repo KEY | --all-repos] | scripts delete --all --yes [--project PATH | --repo KEY] \
                      [--json] | scripts discard-local (--all | ID[,ID...] | -) [--scope repo|global] --yes [--json] | \
                      scripts push [--dry-run] [--json] [--overwrite none|all|ID[,ID...]|-] [--delete-copied] [--scope \
-                     repo|global] [--repo <key|.>] [--no-global] | trust <id>[=<sha256>]... | --all [--project PATH] \
-                     | notes list --json [--project PATH] [--kind KIND] [--scope repo|global] [--query TEXT] [--sort \
+                     repo|global] [--repo <key|.>] [--no-global] | trust <id>[=<sha256>]... [--repo KEY | --all-repos] | --all [--project PATH | --repo KEY] \
+                     | notes list --json [--project PATH | --repo KEY | --all-repos] [--kind KIND] [--scope repo|global] [--query TEXT] [--sort \
                      updated|title|kind|scope|place] [--order asc|desc] [--offset N] [--limit N] [--hidden] | notes \
-                     get <id> --json [--project PATH] [--hidden] | notes hide <id> [--project PATH] [--json] | notes \
-                     unhide <id> [--project PATH] [--json] | notes delete <id> [--project PATH] | notes delete --all \
-                     --yes [--project PATH] [--json] | notes discard-local (--all | ID[,ID...] | -) [--scope \
+                     get <id> --json [--project PATH | --repo KEY | --all-repos] [--hidden] | notes hide <id> [--project PATH | --repo KEY | --all-repos] [--json] | notes \
+                     unhide <id> [--project PATH | --repo KEY | --all-repos] [--json] | notes delete <id> [--project PATH | --repo KEY | --all-repos] | notes delete --all \
+                     --yes [--project PATH | --repo KEY] [--json] | notes repos --json | scripts repos --json | notes discard-local (--all | ID[,ID...] | -) [--scope \
                      repo|global] --yes [--json] | hooks config --json | hooks list --json [--project PATH] [--offset \
                      N] [--limit N] | hooks get <id> --json | hooks put --json [--project PATH] [--expect-sha SHA256] \
                      [--author NAME] < hook.json | hooks delete <id> [--expect-sha SHA256] --json | routines config \
@@ -56,14 +56,16 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--o
 
 /// What this build can do that older ones could not, as `harness-memory features` lists it: the
 /// `remote+local` note routing, hiding team notes on this computer, `push --json`, and the same for
-/// scripts (`scripts = "remote+local"`, `scripts hide`, `scripts push --json`).
-const FEATURES: [&str; 6] = [
+/// scripts (`scripts = "remote+local"`, `scripts hide`, `scripts push --json`), and reading every
+/// repository at once (`--all-repos`, `--repo KEY`, `notes repos`, `scripts repos`).
+const FEATURES: [&str; 7] = [
     "notes-remote-local",
     "notes-hide",
     "push-json",
     "scripts-remote-local",
     "scripts-hide",
     "scripts-push-json",
+    "all-repos",
 ];
 
 fn main() -> ExitCode {

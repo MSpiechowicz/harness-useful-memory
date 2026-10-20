@@ -17,11 +17,11 @@ use crate::store::{HiddenNote, MemoryStore, Note, NoteListQuery, NotePage, NoteR
 
 /// `notes hide <id>`.
 pub(super) fn hide(args: &[Option<&str>]) -> ExitCode {
-    let Some((id, project, json)) = cli::id_options(args) else {
+    let Some((id, repos, json)) = cli::id_options(args) else {
         return usage();
     };
 
-    let Some(mut opened) = Opened::open(project.as_deref()) else {
+    let Some(mut opened) = Opened::open(&repos) else {
         return ExitCode::FAILURE;
     };
 
@@ -45,11 +45,11 @@ pub(super) fn hide(args: &[Option<&str>]) -> ExitCode {
 
 /// `notes unhide <id>`.
 pub(super) fn unhide(args: &[Option<&str>]) -> ExitCode {
-    let Some((id, project, json)) = cli::id_options(args) else {
+    let Some((id, repos, json)) = cli::id_options(args) else {
         return usage();
     };
 
-    let Some(mut opened) = Opened::open(project.as_deref()) else {
+    let Some(mut opened) = Opened::open(&repos) else {
         return ExitCode::FAILURE;
     };
 
@@ -117,12 +117,16 @@ pub(super) fn in_view(opened: &mut Opened) -> Result<Vec<HiddenNote>, StoreError
     let listed = hidden.list();
     let reads_team = |scope| crate::open::notes_place(&opened.selection, scope).reads_team();
     let repo = opened.view.repo.as_ref().map(|key| key.key.as_str());
+    let every = opened.view.sees_every_repo();
 
     Ok(listed
         .into_iter()
         .filter(|note| reads_team(note.scope))
         .filter(|note| match note.scope {
-            Scope::Repo => note.project.as_deref().is_some_and(|project| Some(project) == repo),
+            Scope::Repo => note
+                .project
+                .as_deref()
+                .is_some_and(|project| every || Some(project) == repo),
             Scope::Global => opened.view.global,
         })
         .collect())

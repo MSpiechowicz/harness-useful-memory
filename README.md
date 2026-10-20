@@ -330,7 +330,16 @@ harness-memory notes list --json --project ~/src/widget --query cache --sort upd
 harness-memory notes get 12 --json --project ~/src/widget
 harness-memory notes delete 12 --project ~/src/widget
 harness-memory notes delete --all --yes --json --project ~/src/widget
+harness-memory notes list --json --all-repos
+harness-memory notes list --json --repo git:github.com/acme/widget
+harness-memory notes repos --json
 ```
+
+`notes list`, `get`, `hide`, `unhide` and `delete <id>` (and the same `scripts` commands) take one of `--project PATH`,
+`--repo KEY` (a repository key, `git:github.com/acme/widget`, wherever it is checked out) or `--all-repos` (every
+repository's notes and the global ones; `delete --all` refuses it). Each note has `repoKey` next to its `repo` label.
+`notes repos --json` and `scripts repos --json` print `{"repos": [{"key", "label", "count"}], "global": N}`: the
+repositories that have entries, by label, and how many global ones there are.
 
 - `notes list --json` prints one page, `{"total", "kinds": [{"kind", "count"}], "scopes": {"repo", "global"},
   "notes"}`. `--query TEXT` keeps the notes whose title, body or tags contain it, ignoring case (on SQLite and libSQL
