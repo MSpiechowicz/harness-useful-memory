@@ -947,6 +947,15 @@ fn scope_value(project: Option<&str>) -> Bson {
 
 /// The filter of the scopes `view` can read (matches nothing when it can read none).
 fn visible(view: &View) -> Document {
+    if view.sees_every_repo() {
+        // Every repository note has a string `project`; the global ones have `null`.
+        return if view.global {
+            doc! {}
+        } else {
+            doc! { "project": { "$ne": Bson::Null } }
+        };
+    }
+
     let mut scopes: Vec<Bson> = Vec::new();
 
     if let Some(repo) = &view.repo {

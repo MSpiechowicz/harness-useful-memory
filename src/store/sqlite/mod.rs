@@ -261,10 +261,14 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// The project id [`view_params`] gives a view of every repository (no row has it).
+pub(super) const ALL_REPOS: i64 = -1;
+
 /// The SQL parameters of a view: the repository's project id (NULL when the repository has no
 /// rows yet or is not visible) and whether global rows are visible.
 fn view_params(db: &mut dyn Sql, view: &View) -> Result<(Option<i64>, bool), StoreError> {
     let repo = match &view.repo {
+        Some(key) if key.is_every() => Some(ALL_REPOS),
         Some(key) => project_id(db, key)?,
         None => None,
     };

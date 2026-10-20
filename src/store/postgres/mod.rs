@@ -385,6 +385,7 @@ fn now() -> i64 {
 /// rows yet or is not visible) and whether global rows are visible.
 fn view_params(client: &mut impl GenericClient, view: &View) -> Result<(Option<i64>, bool), StoreError> {
     let repo = match &view.repo {
+        Some(key) if key.is_every() => Some(-1),
         Some(key) => project_id(client, key)?,
         None => None,
     };

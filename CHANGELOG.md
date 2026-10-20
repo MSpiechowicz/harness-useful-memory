@@ -1,3 +1,17 @@
+# [2.4.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.3.0...v2.4.0) (2026-10-20)
+
+
+### Features
+
+* **cli:** read every repository, one by key, or the global scope ([22a4abb](https://github.com/MSpiechowicz/harness-useful-memory/commit/22a4abb61b8fdda22fa6e3813e46addebb8c4912))
+
+# [2.3.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.2.0...v2.3.0) (2026-10-19)
+
+
+### Features
+
+* **routing:** remote+local notes and scripts, hide on this computer, push --json ([f37a30e](https://github.com/MSpiechowicz/harness-useful-memory/commit/f37a30e0e8eb7c48a4a36a1d8f9cd4c8ebcbf7c3))
+
 # [2.2.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.1.0...v2.2.0) (2026-10-19)
 
 

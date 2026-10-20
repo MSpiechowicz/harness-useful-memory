@@ -5,12 +5,13 @@
 //! Usage errors exit 2, failures (settings, database) exit 1. A failure ends stderr with the line
 //! that says why (`harness-memory: …`, after any warning), so a caller may show the last line.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use crate::backend::{self, Selection};
 use crate::limits::{LIST_PAGE_DEFAULT, LIST_PAGE_MAX};
 use crate::project::ProjectResolver;
-use crate::store::{ProjectKey, Scope};
+use crate::store::{ProjectKey, Scope, View};
 use crate::support::Env;
 
 /// The options of the lists' paging: `--offset N`, `--limit N`, `--query TEXT`, `--order asc|desc`.
@@ -87,6 +88,24 @@ impl<'a> Args<'a> {
         }
     }
 
+    /// The repositories `--project`, `--repo` and `--all-repos` pick (at most one of them, not
+    /// blank); `Err` otherwise. Without any it is the repository of the working directory.
+    pub(crate) fn repos(&self) -> Result<Repos, ()> {
+        let every = self.flag("--all-repos");
+        let key = self.value("--repo");
+        let project = self.value("--project");
+
+        match (every, key, project) {
+            (true, None, None) => Ok(Repos::Every),
+            // A real key starts with `git:` or `path:`; anything else (`*`, a blank) is no repository.
+            (false, Some(key), None) if key.starts_with("git:") || key.starts_with("path:") => {
+                Ok(Repos::Key(key.to_owned()))
+            }
+            (false, None, _) => self.project().map(Repos::Project),
+            _ => Err(()),
+        }
+    }
+
     /// The scope of `--scope` (`repo` or `global`); `Err` for any other value.
     pub(crate) fn scope(&self) -> Result<Option<Scope>, ()> {
         match self.value("--scope") {
@@ -95,6 +114,45 @@ impl<'a> Args<'a> {
             Some(_) => Err(()),
             None => Ok(None),
         }
+    }
+}
+
+/// The valued options that name the repositories a command reads, with the flag `--all-repos`
+/// (see [`Args::repos`]).
+pub(crate) const PICK_VALUED: [&str; 2] = ["--project", "--repo"];
+
+/// Which repositories a command sees besides the global scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Repos {
+    /// `--project PATH`: the repository of that directory, else of the working directory.
+    Project(Option<String>),
+    /// `--repo KEY`: the repository with that key (`git:host/owner/repo`), wherever it is checked out.
+    Key(String),
+    /// `--all-repos`: every repository.
+    Every,
+}
+
+impl From<Option<&str>> for Repos {
+    fn from(project: Option<&str>) -> Self {
+        Self::Project(project.map(str::to_owned))
+    }
+}
+
+impl Repos {
+    /// The view of the entries this picks and the global ones. `None`, with the reason printed,
+    /// when `--project` names a wrong path.
+    pub(crate) fn view(&self, env: &Env) -> Option<View> {
+        let repo = match self {
+            Self::Project(path) => repository(env, path.as_deref())?,
+            Self::Key(key) => Some(ProjectKey {
+                key: key.clone(),
+                root: PathBuf::new(),
+                remote: None,
+            }),
+            Self::Every => Some(ProjectKey::every()),
+        };
+
+        Some(View { repo, global: true })
     }
 }
 
@@ -147,9 +205,14 @@ impl Page {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Delete {
     /// `delete <id>`.
-    One { id: i64, project: Option<String> },
+    One { id: i64, pick: Repos },
     /// `delete --all --yes [--json]`: every entry the list shows without filters.
-    All { project: Option<String>, json: bool },
+    /// Never of every repository at once; `scope` keeps the repository's own entries or the global ones only.
+    All {
+        pick: Repos,
+        scope: Option<Scope>,
+        json: bool,
+    },
     /// `delete --all` without `--yes`.
     Unconfirmed,
 }
@@ -158,21 +221,23 @@ impl Delete {
     /// The options after `delete`; `None` for anything but one id, or `--all` (with `--yes` and
     /// `--json` when given) and no id.
     pub(crate) fn parse(args: &[Option<&str>]) -> Option<Self> {
-        let parsed = Args::parse(args, &["--all", "--yes", "--json"], &["--project"])?;
-        let project = parsed.project().ok()?;
+        let valued = [&PICK_VALUED[..], &["--scope"]].concat();
+        let parsed = Args::parse(args, &["--all", "--yes", "--json", "--all-repos"], &valued)?;
+        let pick = parsed.repos().ok()?;
+        let scope = parsed.scope().ok()?;
 
         if !parsed.flag("--all") {
             let [id] = parsed.positional[..] else {
                 return None;
             };
 
-            if parsed.flag("--yes") || parsed.flag("--json") {
+            if parsed.flag("--yes") || parsed.flag("--json") || scope.is_some() {
                 return None;
             }
 
             return Some(Self::One {
                 id: id.parse().ok()?,
-                project,
+                pick,
             });
         }
 
@@ -184,10 +249,24 @@ impl Delete {
             return Some(Self::Unconfirmed);
         }
 
+        if pick == Repos::Every {
+            return None;
+        }
+
         Some(Self::All {
-            project,
+            pick,
+            scope,
             json: parsed.flag("--json"),
         })
+    }
+}
+
+/// `view` narrowed to the entries of `scope`: a repository's own, or the global ones.
+pub(crate) fn narrowed(view: View, scope: Option<Scope>) -> View {
+    match scope {
+        Some(Scope::Repo) => View { global: false, ..view },
+        Some(Scope::Global) => View { repo: None, ..view },
+        None => view,
     }
 }
 
@@ -235,14 +314,29 @@ pub(crate) fn deleted_all_keeping(noun: &str, (deleted, team): (usize, usize), k
 
 /// The options of `notes hide|unhide` and `scripts hide|unhide`: `<id> [--project PATH] [--json]`;
 /// `None` for anything else.
-pub(crate) fn id_options(args: &[Option<&str>]) -> Option<(i64, Option<String>, bool)> {
-    let parsed = Args::parse(args, &["--json"], &["--project"])?;
+pub(crate) fn id_options(args: &[Option<&str>]) -> Option<(i64, Repos, bool)> {
+    let parsed = Args::parse(args, &["--json", "--all-repos"], &PICK_VALUED)?;
 
     let [id] = parsed.positional[..] else {
         return None;
     };
 
-    Some((id.parse().ok()?, parsed.project().ok()?, parsed.flag("--json")))
+    Some((id.parse().ok()?, parsed.repos().ok()?, parsed.flag("--json")))
+}
+
+/// The `repos` of `notes repos` and `scripts repos`: each repository key with its label and how
+/// many entries it has, ordered by label (ignoring case).
+pub(crate) fn repos_json(counts: std::collections::BTreeMap<String, usize>) -> Vec<serde_json::Value> {
+    let mut repos: Vec<(String, String, usize)> = counts
+        .into_iter()
+        .map(|(key, count)| (crate::mcp::repo_label(&key).to_lowercase(), key, count))
+        .collect();
+    repos.sort();
+
+    repos
+        .into_iter()
+        .map(|(_, key, count)| serde_json::json!({ "key": key, "label": crate::mcp::repo_label(&key), "count": count }))
+        .collect()
 }
 
 /// Prints `object` with `json`, else `line`.
@@ -342,20 +436,22 @@ mod tests {
             Delete::parse(&args(&["7", "--project", "/w"])),
             Some(Delete::One {
                 id: 7,
-                project: Some("/w".to_owned())
+                pick: Repos::Project(Some("/w".to_owned()))
             })
         );
         assert_eq!(
             Delete::parse(&args(&["--all", "--yes", "--json"])),
             Some(Delete::All {
-                project: None,
+                pick: Repos::Project(None),
+                scope: None,
                 json: true
             })
         );
         assert_eq!(
             Delete::parse(&args(&["--yes", "--all", "--project=/w"])),
             Some(Delete::All {
-                project: Some("/w".to_owned()),
+                pick: Repos::Project(Some("/w".to_owned())),
+                scope: None,
                 json: false
             })
         );

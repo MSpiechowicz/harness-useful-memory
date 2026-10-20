@@ -81,6 +81,26 @@ pub struct ProjectKey {
     pub remote: Option<String>,
 }
 
+impl ProjectKey {
+    /// The key that stands for every repository in a [`View`] ([`View::every_repo`]); a real key
+    /// always starts with `git:` or `path:`, so it never names one.
+    pub const EVERY: &'static str = "*";
+
+    /// The key of [`View::every_repo`]: it only reads, it has no work-tree.
+    pub fn every() -> Self {
+        Self {
+            key: Self::EVERY.to_owned(),
+            root: PathBuf::new(),
+            remote: None,
+        }
+    }
+
+    /// Whether this is [`ProjectKey::every`].
+    pub fn is_every(&self) -> bool {
+        self.key == Self::EVERY
+    }
+}
+
 /// The scope an operation writes to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -100,6 +120,20 @@ pub struct View {
 }
 
 impl View {
+    /// Every repository's notes or scripts and the global ones, to read and to change one by id.
+    /// Backends that do not know it see no repository.
+    pub fn every_repo() -> Self {
+        Self {
+            repo: Some(ProjectKey::every()),
+            global: true,
+        }
+    }
+
+    /// Whether the view reads every repository.
+    pub fn sees_every_repo(&self) -> bool {
+        self.repo.as_ref().is_some_and(ProjectKey::is_every)
+    }
+
     /// The scope `target` writes to, plus the global scope.
     pub fn around(target: &Target) -> Self {
         match target {

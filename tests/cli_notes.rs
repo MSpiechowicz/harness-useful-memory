@@ -257,6 +257,7 @@ fn lists_gets_and_deletes(folders: &Folders, repo_place: &str, global_place: &st
             "title",
             "scope",
             "repo",
+            "repoKey",
             "place",
             "readOnly",
             "hidden",
@@ -472,6 +473,98 @@ fn notes_on_the_local_database() {
 }
 
 #[test]
+fn every_repository_is_read_by_key_or_all_at_once() {
+    let folders = folders();
+    let [flaky, fix, other, tabs] = seed(&folders);
+    let cli = |args: &[&str]| {
+        let output = folders.cli(args);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {}", stderr(&output));
+        serde_json::from_str::<Value>(&stdout(&output)).expect("json")
+    };
+
+    let all = cli(&["notes", "list", "--json", "--all-repos"]);
+    assert_eq!(all["total"], 4);
+    assert_eq!(all["scopes"], json!({ "repo": 3, "global": 1 }));
+
+    let repos = cli(&["notes", "repos", "--json"]);
+    assert_eq!(
+        repos,
+        json!({
+            "repos": [
+                { "key": "git:github.com/acme/gadget", "label": "github.com/acme/gadget", "count": 1 },
+                { "key": "git:github.com/acme/widget", "label": "github.com/acme/widget", "count": 2 },
+            ],
+            "global": 1,
+        })
+    );
+
+    let widget = cli(&[
+        "notes",
+        "list",
+        "--json",
+        "--repo",
+        "git:github.com/acme/widget",
+        "--scope",
+        "repo",
+    ]);
+    assert_eq!(widget["total"], 2);
+    assert_eq!(titles(&widget).len(), 2);
+    assert_eq!(widget["notes"][0]["repoKey"], "git:github.com/acme/widget");
+
+    // A note of another repository is read and deleted by its id when every repository is in view.
+    let note = cli(&["notes", "get", &other.to_string(), "--json", "--all-repos"]);
+    assert_eq!(note["note"]["title"], "Gadget only");
+    assert_eq!(
+        folders
+            .cli(&["notes", "get", &other.to_string(), "--json"])
+            .status
+            .code(),
+        Some(1)
+    );
+    assert_eq!(
+        folders
+            .cli(&["notes", "delete", &fix.to_string(), "--all-repos"])
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(cli(&["notes", "list", "--json", "--all-repos"])["total"], 3);
+
+    // The choices exclude each other, and every repository is never deleted at once.
+    for bad in [
+        &["notes", "list", "--json", "--all-repos", "--project", "/w"][..],
+        &["notes", "list", "--json", "--repo", "git:a/b/c", "--all-repos"],
+        &["notes", "delete", "--all", "--yes", "--all-repos"],
+        // Every repository is not a key: `*` is what the server uses inside, and a key starts with git: or path:.
+        &["notes", "list", "--json", "--repo", "*"],
+        &["notes", "delete", "--all", "--yes", "--repo", "*"],
+        &["scripts", "delete", "--all", "--yes", "--repo", "*"],
+        &["trust", "--all", "--repo", "*"],
+        &["notes", "delete", "7", "--scope", "repo"],
+    ] {
+        assert_eq!(folders.cli(bad).status.code(), Some(2), "{bad:?}");
+    }
+
+    // Deleting all of one repository by its key leaves the global notes, with `--scope repo`.
+    let deleted = cli(&[
+        "notes",
+        "delete",
+        "--all",
+        "--yes",
+        "--json",
+        "--repo",
+        "git:github.com/acme/gadget",
+        "--scope",
+        "repo",
+    ]);
+    assert_eq!(deleted["deleted"], 1);
+    let rest = cli(&["notes", "list", "--json", "--all-repos"]);
+    assert_eq!(rest["scopes"], json!({ "repo": 1, "global": 1 }));
+
+    let _ = (flaky, tabs, other);
+}
+
+#[test]
 fn delete_all_takes_every_page_of_many_notes() {
     let folders = folders();
     let mut store = SqliteStore::open(&folders.data.join("memory.sqlite3")).expect("store");
@@ -599,6 +692,12 @@ fn get_lists_the_notes_linked_through_relations() {
     );
     assert_eq!(shown["note"]["entities"], json!(["auth.rs"]));
     assert_eq!(shown["note"]["hits"], 0, "no hit counted yet");
+
+    // Read among every repository, a note has the links of the repository it lives in.
+    let among_all = folders.json(&["notes", "get", &auth.to_string(), "--json", "--all-repos"]);
+    let mut among_all_links = among_all["links"].as_array().expect("links").clone();
+    among_all_links.sort_by_key(|link| link["id"].as_i64());
+    assert_eq!(among_all_links, links);
 
     let again = folders.json(&["notes", "get", &auth.to_string(), "--json", "--project", &project]);
     assert_eq!(again["note"]["hits"], 0, "showing a note counts no hit");

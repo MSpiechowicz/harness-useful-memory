@@ -24,11 +24,11 @@ use crate::store::{HiddenEntry, Scope, Script, ScriptRef, ScriptStore, ScriptSum
 
 /// `scripts hide <id>`.
 pub(crate) fn hide(args: &[Option<&str>]) -> ExitCode {
-    let Some((id, project, json)) = cli::id_options(args) else {
+    let Some((id, repos, json)) = cli::id_options(args) else {
         return crate::cli_trust::usage();
     };
 
-    let Some(mut opened) = Opened::open(project.as_deref()) else {
+    let Some(mut opened) = Opened::open(&repos) else {
         return ExitCode::FAILURE;
     };
 
@@ -49,11 +49,11 @@ pub(crate) fn hide(args: &[Option<&str>]) -> ExitCode {
 
 /// `scripts unhide <id>`.
 pub(crate) fn unhide(args: &[Option<&str>]) -> ExitCode {
-    let Some((id, project, json)) = cli::id_options(args) else {
+    let Some((id, repos, json)) = cli::id_options(args) else {
         return crate::cli_trust::usage();
     };
 
-    let Some(mut opened) = Opened::open(project.as_deref()) else {
+    let Some(mut opened) = Opened::open(&repos) else {
         return ExitCode::FAILURE;
     };
 
@@ -119,12 +119,16 @@ fn in_view(opened: &mut Opened) -> Vec<HiddenEntry> {
     };
 
     let repo = opened.view.repo.as_ref().map(|key| key.key.as_str());
+    let every = opened.view.sees_every_repo();
 
     hidden
         .list()
         .into_iter()
         .filter(|entry| match entry.scope {
-            Scope::Repo => entry.project.as_deref().is_some_and(|project| Some(project) == repo),
+            Scope::Repo => entry
+                .project
+                .as_deref()
+                .is_some_and(|project| every || Some(project) == repo),
             Scope::Global => opened.view.global,
         })
         .collect()

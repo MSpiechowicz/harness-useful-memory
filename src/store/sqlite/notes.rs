@@ -20,7 +20,8 @@ pub(super) const ROW_COLUMNS: &str = "n.id, n.project_id, p.key, n.kind, n.title
                                       n.created_at, n.updated_at, n.revision, n.hits, n.writer_root, n.via_override";
 
 /// The visibility condition of a view (`?2` the project id, `?3` whether global is visible).
-pub(super) const VISIBLE: &str = "(n.project_id = ?2 OR (?3 AND n.project_id IS NULL))";
+pub(super) const VISIBLE: &str =
+    "(n.project_id = ?2 OR (?2 = -1 AND n.project_id IS NOT NULL) OR (?3 AND n.project_id IS NULL))";
 
 pub(super) fn remember(db: &mut dyn Sql, target: &Target, draft: &CleanDraft) -> Result<Saved, StoreError> {
     let project = target_project(db, target)?;

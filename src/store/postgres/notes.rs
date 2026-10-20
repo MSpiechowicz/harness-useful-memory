@@ -37,7 +37,7 @@ fn columns(body: &str) -> String {
 }
 
 /// The visibility condition of a view (`$2` the project id, `$3` whether global is visible).
-pub(super) const VISIBLE: &str = "(n.project_id = $2::bigint OR ($3::boolean AND n.project_id IS NULL))";
+pub(super) const VISIBLE: &str = "(n.project_id = $2::bigint OR ($2::bigint = -1 AND n.project_id IS NOT NULL) OR ($3::boolean AND n.project_id IS NULL))";
 
 pub(super) fn remember(tx: &mut Transaction<'_>, target: &Target, draft: &CleanDraft) -> Result<Saved, StoreError> {
     let project = target_project(tx, target)?;

@@ -28,7 +28,7 @@ const LANGUAGE_MAX: usize = 16;
 const FROM: &str = "FROM scripts s LEFT JOIN projects p ON p.id = s.project_id";
 
 /// The visibility condition of a view (`?1` the project id, `?2` whether global is visible).
-const VISIBLE: &str = "(s.project_id = ?1 OR (?2 AND s.project_id IS NULL))";
+const VISIBLE: &str = "(s.project_id = ?1 OR (?1 = -1 AND s.project_id IS NOT NULL) OR (?2 AND s.project_id IS NULL))";
 
 /// The columns [`stored_from_row`] reads, text cut one character over its limit and the timeout
 /// read as an integer whatever was stored, so a row changed by hand cannot make a reply of any

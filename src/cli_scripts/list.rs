@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use super::{Opened, hidden};
 use crate::backend::Place;
-use crate::cli::{Args, PAGE_OPTIONS, Page};
+use crate::cli::{Args, PAGE_OPTIONS, PICK_VALUED, Page, Repos};
 use crate::cli_trust::usage;
 use crate::limits::QUERY_MAX;
 use crate::mcp::Approval;
@@ -19,7 +19,7 @@ pub(crate) fn list(args: &[Option<&str>]) -> ExitCode {
         return usage();
     };
 
-    let Some(mut opened) = Opened::open(options.project.as_deref()) else {
+    let Some(mut opened) = Opened::open(&options.repos) else {
         return ExitCode::FAILURE;
     };
 
@@ -116,7 +116,7 @@ pub(crate) struct ListOptions {
     review: Option<Review>,
     /// `--hidden`: the hidden team scripts instead of the visible ones.
     hidden: bool,
-    project: Option<String>,
+    repos: Repos,
     sort: ScriptSort,
     descending: bool,
     page: Page,
@@ -262,10 +262,11 @@ impl Review {
 fn parse_list(args: &[Option<&str>]) -> Option<ListOptions> {
     let valued = [
         &PAGE_OPTIONS[..],
-        &["--project", "--group", "--scope", "--review", "--sort"],
+        &PICK_VALUED[..],
+        &["--group", "--scope", "--review", "--sort"],
     ]
     .concat();
-    let parsed = Args::parse(args, &["--json", "--untrusted", "--hidden"], &valued)?;
+    let parsed = Args::parse(args, &["--json", "--untrusted", "--hidden", "--all-repos"], &valued)?;
 
     if parsed.positional != ["list"] || !parsed.flag("--json") {
         return None;
@@ -300,7 +301,7 @@ fn parse_list(args: &[Option<&str>]) -> Option<ListOptions> {
         scope,
         review,
         hidden: parsed.flag("--hidden"),
-        project: parsed.project().ok()?,
+        repos: parsed.repos().ok()?,
         sort,
         descending: page.descending.unwrap_or(sort == ScriptSort::Updated),
         page,
@@ -320,7 +321,7 @@ mod tests {
         let parsed = parse_list(&args(&["list", "--json", "--project", "/w", "--untrusted"])).expect("valid");
         assert_eq!(parsed.group, Some(Group::NeedsReview));
         assert_eq!((parsed.sort, parsed.descending), (ScriptSort::Name, false));
-        assert_eq!(parsed.project.as_deref(), Some("/w"));
+        assert_eq!(parsed.repos, Repos::Project(Some("/w".to_owned())));
 
         for (raw, sort) in [
             ("language", ScriptSort::Language),
@@ -348,9 +349,20 @@ mod tests {
         assert_eq!(
             parse_list(&args(&["list", "--json", "--project=/w"]))
                 .expect("valid")
-                .project
-                .as_deref(),
-            Some("/w")
+                .repos,
+            Repos::Project(Some("/w".to_owned()))
+        );
+        assert_eq!(
+            parse_list(&args(&["list", "--json", "--all-repos"]))
+                .expect("valid")
+                .repos,
+            Repos::Every
+        );
+        assert_eq!(
+            parse_list(&args(&["list", "--json", "--repo", "git:h/o/r"]))
+                .expect("valid")
+                .repos,
+            Repos::Key("git:h/o/r".to_owned())
         );
 
         for bad in [
@@ -360,6 +372,9 @@ mod tests {
             &["list", "--json", "--json"],
             &["list", "--json", "--project"],
             &["list", "--json", "--project", "/a", "--project", "/b"],
+            &["list", "--json", "--all-repos", "--project", "/a"],
+            &["list", "--json", "--repo", "git:h/o/r", "--all-repos"],
+            &["list", "--json", "--repo", " "],
             &["list", "--json", "--yaml"],
             &["list", "--json", "--untrusted", "--group", "repo"],
             &["list", "--json", "--untrusted", "--scope", "repo"],
