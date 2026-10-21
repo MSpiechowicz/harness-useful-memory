@@ -421,7 +421,8 @@ fn deleting_mine_keeps_the_other_authors_routines() {
 
         let listed = theirs.ok(&["routines", "list", "--json", "--limit", "200"], None);
         assert_eq!(listed["total"], 2);
-        assert_eq!(listed["routines"][0], kept);
+        // Listed oldest first: the two may be saved in different seconds, so the kept one is found, not assumed first.
+        assert!(listed["routines"].as_array().unwrap().contains(&kept), "{listed}");
 
         assert_eq!(
             mine.ok(
