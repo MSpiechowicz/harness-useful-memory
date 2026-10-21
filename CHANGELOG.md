@@ -1,3 +1,15 @@
+# [2.6.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.5.0...v2.6.0) (2026-10-21)
+
+
+### Bug Fixes
+
+* **deps:** update rustls-webpki to 0.103.16 and webpki-roots to 1.0.10 for RUSTSEC-2026-0381 and RUSTSEC-2026-0382 ([6044e02](https://github.com/MSpiechowicz/harness-useful-memory/commit/6044e0242013c53c5389327fdfe418e4774738d5))
+
+
+### Features
+
+* **cli:** filter notes and scripts lists by place and count each place ([67d918a](https://github.com/MSpiechowicz/harness-useful-memory/commit/67d918a6c3c38773d1215a965757b3a8df3b9b26))
+
 # [2.5.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.4.0...v2.5.0) (2026-10-20)
 
 
