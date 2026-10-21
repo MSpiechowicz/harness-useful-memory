@@ -42,7 +42,7 @@ pub(super) fn script_save() -> Value {
             },
             "project_path": project_path(),
         }),
-        &["name", "description", "language", "body"],
+        &["name", "description", "language", "body", "project_path"],
     );
 
     // Saving replaces a script with the same name.

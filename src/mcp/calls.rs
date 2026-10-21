@@ -11,13 +11,14 @@ use crate::limits::{
     DEPTH_MAX, GET_REPLY_MAX, LIST_REPLY_MAX, NEIGHBORS_LIMIT_DEFAULT, SEARCH_LIMIT_DEFAULT, SIMILAR_MAX,
 };
 use crate::store::{
-    Forget, Link, NoteDraft, NoteKind, NoteOrigin, NotePatch, Provenance, SearchQuery, Target, View, clean,
+    Forget, Link, NoteDraft, NoteKind, NoteOrigin, NotePatch, ProjectKey, Provenance, SearchQuery, Target, View, clean,
 };
 
 /// Sent when a repository-scope call has no repository.
 pub(super) const NO_PROJECT: &str = "cannot tell which repository this is (the server runs outside one, or in the home folder \
-                          or a filesystem root): pass project_path with the absolute repository path, or use \
-                          scope \"global\"";
+                          or a filesystem root). Retry the same call with the argument project_path set to the absolute \
+                          path of the repository you are working in (its git root, e.g. \"/Users/me/work/repo\"), or with \
+                          scope \"global\" for knowledge that belongs to no repository";
 
 /// Sent when `same_checkout` is asked for outside a checkout.
 const NO_CHECKOUT: &str = "same_checkout needs the server to run inside a repository checkout";
@@ -409,7 +410,9 @@ fn forget_with(server: &mut Server, view: &View, target: &Target, what: &Forget)
 
 /// Parses tool arguments; serde's message names the offending field.
 pub(super) fn parse<T: DeserializeOwned>(arguments: Value) -> Result<T, String> {
-    serde_json::from_value(arguments).map_err(|error| format!("invalid arguments: {error}"))
+    serde_json::from_value(arguments).map_err(|error| {
+        format!("invalid arguments: {error}. Check the tool's input schema in tools/list for the required fields")
+    })
 }
 
 fn kind(raw: &str) -> Result<NoteKind, String> {
@@ -431,12 +434,23 @@ fn scope_arg<'a>(raw: Option<&'a str>, default: &'a str) -> Result<&'a str, Stri
 pub(super) fn target(server: &mut Server, scope: Option<&str>, project_path: Option<&str>) -> Result<Target, String> {
     match scope_arg(scope, "repo")? {
         "global" => Ok(Target::Global),
-        "repo" => match server.projects.resolve(project_path)? {
+        "repo" => match resolve(server, project_path)? {
             Some(key) => Ok(Target::Repo(key)),
             None => Err(NO_PROJECT.to_owned()),
         },
         _ => Err("scope must be repo or global here".to_owned()),
     }
+}
+
+/// `Projects::resolve`, with the fix added to a refused `project_path`.
+fn resolve(server: &mut Server, project_path: Option<&str>) -> Result<Option<ProjectKey>, String> {
+    server.projects.resolve(project_path).map_err(|reason| {
+        format!(
+            "{reason} (got {:?}). Pass project_path as the absolute path of the repository you are working in \
+             (its git root, e.g. \"/Users/me/work/repo\"), or use scope \"global\"",
+            project_path.unwrap_or_default()
+        )
+    })
 }
 
 /// What a read may see (default: this repository, when known, and the global scope).
@@ -446,7 +460,7 @@ fn view(server: &mut Server, scope: Option<&str>, project_path: Option<&str>) ->
             repo: None,
             global: true,
         }),
-        "repo" => match server.projects.resolve(project_path)? {
+        "repo" => match resolve(server, project_path)? {
             Some(key) => Ok(View {
                 repo: Some(key),
                 global: false,
@@ -454,7 +468,7 @@ fn view(server: &mut Server, scope: Option<&str>, project_path: Option<&str>) ->
             None => Err(NO_PROJECT.to_owned()),
         },
         _ => Ok(View {
-            repo: server.projects.resolve(project_path)?,
+            repo: resolve(server, project_path)?,
             global: true,
         }),
     }
