@@ -1,3 +1,10 @@
+## [2.6.1](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.6.0...v2.6.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* **mcp:** require project_path on saves and make repository errors say how to fix the call ([cad8b90](https://github.com/MSpiechowicz/harness-useful-memory/commit/cad8b900a8b1c1c14c6f19b9951120eb6bc37d4d))
+
 # [2.6.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.5.0...v2.6.0) (2026-10-21)
 
 
