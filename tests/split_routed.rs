@@ -12,10 +12,10 @@ mod postgres_support;
 use std::path::PathBuf;
 
 use common::{both, draft, global_only, query, repo, repo_only};
-use harness_memory::backend::NotesPlace;
+use harness_memory::backend::{NotesPlace, Place};
 use harness_memory::store::split::LOCAL_ID_OFFSET;
 use harness_memory::store::{
-    Forget, HiddenNotes, Link, MemoryStore, NoteKind, NoteListQuery, NoteOrigin, NotePatch, NoteSort, Scope,
+    Forget, HiddenNotes, Link, MemoryStore, NoteKind, NoteListQuery, NoteOrigin, NotePage, NotePatch, NoteSort, Scope,
     SplitStore, SqliteStore, StoreError, Target, View,
 };
 use pretty_assertions::assert_eq;
@@ -96,9 +96,10 @@ impl Fixture {
 
 type Case = fn(&Fixture);
 
-const CASES: [Case; 10] = [
+const CASES: [Case; 11] = [
     remote_local_reads_both_and_saves_here,
     pages_merge_both_stores_in_order,
+    a_place_lists_its_store_and_counts_both,
     team_notes_of_a_remote_local_scope_are_read_only,
     hidden_team_notes_are_left_out_of_every_read,
     similar_notes_come_from_both_stores_in_a_remote_local_scope,
@@ -148,6 +149,7 @@ fn listing(view: View) -> NoteListQuery {
         text: String::new(),
         kind: None,
         scope: None,
+        place: None,
         entity: None,
         sort: NoteSort::Updated,
         descending: true,
@@ -291,6 +293,142 @@ fn pages_merge_both_stores_in_order(fixture: &Fixture) {
         places,
         [false, false, false, false, true, true, true],
         "team first, descending"
+    );
+}
+
+fn a_place_lists_its_store_and_counts_both(fixture: &Fixture) {
+    let mut team = fixture.team.open();
+
+    for index in 0..4 {
+        team.remember(
+            &repo(REPO),
+            &draft(&format!("Team {index}"), "team body", NoteKind::Note),
+        )
+        .expect("team note");
+    }
+
+    let hidden = team
+        .remember(&repo(REPO), &draft("Team hidden", "hidden body", NoteKind::Note))
+        .expect("hidden team note");
+    team.remember(&Target::Global, &draft("Team rule", "global body", NoteKind::Decision))
+        .expect("team global note");
+    fixture.hide(&repo_only(REPO), hidden.id);
+
+    let mut split = fixture.routed(NotesPlace::RemoteLocal, NotesPlace::Remote);
+
+    for index in 0..3 {
+        split
+            .remember(
+                &repo(REPO),
+                &draft(&format!("Local {index}"), "local body", NoteKind::Fix),
+            )
+            .expect("local note");
+    }
+
+    let by_title = |place: Option<Place>| NoteListQuery {
+        sort: NoteSort::Title,
+        descending: false,
+        place,
+        ..listing(both(REPO))
+    };
+    let counts = [(Place::Local, 3), (Place::Remote, 5)];
+    let kind_count = |page: &NotePage, kind: NoteKind| {
+        page.kinds
+            .iter()
+            .find(|(listed, _)| *listed == kind)
+            .map(|(_, count)| *count)
+    };
+
+    let every = split.list_notes(&by_title(None)).expect("every note");
+    assert_eq!(every.total, 8);
+    assert_eq!(every.places, counts, "the hidden team note is not counted");
+
+    let team_notes = split.list_notes(&by_title(Some(Place::Remote))).expect("team notes");
+    let team_titles: Vec<String> = team_notes.rows.iter().map(|row| row.title.clone()).collect();
+    assert_eq!(team_titles, ["Team 0", "Team 1", "Team 2", "Team 3", "Team rule"]);
+    assert!(team_notes.rows.iter().all(|row| row.id < LOCAL_ID_OFFSET));
+    assert_eq!(team_notes.total, 5, "the total follows the place");
+    assert_eq!(team_notes.places, counts, "the place counts ignore the place");
+    assert_eq!(team_notes.scopes, [(Scope::Repo, 4), (Scope::Global, 1)]);
+    assert_eq!(
+        (
+            kind_count(&team_notes, NoteKind::Note),
+            kind_count(&team_notes, NoteKind::Decision),
+            kind_count(&team_notes, NoteKind::Fix)
+        ),
+        (Some(4), Some(1), Some(0)),
+        "the kind counts follow the place"
+    );
+
+    let mine = split.list_notes(&by_title(Some(Place::Local))).expect("local notes");
+    assert_eq!(
+        listed_titles(&mut split, &by_title(Some(Place::Local))),
+        ["Local 0", "Local 1", "Local 2"]
+    );
+    assert!(mine.rows.iter().all(|row| row.id >= LOCAL_ID_OFFSET));
+    assert_eq!(mine.total, 3);
+    assert_eq!(mine.places, counts);
+    assert_eq!(mine.scopes, [(Scope::Repo, 3), (Scope::Global, 0)]);
+
+    let mut paged: Vec<String> = Vec::new();
+
+    for offset in (0..5).step_by(2) {
+        let page = split
+            .list_notes(&NoteListQuery {
+                offset,
+                limit: 2,
+                ..by_title(Some(Place::Remote))
+            })
+            .expect("page");
+        assert_eq!(
+            (page.total, page.places.clone()),
+            (5, counts.to_vec()),
+            "offset {offset}"
+        );
+        paged.extend(page.rows.into_iter().map(|row| row.title));
+    }
+
+    assert_eq!(paged, team_titles, "the pages of one place follow on");
+
+    let team_fixes = split
+        .list_notes(&NoteListQuery {
+            kind: Some(NoteKind::Fix),
+            ..by_title(Some(Place::Remote))
+        })
+        .expect("team fixes");
+    assert_eq!((team_fixes.total, team_fixes.rows.len()), (0, 0));
+    assert_eq!(
+        team_fixes.places,
+        [(Place::Local, 3), (Place::Remote, 0)],
+        "the place counts follow the kind"
+    );
+
+    let global = split
+        .list_notes(&NoteListQuery {
+            scope: Some(Scope::Global),
+            ..by_title(Some(Place::Local))
+        })
+        .expect("local global notes");
+    assert_eq!((global.total, global.rows.len()), (0, 0));
+    assert_eq!(
+        global.places,
+        [(Place::Local, 0), (Place::Remote, 1)],
+        "the place counts follow the scope"
+    );
+
+    // Only the team database is read: every note is a team note.
+    let mut remote = fixture.routed(NotesPlace::Remote, NotesPlace::Remote);
+    let elsewhere = remote
+        .list_notes(&by_title(Some(Place::Local)))
+        .expect("no local notes");
+    assert_eq!((elsewhere.total, elsewhere.rows.len()), (0, 0));
+    assert_eq!(elsewhere.places, [(Place::Local, 0), (Place::Remote, 5)]);
+    assert_eq!(elsewhere.scopes, [(Scope::Repo, 0), (Scope::Global, 0)]);
+
+    let read = remote.list_notes(&by_title(Some(Place::Remote))).expect("team notes");
+    assert_eq!(
+        (read.total, read.places),
+        (5, vec![(Place::Local, 0), (Place::Remote, 5)])
     );
 }
 

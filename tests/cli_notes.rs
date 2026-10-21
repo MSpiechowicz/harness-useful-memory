@@ -216,11 +216,19 @@ fn lists_gets_and_deletes(folders: &Folders, repo_place: &str, global_place: &st
     let keys: Vec<&String> = listing.as_object().expect("object").keys().collect();
 
     if folders.team.is_empty() {
-        assert_eq!(keys, ["total", "kinds", "scopes", "notes"]);
+        assert_eq!(keys, ["total", "kinds", "scopes", "places", "notes"]);
     } else {
         assert_eq!(
             keys,
-            ["total", "kinds", "scopes", "notes", "hiddenCount", "localCounts"],
+            [
+                "total",
+                "kinds",
+                "scopes",
+                "places",
+                "notes",
+                "hiddenCount",
+                "localCounts"
+            ],
             "a team database adds the hidden and local counts"
         );
         assert_eq!(listing["hiddenCount"], 0);
@@ -320,6 +328,7 @@ fn lists_gets_and_deletes(folders: &Folders, repo_place: &str, global_place: &st
     assert_eq!(fixes["scopes"], json!({ "repo": 1, "global": 0 }));
 
     filters_combine(folders);
+    places_filter(folders, repo_place, global_place);
 
     let project = folders.widget_project();
     let shown = folders.json(&["notes", "get", &fix.to_string(), "--json", "--project", &project]);
@@ -425,6 +434,75 @@ fn filters_combine(folders: &Folders) {
     let global = folders.json(&["notes", "list", "--json", "--scope", "repo"]);
     assert_eq!(global["total"], 0, "without --project no repository notes");
     assert_eq!(global["scopes"], json!({ "repo": 0, "global": 1 }));
+}
+
+/// Checks `--place` on the widget notes [`seed`] wrote, `repo_place` and `global_place` being where
+/// each scope is kept: the page and the total follow the place, the counts per place every other
+/// filter. A lone store asked for the place it does not keep lists nothing.
+fn places_filter(folders: &Folders, repo_place: &str, global_place: &str) {
+    let of = |place: &str| -> Vec<&str> {
+        [
+            ("Editor tabs", global_place),
+            ("Flaky test", repo_place),
+            ("Raise the timeout", repo_place),
+        ]
+        .into_iter()
+        .filter(|(_, at)| *at == place)
+        .map(|(title, _)| title)
+        .collect()
+    };
+    let counts = json!({ "local": of("local").len(), "team": of("team").len() });
+
+    assert_eq!(folders.widget_list(&[])["places"], counts);
+
+    for place in ["local", "team"] {
+        let listing = folders.widget_list(&["--place", place, "--sort", "title"]);
+        assert_eq!(titles(&listing), of(place), "{place}");
+        assert_eq!(
+            listing["total"],
+            of(place).len(),
+            "{place}: the total follows the place"
+        );
+        assert_eq!(listing["places"], counts, "{place}: the place counts ignore the place");
+        assert!(
+            listing["notes"]
+                .as_array()
+                .expect("notes")
+                .iter()
+                .all(|note| note["place"] == place),
+            "{place}"
+        );
+
+        let repo_count = if repo_place == place { 2 } else { 0 };
+        let global_count = usize::from(global_place == place);
+        assert_eq!(
+            listing["scopes"],
+            json!({ "repo": repo_count, "global": global_count }),
+            "{place}: the scope counts follow the place"
+        );
+        assert_eq!(kind_count(&listing, "fix"), repo_count / 2, "{place}");
+
+        let paged = folders.widget_list(&["--place", place, "--sort", "title", "--offset", "1", "--limit", "1"]);
+        assert_eq!(titles(&paged), of(place).get(1..2).unwrap_or_default(), "{place}");
+        assert_eq!(paged["total"], of(place).len(), "{place}");
+    }
+
+    let fixes = folders.widget_list(&["--kind", "fix", "--place", repo_place]);
+    assert_eq!(titles(&fixes), ["Raise the timeout"]);
+    let local_fixes = usize::from(repo_place == "local");
+    assert_eq!(
+        fixes["places"],
+        json!({ "local": local_fixes, "team": 1 - local_fixes }),
+        "the place counts follow the kind"
+    );
+
+    let global = folders.json(&["notes", "list", "--json", "--place", global_place]);
+    assert_eq!(titles(&global), ["Editor tabs"]);
+    let local_global = usize::from(global_place == "local");
+    assert_eq!(
+        global["places"],
+        json!({ "local": local_global, "team": 1 - local_global })
+    );
 }
 
 /// Checks `notes delete --all` on notes [`seed`] wrote; `repo_team` and `global_team` say whether
@@ -778,6 +856,10 @@ fn bad_usage_exits_2() {
         &["notes", "list", "--json", "--scope", ""],
         &["notes", "list", "--json", "--scope"],
         &["notes", "list", "--json", "--scope", "repo", "--scope", "global"],
+        &["notes", "list", "--json", "--place", "remote"],
+        &["notes", "list", "--json", "--place", "Local"],
+        &["notes", "list", "--json", "--place"],
+        &["notes", "list", "--json", "--place", "local", "--place", "local"],
         &["notes", "get", "1"],
         &["notes", "get", "x", "--json"],
         &["notes", "delete"],
@@ -942,6 +1024,24 @@ fn reads_both_hides_and_keeps(url: &str) {
     let only_hidden = folders.widget_list(&["--hidden"]);
     assert_eq!(titles(&only_hidden), ["Team deploy"]);
     assert_eq!(only_hidden["total"], 1);
+    assert_eq!(
+        only_hidden["places"],
+        json!({ "local": 0, "team": 1 }),
+        "hidden notes are team notes"
+    );
+
+    let hidden_here = folders.widget_list(&["--hidden", "--place", "local"]);
+    assert_eq!(
+        (hidden_here["total"].clone(), titles(&hidden_here).len()),
+        (json!(0), 0)
+    );
+    assert_eq!(hidden_here["places"], json!({ "local": 0, "team": 1 }));
+
+    let team_side = folders.widget_list(&["--place", "team"]);
+    assert_eq!(titles(&team_side), ["Team tabs"], "the hidden team note stays out");
+    assert_eq!(team_side["total"], 1);
+    assert_eq!(team_side["places"], json!({ "local": 1, "team": 1 }));
+    assert_eq!(team_side["hiddenCount"], 1);
     assert_eq!(
         (
             row(&only_hidden, "Team deploy")["hidden"].clone(),

@@ -34,15 +34,15 @@ use serde_json::{Value, json};
 const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--overwrite none|all|ID[,ID...]|-] \
                      [--delete-copied] [--scope repo|global] [--repo <key|.>] [--no-global] | check | kinds | features \
                      | scripts list --json [--project PATH | --repo KEY | --all-repos] [--group needsReview|repo|global] [--scope repo|global] \
-                     [--review needed|trusted] [--query TEXT] [--sort name|language|scope|place|runs|lastRun|updated] \
+                     [--place local|team] [--review needed|trusted] [--query TEXT] [--sort name|language|scope|place|runs|lastRun|updated] \
                      [--order asc|desc] [--offset N] [--limit N] [--hidden] | scripts get <id> --json [--project PATH | --repo KEY | --all-repos] \
                      [--hidden] | scripts hide <id> [--project PATH | --repo KEY | --all-repos] [--json] | scripts unhide <id> [--project PATH | --repo KEY | --all-repos] \
                      [--json] | scripts delete <id> [--project PATH | --repo KEY | --all-repos] | scripts delete --all --yes [--project PATH | --repo KEY] \
                      [--json] | scripts discard-local (--all | ID[,ID...] | -) [--scope repo|global] --yes [--json] | \
                      scripts push [--dry-run] [--json] [--overwrite none|all|ID[,ID...]|-] [--delete-copied] [--scope \
                      repo|global] [--repo <key|.>] [--no-global] | trust <id>[=<sha256>]... [--repo KEY | --all-repos] | --all [--project PATH | --repo KEY] \
-                     | notes list --json [--project PATH | --repo KEY | --all-repos] [--kind KIND] [--scope repo|global] [--query TEXT] [--sort \
-                     updated|title|kind|scope|place] [--order asc|desc] [--offset N] [--limit N] [--hidden] | notes \
+                     | notes list --json [--project PATH | --repo KEY | --all-repos] [--kind KIND] [--scope repo|global] \
+                     [--place local|team] [--query TEXT] [--sort updated|title|kind|scope|place] [--order asc|desc] [--offset N] [--limit N] [--hidden] | notes \
                      get <id> --json [--project PATH | --repo KEY | --all-repos] [--hidden] | notes hide <id> [--project PATH | --repo KEY | --all-repos] [--json] | notes \
                      unhide <id> [--project PATH | --repo KEY | --all-repos] [--json] | notes delete <id> [--project PATH | --repo KEY | --all-repos] | notes delete --all \
                      --yes [--project PATH | --repo KEY] [--json] | notes repos --json | scripts repos --json | notes discard-local (--all | ID[,ID...] | -) [--scope \

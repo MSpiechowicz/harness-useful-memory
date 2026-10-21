@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crate::backend::{self, Selection};
+use crate::backend::{self, Place, Selection};
 use crate::limits::{LIST_PAGE_DEFAULT, LIST_PAGE_MAX};
 use crate::project::ProjectResolver;
 use crate::store::{ProjectKey, Scope, View};
@@ -111,6 +111,17 @@ impl<'a> Args<'a> {
         match self.value("--scope") {
             Some("repo") => Ok(Some(Scope::Repo)),
             Some("global") => Ok(Some(Scope::Global)),
+            Some(_) => Err(()),
+            None => Ok(None),
+        }
+    }
+
+    /// The place of `--place` (`local`: this computer's file, `team`: the team database); `Err`
+    /// for any other value.
+    pub(crate) fn place(&self) -> Result<Option<Place>, ()> {
+        match self.value("--place") {
+            Some("local") => Ok(Some(Place::Local)),
+            Some("team") => Ok(Some(Place::Remote)),
             Some(_) => Err(()),
             None => Ok(None),
         }

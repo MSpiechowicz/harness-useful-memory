@@ -272,8 +272,9 @@ A script a teammate saved in the team database, or one whose body or language ch
   that line.
 
   `scripts list --json` prints one page, `{"total", "groups": {"needsReview", "repo", "global"}, "scopes": {"repo",
-  "global"}, "review": {"needed", "trusted"}, "scripts"}`, and takes `--group needsReview|repo|global` (`--untrusted`
-  is `--group needsReview`), `--scope repo|global`, `--review needed|trusted`, `--query TEXT` (name or description,
+  "global"}, "review": {"needed", "trusted"}, "places": {"local", "team"}, "scripts"}`, and takes `--group
+  needsReview|repo|global` (`--untrusted` is `--group needsReview`), `--scope repo|global`, `--place local|team` (kept
+  on this computer or in the team database), `--review needed|trusted`, `--query TEXT` (name or description,
   ignoring case), `--sort name|language|scope|place|runs|lastRun|updated`, `--order asc|desc`, `--offset N` and
   `--limit N` (1 to 200, 50 by default). Each script has `place` (`team` or `local`: where it is kept), `readOnly` (a
   team script while `scripts = "remote+local"`) and `hidden` (hidden on this computer). With a team database the object
@@ -284,8 +285,9 @@ A script a teammate saved in the team database, or one whose body or language ch
   The groups do not overlap: `needsReview` holds every script that needs approval, `repo` and `global` the other
   scripts of that scope. `--scope` keeps the scripts of one scope, `--review needed` the ones that need approval (the
   `needsReview` group) and `--review trusted` every other one. `--scope` and `--review` combine with each other but not
-  with `--group` (that is a usage error). The group counts follow `--query`, the `scopes` counts follow `--query` and
-  `--review`, the `review` counts follow `--query` and `--scope`, and `total` follows every filter. By name (A to Z,
+  with `--group` (that is a usage error). `--place` combines with every filter. The group counts follow `--query` and
+  `--place`, the `scopes` counts follow `--query`, `--review` and `--place`, the `review` counts follow `--query`,
+  `--scope` and `--place`, the `places` counts follow every filter but `--place`, and `total` follows every filter. By name (A to Z,
   repository scripts first on a tie) unless `--sort updated` (newest first), `language`, `scope` (global scripts
   first), `place` (this computer's first, then by id), `runs` (the run count) or `lastRun` (a script
   never run comes last whichever the order), all ascending. `--order` turns any round, and ties go by id. Approval is
@@ -342,10 +344,11 @@ repository's notes and the global ones; `delete --all` refuses it). Each note ha
 repositories that have entries, by label, and how many global ones there are.
 
 - `notes list --json` prints one page, `{"total", "kinds": [{"kind", "count"}], "scopes": {"repo", "global"},
-  "notes"}`. `--query TEXT` keeps the notes whose title, body or tags contain it, ignoring case (on SQLite and libSQL
-  only ASCII letters are folded), `--kind KIND` one kind, `--scope repo|global` one scope, and they combine. `kinds`
-  counts every kind under `--query` and `--scope`, `scopes` counts both scopes under `--query` and `--kind`, and
-  `total` follows all three. Newest
+  "places": {"local", "team"}, "notes"}`. `--query TEXT` keeps the notes whose title, body or tags contain it,
+  ignoring case (on SQLite and libSQL only ASCII letters are folded), `--kind KIND` one kind, `--scope repo|global`
+  one scope, `--place local|team` the notes kept on this computer or in the team database, and they combine. `kinds`
+  counts every kind under the other filters, `scopes` both scopes under the other filters, `places` both places
+  under the other filters, and `total` follows all four. Newest
   first unless `--sort title` (A to Z), `kind` (by kind name), `scope` (global notes first) or `place` (notes kept on
   this computer first), all ascending. `--order asc|desc` turns any round and ties go by id, `--offset N` and
   `--limit N` (1 to 200, 50 by default) pick the page. The database filters, sorts and cuts the page, and leaves the bodies there. A note

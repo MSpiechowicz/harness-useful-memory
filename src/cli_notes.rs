@@ -6,15 +6,17 @@
 //! hidden on this computer are left out as they are for the agent.
 //!
 //! - `harness-memory notes list --json [--project PATH | --repo KEY | --all-repos] [--kind KIND] [--scope repo|global]
-//!   [--query TEXT] [--sort updated|title|kind|scope|place] [--order asc|desc] [--offset N]
-//!   [--limit N]` prints `{"total": N, "kinds": [{"kind", "count"}], "scopes": {"repo": N,
-//!   "global": N}, "notes": [...]}`: one page of the notes (see [`crate::store::listing`] for the
-//!   matching and the order). `--query` keeps the notes whose title, body or tags contain it,
-//!   ignoring case, `--kind` the notes of one kind, `--scope` those of one scope. Each filter
-//!   combines with the others: the counts per kind (every kind, in the order the tool schemas list
-//!   them) follow `--query` and `--scope`, the counts per scope follow `--query` and `--kind`, the
-//!   total follows all three. Newest first unless `--sort title` (A to Z), `kind` (by kind name),
-//!   `scope` (global notes first) or `place` (notes on this computer first), all ascending;
+//!   [--place local|team] [--query TEXT] [--sort updated|title|kind|scope|place] [--order asc|desc]
+//!   [--offset N] [--limit N]` prints `{"total": N, "kinds": [{"kind", "count"}], "scopes":
+//!   {"repo": N, "global": N}, "places": {"local": N, "team": N}, "notes": [...]}`: one page of the
+//!   notes (see [`crate::store::listing`] for the matching and the order). `--query` keeps the
+//!   notes whose title, body or tags contain it, ignoring case, `--kind` the notes of one kind,
+//!   `--scope` those of one scope, `--place` those kept in one place (`local`: this computer's
+//!   file, `team`: the team database). Each filter combines with the others: the counts per kind
+//!   (every kind, in the order the tool schemas list them) follow every filter but `--kind`, the
+//!   counts per scope every filter but `--scope`, the counts per place every filter but
+//!   `--place`, the total all four. Newest first unless `--sort title` (A to Z), `kind` (by kind
+//!   name), `scope` (global notes first) or `place` (notes on this computer first), all ascending;
 //!   `--order` turns any round, ties go by id. `--limit` is 1 to 200, 50 when not given. A note
 //!   object has `id`, `kind`, `title`, `scope` (`repo` or `global`), `repo`
 //!   (`github.com/o/r`, a `path:` key whole, `null` for a global note), `place` (`team` or
@@ -68,15 +70,15 @@ use crate::backend::{Backend, NotesPlace, Place, Secrets, Selection};
 use crate::cli::{self, Args, Delete, PAGE_OPTIONS, PICK_VALUED, Page, Repos};
 use crate::limits::{LIST_PAGE_MAX, NEIGHBORS_LIMIT_MAX};
 use crate::mcp::{author_json, place_label, repo_label};
-use crate::open::{notes_place, open_hidden, open_notes};
+use crate::open::{lone_notes_place, notes_place, open_hidden, open_notes};
 use crate::store::{Forget, HiddenNotes, MemoryStore, Note, NoteKind, NoteListQuery, NoteOrigin, NoteRow, NoteSort};
 use crate::store::{ProjectKey, Scope, SqliteStore, StoreError, Target, View, clean};
 use crate::support::Env;
 use crate::support::time::rfc3339;
 
 /// The usage of these commands, for the executable's usage line.
-pub const USAGE: &str = "notes list --json [--project PATH | --repo KEY | --all-repos] [--kind KIND] [--scope repo|global] [--query TEXT] \
-                         [--sort updated|title|kind|scope|place] [--order asc|desc] [--offset N] [--limit N] \
+pub const USAGE: &str = "notes list --json [--project PATH | --repo KEY | --all-repos] [--kind KIND] [--scope repo|global] \
+                         [--place local|team] [--query TEXT] [--sort updated|title|kind|scope|place] [--order asc|desc] [--offset N] [--limit N] \
                          [--hidden] | notes repos --json | notes repos --json | notes get <id> --json [--project PATH | --repo KEY | --all-repos] [--hidden] | notes hide <id> \
                          [--project PATH | --repo KEY | --all-repos] [--json] | notes unhide <id> [--project PATH | --repo KEY | --all-repos] [--json] | notes delete \
                          <id> [--project PATH | --repo KEY | --all-repos] | notes delete --all --yes [--project PATH | --repo KEY] [--json] | notes \
@@ -118,10 +120,15 @@ fn list(args: &[Option<&str>]) -> ExitCode {
         ..query
     };
 
+    // Every hidden note is a team note, and a lone store keeps every note in one place.
     let page = if show_hidden {
-        hidden::page(&mut opened, &query)
+        hidden::page(&mut opened, &query).map(|page| page.kept_in(Place::Remote, &query))
     } else {
-        opened.store.list_notes(&query)
+        let lone = lone_notes_place(&opened.selection);
+        opened.store.list_notes(&query).map(|page| match lone {
+            Some(place) => page.kept_in(place, &query),
+            None => page,
+        })
     };
 
     let page = match page {
@@ -140,8 +147,20 @@ fn list(args: &[Option<&str>]) -> ExitCode {
         scopes.insert(scope.as_str().to_owned(), json!(count));
     }
 
+    let mut places = Map::new();
+
+    for (place, count) in &page.places {
+        places.insert(place_label(*place).to_owned(), json!(count));
+    }
+
     let notes: Vec<Value> = page.rows.iter().map(|row| opened.summary(row, show_hidden)).collect();
-    let mut shown = json!({ "total": page.total, "kinds": kinds, "scopes": scopes, "notes": notes });
+    let mut shown = json!({
+        "total": page.total,
+        "kinds": kinds,
+        "scopes": scopes,
+        "places": places,
+        "notes": notes,
+    });
 
     if let Err(error) = opened.add_team_counts(&mut shown) {
         return opened.failed(&error);
@@ -173,6 +192,7 @@ fn repos(args: &[Option<&str>]) -> ExitCode {
             text: String::new(),
             kind: None,
             scope: None,
+            place: None,
             entity: None,
             sort: NoteSort::Updated,
             descending: true,
@@ -330,7 +350,12 @@ fn local_counts(env: &Env) -> Result<(usize, usize), StoreError> {
 /// `--hidden`; `None` without `--json`, for an unknown or repeated option, or a value that is not
 /// valid.
 fn parse_list(args: &[Option<&str>]) -> Option<(Repos, NoteListQuery, bool)> {
-    let valued = [&PAGE_OPTIONS[..], &PICK_VALUED[..], &["--kind", "--scope", "--sort"]].concat();
+    let valued = [
+        &PAGE_OPTIONS[..],
+        &PICK_VALUED[..],
+        &["--kind", "--scope", "--place", "--sort"],
+    ]
+    .concat();
     let parsed = Args::parse(args, &["--json", "--hidden", "--all-repos"], &valued)?;
 
     if !parsed.positional.is_empty() || !parsed.flag("--json") {
@@ -368,6 +393,7 @@ fn parse_list(args: &[Option<&str>]) -> Option<(Repos, NoteListQuery, bool)> {
         text: query,
         kind,
         scope,
+        place: parsed.place().ok()?,
         entity: None,
         sort,
         descending: descending.unwrap_or(sort == NoteSort::Updated),
@@ -462,6 +488,7 @@ impl Opened {
             text: String::new(),
             kind: None,
             scope: None,
+            place: None,
             entity: None,
             sort: NoteSort::Updated,
             descending: true,
@@ -579,6 +606,7 @@ impl Opened {
             text: String::new(),
             kind: None,
             scope: None,
+            place: None,
             entity: Some(name.to_owned()),
             sort: NoteSort::Updated,
             descending: true,
@@ -648,6 +676,20 @@ mod tests {
             assert_eq!((query.sort, query.descending), (sort, false), "{raw}");
         }
 
+        assert_eq!(query.place, None);
+
+        for (raw, place) in [("local", Place::Local), ("team", Place::Remote)] {
+            let (_, query, _) = parse_list(&args(&["--json", "--place", raw])).expect("valid");
+            assert_eq!(query.place, Some(place), "{raw}");
+        }
+
+        let (_, query, hidden) =
+            parse_list(&args(&["--json", "--hidden", "--place=team", "--scope", "repo"])).expect("valid");
+        assert_eq!(
+            (query.place, query.scope, hidden),
+            (Some(Place::Remote), Some(Scope::Repo), true)
+        );
+
         for bad in [
             &[][..],
             &["--json", "extra"],
@@ -657,6 +699,12 @@ mod tests {
             &["--json", "--project", ""],
             &["--json", "--scope", "team"],
             &["--json", "--scope", "repo", "--scope", "repo"],
+            &["--json", "--place", "remote"],
+            &["--json", "--place", "Team"],
+            &["--json", "--place", ""],
+            &["--json", "--place"],
+            &["--json", "--place", "local", "--place", "team"],
+            &["--json", "--place", "team", "--place", "team"],
         ] {
             assert!(parse_list(&args(bad)).is_none(), "{bad:?}");
         }

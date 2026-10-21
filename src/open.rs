@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use crate::backend::{self, Backend, NotesPlace, Selection};
+use crate::backend::{self, Backend, NotesPlace, Place, Selection};
 use crate::location::{DIR_VAR, Migration, legacy_database_path, migrate_legacy, override_is_relative};
 use crate::store::{
     HiddenNotes, HiddenScripts, Lazy, MemoryStore, Scope, ScriptStore, SplitScripts, SplitStore, SqliteStore,
@@ -110,7 +110,7 @@ fn open_local(env: &Env, path: Option<&Path>) -> Result<SqliteStore, String> {
 pub fn open_notes(env: &Env, selection: &Selection) -> Option<Box<dyn MemoryStore>> {
     let Selection { backend, routing, .. } = selection;
 
-    if *backend == Backend::Local || routing.is_all_local() {
+    if local_alone(selection) {
         return open_local_notes(env);
     }
 
@@ -137,16 +137,26 @@ pub fn open_notes(env: &Env, selection: &Selection) -> Option<Box<dyn MemoryStor
 
 /// Where the notes of `scope` are read and saved under `selection`, as [`open_notes`] opens them.
 pub fn notes_place(selection: &Selection, scope: Scope) -> NotesPlace {
-    let Selection { backend, routing, .. } = selection;
-
-    if *backend == Backend::Local || routing.is_all_local() {
+    if local_alone(selection) {
         return NotesPlace::Local;
     }
 
     match scope {
-        Scope::Repo => routing.repository,
-        Scope::Global => routing.global,
+        Scope::Repo => selection.routing.repository,
+        Scope::Global => selection.routing.global,
     }
+}
+
+/// Where every note is kept when [`open_notes`] opens one store alone (the local file, without a
+/// team database or with every scope routed `local`); `None` when it opens a [`SplitStore`], which
+/// tells its notes apart itself.
+pub fn lone_notes_place(selection: &Selection) -> Option<Place> {
+    local_alone(selection).then_some(Place::Local)
+}
+
+/// True when [`open_notes`] opens the local file alone.
+fn local_alone(selection: &Selection) -> bool {
+    selection.backend == Backend::Local || selection.routing.is_all_local()
 }
 
 /// The team notes hidden on this computer, in the local SQLite file under the team database's

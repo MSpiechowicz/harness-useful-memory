@@ -37,7 +37,8 @@
 //! Similar notes come from the store of the note they resemble, and in a `remote+local` scope from
 //! the other store too, taking turns. A list of notes merges the two stores' sorted pages: a page at
 //! offset N reads the first N rows of both stores (in pages of [`LIST_PAGE_MAX`]) to find where it
-//! starts.
+//! starts. A list of the notes kept in one place reads the page from that place's store alone; the
+//! other store only counts its notes (the list's counts per place).
 //!
 //! Each store only sees the scopes it is read for: notes of another scope left in it (written
 //! before the routing changed) are not shown.
@@ -47,7 +48,7 @@ use std::collections::VecDeque;
 
 use crate::backend::{NotesPlace, Place};
 use crate::limits::{GET_IDS_MAX, LIST_PAGE_MAX, NEIGHBOR_NOTES_MAX, NEIGHBORS_LIMIT_MAX, SEARCH_LIMIT_MAX};
-use crate::store::listing::{compare, directed, page_limit};
+use crate::store::listing::{compare, directed, page_limit, per_place};
 use crate::store::{
     Edge, Forget, Forgotten, HiddenNotes, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NoteListQuery,
     NoteOrigin, NotePage, NotePatch, NoteRow, NoteSort, Saved, Scope, SearchQuery, StoreError, Target, View,
@@ -80,6 +81,16 @@ impl std::fmt::Debug for SplitStore {
 pub(crate) enum Side {
     Team,
     Local,
+}
+
+impl Side {
+    /// Where the store keeps what it holds.
+    pub(crate) fn place(self) -> Place {
+        match self {
+            Self::Team => Place::Remote,
+            Self::Local => Place::Local,
+        }
+    }
 }
 
 /// The note similar notes are looked for next to: one of the store asked, or the title and body of
@@ -342,6 +353,7 @@ impl SplitStore {
     ) -> Result<NotePage, StoreError> {
         let mut page = self.store(side).list_notes(&NoteListQuery {
             view,
+            place: None,
             exclude,
             ..query.clone()
         })?;
@@ -572,6 +584,7 @@ impl Cursor {
             view: self.view.clone(),
             offset: self.read,
             limit: LIST_PAGE_MAX,
+            place: None,
             exclude: self.exclude.clone(),
             ..query.clone()
         })?;
@@ -643,29 +656,57 @@ impl MemoryStore for SplitStore {
 
     fn list_notes(&mut self, query: &NoteListQuery) -> Result<NotePage, StoreError> {
         let mut cursors: Vec<Cursor> = Vec::new();
+        let mut places: Vec<(Place, usize)> = Vec::new();
 
         for side in self.order() {
-            if let Some(view) = self.narrow(&query.view, side) {
-                let exclude = self.excluded(side, &query.exclude)?;
+            let Some(view) = self.narrow(&query.view, side) else {
+                continue;
+            };
+
+            let exclude = self.excluded(side, &query.exclude)?;
+
+            if query.place.is_none_or(|place| place == side.place()) {
                 cursors.push(Cursor::new(side, view, exclude));
+            } else {
+                // The store of the other place is not listed, only counted.
+                let counted = NoteListQuery {
+                    offset: 0,
+                    limit: 1,
+                    ..query.clone()
+                };
+                let total = self.page_of(side, &counted, view, exclude)?.total;
+                places.push((side.place(), total));
             }
         }
 
         if cursors.is_empty() {
-            cursors.push(Cursor::new(self.first(), NOTHING, Vec::new()));
+            let page = self.page_of(self.first(), query, NOTHING, Vec::new())?;
+            return Ok(NotePage {
+                places: per_place(places),
+                ..page
+            });
         }
 
         // One store for the whole view pages in the database, as a single store does.
         if let [only] = cursors.as_slice() {
-            return self.page_of(only.side, query, only.view.clone(), only.exclude.clone());
+            let page = self.page_of(only.side, query, only.view.clone(), only.exclude.clone())?;
+            places.push((only.side.place(), page.total));
+
+            return Ok(NotePage {
+                places: per_place(places),
+                ..page
+            });
         }
 
         let mut page = NotePage::new([], query, Vec::new());
 
         for cursor in &mut cursors {
             let part = cursor.fetch(self.store(cursor.side), query)?;
+            places.push((cursor.side.place(), part.total));
             page = NotePage::new(page.counted.into_iter().chain(part.counted), query, Vec::new());
         }
+
+        page.places = per_place(places);
 
         let limit = page_limit(query);
         let mut skipped = 0;

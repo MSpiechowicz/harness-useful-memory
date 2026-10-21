@@ -1,11 +1,13 @@
 //! Notes page by page, for a person browsing them ([`MemoryStore::list_notes`]): filtered by a
-//! substring, a kind, a scope and a linked entity, sorted by the time of the latest write, title,
-//! kind, scope or place ([`NoteSort`]), counted per kind and per scope.
+//! substring, a kind, a scope, a place and a linked entity, sorted by the time of the latest
+//! write, title, kind, scope or place ([`NoteSort`]), counted per kind, per scope and per place.
 //!
 //! The backends filter, sort, count and cut the page in the database and leave the bodies there.
 //! They count the notes the text and the entity keep per kind and scope ([`NotePage::new`] makes
 //! the counts of the page from those), and list the page of the view narrowed to the scope asked
-//! for ([`scoped`]).
+//! for ([`scoped`]). A backend keeps every note in one place and does not know which: the place is
+//! filtered and counted above it, by [`crate::store::SplitStore`] (which reads only the store of
+//! the place asked for) or by the caller of a lone store ([`NotePage::kept_in`]).
 //! The text matches the title, the body or the tags as a substring, ignoring case as the database
 //! folds it: the SQLite-dialect stores fold ASCII letters only (SQLite's `lower()`), PostgreSQL
 //! and MongoDB fold every letter. A sort by title compares the normalized titles
@@ -16,6 +18,7 @@
 
 use std::cmp::Ordering;
 
+use crate::backend::Place;
 use crate::limits::{HIDDEN_MAX, LIST_PAGE_MAX, QUERY_MAX};
 use crate::store::{Note, NoteKind, Provenance, Scope, StoreError, View, clean};
 
@@ -29,6 +32,9 @@ pub struct NoteListQuery {
     pub kind: Option<NoteKind>,
     /// Keeps the notes of this scope (of those the view shows); `None` keeps both.
     pub scope: Option<Scope>,
+    /// Keeps the notes kept in this place (this computer's file or the team database); `None`
+    /// keeps both. A store over one database leaves it to its caller (see the module docs).
+    pub place: Option<Place>,
     /// Keeps the notes linked to the entity of this name (compared like entity names are).
     pub entity: Option<String>,
     pub sort: NoteSort,
@@ -101,14 +107,18 @@ impl From<Note> for NoteRow {
 /// One page of notes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NotePage {
-    /// The notes the text, the kind and the scope keep, on every page.
+    /// The notes the text, the kind, the scope and the place keep, on every page.
     pub total: usize,
-    /// The notes the text and the scope keep, per kind (every kind, in [`NoteKind::ALL`] order),
-    /// whatever the kind asked for.
+    /// The notes the text, the scope and the place keep, per kind (every kind, in
+    /// [`NoteKind::ALL`] order), whatever the kind asked for.
     pub kinds: Vec<(NoteKind, usize)>,
-    /// The notes the text and the kind keep, per scope (repository, then global), whatever the
-    /// scope asked for.
+    /// The notes the text, the kind and the place keep, per scope (repository, then global),
+    /// whatever the scope asked for.
     pub scopes: Vec<(Scope, usize)>,
+    /// The notes the text, the kind and the scope keep, per place (this computer, then the team
+    /// database), whatever the place asked for; empty from a store over one database, which does
+    /// not know where it is kept (see [`Self::kept_in`]).
+    pub places: Vec<(Place, usize)>,
     pub rows: Vec<NoteRow>,
     /// The notes the text keeps, per kind and scope: what the counts above come from (a
     /// [`crate::store::SplitStore`] adds those of its two stores).
@@ -158,10 +168,44 @@ impl NotePage {
             total,
             kinds,
             scopes,
+            places: Vec::new(),
             rows,
             counted: cells,
         }
     }
+
+    /// This page of a store that keeps every note in `place`, for `query`: what it counts is kept
+    /// there, and it lists and counts nothing else when `query` asks for the other place.
+    pub(crate) fn kept_in(self, place: Place, query: &NoteListQuery) -> Self {
+        let places = per_place([(place, self.total)]);
+
+        if query.place.is_some_and(|asked| asked != place) {
+            return Self {
+                places,
+                ..Self::new([], query, Vec::new())
+            };
+        }
+
+        Self { places, ..self }
+    }
+}
+
+/// The counts `counted` (a place may come more than once) per place: this computer, then the team
+/// database.
+pub(crate) fn per_place(counted: impl IntoIterator<Item = (Place, usize)>) -> Vec<(Place, usize)> {
+    let counted: Vec<(Place, usize)> = counted.into_iter().collect();
+
+    [Place::Local, Place::Remote]
+        .into_iter()
+        .map(|place| {
+            let count = counted
+                .iter()
+                .filter(|(at, _)| *at == place)
+                .map(|(_, count)| count)
+                .sum();
+            (place, count)
+        })
+        .collect()
 }
 
 /// The view parameters `repo` and `global` (the repository and whether global notes are shown)

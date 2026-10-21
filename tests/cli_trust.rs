@@ -110,7 +110,7 @@ fn listing(data: &Path, cwd: &Path, extra: &[&str]) -> Value {
 
     let parsed: Value = serde_json::from_str(&stdout(&output)).expect("JSON");
     let keys: Vec<&String> = parsed.as_object().expect("object").keys().collect();
-    assert_eq!(keys, ["total", "groups", "scopes", "review", "scripts"]);
+    assert_eq!(keys, ["total", "groups", "scopes", "review", "places", "scripts"]);
     parsed
 }
 
@@ -739,6 +739,80 @@ fn scripts_list_filters_by_scope_and_review_together() {
 }
 
 #[test]
+fn scripts_list_filters_by_place() {
+    let (dir, data, work) = folders();
+    let root = repo_with_remote(dir.path(), "widget", "https://github.com/acme/widget.git");
+    let project = root.to_string_lossy().into_owned();
+    let at = |extra: &[&str]| -> Value {
+        let mut args = vec!["--project", project.as_str()];
+        args.extend(extra);
+        listing(&data, &work, &args)
+    };
+
+    for name in ["alpha", "delta"] {
+        save_elsewhere(&data, &Target::Global, name);
+    }
+
+    save_elsewhere(&data, &repo("github.com/acme/widget"), "bravo");
+
+    // Without a team database every script is kept on this computer.
+    let all = at(&[]);
+    assert_eq!(all["places"], json!({ "local": 3, "team": 0 }));
+
+    let here = at(&["--place", "local", "--sort", "name"]);
+    assert_eq!(
+        names(here["scripts"].as_array().expect("scripts")),
+        ["alpha", "bravo", "delta"]
+    );
+    assert_eq!(here["total"], 3);
+    assert_eq!(here["places"], all["places"]);
+    assert_eq!((&here["groups"], &here["scopes"]), (&all["groups"], &all["scopes"]));
+
+    let paged = at(&["--place", "local", "--sort", "name", "--offset", "1", "--limit", "1"]);
+    assert_eq!(names(paged["scripts"].as_array().expect("scripts")), ["bravo"]);
+    assert_eq!(paged["total"], 3);
+
+    let team = at(&["--place", "team"]);
+    assert_eq!((&team["total"], &team["scripts"]), (&json!(0), &json!([])));
+    assert_eq!(team["places"], all["places"], "the place counts ignore the place");
+    assert_eq!(team["groups"], json!({ "needsReview": 0, "repo": 0, "global": 0 }));
+    assert_eq!(team["scopes"], json!({ "repo": 0, "global": 0 }));
+    assert_eq!(team["review"], json!({ "needed": 0, "trusted": 0 }));
+
+    let global = at(&["--scope", "global", "--place", "local", "--query", "LTA"]);
+    assert_eq!(names(global["scripts"].as_array().expect("scripts")), ["delta"]);
+    assert_eq!(
+        global["places"],
+        json!({ "local": 1, "team": 0 }),
+        "the place counts follow the scope and the query"
+    );
+
+    let grouped = at(&["--group", "repo", "--place", "local"]);
+    assert_eq!(grouped["total"], 0, "nothing is trusted yet");
+    assert_eq!(
+        grouped["places"],
+        json!({ "local": 0, "team": 0 }),
+        "the place counts follow the group"
+    );
+
+    for bad in [
+        &["--place", "remote"][..],
+        &["--place", "Team"],
+        &["--place"],
+        &["--place", "local", "--place", "team"],
+    ] {
+        let args: Vec<&str> = ["scripts", "list", "--json"].iter().chain(bad).copied().collect();
+        let output = cli(&data, &work, &args);
+        assert_eq!(output.status.code(), Some(2), "{bad:?}");
+        assert!(
+            stderr(&output).starts_with("usage: harness-memory"),
+            "{}",
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
 fn scripts_delete_removes_one_or_every_listed_script() {
     let (dir, data, work) = folders();
     let widget = repo_with_remote(dir.path(), "widget", "https://github.com/acme/widget.git");
@@ -937,7 +1011,7 @@ fn remote_script_commands_need_a_team_database() {
         .keys()
         .cloned()
         .collect();
-    assert_eq!(keys, ["total", "groups", "scopes", "review", "scripts"]);
+    assert_eq!(keys, ["total", "groups", "scopes", "review", "places", "scripts"]);
 
     let hide = cli(&data, &work, &["scripts", "hide", &id]);
     assert_eq!(hide.status.code(), Some(1));
@@ -1065,6 +1139,18 @@ fn remote_local_scripts(url: &str) {
         (&listing["hiddenCount"], &listing["localCounts"]),
         (&json!(0), &json!({ "repo": 0, "global": 1 }))
     );
+    assert_eq!(listing["places"], json!({ "local": 1, "team": 1 }));
+
+    for (place, id) in [("team", team), ("local", mine)] {
+        let one = json(&["scripts", "list", "--json", "--place", place]);
+        assert_eq!(
+            (&one["total"], &one["scripts"][0]["id"]),
+            (&json!(1), &json!(id)),
+            "{place}"
+        );
+        assert_eq!(one["scripts"].as_array().expect("scripts").len(), 1, "{place}");
+        assert_eq!(one["places"], listing["places"], "{place}");
+    }
 
     let sorted = json(&["scripts", "list", "--json", "--sort", "place", "--order", "desc"]);
     assert_eq!(sorted["scripts"][0]["id"], team);
@@ -1091,9 +1177,19 @@ fn remote_local_scripts(url: &str) {
     );
     let listing = json(&["scripts", "list", "--json"]);
     assert_eq!((&listing["total"], &listing["hiddenCount"]), (&json!(1), &json!(1)));
+    assert_eq!(
+        listing["places"],
+        json!({ "local": 1, "team": 0 }),
+        "the hidden script is not counted"
+    );
 
     let hidden = json(&["scripts", "list", "--json", "--hidden"]);
     assert_eq!(hidden["total"], 1);
+    assert_eq!(hidden["places"], json!({ "local": 0, "team": 1 }));
+    assert_eq!(
+        json(&["scripts", "list", "--json", "--hidden", "--place", "local"])["total"],
+        0
+    );
     assert_eq!(
         (&hidden["scripts"][0]["id"], &hidden["scripts"][0]["hidden"]),
         (&json!(team), &json!(true))
@@ -1143,6 +1239,30 @@ fn remote_local_scripts(url: &str) {
     );
     let team_only = team_json(&data, &work, url, "remote", &["scripts", "list", "--json"]);
     assert_eq!(team_only["scripts"][0]["approval"], "approved");
+
+    // Read alone, each store keeps every script in one place.
+    let here = team_json(
+        &data,
+        &work,
+        url,
+        "remote",
+        &["scripts", "list", "--json", "--place", "local"],
+    );
+    assert_eq!(
+        (&here["total"], &here["places"]),
+        (&json!(0), &json!({ "local": 0, "team": 1 }))
+    );
+    let away = team_json(
+        &data,
+        &work,
+        url,
+        "local",
+        &["scripts", "list", "--json", "--place", "team"],
+    );
+    assert_eq!(
+        (&away["total"], &away["places"]),
+        (&json!(0), &json!({ "local": 1, "team": 0 }))
+    );
 
     // A plain push leaves remote+local scripts out.
     let pushed = json(&["scripts", "push", "--json", "--dry-run"]);

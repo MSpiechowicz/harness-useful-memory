@@ -10,7 +10,7 @@ use crate::backend::Place;
 use crate::cli::{Args, PAGE_OPTIONS, PICK_VALUED, Page, Repos};
 use crate::cli_trust::usage;
 use crate::limits::QUERY_MAX;
-use crate::mcp::Approval;
+use crate::mcp::{Approval, place_label};
 use crate::store::{Scope, ScriptSummary};
 
 /// `scripts list`.
@@ -41,16 +41,27 @@ pub(crate) fn list(args: &[Option<&str>]) -> ExitCode {
         Err(message) => return opened.failed(&message),
     };
 
+    let place_of = |summary: &ScriptSummary| opened.spot(summary.id).0;
+    let place_keeps = |summary: &ScriptSummary| options.place.is_none_or(|place| place_of(summary) == place);
+
     let count = |keeps: &dyn Fn(&ScriptSummary, Approval) -> bool| {
         listed
             .iter()
             .filter(|(summary, approval)| keeps(summary, *approval))
             .count()
     };
-    let in_group = |group: Group| count(&|summary, approval| Group::of(summary, approval) == group);
-    let in_scope = |scope: Scope| count(&|summary, approval| summary.scope == scope && options.review_keeps(approval));
-    let in_review =
-        |review: Review| count(&|summary, approval| Review::of(approval) == review && options.scope_keeps(summary));
+    let in_group =
+        |group: Group| count(&|summary, approval| Group::of(summary, approval) == group && place_keeps(summary));
+    let in_scope = |scope: Scope| {
+        count(&|summary, approval| summary.scope == scope && options.review_keeps(approval) && place_keeps(summary))
+    };
+    let in_review = |review: Review| {
+        count(&|summary, approval| {
+            Review::of(approval) == review && options.scope_keeps(summary) && place_keeps(summary)
+        })
+    };
+    let in_place =
+        |place: Place| count(&|summary, approval| place_of(summary) == place && options.keeps(summary, approval));
 
     let groups = json!({
         "needsReview": in_group(Group::NeedsReview),
@@ -65,10 +76,13 @@ pub(crate) fn list(args: &[Option<&str>]) -> ExitCode {
         "needed": in_review(Review::Needed),
         "trusted": in_review(Review::Trusted),
     });
+    let places = json!({
+        place_label(Place::Local): in_place(Place::Local),
+        place_label(Place::Remote): in_place(Place::Remote),
+    });
 
-    let local = |summary: &ScriptSummary| opened.spot(summary.id).0 == Place::Local;
-    listed.retain(|(summary, approval)| options.keeps(summary, *approval));
-    listed.sort_by(|(a, _), (b, _)| options.compare(a, b, local));
+    listed.retain(|(summary, approval)| options.keeps(summary, *approval) && place_keeps(summary));
+    listed.sort_by(|(a, _), (b, _)| options.compare(a, b, |summary| place_of(summary) == Place::Local));
 
     let objects: Vec<Value> = listed
         .iter()
@@ -82,6 +96,7 @@ pub(crate) fn list(args: &[Option<&str>]) -> ExitCode {
         "groups": groups,
         "scopes": scopes,
         "review": review,
+        "places": places,
         "scripts": objects,
     });
 
@@ -114,6 +129,8 @@ pub(crate) struct ListOptions {
     scope: Option<Scope>,
     /// `--review`; never given with [`Self::group`].
     review: Option<Review>,
+    /// `--place`: the scripts kept on this computer or in the team database.
+    place: Option<Place>,
     /// `--hidden`: the hidden team scripts instead of the visible ones.
     hidden: bool,
     repos: Repos,
@@ -263,7 +280,7 @@ fn parse_list(args: &[Option<&str>]) -> Option<ListOptions> {
     let valued = [
         &PAGE_OPTIONS[..],
         &PICK_VALUED[..],
-        &["--group", "--scope", "--review", "--sort"],
+        &["--group", "--scope", "--place", "--review", "--sort"],
     ]
     .concat();
     let parsed = Args::parse(args, &["--json", "--untrusted", "--hidden", "--all-repos"], &valued)?;
@@ -300,6 +317,7 @@ fn parse_list(args: &[Option<&str>]) -> Option<ListOptions> {
         group,
         scope,
         review,
+        place: parsed.place().ok()?,
         hidden: parsed.flag("--hidden"),
         repos: parsed.repos().ok()?,
         sort,
@@ -339,6 +357,20 @@ mod tests {
         assert_eq!(
             (filtered.group, filtered.scope, filtered.review),
             (None, Some(Scope::Global), Some(Review::Needed))
+        );
+
+        assert_eq!(filtered.place, None);
+
+        for (raw, place) in [("local", Place::Local), ("team", Place::Remote)] {
+            let parsed = parse_list(&args(&["list", "--json", "--place", raw])).expect("valid");
+            assert_eq!(parsed.place, Some(place), "{raw}");
+        }
+
+        let grouped = parse_list(&args(&["list", "--json", "--untrusted", "--place=team", "--hidden"])).expect("valid");
+        assert_eq!(
+            (grouped.group, grouped.place, grouped.hidden),
+            (Some(Group::NeedsReview), Some(Place::Remote), true),
+            "a place combines with a group"
         );
 
         let updated = parse_list(&args(&["list", "--json", "--group", "repo", "--sort", "updated"])).expect("valid");
@@ -384,6 +416,11 @@ mod tests {
             &["list", "--json", "--group", "trusted"],
             &["list", "--json", "--sort", "size"],
             &["list", "--json", "--limit", "500"],
+            &["list", "--json", "--place", "remote"],
+            &["list", "--json", "--place", "Local"],
+            &["list", "--json", "--place", ""],
+            &["list", "--json", "--place"],
+            &["list", "--json", "--place", "local", "--place", "team"],
         ] {
             assert!(parse_list(&args(bad)).is_none(), "{bad:?}");
         }

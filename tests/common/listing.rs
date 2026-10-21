@@ -57,6 +57,7 @@ pub fn listing(view: View) -> NoteListQuery {
         text: String::new(),
         kind: None,
         scope: None,
+        place: None,
         entity: None,
         sort: NoteSort::Updated,
         descending: true,
