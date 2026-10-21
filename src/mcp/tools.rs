@@ -249,5 +249,7 @@ fn scope(both: bool, default: &str) -> Value {
 }
 
 pub(super) fn project_path() -> Value {
-    text("Absolute path of the repository you are working in (your working directory's git root). Always pass it: the server's own working directory may be another project. Unused for scope global")
+    text(
+        "Absolute path of the repository you are working in (your working directory's git root). Always pass it: the server's own working directory may be another project. Unused for scope global",
+    )
 }
