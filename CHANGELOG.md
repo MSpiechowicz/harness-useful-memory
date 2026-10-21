@@ -1,3 +1,10 @@
+# [2.7.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.6.1...v2.7.0) (2026-10-21)
+
+
+### Features
+
+* **guards:** save guards and held proposals for Harness Desktop ([#39](https://github.com/MSpiechowicz/harness-useful-memory/issues/39)) ([20daaf7](https://github.com/MSpiechowicz/harness-useful-memory/commit/20daaf7a0e722565ec91d2ff0b9bdc2e6c19c45a))
+
 ## [2.6.1](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.6.0...v2.6.1) (2026-10-21)
 
 
