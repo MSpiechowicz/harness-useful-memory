@@ -19,6 +19,8 @@
 //!   browses and deletes notes.
 //! - [`cli_team_docs`]: the `hooks` and `routines` commands, through which Harness Desktop shares
 //!   hooks and routines with the team.
+//! - [`held`] and [`cli_held`]: what agents asked to save while the user reviews saves first, and
+//!   the user-only commands that save it, skip it, or save notes and scripts past the save guards.
 //! - [`location`]: where the database lives, and the one-time move from Harness Desktop's folder.
 //! - [`support`]: the environment, git runner, secret masking and text checks the rest uses.
 //!
@@ -28,11 +30,13 @@
 pub mod backend;
 mod cli;
 mod cli_discard;
+pub mod cli_held;
 pub mod cli_notes;
 pub mod cli_push;
 mod cli_scripts;
 pub mod cli_team_docs;
 pub mod cli_trust;
+pub mod held;
 pub mod limits;
 pub mod location;
 pub mod mcp;

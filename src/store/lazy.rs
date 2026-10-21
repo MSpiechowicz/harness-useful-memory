@@ -157,6 +157,14 @@ impl TrustStore for Lazy<dyn TrustStore> {
     fn was_unapproved(&mut self, sha256s: &[String]) -> Result<bool, StoreError> {
         self.store()?.was_unapproved(sha256s)
     }
+
+    fn hold_back(&mut self, place: &str, script_id: Option<i64>, name: &str, sha256: &str) -> Result<(), StoreError> {
+        self.store()?.hold_back(place, script_id, name, sha256)
+    }
+
+    fn is_held_back(&mut self, place: &str, script_id: i64, name: &str, sha256: &str) -> Result<bool, StoreError> {
+        self.store()?.is_held_back(place, script_id, name, sha256)
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +200,14 @@ mod tests {
         }
 
         fn was_unapproved(&mut self, _sha256s: &[String]) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        fn hold_back(&mut self, _place: &str, _id: Option<i64>, _name: &str, _sha256: &str) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn is_held_back(&mut self, _place: &str, _id: i64, _name: &str, _sha256: &str) -> Result<bool, StoreError> {
             Ok(false)
         }
     }

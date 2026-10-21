@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use super::SqliteStore;
 use super::engine::Engine;
+use super::held_back;
 use super::notes::scope_of;
 use super::sql::{Row, Sql, Value, args};
 use super::{now, target_project, view_params};
@@ -386,11 +387,16 @@ impl TrustStore for SqliteStore {
     }
 
     /// Replaces the row of a version trusted before, so it becomes the script's newest, then drops
-    /// the script's versions past the newest [`TRUSTED_VERSIONS_KEPT`].
+    /// the script's versions past the newest [`TRUSTED_VERSIONS_KEPT`]. An approved version is no
+    /// longer held back.
     fn trust(&mut self, version: &TrustedVersion) -> Result<(), StoreError> {
         let sha256 = script_sha256(version.language, version.body);
 
         self.write(|db| {
+            if version.origin == TrustOrigin::Approved {
+                held_back::release(db, version.place, version.script_id, version.name, &sha256)?;
+            }
+
             db.execute(
                 "DELETE FROM script_trust WHERE place = ?1 AND script_id = ?2 AND sha256 = ?3",
                 args![version.place, version.script_id, &sha256],
@@ -480,5 +486,13 @@ impl TrustStore for SqliteStore {
 
             Ok(false)
         })
+    }
+
+    fn hold_back(&mut self, place: &str, script_id: Option<i64>, name: &str, sha256: &str) -> Result<(), StoreError> {
+        self.write(|db| held_back::hold_back(db, place, script_id, name, sha256))
+    }
+
+    fn is_held_back(&mut self, place: &str, script_id: i64, name: &str, sha256: &str) -> Result<bool, StoreError> {
+        self.read(|db| held_back::is_held_back(db, place, script_id, name, sha256))
     }
 }

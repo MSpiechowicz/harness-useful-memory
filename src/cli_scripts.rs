@@ -8,6 +8,7 @@ pub(crate) mod discard;
 pub(crate) mod hidden;
 pub(crate) mod list;
 pub(crate) mod push;
+pub(crate) mod save;
 
 use std::process::ExitCode;
 

@@ -53,6 +53,9 @@ pub const CAPTURED_VARS: &[&str] = &[
     "USERNAME",
     // How long `script_run` waits for Harness Desktop's answer, in milliseconds (for tests).
     "HARNESS_MEMORY_APPROVAL_WAIT_MS",
+    // The chat Harness Desktop started this server's harness for, whose save guards apply (see
+    // `crate::backend::SESSION_VAR`).
+    "HARNESS_MEMORY_SESSION",
     // The Windows config folder (roaming), which holds the config file.
     "APPDATA",
 ];

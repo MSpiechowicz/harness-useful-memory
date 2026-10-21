@@ -17,8 +17,10 @@
 //! [`script_sha256`], as the script it is now), the team script is trusted as well (under the team
 //! database's key and the team's id), with the same origin, once the team's row is checked to hold
 //! that version under that name, scope and repository. A local version waiting for approval is
-//! never trusted by a copy. Failing to trust is a failure of that script: it is left out of the
-//! totals and not deleted.
+//! never trusted by a copy. A local version held back from team trust
+//! ([`TrustStore::hold_back`]) is held back on this computer as the team's copy too, by name
+//! before it is copied and by the team's id after, so `trust_team_scripts` does not trust it. Failing to trust, or to
+//! hold back, is a failure of that script: it is left out of the totals and not deleted.
 //!
 //! **`--delete-copied`.** After a push that is not a dry run, the local scripts the team now holds
 //! as they are here (added, updated, overwritten, identical) are deleted, unless their push failed
@@ -179,6 +181,12 @@ fn push_one(
         return Ok(());
     }
 
+    let held_back = trust.is_held_back(LOCAL_KEY, local.summary.id, &local.summary.name, &local.summary.sha256)?;
+
+    if held_back {
+        trust.hold_back(team.key, None, &local.summary.name, &local.summary.sha256)?;
+    }
+
     let stored = match action {
         Action::Added | Action::Updated | Action::Overwritten => {
             let saved = team.scripts.save_script(target, &draft_of(local))?;
@@ -196,6 +204,15 @@ fn push_one(
         return Err(StoreError::Backend(
             "the team database holds another version than the one pushed".to_owned(),
         ));
+    }
+
+    if held_back {
+        trust.hold_back(
+            team.key,
+            Some(stored.summary.id),
+            &stored.summary.name,
+            &stored.summary.sha256,
+        )?;
     }
 
     summary.changes[index].trusted = carry_trust(trust, team.key, local, &stored)?;

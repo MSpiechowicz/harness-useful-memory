@@ -54,6 +54,8 @@
 //!   [`crate::cli_scripts::discard`]).
 //! - `harness-memory scripts push [...]` copies the scripts saved on this computer into the team
 //!   database (see [`crate::cli_scripts::push`]).
+//! - `harness-memory scripts save --json [--project PATH] [--client NAME]` saves the user's own script past the
+//!   save guards (see [`crate::cli_scripts::save`]).
 //! - `harness-memory trust <id>=<sha256>... [--project PATH | --repo KEY | --all-repos]` approves those scripts on this
 //!   machine when each still has the `sha256` that was reviewed (the `id` and `sha256` of
 //!   `scripts list`); a script changed since is not approved. `harness-memory trust <id>...` and
@@ -73,7 +75,7 @@ use serde_json::{Value, json};
 
 use crate::backend::{NotesPlace, Place, Selection};
 use crate::cli::{self, Args, Delete, PICK_VALUED, Repos};
-use crate::cli_scripts::{Opened, discard, hidden, list, not_found, push};
+use crate::cli_scripts::{Opened, discard, hidden, list, not_found, push, save};
 use crate::store::{Scope, Script, ScriptRef, TrustOrigin, TrustedVersion};
 use crate::store::{foreign_encoding, foreign_encoding_error, hidden_character, hidden_character_error};
 
@@ -86,8 +88,8 @@ pub const USAGE: &str = "scripts list --json [--project PATH | --repo KEY | --al
                          <id> [--project PATH | --repo KEY | --all-repos] | scripts delete --all --yes [--project PATH | --repo KEY] [--json] | scripts \
                          discard-local (--all | ID[,ID...] | -) [--scope repo|global] --yes [--json] | scripts push \
                          [--dry-run] [--json] [--overwrite none|all|ID[,ID...]|-] [--delete-copied] [--scope \
-                         repo|global] [--repo <key|.>] [--no-global] | trust <id>[=<sha256>]... | --all [--project \
-                         PATH]";
+                         repo|global] [--repo <key|.>] [--no-global] | scripts save --json [--project PATH] [--client NAME] < script.json \
+                         | trust <id>[=<sha256>]... | --all [--project PATH]";
 
 /// The line `harness-memory check` adds when every team script runs without approval.
 pub fn check_line(selection: &Selection) -> Option<&'static str> {
@@ -106,6 +108,7 @@ pub fn scripts(args: &[Option<&str>]) -> ExitCode {
         [Some("delete"), rest @ ..] => delete(rest),
         [Some("discard-local"), rest @ ..] => discard::discard_local(rest),
         [Some("push"), rest @ ..] => push::push(rest),
+        [Some("save"), rest @ ..] => save::save(rest),
         _ => list::list(args),
     }
 }

@@ -490,6 +490,14 @@ impl TrustStore for Racing {
     fn was_unapproved(&mut self, sha256s: &[String]) -> Result<bool, StoreError> {
         self.inner.was_unapproved(sha256s)
     }
+
+    fn hold_back(&mut self, place: &str, script_id: Option<i64>, name: &str, sha256: &str) -> Result<(), StoreError> {
+        self.inner.hold_back(place, script_id, name, sha256)
+    }
+
+    fn is_held_back(&mut self, place: &str, script_id: i64, name: &str, sha256: &str) -> Result<bool, StoreError> {
+        self.inner.is_held_back(place, script_id, name, sha256)
+    }
 }
 
 /// This machine's trust, failing to trust anything for local script `fail` (its team copy).
@@ -526,5 +534,13 @@ impl TrustStore for Failing {
 
     fn was_unapproved(&mut self, sha256s: &[String]) -> Result<bool, StoreError> {
         self.inner.was_unapproved(sha256s)
+    }
+
+    fn hold_back(&mut self, place: &str, script_id: Option<i64>, name: &str, sha256: &str) -> Result<(), StoreError> {
+        self.inner.hold_back(place, script_id, name, sha256)
+    }
+
+    fn is_held_back(&mut self, place: &str, script_id: i64, name: &str, sha256: &str) -> Result<bool, StoreError> {
+        self.inner.is_held_back(place, script_id, name, sha256)
     }
 }

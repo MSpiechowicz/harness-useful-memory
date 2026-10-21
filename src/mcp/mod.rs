@@ -7,6 +7,8 @@
 //! - Notifications are never answered; answers from the client are ignored.
 //! - Tool validation and store failures are tool results with `isError: true`.
 //! - Nothing a client sends is written to stderr.
+//! - The save guards refuse or hold an agent's writes before they run ([`guards`]), and the reads
+//!   say when they would ([`saving`]).
 //! - A running script stops when the client cancels its request, closes the input, or the server
 //!   gets SIGTERM ([`input`]).
 
@@ -14,16 +16,24 @@ mod approval;
 mod blocks;
 mod calls;
 mod calls_scripts;
+mod guard_repos;
+mod guards;
+mod hold;
 mod input;
 pub mod protocol;
 mod reply;
+mod saving;
+mod scope;
 mod script_blocks;
 mod search_scripts;
 pub mod tools;
 mod tools_scripts;
+mod trusting;
+pub(crate) mod user;
 
 pub(crate) use approval::approval_of;
 pub use approval::{ALIVE_FILE, APPROVAL_WAIT_VAR, REQUESTS_FOLDER, SCRIPT_APPROVAL_WAIT};
+pub use guards::{GUARDS_FOLDER, HELD_TEXT};
 pub use input::stop_on_sigterm;
 pub(crate) use script_blocks::{Approval, Shown, author_json, place_label, repo_label};
 
@@ -107,6 +117,13 @@ impl Server {
     /// [`crate::store::SplitScripts`] says per script ([`ScriptStore::origin`]).
     pub fn with_scripts_place(mut self, place: impl Into<NotesPlace>) -> Self {
         self.scripts_place = place.into();
+        self
+    }
+
+    /// The server writing as client `client` (as if `initialize` named it), for the user-only
+    /// commands that save through the tool bodies.
+    pub fn with_client(mut self, client: Option<String>) -> Self {
+        self.client = client;
         self
     }
 

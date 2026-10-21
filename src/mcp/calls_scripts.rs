@@ -7,8 +7,10 @@
 //! never taken from the store, so a body or language changed behind the store's back is not
 //! trusted. `script_save` trusts the draft the agent sent, and only when the store gives back that
 //! draft unchanged; never the code of a script waiting for approval, or of one reported as waiting
-//! before. A body with a [`hidden_character`], or a Python body that declares a
-//! [`foreign_encoding`], never runs.
+//! before, and nothing while a save guard applies to the call ([`super::guards::applies`]): such a
+//! save is also held back from team trust ([`super::trusting`]), so `trust_team_scripts` cannot
+//! trust it either. A body with a
+//! [`hidden_character`], or a Python body that declares a [`foreign_encoding`], never runs.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,9 +20,12 @@ use serde_json::{Value, json};
 
 use super::Server;
 use super::approval::{self, Answer, RunInput, approval_of};
-use super::calls::{NO_PROJECT, Reply, parse, provenance, target};
+use super::calls::{Reply, parse};
 use super::reply::now;
+use super::scope::{NO_PROJECT, provenance, target};
 use super::script_blocks::{Approval, SCRIPTS_FRAME, Shown, run_json, run_text, saved_line};
+pub(super) use super::trusting::Trusting;
+use super::trusting::{hold_back_draft, hold_back_saved};
 use crate::backend::Place;
 use crate::limits::{
     QUERY_MAX, SCRIPT_ARG_MAX, SCRIPT_ARGS_MAX, SCRIPT_STDERR_MAX, SCRIPT_STDIN_MAX, SCRIPT_STDOUT_MAX,
@@ -34,7 +39,15 @@ use crate::support::runner::{self, Run};
 /// Runs script tool `name`; `None` when there is no such tool.
 pub(super) fn call(server: &mut Server, name: &str, arguments: Value) -> Option<Reply> {
     let result = match name {
-        "script_save" => parse(arguments).and_then(|args| save(server, args)),
+        "script_save" => {
+            // A chat or repository with save guards gets no script trusted without the user.
+            let trusting = if super::guards::applies(server, &arguments) {
+                Trusting::Guarded
+            } else {
+                Trusting::AsSaved
+            };
+            parse(arguments).and_then(|args| save(server, args, trusting))
+        }
         "script_list" => parse(arguments).and_then(|args| list(server, args)),
         "script_get" => parse(arguments).and_then(|args| get(server, args)),
         "script_run" => parse(arguments).and_then(|args| run(server, args)),
@@ -51,14 +64,14 @@ pub(super) fn call(server: &mut Server, name: &str, arguments: Value) -> Option<
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SaveArgs {
-    scope: Option<String>,
-    name: String,
-    description: String,
-    language: String,
-    body: String,
-    timeout_secs: Option<u64>,
-    project_path: Option<String>,
+pub(super) struct SaveArgs {
+    pub scope: Option<String>,
+    pub name: String,
+    pub description: String,
+    pub language: String,
+    pub body: String,
+    pub timeout_secs: Option<u64>,
+    pub project_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -90,25 +103,41 @@ struct RunArgs {
     project_path: Option<String>,
 }
 
-fn save(server: &mut Server, args: SaveArgs) -> Result<Reply, String> {
-    let target = target(server, args.scope.as_deref(), args.project_path.as_deref())?;
-    let Some(language) = Language::parse(&args.language) else {
+/// The language `raw` names.
+pub(super) fn language(raw: &str) -> Result<Language, String> {
+    Language::parse(raw).ok_or_else(|| {
         let languages: Vec<&str> = Language::ALL.iter().map(|language| language.as_str()).collect();
-        return Err(format!("language must be one of {}", languages.join(", ")));
-    };
+        format!("language must be one of {}", languages.join(", "))
+    })
+}
 
+/// The checked draft `args` describe and where it goes.
+pub(super) fn draft_of(server: &mut Server, args: SaveArgs) -> Result<(Target, ScriptDraft), String> {
+    let target = target(server, args.scope.as_deref(), args.project_path.as_deref())?;
     let draft = ScriptDraft {
         name: args.name,
         description: args.description,
-        language,
+        language: language(&args.language)?,
         body: args.body,
         timeout_secs: args.timeout_secs.unwrap_or(SCRIPT_TIMEOUT_DEFAULT),
         provenance: provenance(server, args.project_path.as_deref()),
     };
     let draft = checked_draft(&draft).map_err(|error| error.to_string())?;
 
+    Ok((target, draft))
+}
+
+/// Saves the script `args` describe (the body of `script_save`), trusting it as `trusting` says.
+pub(super) fn save(server: &mut Server, args: SaveArgs, trusting: Trusting) -> Result<Reply, String> {
+    let project_path = args.project_path.clone();
+    let (target, draft) = draft_of(server, args)?;
+
+    if trusting.held_back().is_some() {
+        hold_back_draft(server, &draft)?;
+    }
+
     // Looked up before the save, which may replace the script waiting for approval.
-    let view = view(server, None, args.project_path.as_deref())?;
+    let view = view(server, None, project_path.as_deref())?;
     let copied = unapproved_copy(server, &view, &draft.body);
     let seen = server
         .trust
@@ -122,7 +151,9 @@ fn save(server: &mut Server, args: SaveArgs) -> Result<Reply, String> {
     let script = &saved.script;
 
     // What the agent sent is what is trusted, never what the store gives back.
-    let untrusted_because = if !stored_as_drafted(script, &draft, &target) {
+    let untrusted_because = if let Some(reason) = trusting.held_back() {
+        Some(reason.to_owned())
+    } else if !stored_as_drafted(script, &draft, &target) {
         Some("the stored version differs from what was saved".to_owned())
     } else {
         match (copied, seen) {
@@ -148,6 +179,11 @@ fn save(server: &mut Server, args: SaveArgs) -> Result<Reply, String> {
     }
 
     let sha256 = script_sha256(script.summary.language, &script.body);
+
+    if trusting.held_back().is_some() {
+        hold_back_saved(server, script, &sha256)?;
+    }
+
     let approval = approval_for(server, &script.summary, &sha256)?;
     let shown = shown(server, &script.summary, &sha256, approval);
     Ok(Reply {

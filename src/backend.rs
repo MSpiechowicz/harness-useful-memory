@@ -110,6 +110,11 @@ pub const ROUTINES_VAR: &str = "HARNESS_MEMORY_ROUTINES";
 /// config file; empty = unset.
 pub const TRUST_TEAM_ROUTINES_VAR: &str = "HARNESS_MEMORY_TRUST_TEAM_ROUTINES";
 
+/// Environment variable naming the Harness Desktop chat this server's harness runs for (its
+/// `chatKey`, a lowercase UUID), whose save guards apply (see [`crate::mcp`]'s guards). Any other
+/// value makes every guarded call refuse; empty = unset.
+pub const SESSION_VAR: &str = "HARNESS_MEMORY_SESSION";
+
 /// The config file name inside `<config dir>/harness-memory/`.
 pub const CONFIG_FILE: &str = "config.toml";
 

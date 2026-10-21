@@ -368,6 +368,63 @@ repositories that have entries, by label, and how many global ones there are.
 A note that is not visible exits with 1 and the last line on stderr is `harness-memory: note <id> not found`. Usage
 errors exit with 2, other failures with 1 and the reason on the last line of stderr.
 
+### Save guards
+
+Harness Desktop lets you decide what agents may save, per chat, per project and everywhere, and can ask you before a
+save. Reading, recall and `script_run` are never guarded. The desktop writes `guards/global.json` (notes and scripts:
+`paused`, `offRepos`) and `guards/chats/<chatKey>.json` (`paused`, notes and scripts `on` and `ask`, and `repoRoot`, the
+chat's project root or `null`) next to the local database, and starts each chat's harness with
+`HARNESS_MEMORY_SESSION=<chatKey>`. Before `note_save`, `note_update`, `note_delete`, `entity_link`, `entity_delete`,
+`script_save` or `script_delete` runs, the server checks the global pause of that kind, then the repository (the git
+root of `project_path`, that of its working folder and the chat's `repoRoot`: any one turned off refuses, global-scope
+writes included). A repository counts as turned off when its canonical path is an `offRepos` entry or its repository
+key (`git:host/owner/repo`, see [Which repository](#which-repository)) is that of an entry, so other clones and git
+worktrees of it are covered. Then the chat: paused or off refuses. With `HARNESS_MEMORY_SESSION` set, a missing chat
+file refuses too (the desktop writes it before it starts the chat). With Ask on, `note_save`, `note_update` and
+`script_save` are held in `held/<chatKey>/<heldId>.json` (one private folder per chat) for your review while Harness
+Desktop runs (refused when it does not), at most 50 items and 4 MiB per chat, kept 30 days. Files of the older flat
+layout `held/<heldId>.json` are ignored. A held item keeps only the fields the tool knows, in normal form (scope, kind
+and language as the tool reads them, note text, tags, entities and script descriptions masked), and a `revision` that
+changes whenever the agent holds it again. Nothing held is saved or searchable. The agent gets a normal result saying
+it was held or refused, with `structuredContent` `{"held": true, "heldId"}` or `{"saved": false, "reason"}`. Reads
+(`note_search`, `note_get`, `entity_neighbors` for notes, `script_list`, `script_get` for scripts) end with one line when
+the same checks would not plainly let that kind save, such as "Saving notes is off for this project (the user's
+setting). Reading works. Do not try to save notes.", and script reads add `structuredContent.saving` (`{"allowed":
+false, "reason"}` or `{"ask": true}`). A guard
+file that cannot be read, or a `HARNESS_MEMORY_SESSION` that is not a lowercase UUID, refuses. While any guard applies
+to a call (a pause, a kind off or on Ask in its chat, a repository opt-out or a global pause of either kind), an
+agent's `script_save` trusts nothing and holds the version back on this computer (in a table of the local database,
+never in a team database, never pruned), so `script_run` asks you first with the code, also with `trust_team_scripts`
+on. Only your approval (`harness-memory trust`, or Allow in Harness Desktop) releases it. Scripts never see
+`HARNESS_MEMORY_SESSION`. The guards stop agents that use these tools. They are no sandbox: an agent with a shell can
+change files in your home.
+
+Your own saves go past every guard, through commands no agent reaches through MCP:
+
+```sh
+harness-memory held list --json [--chat KEY]                 # {"held": [...]}, newest first
+harness-memory held save <heldId> --json [--expect REVISION] [< edited.json]   # {"saved": {"kind": "note", "id": 12}}
+harness-memory held skip <heldId> --json [--expect REVISION] # {"skipped": "<heldId>"}
+harness-memory notes save --json --project ~/src/widget < note.json          # {"id", "title", "scope"}
+harness-memory notes update 12 --json --project ~/src/widget < patch.json    # {"id", "title"}
+harness-memory scripts save --json --project ~/src/widget < script.json      # {"name", "scope", "id", "created", "approval"}
+```
+
+`held save` and `held skip` claim the item first, so two saves of one item save it once (the other gets `notFound`), and
+an item the agent holds again meanwhile waits as a new one. With `--expect` they save or skip only the revision you saw.
+A held `note_update` is refused with `changed` when the note's title, body, kind or tags are no longer those the item
+shows as `current`. The item then keeps its id but shows the note as it is now as `current`, with a new `revision`, so
+you review it again against that note and can save it. A held script is saved untrusted and held back: it needs your approval before it runs, also with
+`trust_team_scripts` on.
+
+`notes save`, `notes update` and `scripts save` take `--client NAME` to name the author (Harness Desktop passes
+`harness-desktop`): 1 to 64 visible characters on one line. Without it the author is unknown.
+
+A refusal prints `{"error": "notFound" | "gone" | "changed" | "invalid" | "refused", "message"}` and exits with 1.
+`gone`: the note a held `note_update` changes was deleted since. `changed`: the held item is not of the `--expect`
+revision, or the note a held `note_update` changes was changed since (the item now shows that note). A refused `held save` or `held skip` keeps the
+item.
+
 ### Which repository
 
 The server asks git (`git rev-parse --show-toplevel` and `git config --get remote.origin.url`) in its working directory,

@@ -1,6 +1,7 @@
 //! Who may let a script run: never the agent through these tools. A version runs when this
 //! machine trusts it for that script (saved here, or approved by a person here), or when it comes
-//! from the team database and `trust_team_scripts` is on ([`approval_of`]).
+//! from the team database, `trust_team_scripts` is on and this machine does not hold it back
+//! ([`approval_of`]).
 //!
 //! For any other version `script_run` asks Harness Desktop when it runs ([`ask`]): the desktop
 //! touches `desktop.alive` next to the database every few seconds, the server writes a request
@@ -19,7 +20,7 @@
 //! waiting changes nothing: after `allow` the approved version still runs with no one to read its
 //! reply, and the agent's next `script_run` runs it again.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -31,6 +32,7 @@ use super::reply::now;
 use super::script_blocks::{Approval, shown_text};
 use crate::store::{PreviousVersion, Script, ScriptSummary, TrustOrigin, TrustStore, clean};
 use crate::support::Env;
+use crate::support::private::{check_folders, data_folder, desktop_alive, private_folder, write_atomic};
 use crate::support::runner::{STOPPED, Stop};
 use crate::support::time::rfc3339;
 
@@ -43,11 +45,8 @@ pub const APPROVAL_WAIT_VAR: &str = "HARNESS_MEMORY_APPROVAL_WAIT_MS";
 /// Pause between looks for the answer.
 const POLL: Duration = Duration::from_millis(250);
 
-/// How fresh `desktop.alive` must be for the desktop to count as running.
-const ALIVE_FOR: Duration = Duration::from_secs(15);
-
 /// The file Harness Desktop keeps touching while it runs, next to the database.
-pub const ALIVE_FILE: &str = "desktop.alive";
+pub use crate::support::private::ALIVE_FILE;
 
 /// The folder next to the database that holds the run requests and their answers.
 pub const REQUESTS_FOLDER: &str = "requests";
@@ -82,7 +81,9 @@ pub(super) enum Answer {
 /// How this machine may run version `sha256` of the script `summary` describes, kept in `place`
 /// (its trust name, see [`crate::backend::Selection::scripts_trust_key`]) as script `script_id`
 /// (its id there, which a [`crate::store::SplitScripts`] may show otherwise); `team_trusted` when
-/// the script was read from the team database and `trust_team_scripts` is on. A version trusted as
+/// the script was read from the team database and `trust_team_scripts` is on. A version held back
+/// on this machine ([`TrustStore::hold_back`]: saved by an agent while a save guard applied, or a
+/// held script the user saved) needs approval whatever team trust says. A version trusted as
 /// another name, scope or repository ([`crate::store::TrustRecord::is_for`]) needs approval
 /// again. A version that needs approval is remembered ([`TrustStore::note_unapproved`], as well
 /// as it can be), so `script_save` never trusts its code.
@@ -99,10 +100,17 @@ pub(crate) fn approval_of(
         .map_err(|error| error.to_string())?
         .filter(|record| record.is_for(summary));
 
+    // A version held back waits for the user's approval even among trusted team scripts.
+    let held_back = |trust: &mut dyn TrustStore| {
+        trust
+            .is_held_back(place, script_id, &summary.name, sha256)
+            .map_err(|error| error.to_string())
+    };
+
     let approval = match record.map(|record| record.origin) {
         Some(TrustOrigin::Saved) => Approval::Local,
         Some(TrustOrigin::Approved) => Approval::Approved,
-        None if team_trusted => Approval::Team,
+        None if team_trusted && !held_back(trust)? => Approval::Team,
         None => Approval::Needed,
     };
 
@@ -140,7 +148,10 @@ pub(super) fn ask(server: &mut Server, script: &Script, summary: Value, input: &
 
     let requests = folder.join(REQUESTS_FOLDER);
 
-    if let Err(reason) = private_folder(&requests).and_then(|()| check_folders(&requests, &folder)) {
+    let checked = private_folder(&requests, "requests folder")
+        .and_then(|()| check_folders(&[(&folder, "data folder"), (&requests, "requests folder")]));
+
+    if let Err(reason) = checked {
         return Answer::Unasked(Some(reason));
     }
 
@@ -174,7 +185,7 @@ pub(super) fn ask(server: &mut Server, script: &Script, summary: Value, input: &
         decision: requests.join(format!("{id}.decision")),
     };
 
-    if let Err(reason) = write_atomic(&requests, &pending.request, &text) {
+    if let Err(reason) = write_atomic(&requests, &pending.request, &text, ".request-", "request") {
         return Answer::Unasked(Some(reason));
     }
 
@@ -222,24 +233,6 @@ pub(super) fn refusal(summary: &ScriptSummary, answer: &Answer) -> Option<Reply>
         is_error: true,
         structured: Some(json!({ "untrusted": true, "id": id, "name": name, "pending": pending })),
     })
-}
-
-/// The folder that holds the database, where Harness Desktop and the server meet.
-fn data_folder(env: &Env) -> Option<PathBuf> {
-    crate::database_path(env).and_then(|path| path.parent().map(Path::to_path_buf))
-}
-
-/// True when `desktop.alive` in `folder` was touched less than [`ALIVE_FOR`] ago (or is dated at
-/// most that far ahead, for a clock set back).
-fn desktop_alive(folder: &Path) -> bool {
-    let Ok(touched) = std::fs::metadata(folder.join(ALIVE_FILE)).and_then(|metadata| metadata.modified()) else {
-        return false;
-    };
-
-    match SystemTime::now().duration_since(touched) {
-        Ok(age) => age < ALIVE_FOR,
-        Err(ahead) => ahead.duration() < ALIVE_FOR,
-    }
 }
 
 /// The request object Harness Desktop reads (camelCase, version 1).
@@ -356,63 +349,6 @@ fn read_decision(path: &Path) -> Option<Answer> {
     }
 }
 
-/// Creates `folder` when missing and makes it `0700` on Unix (failing for a folder another user
-/// owns).
-fn private_folder(folder: &Path) -> Result<(), String> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-
-    builder
-        .create(folder)
-        .map_err(|error| format!("creating the requests folder failed: {error}"))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700))
-            .map_err(|error| format!("securing the requests folder failed: {error}"))?;
-    }
-
-    Ok(())
-}
-
-/// Fails unless `requests` and the data folder above it are folders (not symbolic links) owned
-/// by this user that no one else may write to, so no other user can read or swap a request.
-#[cfg(unix)]
-fn check_folders(requests: &Path, data: &Path) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-
-    let user = nix::unistd::getuid().as_raw();
-
-    for (folder, name) in [(data, "data folder"), (requests, "requests folder")] {
-        let metadata =
-            std::fs::symlink_metadata(folder).map_err(|error| format!("the {name} cannot be read: {error}"))?;
-
-        if !metadata.file_type().is_dir() {
-            return Err(format!("the {name} is not a folder"));
-        }
-
-        if metadata.uid() != user {
-            return Err(format!("the {name} belongs to another user"));
-        }
-
-        if metadata.mode() & 0o022 != 0 {
-            return Err(format!("other users may write to the {name}"));
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_folders(_requests: &Path, _data: &Path) -> Result<(), String> {
-    Ok(())
-}
-
 /// Removes the requests, answers and half-written requests in `requests` older than
 /// [`STALE_AFTER`], left by a server that was killed while it waited.
 fn sweep(requests: &Path) {
@@ -438,32 +374,6 @@ fn sweep(requests: &Path) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
-}
-
-/// Writes `text` to `path` through a temporary file in `folder` (`0600` on Unix) renamed into
-/// place, so the desktop never reads half a request.
-fn write_atomic(folder: &Path, path: &Path, text: &[u8]) -> Result<(), String> {
-    let failed = |error: std::io::Error| format!("writing the request failed: {error}");
-
-    let mut file = tempfile::Builder::new()
-        .prefix(".request-")
-        .suffix(".tmp")
-        .tempfile_in(folder)
-        .map_err(failed)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        file.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(failed)?;
-    }
-
-    file.write_all(text).and_then(|()| file.flush()).map_err(failed)?;
-    file.persist(path).map_err(|error| failed(error.error))?;
-
-    Ok(())
 }
 
 /// The request and answer files of one run, removed when dropped.
@@ -557,12 +467,13 @@ mod tests {
         let requests = data.join(REQUESTS_FOLDER);
         std::fs::create_dir_all(&data).expect("mkdir");
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        private_folder(&requests).expect("created");
-        assert_eq!(check_folders(&requests, &data), Ok(()));
+        private_folder(&requests, "requests folder").expect("created");
+        let both = [(data.as_path(), "data folder"), (requests.as_path(), "requests folder")];
+        assert_eq!(check_folders(&both), Ok(()));
 
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o777)).expect("chmod");
         assert_eq!(
-            check_folders(&requests, &data),
+            check_folders(&both),
             Err("other users may write to the data folder".to_owned())
         );
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).expect("chmod");
@@ -572,7 +483,7 @@ mod tests {
         std::fs::remove_dir(&requests).expect("rmdir");
         std::os::unix::fs::symlink(&elsewhere, &requests).expect("link");
         assert_eq!(
-            check_folders(&requests, &data),
+            check_folders(&both),
             Err("the requests folder is not a folder".to_owned())
         );
     }

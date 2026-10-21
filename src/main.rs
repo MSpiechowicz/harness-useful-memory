@@ -7,7 +7,9 @@
 //! `harness-memory scripts list|get|hide|unhide|delete|discard-local|push` and `harness-memory
 //! trust` list, hide, delete, copy and approve scripts ([`harness_memory::cli_trust`]),
 //! `harness-memory notes list|get|hide|unhide|delete|discard-local` browse, hide and delete notes
-//! ([`harness_memory::cli_notes`]), `harness-memory hooks config|list|get|put|delete` and
+//! ([`harness_memory::cli_notes`]), `harness-memory notes save|update`, `scripts save` and
+//! `held list|save|skip` save the user's notes and scripts and the held items past the save guards
+//! ([`harness_memory::cli_held`]), `harness-memory hooks config|list|get|put|delete` and
 //! `harness-memory routines config|list|get|put|delete` share Harness Desktop hooks and routines
 //! with the team ([`harness_memory::cli_team_docs`]), `harness-memory --version` prints the
 //! version.
@@ -20,15 +22,14 @@ use harness_memory::backend::{self, Backend, CONFIG_VAR, NotesPlace, Routing, Se
 use harness_memory::cli_push::{PushArgs, overwrite, repo_key};
 use harness_memory::location::{DIR_VAR, override_is_relative};
 use harness_memory::mcp::stop_on_sigterm;
-use harness_memory::open::{open_hidden, open_notes, open_other_scripts, open_scripts, open_trust};
-use harness_memory::project::ProjectResolver;
+use harness_memory::open::{open_hidden, open_server};
 use harness_memory::push::{Action, Change, GLOBAL, Options, Summary, push};
 use harness_memory::store::Scope;
 use harness_memory::support::Env;
 use harness_memory::support::runner::Stop;
 use harness_memory::support::time::rfc3339;
-use harness_memory::{Server, database_path, serve};
-use harness_memory::{cli_notes, cli_team_docs, cli_trust};
+use harness_memory::{cli_held, cli_notes, cli_team_docs, cli_trust};
+use harness_memory::{database_path, serve};
 use serde_json::{Value, json};
 
 const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--overwrite none|all|ID[,ID...]|-] \
@@ -52,13 +53,18 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--o
                      --json | routines list --json [--project PATH] [--offset N] [--limit N] | routines get <id> \
                      --json | routines put --json [--project PATH] [--expect-sha SHA256] [--author NAME] < \
                      routine.json | routines delete <id> [--expect-sha SHA256] --json | routines delete --mine \
-                     [--author NAME] --json | --version]";
+                     [--author NAME] --json | notes save --json [--project PATH] [--client NAME] < note.json | notes update <id> --json \
+                     [--project PATH] [--client NAME] < patch.json | scripts save --json [--project PATH] [--client NAME] \
+                     < script.json | held list --json \
+                     [--chat KEY] | held save <heldId> --json [< draft.json] | held skip <heldId> --json | --version]";
 
 /// What this build can do that older ones could not, as `harness-memory features` lists it: the
 /// `remote+local` note routing, hiding team notes on this computer, `push --json`, and the same for
 /// scripts (`scripts = "remote+local"`, `scripts hide`, `scripts push --json`), and reading every
-/// repository at once (`--all-repos`, `--repo KEY`, `notes repos`, `scripts repos`).
-const FEATURES: [&str; 7] = [
+/// repository at once (`--all-repos`, `--repo KEY`, `notes repos`, `scripts repos`), and the save
+/// guards with their held items and user-only saves (`notes save`, `notes update`, `scripts save`,
+/// `held list|save|skip`).
+const FEATURES: [&str; 8] = [
     "notes-remote-local",
     "notes-hide",
     "push-json",
@@ -66,6 +72,7 @@ const FEATURES: [&str; 7] = [
     "scripts-hide",
     "scripts-push-json",
     "all-repos",
+    "save-guards",
 ];
 
 fn main() -> ExitCode {
@@ -101,6 +108,7 @@ fn main() -> ExitCode {
         [Some("scripts"), rest @ ..] => cli_trust::scripts(rest),
         [Some("trust"), rest @ ..] => cli_trust::trust(rest),
         [Some("notes"), rest @ ..] => cli_notes::notes(rest),
+        [Some("held"), rest @ ..] => cli_held::held(rest),
         [Some("hooks"), rest @ ..] => cli_team_docs::hooks(rest),
         [Some("routines"), rest @ ..] => cli_team_docs::routines(rest),
         [Some("--version")] => {
@@ -128,23 +136,10 @@ fn run() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let Some(store) = open_notes(&env, &selection) else {
+    let Some(server) = open_server(&env, &selection, std::env::current_dir().ok()) else {
         return ExitCode::FAILURE;
     };
-
-    let scripts = open_scripts(&env, &selection);
-    let other_scripts = open_other_scripts(&env, &selection);
-    let trust = open_trust(&env);
-    let projects = ProjectResolver::new(env, std::env::current_dir().ok());
-    let mut server = Server::new(store, scripts, trust, projects)
-        .with_scripts_place(selection.scripts_place())
-        .with_team_key(selection.backend.team_key())
-        .with_trust_team_scripts(selection.team_scripts_trusted())
-        .with_stop(stop);
-
-    if let Some(other) = other_scripts {
-        server = server.with_other_scripts(other);
-    }
+    let mut server = server.with_stop(stop);
 
     let stdin = BufReader::new(std::io::stdin());
     let mut stdout = std::io::stdout().lock();

@@ -3,15 +3,37 @@
 //! script neither connects to the team database for scripts nor creates the local file; a failed
 //! open is a tool error, not a stopped server.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::Server;
 use crate::backend::{self, Backend, NotesPlace, Place, Selection};
 use crate::location::{DIR_VAR, Migration, legacy_database_path, migrate_legacy, override_is_relative};
+use crate::project::ProjectResolver;
 use crate::store::{
     HiddenNotes, HiddenScripts, Lazy, MemoryStore, Scope, ScriptStore, SplitScripts, SplitStore, SqliteStore,
     TrustStore,
 };
 use crate::support::Env;
+
+/// The MCP server over the stores `selection` names, started in `cwd`; `None` (with the reason
+/// printed) when the notes store cannot be opened.
+pub fn open_server(env: &Env, selection: &Selection, cwd: Option<PathBuf>) -> Option<Server> {
+    let store = open_notes(env, selection)?;
+    let scripts = open_scripts(env, selection);
+    let other_scripts = open_other_scripts(env, selection);
+    let trust = open_trust(env);
+    let projects = ProjectResolver::new(env.clone(), cwd);
+    let mut server = Server::new(store, scripts, trust, projects)
+        .with_scripts_place(selection.scripts_place())
+        .with_team_key(selection.backend.team_key())
+        .with_trust_team_scripts(selection.team_scripts_trusted());
+
+    if let Some(other) = other_scripts {
+        server = server.with_other_scripts(other);
+    }
+
+    Some(server)
+}
 
 /// The scripts: in the local SQLite file without a team database or with `scripts = "local"`
 /// ([`Selection::scripts_place`]), else a [`SplitScripts`] reading the team database (its own

@@ -55,6 +55,9 @@
 //!   read (every repository's, see [`discard`]), and prints `deleted N notes from this computer`,
 //!   or `{"deleted": N}`.
 //!
+//! - `harness-memory notes save --json [--project PATH] [--client NAME]` and `notes update <id>
+//!   --json [--project PATH] [--client NAME]` save the user's own note past the save guards (see [`save`]).
+//!
 //! A note that is not visible exits 1 with `harness-memory: note <id> not found` as the last line
 //! of stderr. Other exit codes and errors as in [`crate::cli`].
 
@@ -65,6 +68,7 @@ use serde_json::{Map, Value, json};
 
 mod discard;
 mod hidden;
+mod save;
 
 use crate::backend::{Backend, NotesPlace, Place, Secrets, Selection};
 use crate::cli::{self, Args, Delete, PAGE_OPTIONS, PICK_VALUED, Page, Repos};
@@ -82,7 +86,9 @@ pub const USAGE: &str = "notes list --json [--project PATH | --repo KEY | --all-
                          [--hidden] | notes repos --json | notes repos --json | notes get <id> --json [--project PATH | --repo KEY | --all-repos] [--hidden] | notes hide <id> \
                          [--project PATH | --repo KEY | --all-repos] [--json] | notes unhide <id> [--project PATH | --repo KEY | --all-repos] [--json] | notes delete \
                          <id> [--project PATH | --repo KEY | --all-repos] | notes delete --all --yes [--project PATH | --repo KEY] [--json] | notes \
-                         discard-local (--all | ID[,ID...] | -) [--scope repo|global] --yes [--json]";
+                         discard-local (--all | ID[,ID...] | -) [--scope repo|global] --yes [--json] | notes save --json \
+                         [--project PATH] [--client NAME] < note.json | notes update <id> --json [--project PATH] \
+                         [--client NAME] < patch.json";
 
 /// The most linked notes `notes get` lists.
 const LINKS_MAX: usize = 50;
@@ -97,6 +103,8 @@ pub fn notes(args: &[Option<&str>]) -> ExitCode {
         [Some("hide"), rest @ ..] => hidden::hide(rest),
         [Some("unhide"), rest @ ..] => hidden::unhide(rest),
         [Some("discard-local"), rest @ ..] => discard::discard_local(rest),
+        [Some("save"), rest @ ..] => save::save(rest),
+        [Some("update"), rest @ ..] => save::update(rest),
         _ => usage(),
     }
 }

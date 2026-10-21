@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 pub mod approval;
+pub mod guards;
 pub mod hooks;
 pub mod listing;
 pub mod mcp;

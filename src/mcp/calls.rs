@@ -7,21 +7,11 @@ use serde_json::Value;
 use super::Server;
 use super::blocks::{FRAME, hit_block, note_block, saved_line, similar_line};
 use super::reply::{Capped, now};
+use super::scope::{kind, own_root, provenance, scope_arg, target, view};
 use crate::limits::{
     DEPTH_MAX, GET_REPLY_MAX, LIST_REPLY_MAX, NEIGHBORS_LIMIT_DEFAULT, SEARCH_LIMIT_DEFAULT, SIMILAR_MAX,
 };
-use crate::store::{
-    Forget, Link, NoteDraft, NoteKind, NoteOrigin, NotePatch, ProjectKey, Provenance, SearchQuery, Target, View, clean,
-};
-
-/// Sent when a repository-scope call has no repository.
-pub(super) const NO_PROJECT: &str = "cannot tell which repository this is (the server runs outside one, or in the home folder \
-                          or a filesystem root). Retry the same call with the argument project_path set to the absolute \
-                          path of the repository you are working in (its git root, e.g. \"/Users/me/work/repo\"), or with \
-                          scope \"global\" for knowledge that belongs to no repository";
-
-/// Sent when `same_checkout` is asked for outside a checkout.
-const NO_CHECKOUT: &str = "same_checkout needs the server to run inside a repository checkout";
+use crate::store::{Forget, Link, NoteDraft, NoteOrigin, NotePatch, Saved, SearchQuery, Target, View, clean};
 
 /// A tool result.
 pub(super) struct Reply {
@@ -33,14 +23,35 @@ pub(super) struct Reply {
 
 /// Runs tool `name`; `None` when there is no such tool.
 pub(super) fn call(server: &mut Server, name: &str, arguments: Value) -> Option<Reply> {
+    // The save guards refuse or hold a write before any tool body runs.
+    if let Some(reply) = super::guards::gate(server, name, &arguments) {
+        return Some(reply);
+    }
+
+    // A read says when the user does not plainly let agents save what it reads, in room its
+    // capped reply keeps free.
+    let notice = super::saving::notice(server, name, &arguments);
+    let reserved = notice.as_ref().map_or(0, super::saving::Notice::room);
+    let mut reply = run(server, name, arguments, reserved)?;
+
+    if let Some(notice) = notice {
+        notice.add_to(&mut reply);
+    }
+
+    Some(reply)
+}
+
+/// Runs the body of tool `name`, keeping `reserved` bytes of a capped reply free; `None` when
+/// there is no such tool.
+fn run(server: &mut Server, name: &str, arguments: Value, reserved: usize) -> Option<Reply> {
     let result = match name {
         "note_save" => parse(arguments).and_then(|args| remember(server, args)),
         "note_update" => parse(arguments).and_then(|args| update(server, args)),
-        "note_search" => parse(arguments).and_then(|args| search(server, args)),
-        "note_get" => parse(arguments).and_then(|args| get(server, args)),
+        "note_search" => parse(arguments).and_then(|args| search(server, args, reserved)),
+        "note_get" => parse(arguments).and_then(|args| get(server, args, reserved)),
         "note_delete" => parse(arguments).and_then(|args| delete_note(server, args)),
         "entity_link" => parse(arguments).and_then(|args| link(server, args)),
-        "entity_neighbors" => parse(arguments).and_then(|args| neighbors(server, args)),
+        "entity_neighbors" => parse(arguments).and_then(|args| neighbors(server, args, reserved)),
         "entity_delete" => parse(arguments).and_then(|args| delete_entity(server, args)),
         _ => return super::calls_scripts::call(server, name, arguments),
     };
@@ -60,26 +71,26 @@ pub(super) fn call(server: &mut Server, name: &str, arguments: Value) -> Option<
 }
 
 #[derive(Deserialize)]
-struct RememberArgs {
-    title: String,
-    body: String,
-    kind: String,
-    tags: Option<Vec<String>>,
-    entities: Option<Vec<String>>,
-    scope: Option<String>,
-    project_path: Option<String>,
+pub(super) struct RememberArgs {
+    pub title: String,
+    pub body: String,
+    pub kind: String,
+    pub tags: Option<Vec<String>>,
+    pub entities: Option<Vec<String>>,
+    pub scope: Option<String>,
+    pub project_path: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct UpdateArgs {
-    id: i64,
-    title: Option<String>,
-    body: Option<String>,
-    append: Option<String>,
-    kind: Option<String>,
-    tags: Option<Vec<String>>,
-    scope: Option<String>,
-    project_path: Option<String>,
+pub(super) struct UpdateArgs {
+    pub id: i64,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub append: Option<String>,
+    pub kind: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub scope: Option<String>,
+    pub project_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -138,20 +149,7 @@ struct EntityDeleteArgs {
 }
 
 fn remember(server: &mut Server, args: RememberArgs) -> Result<String, String> {
-    let target = target(server, args.scope.as_deref(), args.project_path.as_deref())?;
-    let draft = NoteDraft {
-        title: args.title,
-        body: args.body,
-        kind: kind(&args.kind)?,
-        tags: args.tags.unwrap_or_default(),
-        entities: args.entities.unwrap_or_default(),
-        provenance: provenance(server, args.project_path.as_deref()),
-    };
-
-    let saved = server
-        .store
-        .remember(&target, &draft)
-        .map_err(|error| error.to_string())?;
+    let (target, saved) = save_note(server, args)?;
     let similar = server
         .store
         .similar(&View::around(&target), saved.id, SIMILAR_MAX)
@@ -180,7 +178,32 @@ fn remember(server: &mut Server, args: RememberArgs) -> Result<String, String> {
     Ok(text)
 }
 
+/// Saves the note `args` describe (the body of `note_save`): where it went, and the result.
+pub(super) fn save_note(server: &mut Server, args: RememberArgs) -> Result<(Target, Saved), String> {
+    let target = target(server, args.scope.as_deref(), args.project_path.as_deref())?;
+    let draft = NoteDraft {
+        title: args.title,
+        body: args.body,
+        kind: kind(&args.kind)?,
+        tags: args.tags.unwrap_or_default(),
+        entities: args.entities.unwrap_or_default(),
+        provenance: provenance(server, args.project_path.as_deref()),
+    };
+
+    let saved = server
+        .store
+        .remember(&target, &draft)
+        .map_err(|error| error.to_string())?;
+
+    Ok((target, saved))
+}
+
 fn update(server: &mut Server, args: UpdateArgs) -> Result<String, String> {
+    update_note(server, args).map(|saved| saved_line(&saved))
+}
+
+/// Changes the note `args` name (the body of `note_update`).
+pub(super) fn update_note(server: &mut Server, args: UpdateArgs) -> Result<Saved, String> {
     let view = view(server, args.scope.as_deref(), args.project_path.as_deref())?;
     let patch = NotePatch {
         title: args.title,
@@ -191,14 +214,13 @@ fn update(server: &mut Server, args: UpdateArgs) -> Result<String, String> {
         provenance: provenance(server, args.project_path.as_deref()),
     };
 
-    let saved = server
+    server
         .store
         .update(&view, args.id, &patch)
-        .map_err(|error| error.to_string())?;
-    Ok(saved_line(&saved))
+        .map_err(|error| error.to_string())
 }
 
-fn search(server: &mut Server, args: SearchArgs) -> Result<String, String> {
+fn search(server: &mut Server, args: SearchArgs, reserved: usize) -> Result<String, String> {
     let view = view(server, args.scope.as_deref(), args.project_path.as_deref())?;
     let limit = args
         .limit
@@ -222,9 +244,9 @@ fn search(server: &mut Server, args: SearchArgs) -> Result<String, String> {
     let scripts = super::search_scripts::block(server, &query.view, &query.text);
     let home = server.projects.home();
 
-    // The saved scripts always fit: the notes get the room they leave.
+    // The saved scripts always fit: the notes get the room they and the notice leave.
     let room = scripts.as_ref().map_or(0, |block| block.len() + 1);
-    let mut reply = Capped::new(LIST_REPLY_MAX.saturating_sub(room));
+    let mut reply = Capped::new(LIST_REPLY_MAX.saturating_sub(room + reserved));
 
     if !hits.is_empty() {
         reply.push(FRAME);
@@ -252,12 +274,12 @@ fn search(server: &mut Server, args: SearchArgs) -> Result<String, String> {
     Ok(text)
 }
 
-fn get(server: &mut Server, args: GetArgs) -> Result<String, String> {
+fn get(server: &mut Server, args: GetArgs, reserved: usize) -> Result<String, String> {
     let view = view(server, args.scope.as_deref(), args.project_path.as_deref())?;
     let notes = server.store.get(&view, &args.ids).map_err(|error| error.to_string())?;
     let now = now();
     let home = server.projects.home();
-    let mut reply = Capped::new(GET_REPLY_MAX);
+    let mut reply = Capped::new(GET_REPLY_MAX.saturating_sub(reserved));
 
     let missing: Vec<String> = args
         .ids
@@ -306,7 +328,7 @@ fn link(server: &mut Server, args: LinkArgs) -> Result<String, String> {
     ))
 }
 
-fn neighbors(server: &mut Server, args: NeighborsArgs) -> Result<String, String> {
+fn neighbors(server: &mut Server, args: NeighborsArgs, reserved: usize) -> Result<String, String> {
     let view = view(server, args.scope.as_deref(), args.project_path.as_deref())?;
     let depth = u8::try_from(args.depth.unwrap_or(1).clamp(1, i64::from(DEPTH_MAX))).unwrap_or(1);
     let limit = args.limit.map_or(NEIGHBORS_LIMIT_DEFAULT, |limit| {
@@ -318,7 +340,7 @@ fn neighbors(server: &mut Server, args: NeighborsArgs) -> Result<String, String>
         .neighbors(&view, &args.entity, depth, limit)
         .map_err(|error| error.to_string())?;
 
-    let mut reply = Capped::new(LIST_REPLY_MAX);
+    let mut reply = Capped::new(LIST_REPLY_MAX.saturating_sub(reserved));
 
     if !around.edges.is_empty() || !around.notes.is_empty() {
         reply.push(FRAME);
@@ -413,92 +435,4 @@ pub(super) fn parse<T: DeserializeOwned>(arguments: Value) -> Result<T, String> 
     serde_json::from_value(arguments).map_err(|error| {
         format!("invalid arguments: {error}. Check the tool's input schema in tools/list for the required fields")
     })
-}
-
-fn kind(raw: &str) -> Result<NoteKind, String> {
-    NoteKind::parse(raw).ok_or_else(|| {
-        let kinds: Vec<&str> = NoteKind::ALL.iter().map(|kind| kind.as_str()).collect();
-        format!("kind must be one of {}", kinds.join(", "))
-    })
-}
-
-/// `scope` or its default, checked against `repo`, `global`, `both`.
-fn scope_arg<'a>(raw: Option<&'a str>, default: &'a str) -> Result<&'a str, String> {
-    match raw.map(str::trim).filter(|raw| !raw.is_empty()).unwrap_or(default) {
-        scope @ ("repo" | "global" | "both") => Ok(scope),
-        _ => Err("scope must be repo, global or both".to_owned()),
-    }
-}
-
-/// The scope a write goes to (default: this repository).
-pub(super) fn target(server: &mut Server, scope: Option<&str>, project_path: Option<&str>) -> Result<Target, String> {
-    match scope_arg(scope, "repo")? {
-        "global" => Ok(Target::Global),
-        "repo" => match resolve(server, project_path)? {
-            Some(key) => Ok(Target::Repo(key)),
-            None => Err(NO_PROJECT.to_owned()),
-        },
-        _ => Err("scope must be repo or global here".to_owned()),
-    }
-}
-
-/// `Projects::resolve`, with the fix added to a refused `project_path`.
-fn resolve(server: &mut Server, project_path: Option<&str>) -> Result<Option<ProjectKey>, String> {
-    server.projects.resolve(project_path).map_err(|reason| {
-        format!(
-            "{reason} (got {:?}). Pass project_path as the absolute path of the repository you are working in \
-             (its git root, e.g. \"/Users/me/work/repo\"), or use scope \"global\"",
-            project_path.unwrap_or_default()
-        )
-    })
-}
-
-/// What a read may see (default: this repository, when known, and the global scope).
-fn view(server: &mut Server, scope: Option<&str>, project_path: Option<&str>) -> Result<View, String> {
-    match scope_arg(scope, "both")? {
-        "global" => Ok(View {
-            repo: None,
-            global: true,
-        }),
-        "repo" => match resolve(server, project_path)? {
-            Some(key) => Ok(View {
-                repo: Some(key),
-                global: false,
-            }),
-            None => Err(NO_PROJECT.to_owned()),
-        },
-        _ => Ok(View {
-            repo: resolve(server, project_path)?,
-            global: true,
-        }),
-    }
-}
-
-/// The root of the checkout the server runs in (never the one `project_path` names).
-fn own_root(server: &mut Server) -> Result<std::path::PathBuf, String> {
-    match server.projects.resolve(None)? {
-        Some(key) => Ok(key.root),
-        None => Err(NO_CHECKOUT.to_owned()),
-    }
-}
-
-/// Who is writing: the client, the root of the checkout the server runs in (`None` outside one),
-/// and whether `project_path` named another repository than that one. The root is always the
-/// writer's own, never the checkout `project_path` named, so a note does not claim to come from a
-/// checkout that did not write it.
-pub(super) fn provenance(server: &mut Server, project_path: Option<&str>) -> Provenance {
-    let named = server.projects.resolve(project_path).ok().flatten().map(|key| key.root);
-    let given = project_path.is_some_and(|raw| !raw.trim().is_empty());
-
-    let own = if given {
-        server.projects.resolve(None).ok().flatten().map(|key| key.root)
-    } else {
-        named.clone()
-    };
-
-    Provenance {
-        via_override: named != own,
-        root: own,
-        source: server.client.clone(),
-    }
 }

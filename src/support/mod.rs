@@ -2,6 +2,7 @@
 //!
 //! - [`env`]: the injected process environment ([`Env`]) and the per-machine data folder.
 //! - [`paths`]: project folder validation.
+//! - [`private`]: the private files Harness Desktop and the server share next to the database.
 //! - [`git`]: a hardened, shell-free `git` runner with a timeout and an output cap.
 //! - [`redact`]: masks secrets in free text before it is stored.
 //! - [`text`]: display safety checks and the search stopword list.
@@ -13,6 +14,7 @@ pub mod env;
 pub mod git;
 pub mod ids;
 pub mod paths;
+pub mod private;
 pub mod redact;
 pub mod runner;
 pub mod text;

@@ -331,6 +331,15 @@ pub trait TrustStore: Send {
 
     /// True when one of `sha256s` was reported here as waiting for approval.
     fn was_unapproved(&mut self, sha256s: &[String]) -> Result<bool, StoreError>;
+
+    /// Holds version `sha256` of the script `name` in `place` (as script `script_id` there, when
+    /// known) back from team trust: it needs the user's approval before it runs even while every
+    /// team script is trusted. Never forgotten until the user trusts the version ([`Self::trust`]
+    /// with [`TrustOrigin::Approved`] releases it).
+    fn hold_back(&mut self, place: &str, script_id: Option<i64>, name: &str, sha256: &str) -> Result<(), StoreError>;
+
+    /// True when version `sha256` of script `script_id` (named `name`) in `place` is held back.
+    fn is_held_back(&mut self, place: &str, script_id: i64, name: &str, sha256: &str) -> Result<bool, StoreError>;
 }
 
 /// The hash that names a script version for trust: the lowercase hex SHA-256 of
