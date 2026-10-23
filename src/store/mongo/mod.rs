@@ -95,6 +95,7 @@
 
 mod connection;
 pub mod documentdb;
+mod embed;
 mod graph;
 mod listing;
 mod notes;
@@ -114,7 +115,7 @@ use mongodb::options::{ClientOptions, ReadConcern, ReturnDocument, WriteConcern}
 use mongodb::sync::{Client, ClientSession, Collection, Database};
 
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, Saved, SearchQuery};
-use super::{Forgotten, NoteListQuery, NotePage, Scope, StoreError, Target, View};
+use super::{Forgotten, NoteListQuery, NotePage, NoteText, Scope, StoreError, Target, View};
 use crate::limits::{BODY_MAX, ENTITY_MAX, TAG_MAX, TAGS_MAX, TITLE_MAX};
 use crate::store::listing::checked_exclude;
 use schema::SchemaState;
@@ -369,6 +370,14 @@ impl MemoryStore for MongoStore {
     fn similar_text(&mut self, view: &View, text: (&str, &str), limit: usize) -> Result<Vec<Hit>, StoreError> {
         let text_index = self.text_index;
         search::resembling(&mut self.reader()?, view, text, None, limit, text_index).map_err(|fail| self.failed(fail))
+    }
+
+    fn notes_since(&mut self, cursor: i64, limit: usize) -> Result<Vec<NoteText>, StoreError> {
+        embed::notes_since(&mut self.reader()?, cursor, limit).map_err(|fail| self.failed(fail))
+    }
+
+    fn note_ids(&mut self) -> Result<Vec<i64>, StoreError> {
+        embed::note_ids(&mut self.reader()?).map_err(|fail| self.failed(fail))
     }
 
     fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {

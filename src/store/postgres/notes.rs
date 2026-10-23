@@ -13,7 +13,7 @@ use crate::store::{Forgotten, Note, NoteKind, Provenance, Saved, Scope, StoreErr
 
 /// The columns [`note_from_row`] reads, from `notes n LEFT JOIN projects p`, with the text cut to
 /// the limits (see [`cut`]).
-fn note_columns() -> String {
+pub(super) fn note_columns() -> String {
     columns(&cut("n.body", BODY_MAX))
 }
 

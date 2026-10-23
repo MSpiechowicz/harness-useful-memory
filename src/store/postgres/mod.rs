@@ -21,6 +21,7 @@
 //! server's message, stored text, the URL or a password.
 
 mod connect;
+mod embed;
 mod graph;
 mod listing;
 mod notes;
@@ -36,7 +37,7 @@ use postgres::types::FromSql;
 use postgres::{Client, GenericClient, NoTls, Row, Transaction};
 
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, ProjectKey};
-use super::{Forgotten, NoteListQuery, NotePage, Saved, SearchQuery, StoreError, Target, View, clean};
+use super::{Forgotten, NoteListQuery, NotePage, NoteText, Saved, SearchQuery, StoreError, Target, View, clean};
 use crate::store::listing::checked_exclude;
 pub use connect::UrlError;
 use schema::SchemaState;
@@ -224,6 +225,14 @@ impl MemoryStore for PostgresStore {
 
     fn similar_text(&mut self, view: &View, text: (&str, &str), limit: usize) -> Result<Vec<Hit>, StoreError> {
         self.read(|client| search::resembling(client, view, text, None, limit))
+    }
+
+    fn notes_since(&mut self, cursor: i64, limit: usize) -> Result<Vec<NoteText>, StoreError> {
+        self.read(|client| embed::notes_since(client, cursor, limit))
+    }
+
+    fn note_ids(&mut self) -> Result<Vec<i64>, StoreError> {
+        self.read(embed::note_ids)
     }
 
     fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {

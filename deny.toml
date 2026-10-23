@@ -2,6 +2,11 @@
 
 [advisories]
 yanked = "deny"
+ignore = [
+  # paste is unmaintained (archived), but it is only a proc macro that tokenizers 0.23 uses at
+  # build time (the embedder's tokenizer). No safe upgrade exists.
+  "RUSTSEC-2024-0436",
+]
 
 [licenses]
 confidence-threshold = 0.8
@@ -19,6 +24,8 @@ allow = [
   "CDLA-Permissive-2.0",
   # tiny-keccak, a build-time dependency of the MongoDB driver's macros.
   "CC0-1.0",
+  # doctest-file and recvmsg, dependencies of interprocess (the embedder's local socket).
+  "0BSD",
   # This crate.
   "GPL-3.0-or-later",
 ]

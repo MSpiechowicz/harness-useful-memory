@@ -288,6 +288,20 @@ pub struct SearchQuery {
     pub exclude: Vec<i64>,
 }
 
+/// The text of a stored note and where it belongs, as the embedder reads it
+/// ([`MemoryStore::notes_since`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteText {
+    pub id: i64,
+    /// The repository key, `None` for a global note.
+    pub project: Option<String>,
+    pub title: String,
+    pub body: String,
+    pub tags: Vec<String>,
+    /// Unix seconds.
+    pub updated_at: i64,
+}
+
 /// One search row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
@@ -457,6 +471,24 @@ pub trait MemoryStore: Send {
     fn similar_text(&mut self, view: &View, text: (&str, &str), limit: usize) -> Result<Vec<Hit>, StoreError> {
         let _ = (view, text, limit);
         Ok(Vec::new())
+    }
+
+    /// Up to `limit` notes last updated at `cursor` (Unix seconds) or later, oldest first, every
+    /// repository's and the global ones, for the embedder to index. Several notes can share one
+    /// second, so a caller pages by moving the cursor to the last note's `updated_at`. The default
+    /// fails: only a store over one database has one id space to read.
+    fn notes_since(&mut self, cursor: i64, limit: usize) -> Result<Vec<NoteText>, StoreError> {
+        let _ = (cursor, limit);
+        Err(StoreError::Invalid(
+            "this store cannot list its notes for indexing".to_owned(),
+        ))
+    }
+
+    /// The id of every note, for the embedder to find the ones that were deleted.
+    fn note_ids(&mut self) -> Result<Vec<i64>, StoreError> {
+        Err(StoreError::Invalid(
+            "this store cannot list its notes for indexing".to_owned(),
+        ))
     }
 
     /// Where note `id` of `scope` (as this store shows it) lives, and whether it can be changed

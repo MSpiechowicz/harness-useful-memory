@@ -24,11 +24,12 @@ mod team_docs;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::sqlite::embed;
 use super::sqlite::engine::{self, Engine};
 use super::sqlite::schema::{self, SCHEMA_VERSION, SchemaState};
 use super::sqlite::sql::Sql;
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, Saved, SearchQuery};
-use super::{Forgotten, NoteListQuery, NotePage, StoreError, Target, View};
+use super::{Forgotten, NoteListQuery, NotePage, NoteText, StoreError, Target, View};
 use hrana::{Client, Outcome, Stream, execute};
 
 /// How long a write keeps asking for a lock the server reports busy.
@@ -177,6 +178,14 @@ impl MemoryStore for LibsqlStore {
 
     fn similar_text(&mut self, view: &View, text: (&str, &str), limit: usize) -> Result<Vec<Hit>, StoreError> {
         engine::similar_text(self, view, text, limit)
+    }
+
+    fn notes_since(&mut self, cursor: i64, limit: usize) -> Result<Vec<NoteText>, StoreError> {
+        embed::notes_since(self, cursor, limit)
+    }
+
+    fn note_ids(&mut self) -> Result<Vec<i64>, StoreError> {
+        embed::note_ids(self)
     }
 
     fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {
