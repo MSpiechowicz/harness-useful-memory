@@ -10,6 +10,8 @@ use tempfile::TempDir;
 use super::support::{Notes, World, fake_manifest, ids, install, target};
 use crate::embed::client::{ClientError, EmbedderClient};
 use crate::embed::protocol::NoteInput;
+#[cfg(unix)]
+use crate::embed::server;
 use crate::embed::server::{Endpoint, Lock, LockError, Server};
 
 const MODEL: &str = "fake@1";
@@ -240,27 +242,111 @@ fn a_socket_left_by_a_killed_embedder_is_replaced_and_a_file_is_not() {
 
 #[cfg(unix)]
 #[test]
-fn a_long_data_folder_gets_its_socket_in_the_temporary_folder() {
+fn a_long_data_folder_gets_its_socket_in_a_folder_of_this_user() {
     let temp = TempDir::new().expect("temp dir");
+    let runtime = TempDir::new().expect("runtime dir");
     let short = std::path::Path::new("/data/harness-memory");
     let long = std::path::PathBuf::from(format!("/home/someone/{}/harness-memory", "deep/".repeat(30)));
 
-    let near = Endpoint::of(short, temp.path());
+    let near = Endpoint::placed(short, temp.path(), Some(runtime.path()));
     assert_eq!(near.path(), short.join("embedder.sock"));
 
-    let far = Endpoint::of(&long, temp.path());
-    assert!(far.path().starts_with(temp.path()));
-    assert!(
-        far.path()
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with("harness-memory-"))
+    let run = Endpoint::placed(&long, temp.path(), Some(runtime.path()));
+    assert_eq!(run.path().parent(), Some(runtime.path()));
+    assert!(run.path().as_os_str().len() <= 100);
+
+    let far = Endpoint::placed(&long, temp.path(), None);
+    let uid = nix::unistd::getuid().as_raw();
+    assert_eq!(
+        far.path().parent(),
+        Some(temp.path().join(format!("harness-memory-{uid}")).as_path())
     );
-    assert!(far.path().as_os_str().len() <= 100 || temp.path().as_os_str().len() > 60);
     assert_ne!(
         far.path(),
-        Endpoint::of(&long.join("other"), temp.path()).path(),
+        Endpoint::placed(&long.join("other"), temp.path(), None).path(),
         "one per data folder"
     );
+
+    // A runtime folder that does not fit the socket path is passed over.
+    let deep = temp.path().join("d".repeat(90));
+    std::fs::create_dir(&deep).expect("deep runtime dir");
+    assert_eq!(
+        Endpoint::placed(&long, temp.path(), Some(&deep)).path().parent(),
+        far.path().parent()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_runtime_folder_is_used_only_when_it_is_private_and_this_users() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().expect("temp dir");
+    let folder = dir.path().join("run");
+    std::fs::create_dir(&folder).expect("folder");
+
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).expect("private");
+    assert_eq!(server::usable_runtime(folder.clone()), Some(folder.clone()));
+
+    for mode in [0o750, 0o705, 0o755] {
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(mode)).expect("mode");
+        assert_eq!(server::usable_runtime(folder.clone()), None, "{mode:o}");
+    }
+
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).expect("private");
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&folder, &link).expect("link");
+
+    assert_eq!(server::usable_runtime(link), None, "not through a link");
+    assert_eq!(server::usable_runtime("run".into()), None, "not a relative path");
+    assert_eq!(server::usable_runtime(dir.path().join("missing")), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_folder_of_a_long_data_folders_socket_is_made_private_and_a_strangers_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().expect("temp dir");
+    let temp = TempDir::new().expect("temp folder");
+    let root = dir.path().join("data");
+    std::fs::create_dir_all(&root).expect("data");
+    let long = root.join("deep/".repeat(30));
+    let world = World::open(dir, fake_manifest(MODEL), None, Vec::new());
+
+    let endpoint = Endpoint::placed(&long, temp.path(), None);
+    let folder = endpoint.path().parent().expect("folder").to_path_buf();
+
+    // Taken by a folder other users may write to (a stranger's would fail the same check).
+    std::fs::create_dir(&folder).expect("squatted folder");
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o777)).expect("open it up");
+
+    let refused = Server::start(endpoint.clone(), world.service.clone())
+        .err()
+        .expect("refused");
+    assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(refused.to_string().contains("write"), "{refused}");
+    assert!(!endpoint.path().exists());
+    assert_eq!(
+        endpoint
+            .connect(Duration::from_millis(200))
+            .err()
+            .map(|error| error.kind()),
+        Some(std::io::ErrorKind::PermissionDenied)
+    );
+
+    // A link in its place is refused too.
+    std::fs::remove_dir(&folder).expect("remove");
+    std::os::unix::fs::symlink(temp.path(), &folder).expect("link");
+    assert!(Server::start(endpoint.clone(), world.service.clone()).is_err());
+    std::fs::remove_file(&folder).expect("remove the link");
+
+    // Free, it is made `0700` and serves.
+    let server = Server::start(endpoint.clone(), world.service.clone()).expect("start");
+    let mode = std::fs::metadata(&folder).expect("folder").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+    assert!(EmbedderClient::from_endpoint(endpoint.clone()).ping().is_ok());
+    server.shutdown();
 }
 
 #[test]
@@ -279,6 +365,7 @@ fn a_stuck_embedder_costs_each_call_no_more_than_its_timeout() {
 
     let dir = TempDir::new().expect("temp dir");
     let endpoint = Endpoint::of(dir.path(), &std::env::temp_dir());
+    endpoint.publish().expect("publish");
     let listener = ListenerOptions::new()
         .name(endpoint.name().expect("name"))
         .create_sync()

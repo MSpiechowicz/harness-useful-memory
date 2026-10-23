@@ -322,7 +322,11 @@ fn get(server: &mut Server, args: GetArgs, reserved: usize) -> Result<String, St
     for (index, note) in notes.iter().enumerate() {
         let mut block = note_block(note, now, &home);
 
-        if rewrite && note.lang == Some(Lang::Other) {
+        // The hint asks for a `note_update`, so only a note the caller may change gets it (a team
+        // note in a `remote+local` scope is read-only here).
+        let writable = server.store.origin(note.id, note.scope) != (NoteOrigin::Team { read_only: true });
+
+        if rewrite && writable && note.lang == Some(Lang::Other) {
             block.push('\n');
             block.push_str(&rewrite_line(note));
         }

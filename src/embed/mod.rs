@@ -9,7 +9,8 @@
 //!   notes and drops the deleted ones.
 //! - [`update`]: a new model manifest is downloaded and every note re-embedded while the old model
 //!   keeps answering, then the answer switches at once.
-//! - [`protocol`], [`server`] and [`client`]: the socket, and what `mcp` calls.
+//! - [`protocol`], [`server`] and [`client`]: the socket (on Windows a named pipe kept to this user by
+//!   `pipe`), and what `mcp` calls.
 //!
 //! [`Service`] ties these together without threads or sockets of its own, so tests drive it with
 //! a fake engine; `cli_embedder` runs it.
@@ -20,6 +21,8 @@ pub mod client;
 pub mod engine;
 pub mod manifest;
 pub mod model;
+#[cfg(windows)]
+mod pipe;
 pub mod protocol;
 pub mod server;
 mod update;

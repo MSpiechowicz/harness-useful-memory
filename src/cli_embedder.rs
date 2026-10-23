@@ -202,7 +202,7 @@ fn run() -> ExitCode {
         Ok(server) => server,
         Err(error) => {
             events.emit(Event::Error {
-                message: format!("cannot listen on the socket ({})", error.kind()),
+                message: format!("cannot listen on the socket ({error})"),
             });
             return ExitCode::FAILURE;
         }
@@ -260,7 +260,7 @@ pub fn sources_for(env: &Env, selection: &Selection) -> Vec<Source> {
             None => Err("no team database is set".to_owned()),
         });
 
-        sources.push(Source::new(key, Box::new(store)));
+        sources.push(Source::new(key, Box::new(store)).with_secrets(backend.secrets()));
     }
 
     sources

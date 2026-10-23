@@ -208,6 +208,31 @@ fn a_hidden_team_note_is_never_returned_and_local_ids_keep_their_offset() {
 }
 
 #[test]
+fn a_vector_hit_whose_id_cannot_be_shifted_is_dropped_not_a_crash() {
+    let dir = TempDir::new().expect("temp dir");
+    let mut team = SqliteStore::open(&dir.path().join("team.sqlite3")).expect("team file");
+    seed(&mut team, &[SESSION]);
+    seed(&mut store(dir.path()), &[CACHE]);
+    set_enabled(dir.path(), true).expect("enable");
+
+    // The local store's ids are shifted by LOCAL_ID_OFFSET: this one would overflow.
+    let _embedder = FakeEmbedder::start(
+        dir.path(),
+        answering(&[(LOCAL_KEY, i64::MAX, 0.90), (TEAM_KEY, 1, 0.80), (LOCAL_KEY, 1, 0.70)]),
+    );
+    let mut server = server_over(
+        Box::new(split(dir.path(), NotesPlace::RemoteLocal)),
+        dir.path(),
+        dir.path(),
+    )
+    .with_vectors(vectors(dir.path()));
+
+    let reply = search(&mut server, "legacy authentication");
+
+    assert_eq!(ids_of(&reply), [1, LOCAL_ID_OFFSET + 1], "{reply}");
+}
+
+#[test]
 fn the_first_search_says_the_embedder_is_down_and_later_ones_stay_quiet() {
     let dir = TempDir::new().expect("temp dir");
     seed(&mut store(dir.path()), &[LOGIN, SESSION]);

@@ -6,9 +6,13 @@
 mod common;
 
 use common::guards::{Guarded, structured, tool};
-use common::mcp::{call, is_error, run, server, text};
+use common::mcp::{call, env, is_error, run, server, text};
 use harness_memory::Server;
-use harness_memory::store::{MemoryStore, NoteDraft, NoteKind, Provenance, SqliteStore, Target};
+use harness_memory::backend::NotesPlace;
+use harness_memory::project::ProjectResolver;
+use harness_memory::store::{
+    HiddenNotes, MemoryStore, NoteDraft, NoteKind, Provenance, SplitStore, SqliteStore, Target,
+};
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -241,4 +245,51 @@ fn a_tool_call_without_a_handshake_still_works() {
         &[call(1, "note_save", global_note("Synchronizacja notatek", POLISH))],
     );
     assert_refused(&replies[0], REFUSED_SAVE);
+}
+
+/// The hint asks for a `note_update`, which a team note of a `remote+local` scope refuses: the
+/// caller is not told to do what cannot work, while a team note it may change gets the hint.
+#[test]
+fn note_get_asks_for_no_rewrite_of_a_team_note_this_computer_cannot_change() {
+    let hint = "This note is not in English: rewrite it in English with note_update (id 1).";
+    let dir = TempDir::new().expect("temp dir");
+
+    let mut team = SqliteStore::open(&dir.path().join("team.sqlite3")).expect("team file");
+    let draft = NoteDraft {
+        title: "Notatka synchronizacji".to_owned(),
+        body: POLISH.to_owned(),
+        kind: NoteKind::Note,
+        tags: Vec::new(),
+        entities: Vec::new(),
+        provenance: Provenance::default(),
+    };
+    team.remember(&Target::Global, &draft).expect("save");
+
+    let get = |place: NotesPlace| {
+        let team = SqliteStore::open(&dir.path().join("team.sqlite3")).expect("team file");
+        let local = || SqliteStore::open(&dir.path().join("memory.sqlite3")).expect("local file");
+        let hidden = HiddenNotes::new(dir.path().join("memory.sqlite3"), "team");
+
+        let mut server = Server::new(
+            Box::new(SplitStore::routed(
+                Box::new(team),
+                Box::new(local()),
+                place,
+                place,
+                Some(hidden),
+            )),
+            Box::new(local()),
+            Box::new(local()),
+            ProjectResolver::new(env(dir.path()), Some(dir.path().to_path_buf())),
+        );
+
+        text(&tool(&mut server, "note_get", json!({ "ids": [1] }))).to_owned()
+    };
+
+    let read_only = get(NotesPlace::RemoteLocal);
+    assert!(read_only.contains("Notatka synchronizacji"), "{read_only}");
+    assert!(!read_only.contains("rewrite it in English"), "{read_only}");
+
+    let writable = get(NotesPlace::Remote);
+    assert!(writable.lines().any(|line| line == hint), "{writable}");
 }

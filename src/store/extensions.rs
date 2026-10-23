@@ -11,6 +11,7 @@ use std::sync::Once;
 use std::time::Duration;
 
 use super::StoreError;
+use crate::support::redact::redact_text;
 
 /// Notes filled per backfill write.
 pub(crate) const BACKFILL_PAGE: usize = 500;
@@ -28,8 +29,9 @@ pub(crate) fn warn_unavailable(error: &StoreError) {
 
     WARNED.call_once(|| {
         eprintln!(
-            "harness-memory: cannot add the search extensions to the memory database ({error}), continuing without \
-             them: English stemming and the notes language setting are off for this database"
+            "harness-memory: cannot add the search extensions to the memory database ({}), continuing without \
+             them: English stemming and the notes language setting are off for this database",
+            redact_text(&error.to_string())
         );
     });
 }
@@ -38,7 +40,12 @@ pub(crate) fn warn_unavailable(error: &StoreError) {
 pub(crate) fn warn_backfill(error: &StoreError) {
     static WARNED: Once = Once::new();
 
-    WARNED.call_once(|| eprintln!("harness-memory: cannot fill the notes language yet ({error}), trying again later"));
+    WARNED.call_once(|| {
+        eprintln!(
+            "harness-memory: cannot fill the notes language yet ({}), trying again later",
+            redact_text(&error.to_string())
+        );
+    });
 }
 
 /// The error of a setting that needs the extensions when the database has none.

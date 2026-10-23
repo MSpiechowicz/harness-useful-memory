@@ -185,6 +185,7 @@ fn a_base_url_must_be_https_or_this_computer() {
         "http://127.0.0.1:8000",
         "http://localhost/x",
         "HTTP://LOCALHOST:1",
+        "http://[::1]:8080/models",
     ] {
         assert!(model::check_base(fine).is_ok(), "{fine}");
     }
@@ -194,6 +195,13 @@ fn a_base_url_must_be_https_or_this_computer() {
         "ftp://127.0.0.1/",
         "http://127.0.0.1.evil.example/",
         "http://localhost@evil.example/",
+        "http://localhost:1@evil.example",
+        "https://user:pass@mirror.example.com/models",
+        "http://127.0.0.1:80@evil.example/",
+        "http://localhost:80x/",
+        "http://[::1]x/",
+        "http://localhost\\@evil.example/",
+        "https://",
         "file:///tmp/models",
         "mirror.example.com",
     ] {

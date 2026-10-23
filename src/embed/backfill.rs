@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 use super::engine::TEXT_MAX;
 use super::{Event, Service, locked};
+use crate::backend::Secrets;
 use crate::store::{MemoryStore, NoteText, StoreError};
 
 /// Notes read per page.
@@ -32,6 +33,8 @@ pub struct Source {
     /// The database file a local store reads; the store is not opened while the file is missing.
     file: Option<PathBuf>,
     last_error: Option<String>,
+    /// What a failure message is scrubbed of before it is reported.
+    secrets: Secrets,
 }
 
 impl Source {
@@ -41,7 +44,14 @@ impl Source {
             store,
             file: None,
             last_error: None,
+            secrets: Secrets::default(),
         }
+    }
+
+    /// Scrubs `secrets` (the team database's URL and token) out of what a failure reports.
+    pub fn with_secrets(mut self, secrets: Secrets) -> Self {
+        self.secrets = secrets;
+        self
     }
 
     /// Skips the store while `path` does not exist (the local database is created by the first
@@ -203,6 +213,8 @@ impl Service {
             Ok(()) => source.last_error = None,
             Err(Halt::Stopped | Halt::Changed) => {}
             Err(Halt::Failed(message)) => {
+                let message = source.secrets.scrub(&message);
+
                 if source.last_error.as_deref() != Some(message.as_str()) {
                     self.events.emit(Event::Error {
                         message: format!("{}: {message}", source.key),

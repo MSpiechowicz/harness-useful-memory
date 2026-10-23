@@ -299,6 +299,32 @@ fn a_store_that_cannot_be_read_reports_one_error_and_the_others_go_on() {
 }
 
 #[test]
+fn a_failure_of_a_team_store_is_reported_without_its_url_secrets() {
+    let dir = TempDir::new().expect("temp dir");
+    let url = "postgres://writer:hunter2pass@db.example.com/memory";
+    let broken: Lazy<dyn MemoryStore> =
+        Lazy::new(move || Err(format!("cannot connect to {url} with the password hunter2pass")));
+
+    let manifest = fake_manifest(MODEL);
+    let root = dir.path().join("data");
+    std::fs::create_dir_all(&root).expect("data folder");
+    install(&root, &manifest);
+
+    let source = Source::new("postgres:abc", Box::new(broken)).with_secrets(crate::backend::Secrets::of(url, None));
+    let world = World::open(dir, manifest, None, vec![source]);
+    world.service.prepare().expect("prepare");
+    world.service.backfill_pass(true);
+
+    let errors = world.events.errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("cannot connect to"), "{errors:?}");
+    assert!(
+        !errors[0].contains("hunter2pass") && !errors[0].contains("db.example.com"),
+        "{errors:?}"
+    );
+}
+
+#[test]
 fn a_local_database_that_does_not_exist_yet_is_skipped_without_creating_it() {
     let dir = TempDir::new().expect("temp dir");
     let stores = stores_dir(&dir);

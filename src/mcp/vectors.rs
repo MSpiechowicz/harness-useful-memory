@@ -197,7 +197,7 @@ pub(super) fn search(server: &mut Server, query: &SearchQuery) -> Result<Found, 
         .iter()
         .filter_map(|hit| {
             let (_, offset) = wire.iter().find(|(target, _)| target.store == hit.store)?;
-            Some(hit.id + offset)
+            hit.id.checked_add(*offset)
         })
         .collect();
 

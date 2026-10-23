@@ -1,8 +1,13 @@
 //! The socket the embedder listens on, and the lock that keeps it to one embedder per computer.
 //!
-//! On Unix the socket is `<data>/harness-memory/embedder.sock` (`0600`; when that path is longer
-//! than the 100 bytes a socket path may have, `$TMPDIR/harness-memory-<hash>.sock`), on Windows a
-//! named pipe `harness-memory-embedder-<hash>`. A request is one JSON line of at most 64 KiB, a
+//! On Unix the socket is `<data>/harness-memory/embedder.sock` (`0600`). When that path is longer
+//! than the 100 bytes a socket path may have, it is `$XDG_RUNTIME_DIR/harness-memory-<hash>.sock`
+//! (a folder of this user, `0700`) or else `<temp>/harness-memory-<uid>/<hash>.sock`, in a folder
+//! this user owns that no one else may write to: a folder of another user at that path is an
+//! error, never used. On Windows it is a named pipe `harness-memory-embedder-<hash>-<secret>`,
+//! open to this user and SYSTEM only. The secret is new at every start of the embedder and is kept
+//! with its process id in a private file of the data folder (see [`super::pipe`]), so another user
+//! can neither guess the name to squat on it nor make a client talk to a pipe of theirs. A request is one JSON line of at most 64 KiB, a
 //! connection carries one request, and connections are served on their own threads (the model
 //! serialises the inference itself).
 
@@ -23,6 +28,7 @@ use super::{LOCK_FILE, Service};
 
 /// The longest socket path `sockaddr_un` holds on the platforms we run on (macOS has 104 bytes,
 /// Linux 108).
+#[cfg(unix)]
 const SOCKET_PATH_MAX: usize = 100;
 
 /// How many connections are served at once.
@@ -39,43 +45,86 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
     path: PathBuf,
+    /// The folder of the socket when it is not the data folder or `$XDG_RUNTIME_DIR` (the one in
+    /// the temporary folder, which this user creates and must own).
+    #[cfg(unix)]
+    own_folder: Option<PathBuf>,
+    /// The data folder, where the pipe's secret and the embedder's process id are kept.
+    #[cfg(windows)]
+    root: PathBuf,
+}
+
+fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 impl Endpoint {
     /// The endpoint for the data folder `root`. `temp` is where a socket goes when the data
-    /// folder's path is too long.
+    /// folder's path is too long (after `$XDG_RUNTIME_DIR`, when it is usable).
+    #[cfg(unix)]
     pub fn of(root: &Path, temp: &Path) -> Self {
-        let digest = |bytes: &[u8]| -> String {
-            Sha256::digest(bytes)
-                .iter()
-                .take(8)
-                .map(|byte| format!("{byte:02x}"))
-                .collect()
-        };
+        Self::placed(root, temp, runtime_folder().as_deref())
+    }
 
-        if cfg!(windows) {
-            let user = std::env::var("USERNAME").unwrap_or_default();
-            let hash = digest(format!("{user}\n{}", root.display()).as_bytes());
+    /// [`Endpoint::of`] with the runtime folder given (`None` when there is none to use).
+    #[cfg(unix)]
+    pub(crate) fn placed(root: &Path, temp: &Path, runtime: Option<&Path>) -> Self {
+        let near = root.join("embedder.sock");
+
+        if near.as_os_str().len() <= SOCKET_PATH_MAX {
             return Self {
-                path: PathBuf::from(format!("harness-memory-embedder-{hash}")),
+                path: near,
+                own_folder: None,
             };
         }
 
-        let path = root.join("embedder.sock");
+        let hash = digest(root.to_string_lossy().as_bytes());
 
-        if path.as_os_str().len() <= SOCKET_PATH_MAX {
-            return Self { path };
+        if let Some(runtime) = runtime {
+            let path = runtime.join(format!("harness-memory-{hash}.sock"));
+
+            if path.as_os_str().len() <= SOCKET_PATH_MAX {
+                return Self { path, own_folder: None };
+            }
         }
 
-        let hash = digest(root.to_string_lossy().as_bytes());
+        let folder = temp.join(format!("harness-memory-{}", nix::unistd::getuid().as_raw()));
+
         Self {
-            path: temp.join(format!("harness-memory-{hash}.sock")),
+            path: folder.join(format!("{hash}.sock")),
+            own_folder: Some(folder),
         }
     }
 
-    /// The socket file (on Windows, the pipe name).
+    /// The endpoint for the data folder `root`.
+    #[cfg(windows)]
+    pub fn of(root: &Path, _temp: &Path) -> Self {
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        let hash = digest(format!("{user}\n{}", root.display()).as_bytes());
+
+        Self {
+            path: PathBuf::from(format!("harness-memory-embedder-{hash}")),
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// The socket file (on Windows, the pipe's name without its secret).
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Makes the endpoint ready for [`Endpoint::name`] on the serving side: on Windows a new
+    /// secret for the pipe's name, recorded with this process's id (nothing on Unix). Clients read
+    /// it from there.
+    pub(crate) fn publish(&self) -> std::io::Result<()> {
+        #[cfg(windows)]
+        super::pipe::publish(&self.root)?;
+
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -84,24 +133,94 @@ impl Endpoint {
         self.path.as_os_str().to_fs_name::<GenericFilePath>()
     }
 
+    /// The pipe's name, with the secret of the embedder that published it.
     #[cfg(windows)]
     pub(crate) fn name(&self) -> std::io::Result<interprocess::local_socket::Name<'_>> {
+        let published = super::pipe::read(&self.root)?;
+        self.name_of(&published)
+    }
+
+    #[cfg(windows)]
+    fn name_of(&self, published: &super::pipe::Published) -> std::io::Result<interprocess::local_socket::Name<'_>> {
         use interprocess::local_socket::{GenericNamespaced, ToNsName};
-        self.path.as_os_str().to_ns_name::<GenericNamespaced>()
+
+        format!("{}-{}", self.path.display(), published.secret).to_ns_name::<GenericNamespaced>()
     }
 
     /// Connects to the embedder; where the operating system can, the streams time out after
     /// `timeout`. Windows named pipes cannot (the call is `Unsupported` there), so a caller that
     /// must not wait longer enforces its own deadline (see [`super::client`]).
+    ///
+    /// The server must be this user's: on Unix the socket file (and the folder made for it) is
+    /// checked first, on Windows the process behind the pipe must be the embedder that published
+    /// the pipe's secret.
     pub fn connect(&self, timeout: Duration) -> std::io::Result<Stream> {
         #[cfg(unix)]
-        check_socket_owner(&self.path)?;
+        {
+            if let Some(folder) = &self.own_folder {
+                check_own_folder(folder)?;
+            }
 
+            check_socket_owner(&self.path)?;
+        }
+
+        #[cfg(unix)]
         let stream = Stream::connect(self.name()?)?;
+
+        #[cfg(windows)]
+        let stream = {
+            let published = super::pipe::read(&self.root)?;
+            let stream = Stream::connect(self.name_of(&published)?)?;
+            super::pipe::check_server(&stream, &published)?;
+            stream
+        };
+
         without_unsupported(stream.set_recv_timeout(Some(timeout)))?;
         without_unsupported(stream.set_send_timeout(Some(timeout)))?;
         Ok(stream)
     }
+}
+
+/// `$XDG_RUNTIME_DIR` when it is usable (see [`usable_runtime`]).
+#[cfg(unix)]
+fn runtime_folder() -> Option<PathBuf> {
+    usable_runtime(PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?))
+}
+
+/// `folder` when it is an absolute path to a folder (not a link) of this user that only this user
+/// can enter.
+#[cfg(unix)]
+pub(crate) fn usable_runtime(folder: PathBuf) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(&folder).ok()?;
+
+    let usable = folder.is_absolute()
+        && metadata.file_type().is_dir()
+        && metadata.uid() == nix::unistd::getuid().as_raw()
+        && metadata.mode() & 0o077 == 0;
+
+    usable.then_some(folder)
+}
+
+/// Creates the folder of the socket (`0700`) when it is missing, and fails unless it is a folder
+/// of this user that no one else may write to, so a stranger's folder at that path is never used.
+#[cfg(unix)]
+fn secure_own_folder(folder: &Path) -> std::io::Result<()> {
+    let missing =
+        matches!(std::fs::symlink_metadata(folder), Err(error) if error.kind() == std::io::ErrorKind::NotFound);
+
+    if missing {
+        crate::support::private::private_folder(folder, "socket folder").map_err(std::io::Error::other)?;
+    }
+
+    check_own_folder(folder)
+}
+
+#[cfg(unix)]
+fn check_own_folder(folder: &Path) -> std::io::Result<()> {
+    crate::support::private::check_folders(&[(folder, "socket folder")])
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::PermissionDenied, message))
 }
 
 /// `result`, except that a stream without timeouts (`Unsupported`) is not a failure.
@@ -200,17 +319,26 @@ impl Server {
     /// from an embedder that was killed is removed here, and nothing else is.
     pub fn start(endpoint: Endpoint, service: Arc<Service>) -> std::io::Result<Self> {
         #[cfg(unix)]
-        remove_stale_socket(endpoint.path())?;
-
-        let mut options = ListenerOptions::new().name(endpoint.name()?);
-
-        #[cfg(unix)]
         {
-            use interprocess::os::unix::local_socket::ListenerOptionsExt;
-            options = options.mode(0o600);
+            if let Some(folder) = &endpoint.own_folder {
+                secure_own_folder(folder)?;
+            }
+
+            remove_stale_socket(endpoint.path())?;
         }
 
-        let listener = options.create_sync()?;
+        endpoint.publish()?;
+
+        let listener = match listen(&endpoint) {
+            Ok(listener) => listener,
+            Err(error) => {
+                #[cfg(windows)]
+                super::pipe::withdraw(&endpoint.root);
+
+                return Err(error);
+            }
+        };
+
         let stopping = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stopping);
         let active = Arc::new(AtomicUsize::new(0));
@@ -265,7 +393,30 @@ impl Server {
 
         #[cfg(unix)]
         let _ = std::fs::remove_file(self.endpoint.path());
+
+        #[cfg(windows)]
+        super::pipe::withdraw(&self.endpoint.root);
     }
+}
+
+/// Starts listening at `endpoint`: the socket is `0600` on Unix, the pipe open to this user and
+/// SYSTEM only on Windows.
+fn listen(endpoint: &Endpoint) -> std::io::Result<interprocess::local_socket::Listener> {
+    let options = ListenerOptions::new().name(endpoint.name()?);
+
+    #[cfg(unix)]
+    let options = {
+        use interprocess::os::unix::local_socket::ListenerOptionsExt;
+        options.mode(0o600)
+    };
+
+    #[cfg(windows)]
+    let options = {
+        use interprocess::os::windows::local_socket::ListenerOptionsExt;
+        options.security_descriptor(super::pipe::only_this_user()?)
+    };
+
+    options.create_sync()
 }
 
 /// Removes the socket file left by an embedder that was killed. Anything that is not a socket is

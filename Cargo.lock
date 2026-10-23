@@ -1015,6 +1015,7 @@ dependencies = [
  "unicode-normalization",
  "ureq",
  "whatlang",
+ "widestring",
 ]
 
 [[package]]

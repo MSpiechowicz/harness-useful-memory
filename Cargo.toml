@@ -70,6 +70,10 @@ mimalloc = "0.1"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["signal", "process", "user"] }
 
+# The security descriptor string of the embedder's named pipe (see `src/embed/pipe.rs`).
+[target.'cfg(windows)'.dependencies]
+widestring = "1.2.1"
+
 [dev-dependencies]
 insta = { version = "1.49.0", features = ["json"] }
 pretty_assertions = "1.4"

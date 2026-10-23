@@ -154,28 +154,56 @@ fn remove_partial_files(dir: &Path) {
     }
 }
 
-/// Accepts `https://` and `http://127.0.0.1` or `http://localhost` (for tests and mirrors on this
-/// computer); nothing else may serve the model.
+/// Accepts `https://` and `http://` to `127.0.0.1`, `localhost` or `[::1]` (for tests and mirrors
+/// on this computer); nothing else may serve the model. No scheme takes userinfo
+/// (`http://localhost:1@evil.example` is a request to `evil.example`).
 pub fn check_base(base: &str) -> Result<(), ModelError> {
-    let lower = base.trim().to_ascii_lowercase();
+    let refused = || {
+        ModelError::Refused(
+            "the model base URL must be https:// (or http:// to 127.0.0.1, localhost or [::1]) without a user name"
+                .to_owned(),
+        )
+    };
 
-    if lower.starts_with("https://") {
-        return Ok(());
+    let base = base.trim();
+
+    if base.contains(['\\', ' ']) || base.chars().any(char::is_control) {
+        return Err(refused());
     }
 
-    let local = ["http://127.0.0.1", "http://localhost"].iter().any(|prefix| {
-        lower
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with([':', '/']))
-    });
+    let (scheme, rest) = base.split_once("://").ok_or_else(refused)?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
 
-    if local {
-        return Ok(());
+    if authority.is_empty() || authority.contains('@') {
+        return Err(refused());
     }
 
-    Err(ModelError::Refused(
-        "the model base URL must be https:// (or http:// to localhost)".to_owned(),
-    ))
+    match scheme.to_ascii_lowercase().as_str() {
+        "https" => Ok(()),
+        "http" if is_local_host(authority) => Ok(()),
+        _ => Err(refused()),
+    }
+}
+
+/// Whether `authority` (`host` or `host:port`, no userinfo) is this computer.
+fn is_local_host(authority: &str) -> bool {
+    let split_at = if authority.starts_with('[') {
+        authority.find(']').map(|end| end + 1)
+    } else {
+        Some(authority.find(':').unwrap_or(authority.len()))
+    };
+
+    let Some(split_at) = split_at else {
+        return false;
+    };
+
+    let (host, port) = authority.split_at(split_at);
+    let port_fine = port.is_empty()
+        || port
+            .strip_prefix(':')
+            .is_some_and(|digits| digits.chars().all(|c| c.is_ascii_digit()));
+
+    port_fine && ["127.0.0.1", "localhost", "[::1]"].contains(&host.to_ascii_lowercase().as_str())
 }
 
 /// The HTTP client: TLS with the ring provider and the platform's roots, https only unless the
