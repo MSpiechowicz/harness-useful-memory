@@ -203,16 +203,13 @@ pub(crate) fn usable_runtime(folder: PathBuf) -> Option<PathBuf> {
     usable.then_some(folder)
 }
 
-/// Creates the folder of the socket (`0700`) when it is missing, and fails unless it is a folder
-/// of this user that no one else may write to, so a stranger's folder at that path is never used.
+/// Creates the folder of the socket (`0700`) when it is missing, and fails unless it is a real
+/// folder of this user that only this user can enter, so a stranger's folder or a link at that
+/// path is never used (and never changed).
 #[cfg(unix)]
 fn secure_own_folder(folder: &Path) -> std::io::Result<()> {
-    let missing =
-        matches!(std::fs::symlink_metadata(folder), Err(error) if error.kind() == std::io::ErrorKind::NotFound);
-
-    if missing {
-        crate::support::private::private_folder(folder, "socket folder").map_err(std::io::Error::other)?;
-    }
+    crate::support::private::private_leaf_folder(folder, "socket folder")
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::PermissionDenied, message))?;
 
     check_own_folder(folder)
 }

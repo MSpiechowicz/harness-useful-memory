@@ -172,7 +172,12 @@ impl Service {
             let keys: Vec<String> = self.sources.iter().map(|source| locked(source).key.clone()).collect();
 
             if let Err(error) = locked(&self.cache).keep_stores(&keys) {
-                self.events.emit(Event::Error { message: error });
+                let message = self
+                    .sources
+                    .iter()
+                    .fold(error, |message, source| locked(source).secrets.scrub(&message));
+
+                self.events.emit(Event::Error { message });
             }
         }
 

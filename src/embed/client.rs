@@ -251,8 +251,14 @@ fn within_limited<T: Send + 'static>(
 
     let result = receiver.recv_timeout(timeout).ok();
 
-    if result.is_none() && !settled.swap(true, Ordering::SeqCst) {
+    if result.is_none() {
+        // Counted before the hand-over, so the thread's `fetch_sub` never runs ahead of it and
+        // the count never wraps; undone when the thread had already ended.
         abandoned.fetch_add(1, Ordering::SeqCst);
+
+        if settled.swap(true, Ordering::SeqCst) {
+            abandoned.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     result

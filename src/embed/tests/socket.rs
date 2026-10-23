@@ -278,6 +278,34 @@ fn a_long_data_folder_gets_its_socket_in_a_folder_of_this_user() {
 
 #[cfg(unix)]
 #[test]
+fn a_link_in_place_of_the_socket_folder_is_refused_and_its_target_left_alone() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().expect("temp dir");
+    let root = dir.path().join("data");
+    std::fs::create_dir_all(&root).expect("data");
+    let world = World::open(dir, fake_manifest(MODEL), None, Vec::new());
+
+    let temp = TempDir::new().expect("temp");
+    let long = std::path::PathBuf::from(format!("/home/someone/{}/harness-memory", "deep/".repeat(30)));
+    let endpoint = Endpoint::placed(&long, temp.path(), None);
+    let folder = endpoint.path().parent().expect("folder").to_path_buf();
+
+    let target = temp.path().join("target");
+    std::fs::create_dir(&target).expect("target");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    std::os::unix::fs::symlink(&target, &folder).expect("link");
+
+    assert!(Server::start(endpoint, world.service.clone()).is_err());
+    assert_eq!(
+        std::fs::metadata(&target).expect("target").permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(std::fs::read_dir(&target).expect("listing").count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
 fn a_runtime_folder_is_used_only_when_it_is_private_and_this_users() {
     use std::os::unix::fs::PermissionsExt;
 
