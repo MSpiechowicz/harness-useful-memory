@@ -265,8 +265,9 @@ impl Lock {
     pub fn take(root: &Path) -> Result<Self, LockError> {
         crate::support::private::private_folder(root, "data folder").map_err(LockError::Failed)?;
 
+        // Read and write access: Windows refuses to lock a handle opened only to append.
         let mut options = std::fs::OpenOptions::new();
-        options.create(true).append(true);
+        options.create(true).read(true).write(true).truncate(false);
 
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
