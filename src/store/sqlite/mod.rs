@@ -8,6 +8,7 @@
 //! through [`sql::Sql`] and the operations through [`engine::Engine`], so the libSQL backend
 //! ([`crate::store::libsql`]) shares them: one SQL dialect, one behaviour.
 
+pub(crate) mod embed;
 pub(crate) mod engine;
 mod graph;
 mod held_back;
@@ -28,7 +29,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, TransactionBehavior};
 
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, ProjectKey};
-use super::{Forgotten, NoteListQuery, NotePage, Saved, Scope, SearchQuery, StoreError, Target, View};
+use super::{Forgotten, NoteListQuery, NotePage, NoteText, Saved, Scope, SearchQuery, StoreError, Target, View};
 use engine::Engine;
 use local::Local;
 use schema::SchemaState;
@@ -198,6 +199,14 @@ impl MemoryStore for SqliteStore {
 
     fn similar_text(&mut self, view: &View, text: (&str, &str), limit: usize) -> Result<Vec<Hit>, StoreError> {
         engine::similar_text(self, view, text, limit)
+    }
+
+    fn notes_since(&mut self, cursor: i64, limit: usize) -> Result<Vec<NoteText>, StoreError> {
+        embed::notes_since(self, cursor, limit)
+    }
+
+    fn note_ids(&mut self) -> Result<Vec<i64>, StoreError> {
+        embed::note_ids(self)
     }
 
     fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {

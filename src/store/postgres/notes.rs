@@ -15,7 +15,7 @@ use crate::support::lang;
 /// The columns [`note_from_row`] reads, from `notes n LEFT JOIN projects p`, with the text cut to
 /// the limits (see [`cut`]). The last is the language, which a database without the schema
 /// extensions has no column for.
-fn note_columns(extensions: bool) -> String {
+pub(super) fn note_columns(extensions: bool) -> String {
     columns(&cut("n.body", BODY_MAX), extensions)
 }
 

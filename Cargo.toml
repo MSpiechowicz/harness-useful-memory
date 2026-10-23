@@ -53,6 +53,15 @@ getrandom = "0.4.3"
 # Language detection of a note (English or not) and the Snowball English stems the MongoDB `terms_en` holds.
 whatlang = "0.18.0"
 rust-stemmers = "1.2.0"
+# The embedder (`harness-memory embedder`): the multilingual MiniLM model runs on tract (pure Rust,
+# no native runtime to download), its tokenizer on `tokenizers` without the Oniguruma C library,
+# and every `harness-memory mcp` asks it over a local socket.
+tract-onnx = "0.23.9"
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+interprocess = "2.4.6"
+# Returns the freed model memory to the operating system (glibc keeps it), so the embedder's idle
+# unload gives it back.
+mimalloc = "0.1"
 
 # Kills a timed-out git together with its process group (`killpg`).
 [target.'cfg(unix)'.dependencies]

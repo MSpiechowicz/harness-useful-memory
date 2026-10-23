@@ -1,0 +1,270 @@
+//! The socket, the single-instance lock and the client, over a real local socket.
+
+use std::io::{BufRead, BufReader, Write};
+use std::time::Duration;
+
+use tempfile::TempDir;
+
+use super::support::{Notes, World, fake_manifest, ids, install, target};
+use crate::embed::client::{ClientError, EmbedderClient};
+use crate::embed::protocol::NoteInput;
+use crate::embed::server::{Endpoint, Lock, LockError, Server};
+
+const MODEL: &str = "fake@1";
+
+/// A world with a model, a note, and a server on its socket.
+struct Running {
+    world: World,
+    server: Option<Server>,
+    client: EmbedderClient,
+    key: String,
+    note: i64,
+}
+
+fn running() -> Running {
+    let dir = TempDir::new().expect("temp dir");
+    let stores = dir.path().join("stores");
+    std::fs::create_dir_all(&stores).expect("stores");
+    let mut notes = Notes::new(&stores, "main");
+    let note = notes.add("Socket", "answered over a local socket");
+
+    let manifest = fake_manifest(MODEL);
+    let root = dir.path().join("data");
+    std::fs::create_dir_all(&root).expect("data");
+    install(&root, &manifest);
+
+    let world = World::open(dir, manifest, None, vec![notes.source()]);
+    world.service.prepare().expect("prepare");
+    world.service.backfill_pass(true);
+
+    let endpoint = Endpoint::of(&world.root, &std::env::temp_dir());
+    let server = Server::start(endpoint.clone(), world.service.clone()).expect("start the server");
+
+    Running {
+        world,
+        server: Some(server),
+        client: EmbedderClient::from_endpoint(endpoint),
+        key: notes.key,
+        note,
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Some(server) = self.server.take() {
+            server.shutdown();
+        }
+    }
+}
+
+#[test]
+fn ping_and_search_are_answered_over_the_socket() {
+    let running = running();
+
+    let pong = running.client.ping().expect("ping");
+    assert_eq!(pong.model.as_deref(), Some(MODEL));
+    assert!(pong.ready);
+    assert_eq!(pong.pending, None);
+
+    let (model, hits) = running
+        .client
+        .search_with_model("answered over a local socket", &[target(&running.key, &[None])], 5, 0.0)
+        .expect("search");
+
+    assert_eq!(model, MODEL);
+    assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![running.note]);
+}
+
+#[test]
+fn upsert_and_forget_over_the_socket_reach_the_cache() {
+    let running = running();
+    let everything = [target(&running.key, &[None])];
+
+    running
+        .client
+        .upsert(
+            &running.key,
+            &[NoteInput {
+                id: 77,
+                project: None,
+                title: "Pushed".to_owned(),
+                body: "kubernetes rollout restarts".to_owned(),
+                tags: Vec::new(),
+            }],
+        )
+        .expect("upsert");
+
+    let found = running.world.ask("kubernetes rollout restarts", &everything);
+    assert_eq!(ids(&found).first(), Some(&77));
+
+    running.client.forget(&running.key, &[77]).expect("forget");
+    let found = running.world.ask("kubernetes rollout restarts", &everything);
+    assert!(!ids(&found).contains(&77));
+}
+
+#[test]
+fn many_clients_at_once_are_all_answered() {
+    let running = running();
+    let key = running.key.clone();
+
+    let threads: Vec<_> = (0..16)
+        .map(|_| {
+            let client = running.client.clone();
+            let key = key.clone();
+
+            std::thread::spawn(move || client.search("answered over a local socket", &[target(&key, &[None])], 5, 0.0))
+        })
+        .collect();
+
+    for thread in threads {
+        let hits = thread.join().expect("thread").expect("search");
+        assert_eq!(hits.len(), 1);
+    }
+}
+
+#[test]
+fn a_request_over_the_cap_or_in_another_version_is_refused() {
+    let running = running();
+
+    let exchange = |line: &[u8]| -> String {
+        let mut stream = running.client_stream();
+        stream.write_all(line).expect("write");
+        stream.write_all(b"\n").expect("newline");
+        let mut answer = String::new();
+        BufReader::new(stream).read_line(&mut answer).expect("read");
+        answer
+    };
+
+    let big = format!(
+        "{{\"v\":1,\"op\":\"forget\",\"store\":\"{}\",\"ids\":[]}}",
+        "x".repeat(70 * 1024)
+    );
+    assert!(exchange(big.as_bytes()).contains("too large"));
+    assert!(exchange(b"{\"v\":2,\"op\":\"ping\"}").contains("unsupported protocol version"));
+    assert!(exchange(b"not json").contains("\"ok\":false"));
+    assert!(exchange(b"{\"v\":1,\"op\":\"ping\"}").contains("\"ok\":true"));
+}
+
+impl Running {
+    fn client_stream(&self) -> interprocess::local_socket::Stream {
+        self.server
+            .as_ref()
+            .expect("server")
+            .endpoint()
+            .connect(Duration::from_secs(5))
+            .expect("connect")
+    }
+}
+
+#[test]
+fn a_client_without_an_embedder_fails_at_once() {
+    let dir = TempDir::new().expect("temp dir");
+    let client = EmbedderClient::new(dir.path(), dir.path());
+
+    let started = std::time::Instant::now();
+    let error = client.search("anything", &[], 5, 0.0).expect_err("nobody listens");
+
+    assert!(matches!(error, ClientError::Unreachable(_)), "{error}");
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(client.upsert("local:x", &[]).is_ok(), "nothing to send is fine");
+    assert!(client.forget("local:x", &[1]).is_err());
+}
+
+#[test]
+fn a_model_that_is_not_ready_answers_an_error_and_ping_says_so() {
+    let dir = TempDir::new().expect("temp dir");
+    let root = dir.path().join("data");
+    std::fs::create_dir_all(&root).expect("data");
+    let world = World::open(dir, fake_manifest(MODEL), None, Vec::new());
+
+    let endpoint = Endpoint::of(&root, &std::env::temp_dir());
+    let server = Server::start(endpoint.clone(), world.service.clone()).expect("start");
+    let client = EmbedderClient::from_endpoint(endpoint);
+
+    let pong = client.ping().expect("ping");
+    assert!(!pong.ready);
+    assert_eq!(pong.model, None);
+    assert!(matches!(client.search("x", &[], 5, 0.0), Err(ClientError::Refused(_))));
+
+    server.shutdown();
+}
+
+#[test]
+fn a_second_embedder_in_the_same_folder_finds_the_lock_taken() {
+    let dir = TempDir::new().expect("temp dir");
+
+    assert!(!Lock::is_held(dir.path()));
+    let first = Lock::take(dir.path()).expect("first lock");
+    assert!(Lock::is_held(dir.path()));
+    assert!(matches!(Lock::take(dir.path()), Err(LockError::Busy)));
+
+    drop(first);
+    assert!(!Lock::is_held(dir.path()));
+    assert!(Lock::take(dir.path()).is_ok(), "released with the first");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_socket_left_by_a_killed_embedder_is_replaced_and_a_file_is_not() {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    let dir = TempDir::new().expect("temp dir");
+    let root = dir.path().join("data");
+    std::fs::create_dir_all(&root).expect("data");
+    let world = World::open(dir, fake_manifest(MODEL), None, Vec::new());
+    let endpoint = Endpoint::of(&root, &std::env::temp_dir());
+
+    // A dead process's socket: bound, then left behind.
+    drop(std::os::unix::net::UnixListener::bind(endpoint.path()).expect("bind the stale socket"));
+    assert!(
+        std::fs::symlink_metadata(endpoint.path())
+            .expect("stale")
+            .file_type()
+            .is_socket()
+    );
+
+    let server = Server::start(endpoint.clone(), world.service.clone()).expect("replaces the stale socket");
+    let mode = std::fs::metadata(endpoint.path()).expect("socket").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert!(EmbedderClient::from_endpoint(endpoint.clone()).ping().is_ok());
+    server.shutdown();
+    assert!(!endpoint.path().exists(), "the socket goes with the server");
+
+    // Anything else at that path is not ours to delete.
+    std::fs::write(endpoint.path(), b"precious").expect("a regular file");
+    assert!(Server::start(endpoint.clone(), world.service.clone()).is_err());
+    assert_eq!(std::fs::read(endpoint.path()).expect("still there"), b"precious");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_long_data_folder_gets_its_socket_in_the_temporary_folder() {
+    let temp = TempDir::new().expect("temp dir");
+    let short = std::path::Path::new("/data/harness-memory");
+    let long = std::path::PathBuf::from(format!("/home/someone/{}/harness-memory", "deep/".repeat(30)));
+
+    let near = Endpoint::of(short, temp.path());
+    assert_eq!(near.path(), short.join("embedder.sock"));
+
+    let far = Endpoint::of(&long, temp.path());
+    assert!(far.path().starts_with(temp.path()));
+    assert!(
+        far.path()
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("harness-memory-"))
+    );
+    assert!(far.path().as_os_str().len() <= 100 || temp.path().as_os_str().len() > 60);
+    assert_ne!(
+        far.path(),
+        Endpoint::of(&long.join("other"), temp.path()).path(),
+        "one per data folder"
+    );
+}
+
+#[test]
+fn a_silent_connection_does_not_stop_others_from_being_served() {
+    let running = running();
+    let _silent = running.client_stream();
+
+    assert!(running.client.ping().is_ok());
+}

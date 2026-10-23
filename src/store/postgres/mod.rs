@@ -21,6 +21,7 @@
 //! server's message, stored text, the URL or a password.
 
 mod connect;
+mod embed;
 mod graph;
 mod listing;
 mod notes;
@@ -37,7 +38,7 @@ use postgres::types::FromSql;
 use postgres::{Client, GenericClient, NoTls, Row, Transaction};
 
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, ProjectKey};
-use super::{Forgotten, NoteListQuery, NotePage, Saved, SearchQuery, StoreError, Target, View, clean};
+use super::{Forgotten, NoteListQuery, NotePage, NoteText, Saved, SearchQuery, StoreError, Target, View, clean};
 use crate::store::extensions;
 use crate::store::listing::checked_exclude;
 pub use connect::UrlError;
@@ -288,6 +289,14 @@ impl MemoryStore for PostgresStore {
         self.read(|client| search::resembling(client, view, text, None, limit))
     }
 
+    fn notes_since(&mut self, cursor: i64, limit: usize) -> Result<Vec<NoteText>, StoreError> {
+        self.read(|client| embed::notes_since(client, cursor, limit))
+    }
+
+    fn note_ids(&mut self) -> Result<Vec<i64>, StoreError> {
+        self.read(embed::note_ids)
+    }
+
     fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {
         let link = clean::link(link)?;
         self.write(|tx| graph::link(tx, target, &link))
@@ -315,14 +324,6 @@ impl MemoryStore for PostgresStore {
         let title = clean::title(title)?;
         let extensions = self.extensions;
         self.read(|client| notes::find_by_title(client, target, &title, extensions))
-    }
-
-    fn english_notes(&mut self) -> Result<bool, StoreError> {
-        self.read(settings::english_notes)
-    }
-
-    fn set_english_notes(&mut self, on: bool) -> Result<(), StoreError> {
-        self.write(|tx| settings::set_english_notes(tx, on))
     }
 
     fn english_notes(&mut self) -> Result<bool, StoreError> {

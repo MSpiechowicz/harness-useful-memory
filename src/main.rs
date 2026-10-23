@@ -29,7 +29,7 @@ use harness_memory::store::Scope;
 use harness_memory::support::Env;
 use harness_memory::support::runner::Stop;
 use harness_memory::support::time::rfc3339;
-use harness_memory::{cli_held, cli_notes, cli_settings, cli_team_docs, cli_trust};
+use harness_memory::{cli_embedder, cli_held, cli_notes, cli_settings, cli_team_docs, cli_trust};
 use harness_memory::{database_path, serve};
 use serde_json::{Value, json};
 
@@ -65,9 +65,9 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--o
 /// scripts (`scripts = "remote+local"`, `scripts hide`, `scripts push --json`), and reading every
 /// repository at once (`--all-repos`, `--repo KEY`, `notes repos`, `scripts repos`), and the save
 /// guards with their held items and user-only saves (`notes save`, `notes update`, `scripts save`,
-/// `held list|save|skip`), the `settings` command, and the notes language (`notes list --lang`, the
-/// `lang` of a note, the English notes setting).
-const FEATURES: [&str; 10] = [
+/// `held list|save|skip`), the `settings` command, the notes language (`notes list --lang`, the
+/// `lang` of a note, the English notes setting), and the shared embedder (`embedder`).
+const FEATURES: [&str; 11] = [
     "notes-remote-local",
     "notes-hide",
     "push-json",
@@ -78,7 +78,13 @@ const FEATURES: [&str; 10] = [
     "save-guards",
     "settings",
     "notes-lang",
+    "embedder",
 ];
+
+/// mimalloc hands freed memory back to the operating system, which the embedder's idle unload of
+/// the model relies on (glibc's allocator keeps most of it).
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -115,6 +121,7 @@ fn main() -> ExitCode {
         [Some("notes"), rest @ ..] => cli_notes::notes(rest),
         [Some("held"), rest @ ..] => cli_held::held(rest),
         [Some("settings"), rest @ ..] => cli_settings::settings(rest),
+        [Some("embedder"), rest @ ..] => cli_embedder::embedder(rest),
         [Some("hooks"), rest @ ..] => cli_team_docs::hooks(rest),
         [Some("routines"), rest @ ..] => cli_team_docs::routines(rest),
         [Some("--version")] => {
