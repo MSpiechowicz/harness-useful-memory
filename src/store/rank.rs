@@ -228,10 +228,12 @@ pub(crate) struct Entry<'a> {
     pub id: i64,
 }
 
-/// A kept candidate: its index in the pool and its score in thousandths.
+/// A kept candidate: its index in the pool, its score in thousandths and the boost that score
+/// includes (see [`boost_milli`]).
 pub(crate) struct Ranked {
     pub index: usize,
     pub milli: u32,
+    pub boost_milli: u32,
 }
 
 /// What a subject has of a query.
@@ -271,19 +273,13 @@ pub(crate) fn rank(terms: &Terms, entries: &[Entry<'_>], floor: Floor, limit: us
         }
 
         let strength = reading.relevance / reference;
-        let mut score = share * strength / (1.0 + strength);
-
-        if entries[index].repo {
-            score *= REPO_BOOST;
-        }
-
-        if reading.named {
-            score *= CONTEXT_BOOST;
-        }
+        let boost = boost(entries[index].repo, reading.named);
+        let score = share * strength / (1.0 + strength) * boost;
 
         ranked.push(Ranked {
             index,
             milli: (score * 1000.0).round() as u32,
+            boost_milli: (boost * 1000.0).round() as u32,
         });
     }
 
@@ -299,6 +295,33 @@ pub(crate) fn rank(terms: &Terms, entries: &[Entry<'_>], floor: Floor, limit: us
     ranked.truncate(limit);
 
     ranked
+}
+
+/// The factor a note scores times: [`REPO_BOOST`] for a note of the repository the search is for,
+/// [`CONTEXT_BOOST`] when a query word names it.
+fn boost(repo: bool, named: bool) -> f64 {
+    let mut boost = 1.0;
+
+    if repo {
+        boost *= REPO_BOOST;
+    }
+
+    if named {
+        boost *= CONTEXT_BOOST;
+    }
+
+    boost
+}
+
+/// The boost of `subject` for `terms` in thousandths, the one [`rank`] applies: for a note that
+/// did not come from a keyword search (a hybrid search finds it by its vector).
+pub(crate) fn boost_milli(terms: &Terms, subject: &Subject<'_>, repo: bool) -> u32 {
+    let named = {
+        let context = context_words(subject);
+        terms.iter().any(|term| context.contains(&term.word))
+    };
+
+    (boost(repo, named) * 1000.0).round() as u32
 }
 
 /// How many terms `subject` has (its title, body, tags and entity names), how relevant it is, and

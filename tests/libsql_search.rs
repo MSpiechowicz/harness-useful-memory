@@ -32,6 +32,7 @@ store_cases!(
     a_query_word_naming_an_entity_or_a_path_boosts_the_note,
     an_empty_store_finds_nothing,
     similar_notes_are_unchanged,
+    hits_for_loads_the_notes_a_search_may_see,
 );
 
 fn one_ranking_for_repository_and_global_notes(db: &Database) {
@@ -293,4 +294,8 @@ fn an_empty_store_finds_nothing(db: &Database) {
 
 fn similar_notes_are_unchanged(db: &Database) {
     common::search_cases::similar_notes_are_unchanged(&mut *db.open());
+}
+
+fn hits_for_loads_the_notes_a_search_may_see(db: &Database) {
+    common::search_cases::hits_for_loads_the_notes_a_search_may_see(&mut *db.open());
 }

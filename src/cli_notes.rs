@@ -76,6 +76,7 @@ mod save;
 use crate::backend::{Backend, NotesPlace, Place, Secrets, Selection};
 use crate::cli::{self, Args, Delete, PAGE_OPTIONS, PICK_VALUED, Page, Repos};
 use crate::limits::{LIST_PAGE_MAX, NEIGHBORS_LIMIT_MAX};
+use crate::mcp::Vectors;
 use crate::mcp::{author_json, place_label, repo_label};
 use crate::open::{lone_notes_place, notes_place, open_hidden, open_notes};
 use crate::store::{
@@ -310,6 +311,10 @@ fn delete_one(id: i64, pick: &Repos) -> ExitCode {
 
     match opened.store.forget(&opened.view, &Target::Global, &Forget::Note(id)) {
         Ok(_) => {
+            if let Some(vectors) = Vectors::for_selection(&opened.env, &opened.selection) {
+                vectors.forget(opened.store.origin(id, note.scope), id);
+            }
+
             println!("deleted note {id} {}", clean::line(&note.title));
             ExitCode::SUCCESS
         }

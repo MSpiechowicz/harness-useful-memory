@@ -28,8 +28,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, TransactionBehavior};
 
+use super::VectorTarget;
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, ProjectKey};
 use super::{Forgotten, NoteListQuery, NotePage, NoteText, Saved, Scope, SearchQuery, StoreError, Target, View};
+use crate::backend::Place;
 use engine::Engine;
 use local::Local;
 use schema::SchemaState;
@@ -191,6 +193,14 @@ impl MemoryStore for SqliteStore {
 
     fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
         engine::search(self, query)
+    }
+
+    fn vector_targets(&mut self, view: &View) -> Vec<VectorTarget> {
+        VectorTarget::of_view(Place::Local, view, 0).into_iter().collect()
+    }
+
+    fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
+        embed::hits_for(self, query, ids)
     }
 
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {

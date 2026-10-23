@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 pub mod approval;
+pub mod embedder;
 pub mod guards;
 pub mod hooks;
 pub mod listing;

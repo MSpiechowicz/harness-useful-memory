@@ -80,6 +80,8 @@ struct Candidate {
     score: f64,
     /// The search score in thousandths once ranked.
     milli: u32,
+    /// The boost that score includes, in thousandths.
+    boost_milli: u32,
 }
 
 impl Candidate {
@@ -97,6 +99,7 @@ impl Candidate {
             provenance: provenance_of(document),
             score: 0.0,
             milli: 0,
+            boost_milli: Hit::NO_BOOST,
         }
     }
 }
@@ -229,12 +232,47 @@ fn ranked(ctx: &mut Ctx<'_>, terms: &Terms, pool: Vec<Candidate>, limit: usize) 
     for item in ranking {
         if let Some(mut candidate) = slots[item.index].take() {
             candidate.milli = item.milli;
+            candidate.boost_milli = item.boost_milli;
             let snippet = snippet(&candidate.body, |word| terms.matches(&stemmer, word));
             rows.push((candidate, snippet));
         }
     }
 
     finish(ctx, rows)
+}
+
+/// The notes among `ids` that `query` may see, with the boost of its words (see
+/// [`crate::store::MemoryStore::hits_for`]).
+pub(super) fn by_ids(ctx: &mut Ctx<'_>, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, Fail> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let wanted: Vec<i64> = ids.to_vec();
+    let filter = doc! { "$and": [filter(query)?, doc! { "_id": { "$in": wanted } }] };
+    let limit = i64::try_from(ids.len()).unwrap_or(i64::MAX);
+    let found = ctx.find(NOTES, filter, pool_order(), limit, note_fields())?;
+
+    let terms = Terms::parse(&query.text);
+    let mut hits: Vec<Hit> = Vec::with_capacity(found.len());
+
+    for document in &found {
+        let mut candidate = Candidate::new(document);
+        let start: String = candidate.body.chars().take(SNIPPET_MAX).collect();
+        let snippet = shorten(&start);
+
+        let subject = Subject {
+            title: &candidate.title,
+            body: &candidate.body,
+            tags: "",
+            entities: &candidate.norms,
+        };
+        candidate.boost_milli = rank::boost_milli(&terms, &subject, candidate.project.is_some());
+
+        hits.extend(finish(ctx, vec![(candidate, snippet)])?);
+    }
+
+    Ok(hits)
 }
 
 pub(super) fn similar(
@@ -614,6 +652,7 @@ fn finish(ctx: &mut Ctx<'_>, rows: Vec<(Candidate, String)>) -> Result<Vec<Hit>,
             entities,
             provenance: candidate.provenance,
             score_milli: candidate.milli,
+            boost_milli: candidate.boost_milli,
         });
     }
 
@@ -673,6 +712,7 @@ mod tests {
             provenance: Provenance::default(),
             score: 0.0,
             milli: 0,
+            boost_milli: Hit::NO_BOOST,
         }
     }
 

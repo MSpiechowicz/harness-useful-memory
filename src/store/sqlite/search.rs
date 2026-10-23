@@ -151,12 +151,83 @@ fn ranked(
             hits.push(Hit {
                 entities: entities.remove(&candidate.hit.id).unwrap_or_default(),
                 score_milli: item.milli,
+                boost_milli: item.boost_milli,
                 ..candidate.hit
             });
         }
     }
 
     Ok(hits)
+}
+
+/// The notes among `ids` that `query` may see, with the boost of its words (see
+/// [`crate::store::MemoryStore::hits_for`]).
+pub(super) fn by_ids(db: &mut dyn Sql, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (repo, global) = view_params(db, &query.view)?;
+    let checkout = query.checkout.as_ref().map(|root| root.to_string_lossy().into_owned());
+    let exclude = excluded_json(&query.exclude)?;
+    let filter = Filter {
+        kind: query.kind.map(NoteKind::as_str),
+        checkout: checkout.as_deref(),
+        exclude: Some(&exclude),
+    };
+    let wanted: Vec<String> = ids.iter().map(i64::to_string).collect();
+
+    // The parameters keep the numbers of `recent`, so VISIBLE, SAME_CHECKOUT and the exclusion fit
+    // both.
+    let sql = format!(
+        "SELECT n.id, n.kind, n.project_id, n.title, substr(n.body, 1, {SNIPPET_MAX}), n.updated_at, n.body,
+                {PROVENANCE}
+         FROM notes n
+         WHERE n.id IN (SELECT value FROM json_each(?1)) AND {VISIBLE} AND (?4 IS NULL OR n.kind = ?4)
+               AND {SAME_CHECKOUT} AND {}
+         LIMIT ?5",
+        not_excluded(8)
+    );
+
+    let found = collect(
+        db,
+        &sql,
+        args![
+            format!("[{}]", wanted.join(",")),
+            repo,
+            global,
+            filter.kind,
+            limit_param(ids.len()),
+            None::<i64>,
+            filter.checkout,
+            filter.excluded()
+        ],
+        false,
+    )?;
+
+    let found_ids: Vec<i64> = found.iter().map(|candidate| candidate.hit.id).collect();
+    let mut entities = entities_by_id(db, &found_ids)?;
+    let terms = Terms::parse(&query.text);
+
+    Ok(found
+        .into_iter()
+        .map(|candidate| {
+            let entities = entities.remove(&candidate.hit.id).unwrap_or_default();
+            let subject = Subject {
+                title: &candidate.hit.title,
+                body: &candidate.body,
+                tags: "",
+                entities: &entities,
+            };
+            let boost_milli = rank::boost_milli(&terms, &subject, candidate.hit.scope == Scope::Repo);
+
+            Hit {
+                entities,
+                boost_milli,
+                ..candidate.hit
+            }
+        })
+        .collect())
 }
 
 pub(super) fn similar(db: &mut dyn Sql, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {
@@ -386,6 +457,7 @@ fn collect(db: &mut dyn Sql, sql: &str, args: &[Value], scored: bool) -> Result<
                     via_override: row.get(9)?,
                 },
                 score_milli: 0,
+                boost_milli: Hit::NO_BOOST,
             },
             body: row.get(6)?,
             tags,

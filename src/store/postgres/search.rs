@@ -162,12 +162,82 @@ fn ranked(
             hits.push(Hit {
                 entities: entities.remove(&candidate.hit.id).unwrap_or_default(),
                 score_milli: item.milli,
+                boost_milli: item.boost_milli,
                 ..candidate.hit
             });
         }
     }
 
     Ok(hits)
+}
+
+/// The notes among `ids` that `query` may see, with the boost of its words (see
+/// [`crate::store::MemoryStore::hits_for`]).
+pub(super) fn by_ids(
+    client: &mut impl GenericClient,
+    query: &SearchQuery,
+    ids: &[i64],
+) -> Result<Vec<Hit>, StoreError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (repo, global) = view_params(client, &query.view)?;
+    let checkout = query.checkout.as_ref().map(|root| root.to_string_lossy().into_owned());
+    let kind = query.kind.map(NoteKind::as_str);
+    let exclude = checked_exclude(&query.exclude)?.to_vec();
+
+    // The parameters keep the numbers of `pool`, so VISIBLE, SAME_CHECKOUT and NOT_EXCLUDED fit
+    // both.
+    let sql = format!(
+        "SELECT {} FROM notes n
+         WHERE n.id = ANY($1::bigint[]) AND {VISIBLE} AND ($4::text IS NULL OR n.kind = $4::text)
+           AND n.id != $6 AND {SAME_CHECKOUT} AND {NOT_EXCLUDED}
+         LIMIT $5",
+        hit_columns()
+    );
+
+    let wanted = ids.to_vec();
+    let params: [&(dyn ToSql + Sync); 8] = [
+        &wanted,
+        &repo,
+        &global,
+        &kind,
+        &limit_param(ids.len()),
+        &0_i64,
+        &checkout,
+        &exclude,
+    ];
+
+    let rows = client.query(&sql, &params).map_err(backend)?;
+    let found = rows
+        .iter()
+        .map(|row| candidate(row, |body| body.chars().take(SNIPPET_MAX).collect()))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let found_ids: Vec<i64> = found.iter().map(|candidate| candidate.hit.id).collect();
+    let mut entities = entities_by_id(client, &found_ids)?;
+    let terms = Terms::parse(&query.text);
+
+    Ok(found
+        .into_iter()
+        .map(|candidate| {
+            let entities = entities.remove(&candidate.hit.id).unwrap_or_default();
+            let subject = Subject {
+                title: &candidate.hit.title,
+                body: &candidate.body,
+                tags: "",
+                entities: &entities,
+            };
+            let boost_milli = rank::boost_milli(&terms, &subject, candidate.hit.scope == Scope::Repo);
+
+            Hit {
+                entities,
+                boost_milli,
+                ..candidate.hit
+            }
+        })
+        .collect())
 }
 
 pub(super) fn similar(
@@ -498,6 +568,7 @@ fn candidate(row: &Row, excerpt: impl Fn(&str) -> String) -> Result<Candidate, S
                 via_override: column(row, 8)?,
             },
             score_milli: 0,
+            boost_milli: Hit::NO_BOOST,
         },
         body,
         tags: String::new(),

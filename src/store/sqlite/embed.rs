@@ -2,8 +2,9 @@
 //! dialect, shared by the local file and the libSQL backend.
 
 use super::engine::Engine;
+use super::search;
 use super::sql::args;
-use crate::store::{NoteText, StoreError};
+use crate::store::{Hit, NoteText, SearchQuery, StoreError};
 
 pub(crate) fn notes_since(engine: &mut impl Engine, cursor: i64, limit: usize) -> Result<Vec<NoteText>, StoreError> {
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
@@ -34,4 +35,8 @@ pub(crate) fn notes_since(engine: &mut impl Engine, cursor: i64, limit: usize) -
 
 pub(crate) fn note_ids(engine: &mut impl Engine) -> Result<Vec<i64>, StoreError> {
     engine.read(|db| db.column("SELECT id FROM notes ORDER BY id", &[]))
+}
+
+pub(crate) fn hits_for(engine: &mut impl Engine, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
+    engine.read(|db| search::by_ids(db, query, ids))
 }

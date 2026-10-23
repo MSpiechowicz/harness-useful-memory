@@ -54,7 +54,8 @@ use crate::store::listing::{compare, directed, page_limit, per_place};
 use crate::store::rank::Terms;
 use crate::store::{
     Edge, Forget, Forgotten, HiddenNotes, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NoteListQuery,
-    NoteOrigin, NotePage, NotePatch, NoteRow, NoteSort, Saved, Scope, SearchQuery, StoreError, Target, View,
+    NoteOrigin, NotePage, NotePatch, NoteRow, NoteSort, Saved, Scope, SearchQuery, StoreError, Target, VectorTarget,
+    View,
 };
 
 /// Added to the local store's note ids, so they never equal a team database id.
@@ -835,6 +836,59 @@ impl MemoryStore for SplitStore {
         Ok(hits)
     }
 
+    /// One target per store read for the view, the local one with its id offset.
+    fn vector_targets(&mut self, view: &View) -> Vec<VectorTarget> {
+        let mut targets: Vec<VectorTarget> = Vec::new();
+
+        for side in self.order() {
+            let Some(narrowed) = self.narrow(view, side) else {
+                continue;
+            };
+
+            let offset = match side {
+                Side::Team => 0,
+                Side::Local => LOCAL_ID_OFFSET,
+            };
+
+            targets.extend(VectorTarget::of_view(side.place(), &narrowed, offset));
+        }
+
+        targets
+    }
+
+    /// The notes among `ids` (shown ids) each store reads for the view of `query`, the hidden
+    /// team notes left out.
+    fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
+        let mut hits: Vec<Hit> = Vec::new();
+
+        for side in [Side::Team, Side::Local] {
+            let Some(view) = self.narrow(&query.view, side) else {
+                continue;
+            };
+
+            let wanted: Vec<i64> = ids
+                .iter()
+                .map(|id| decode(*id))
+                .filter(|(of, _)| *of == side)
+                .map(|(_, raw)| raw)
+                .collect();
+
+            if wanted.is_empty() {
+                continue;
+            }
+
+            let part = SearchQuery {
+                view,
+                exclude: self.excluded(side, &query.exclude)?,
+                ..query.clone()
+            };
+
+            hits.extend(encode_hits(side, self.store(side).hits_for(&part, &wanted)?)?);
+        }
+
+        Ok(hits)
+    }
+
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {
         let (side, raw) = decode(id);
 
@@ -1088,6 +1142,7 @@ mod tests {
             entities: Vec::new(),
             provenance: crate::store::Provenance::default(),
             score_milli: 0,
+            boost_milli: Hit::NO_BOOST,
         };
         let ids = |hits: Vec<Hit>| hits.into_iter().map(|hit| hit.id).collect::<Vec<_>>();
 

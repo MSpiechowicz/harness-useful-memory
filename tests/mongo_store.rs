@@ -1143,3 +1143,8 @@ fn mongo_an_empty_store_finds_nothing() {
 fn mongo_similar_notes_are_unchanged() {
     with_store(common::search_cases::similar_notes_are_unchanged);
 }
+
+#[test]
+fn mongo_hits_for_loads_the_notes_a_search_may_see() {
+    with_store(common::search_cases::hits_for_loads_the_notes_a_search_may_see);
+}

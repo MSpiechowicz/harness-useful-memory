@@ -37,8 +37,10 @@ use postgres::config::SslMode;
 use postgres::types::FromSql;
 use postgres::{Client, GenericClient, NoTls, Row, Transaction};
 
+use super::clean;
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, ProjectKey};
-use super::{Forgotten, NoteListQuery, NotePage, NoteText, Saved, SearchQuery, StoreError, Target, View, clean};
+use super::{Forgotten, NoteListQuery, NotePage, NoteText, Saved, SearchQuery, StoreError, Target, VectorTarget, View};
+use crate::backend::Place;
 use crate::store::extensions;
 use crate::store::listing::checked_exclude;
 pub use connect::UrlError;
@@ -279,6 +281,14 @@ impl MemoryStore for PostgresStore {
     fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
         let extensions = self.extensions;
         self.read(|client| search::search(client, query, extensions))
+    }
+
+    fn vector_targets(&mut self, view: &View) -> Vec<VectorTarget> {
+        VectorTarget::of_view(Place::Remote, view, 0).into_iter().collect()
+    }
+
+    fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
+        self.read(|client| search::by_ids(client, query, ids))
     }
 
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {

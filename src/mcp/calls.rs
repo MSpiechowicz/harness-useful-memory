@@ -201,6 +201,8 @@ pub(super) fn save_note(server: &mut Server, args: RememberArgs) -> Result<(Targ
         .remember(&target, &draft)
         .map_err(|error| error.to_string())?;
 
+    super::vectors::refresh(server, saved.id);
+
     Ok((target, saved))
 }
 
@@ -220,10 +222,14 @@ pub(super) fn update_note(server: &mut Server, args: UpdateArgs) -> Result<Saved
         provenance: provenance(server, args.project_path.as_deref()),
     };
 
-    server
+    let saved = server
         .store
         .update(&view, args.id, &patch)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+
+    super::vectors::refresh(server, saved.id);
+
+    Ok(saved)
 }
 
 fn search(server: &mut Server, args: SearchArgs, reserved: usize) -> Result<String, String> {
@@ -246,7 +252,8 @@ fn search(server: &mut Server, args: SearchArgs, reserved: usize) -> Result<Stri
         exclude: Vec::new(),
     };
 
-    let hits = server.store.search(&query).map_err(|error| error.to_string())?;
+    let found = super::vectors::search(server, &query).map_err(|error| error.to_string())?;
+    let hits = found.hits;
     let scripts = super::search_scripts::block(server, &query.view, &query.text);
     let home = server.projects.home();
 
@@ -260,6 +267,10 @@ fn search(server: &mut Server, args: SearchArgs, reserved: usize) -> Result<Stri
 
     if query.view.repo.is_none() && query.view.global && scope_arg(args.scope.as_deref(), "both")? == "both" {
         reply.push("(repository unknown: global notes only; pass project_path for this repository's notes)");
+    }
+
+    if let Some(notice) = found.notice {
+        reply.push(notice);
     }
 
     if hits.is_empty() {
@@ -398,6 +409,8 @@ fn delete_note(server: &mut Server, args: NoteDeleteArgs) -> Result<String, Stri
     let view = view(server, Some(scope), args.project_path.as_deref())?;
 
     forget_with(server, &view, &Target::Global, &Forget::Note(args.id))?;
+    super::vectors::forgot(server, args.id);
+
     Ok(format!("forgot note {}", args.id))
 }
 

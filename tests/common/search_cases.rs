@@ -1,7 +1,8 @@
 //! Keyword search cases every backend passes: stemming, stopwords, the half-of-the-words rule, the
 //! context boost, an empty store and the unchanged similar-note lookup. Each takes a fresh store.
 
-use harness_memory::store::{Hit, MemoryStore, NoteKind, Target};
+use harness_memory::limits::SNIPPET_MAX;
+use harness_memory::store::{Hit, MemoryStore, NoteKind, SearchQuery, Target};
 use pretty_assertions::assert_eq;
 
 use super::{both, draft, query, repo};
@@ -161,4 +162,86 @@ pub fn similar_notes_are_unchanged(store: &mut dyn MemoryStore) {
         .similar_text(&both(REPO), ("Layer caching", "caching layers rules"), 5)
         .expect("similar text");
     assert_eq!(titles(&text), ["Caching layers"]);
+}
+
+/// The ids of `hits`, sorted (`hits_for` gives no order).
+fn sorted_ids(hits: &[Hit]) -> Vec<i64> {
+    let mut ids: Vec<i64> = hits.iter().map(|hit| hit.id).collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// `hits_for` loads the notes asked for under the rules of a search, unranked, with the boost the
+/// words of the query earn them; `vector_targets` names the repositories and the global scope.
+pub fn hits_for_loads_the_notes_a_search_may_see(store: &mut dyn MemoryStore) {
+    let mut named = draft("Alpha cache", "src/cache/rows.rs tuning", NoteKind::Fix);
+    named.entities = vec!["Cache".to_owned()];
+    let named = store.remember(&repo(REPO), &named).expect("named").id;
+    let long = format!("second   line\nof a body {}", "x".repeat(2 * SNIPPET_MAX));
+    let plain = save(store, "Beta rows", &long);
+    let global = save_global(store, "Gamma", "a global body");
+    let other = store
+        .remember(
+            &repo("github.com/acme/other"),
+            &draft("Delta", "another repository", NoteKind::Note),
+        )
+        .expect("other")
+        .id;
+
+    let ids = [named, plain, global, other];
+    let asked = query("cache", both(REPO));
+    let hits = store.hits_for(&asked, &ids).expect("hits for");
+
+    let mut wanted = vec![named, plain, global];
+    wanted.sort_unstable();
+    assert_eq!(sorted_ids(&hits), wanted, "the other repository's note is not visible");
+    assert!(hits.iter().all(|hit| hit.score_milli == 0));
+
+    let hit = |id: i64| hits.iter().find(|hit| hit.id == id).expect("hit");
+    assert!(
+        hit(named).boost_milli > 1250,
+        "repository and entity: {}",
+        hit(named).boost_milli
+    );
+    assert_eq!(hit(named).entities, ["Cache"]);
+    assert_eq!(hit(plain).boost_milli, 1250, "the repository alone");
+    assert_eq!(hit(global).boost_milli, 1000, "no boost");
+
+    let snippet = &hit(plain).snippet;
+    assert!(snippet.starts_with("second line of a body xxx"), "{snippet}");
+    assert!(
+        !snippet.contains('\n') && snippet.chars().count() <= SNIPPET_MAX,
+        "{snippet}"
+    );
+
+    let only_fixes = SearchQuery {
+        kind: Some(NoteKind::Fix),
+        ..asked.clone()
+    };
+    assert_eq!(sorted_ids(&store.hits_for(&only_fixes, &ids).expect("kind")), [named]);
+
+    let leaving_out = SearchQuery {
+        exclude: vec![named],
+        ..asked.clone()
+    };
+    let mut left = vec![plain, global];
+    left.sort_unstable();
+    assert_eq!(sorted_ids(&store.hits_for(&leaving_out, &ids).expect("exclude")), left);
+
+    let elsewhere = SearchQuery {
+        checkout: Some("/work/nowhere".into()),
+        ..asked.clone()
+    };
+    assert!(store.hits_for(&elsewhere, &ids).expect("checkout").is_empty());
+
+    assert!(store.hits_for(&asked, &[]).expect("none").is_empty());
+
+    let targets = store.vector_targets(&both(REPO));
+    assert_eq!(targets.len(), 1);
+    assert_eq!(
+        targets[0].projects,
+        [Some(format!("git:{REPO}")), None],
+        "the repository, then the global notes"
+    );
+    assert_eq!(targets[0].id_offset, 0);
 }

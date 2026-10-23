@@ -127,7 +127,8 @@ use mongodb::options::{ClientOptions, ReadConcern, ReturnDocument, WriteConcern}
 use mongodb::sync::{Client, ClientSession, Collection, Database};
 
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, Saved, SearchQuery};
-use super::{Forgotten, NoteListQuery, NotePage, NoteText, Scope, StoreError, Target, View};
+use super::{Forgotten, NoteListQuery, NotePage, NoteText, Scope, StoreError, Target, VectorTarget, View};
+use crate::backend::Place;
 use crate::limits::{BODY_MAX, ENTITY_MAX, TAG_MAX, TAGS_MAX, TITLE_MAX};
 use crate::store::extensions;
 use crate::store::listing::checked_exclude;
@@ -401,6 +402,14 @@ impl MemoryStore for MongoStore {
     fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
         let (text_index, extensions) = (self.text_index, self.extensions);
         search::search(&mut self.reader()?, query, text_index, extensions).map_err(|fail| self.failed(fail))
+    }
+
+    fn vector_targets(&mut self, view: &View) -> Vec<VectorTarget> {
+        VectorTarget::of_view(Place::Remote, view, 0).into_iter().collect()
+    }
+
+    fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
+        search::by_ids(&mut self.reader()?, query, ids).map_err(|fail| self.failed(fail))
     }
 
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {

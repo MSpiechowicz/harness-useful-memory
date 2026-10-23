@@ -31,12 +31,14 @@ pub mod tools;
 mod tools_scripts;
 mod trusting;
 pub(crate) mod user;
+mod vectors;
 
 pub(crate) use approval::approval_of;
 pub use approval::{ALIVE_FILE, APPROVAL_WAIT_VAR, REQUESTS_FOLDER, SCRIPT_APPROVAL_WAIT};
 pub use guards::{GUARDS_FOLDER, HELD_TEXT};
 pub use input::stop_on_sigterm;
 pub(crate) use script_blocks::{Approval, Shown, author_json, place_label, repo_label};
+pub use vectors::Vectors;
 
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -72,6 +74,11 @@ pub struct Server {
     /// Whether the English notes setting was on when the client initialized (`false` when it was
     /// off or could not be read); the instructions and tool descriptions follow it.
     english: bool,
+    /// The embedder of this computer, for the hybrid note search ([`vectors`]); none to search by
+    /// keywords alone.
+    vectors: Option<Vectors>,
+    /// Whether the line saying the vector search was unavailable was shown already.
+    vector_notice: bool,
     /// Stops the script running now ([`input`]).
     stop: Stop,
 }
@@ -105,6 +112,8 @@ impl Server {
             projects,
             client: None,
             english: false,
+            vectors: None,
+            vector_notice: false,
             stop: Stop::default(),
         }
     }
@@ -113,6 +122,13 @@ impl Server {
     /// fires it when the client cancels the request or closes the input.
     pub fn with_stop(mut self, stop: Stop) -> Self {
         self.stop = stop;
+        self
+    }
+
+    /// The server searching notes by meaning too, through the embedder `vectors` names (when
+    /// embedding is on), and keeping its vectors current.
+    pub fn with_vectors(mut self, vectors: Vectors) -> Self {
+        self.vectors = Some(vectors);
         self
     }
 

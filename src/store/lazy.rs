@@ -3,7 +3,7 @@
 //! team database, opens the local notes store it never reads).
 
 use super::{Edge, Forget, Forgotten, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NoteListQuery, NotePage};
-use super::{NotePatch, NoteText, Saved, SearchQuery};
+use super::{NotePatch, NoteText, Saved, SearchQuery, VectorTarget};
 use super::{PreviousVersion, TrustRecord, TrustStore, TrustedVersion, View};
 use super::{
     SavedScript, Script, ScriptDraft, ScriptOrigin, ScriptRef, ScriptStore, ScriptSummary, StoreError, Target,
@@ -106,6 +106,14 @@ impl MemoryStore for Lazy<dyn MemoryStore> {
 
     fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
         self.store()?.search(query)
+    }
+
+    fn vector_targets(&mut self, view: &View) -> Vec<VectorTarget> {
+        self.store().map(|store| store.vector_targets(view)).unwrap_or_default()
+    }
+
+    fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
+        self.store()?.hits_for(query, ids)
     }
 
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {

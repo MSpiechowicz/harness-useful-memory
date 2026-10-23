@@ -29,7 +29,8 @@ use super::sqlite::engine::{self, Engine};
 use super::sqlite::schema::{self, SCHEMA_VERSION, SchemaState};
 use super::sqlite::sql::Sql;
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, Saved, SearchQuery};
-use super::{Forgotten, NoteListQuery, NotePage, NoteText, StoreError, Target, View};
+use super::{Forgotten, NoteListQuery, NotePage, NoteText, StoreError, Target, VectorTarget, View};
+use crate::backend::Place;
 use hrana::{Client, Outcome, Stream, execute};
 
 /// How long a write keeps asking for a lock the server reports busy.
@@ -193,6 +194,14 @@ impl MemoryStore for LibsqlStore {
 
     fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
         engine::search(self, query)
+    }
+
+    fn vector_targets(&mut self, view: &View) -> Vec<VectorTarget> {
+        VectorTarget::of_view(Place::Remote, view, 0).into_iter().collect()
+    }
+
+    fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
+        embed::hits_for(self, query, ids)
     }
 
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {
