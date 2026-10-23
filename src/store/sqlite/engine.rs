@@ -3,8 +3,11 @@
 //! A store provides its transactions ([`Engine`]); these functions clean and check the input
 //! first, so a rejected call never opens a write transaction, then run the shared statements.
 
+use std::time::Instant;
+
 use super::sql::Sql;
-use super::{graph, listing, notes, search};
+use super::{graph, listing, notes, schema, search, settings};
+use crate::store::extensions::{BACKFILL_BUDGET, BACKFILL_PAGE, unavailable_setting, warn_backfill, warn_unavailable};
 use crate::store::listing::excluded_json;
 use crate::store::{Edge, Forget, Hit, Link, Neighborhood, Note, NoteDraft, NotePatch, Saved, SearchQuery, clean};
 use crate::store::{Forgotten, NoteListQuery, NotePage, StoreError, Target, View};
@@ -17,16 +20,22 @@ pub(crate) trait Engine {
 
     /// Runs `op` without a transaction (each statement on its own).
     fn read<T>(&mut self, op: impl FnOnce(&mut dyn Sql) -> Result<T, StoreError>) -> Result<T, StoreError>;
+
+    /// True when the database has the additive schema extensions (see [`install`]): without them
+    /// no statement may name `notes_fts_en`, `settings` or `notes.lang`.
+    fn extensions(&self) -> bool;
 }
 
 pub(crate) fn remember(engine: &mut impl Engine, target: &Target, draft: &NoteDraft) -> Result<Saved, StoreError> {
     let draft = clean::draft(draft)?;
-    engine.write(|db| notes::remember(db, target, &draft))
+    let extensions = engine.extensions();
+    engine.write(|db| notes::remember(db, target, &draft, extensions))
 }
 
 pub(crate) fn update(engine: &mut impl Engine, view: &View, id: i64, patch: &NotePatch) -> Result<Saved, StoreError> {
     let patch = clean::patch(patch)?;
-    engine.write(|db| notes::update(db, view, id, &patch))
+    let extensions = engine.extensions();
+    engine.write(|db| notes::update(db, view, id, &patch, extensions))
 }
 
 /// A write: reading counts a hit on each note.
@@ -103,4 +112,66 @@ pub(crate) fn find_by_title(
 ) -> Result<Option<Note>, StoreError> {
     let title = clean::title(title)?;
     engine.read(|db| notes::find_by_title(db, target, &title))
+}
+
+/// Adds the schema extensions the database lacks (see [`schema::ensure_extensions`]) and reports
+/// whether it has them now. A database that refuses them is used without, with one line on stderr.
+pub(crate) fn install(engine: &mut impl Engine) -> bool {
+    match engine.read(schema::extensions_present) {
+        Ok(true) => return true,
+        Ok(false) => {}
+        Err(error) => {
+            warn_unavailable(&error);
+            return false;
+        }
+    }
+
+    match engine.write(schema::ensure_extensions) {
+        Ok(()) => true,
+        Err(error) => {
+            warn_unavailable(&error);
+            false
+        }
+    }
+}
+
+/// Fills `lang` of the notes an older server wrote, a page at a time and for at most
+/// [`BACKFILL_BUDGET`]; what is left waits for the next open. A failure is reported once.
+pub(crate) fn backfill(engine: &mut impl Engine) {
+    if !engine.extensions() {
+        return;
+    }
+
+    let deadline = Instant::now() + BACKFILL_BUDGET;
+
+    while Instant::now() < deadline {
+        let step = match engine.read(notes::has_pending_lang) {
+            Ok(true) => engine.write(|db| notes::fill_lang(db, BACKFILL_PAGE)),
+            Ok(false) => return,
+            Err(error) => Err(error),
+        };
+
+        match step {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error) => return warn_backfill(&error),
+        }
+    }
+}
+
+/// The English notes setting; on without extensions.
+pub(crate) fn english_notes(engine: &mut impl Engine) -> Result<bool, StoreError> {
+    if !engine.extensions() {
+        return Ok(true);
+    }
+
+    engine.read(settings::english_notes)
+}
+
+pub(crate) fn set_english_notes(engine: &mut impl Engine, on: bool) -> Result<(), StoreError> {
+    if !engine.extensions() {
+        return Err(unavailable_setting());
+    }
+
+    engine.write(|db| settings::set_english_notes(db, on))
 }

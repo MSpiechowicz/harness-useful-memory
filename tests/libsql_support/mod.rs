@@ -29,6 +29,8 @@ DROP TABLE IF EXISTS script_trust;
 DROP TABLE IF EXISTS script_seen_unapproved;
 DROP TABLE IF EXISTS scripts;
 DROP TABLE IF EXISTS notes_fts;
+DROP TABLE IF EXISTS notes_fts_en;
+DROP TABLE IF EXISTS settings;
 DROP TABLE IF EXISTS note_entities;
 DROP TABLE IF EXISTS relations;
 DROP TABLE IF EXISTS entities;

@@ -10,6 +10,7 @@ use super::{graph, now, target_project, target_project_existing, view_params};
 use crate::limits::GET_IDS_MAX;
 use crate::store::clean::{self, CleanDraft, CleanPatch};
 use crate::store::{Forgotten, Note, NoteKind, Provenance, Saved, Scope, StoreError, Target, View};
+use crate::support::lang;
 
 /// The columns [`note_from_row`] reads, from `notes n LEFT JOIN projects p`.
 const NOTE_COLUMNS: &str = "n.id, n.project_id, p.key, n.kind, n.title, n.body, n.tags, n.source, \
@@ -23,7 +24,14 @@ pub(super) const ROW_COLUMNS: &str = "n.id, n.project_id, p.key, n.kind, n.title
 pub(super) const VISIBLE: &str =
     "(n.project_id = ?2 OR (?2 = -1 AND n.project_id IS NOT NULL) OR (?3 AND n.project_id IS NULL))";
 
-pub(super) fn remember(db: &mut dyn Sql, target: &Target, draft: &CleanDraft) -> Result<Saved, StoreError> {
+/// Saves the draft. With `extensions` the note's `lang` is stored too, in a statement after the
+/// content (see [`set_lang`]).
+pub(super) fn remember(
+    db: &mut dyn Sql,
+    target: &Target,
+    draft: &CleanDraft,
+    extensions: bool,
+) -> Result<Saved, StoreError> {
     let project = target_project(db, target)?;
     let now = now();
 
@@ -87,6 +95,10 @@ pub(super) fn remember(db: &mut dyn Sql, target: &Target, draft: &CleanDraft) ->
         }
     };
 
+    if extensions {
+        set_lang(db, id, &draft.title, &draft.body)?;
+    }
+
     for name in &draft.entities {
         let entity = graph::ensure_entity(db, project, name)?;
         db.execute(
@@ -100,7 +112,13 @@ pub(super) fn remember(db: &mut dyn Sql, target: &Target, draft: &CleanDraft) ->
 
 /// Applies `patch`. The body is masked after `append` is joined to it, so a secret split across
 /// the two is masked as a whole (see [`clean::patched_body`]).
-pub(super) fn update(db: &mut dyn Sql, view: &View, id: i64, patch: &CleanPatch) -> Result<Saved, StoreError> {
+pub(super) fn update(
+    db: &mut dyn Sql,
+    view: &View,
+    id: i64,
+    patch: &CleanPatch,
+    extensions: bool,
+) -> Result<Saved, StoreError> {
     let Some(note) = load(db, view, id)? else {
         return Err(not_found(id));
     };
@@ -120,9 +138,9 @@ pub(super) fn update(db: &mut dyn Sql, view: &View, id: i64, patch: &CleanPatch)
          WHERE id = ?1",
         args![
             id,
-            title,
+            &title,
             title_norm,
-            body,
+            &body,
             kind.as_str(),
             tags.join(" "),
             now(),
@@ -132,7 +150,53 @@ pub(super) fn update(db: &mut dyn Sql, view: &View, id: i64, patch: &CleanPatch)
         ],
     )?;
 
+    if extensions {
+        set_lang(db, id, &title, &body)?;
+    }
+
     saved(db, id, false)
+}
+
+/// Stores the language of the note `id`. It is a statement of its own after the content one:
+/// `notes_lang_reset` clears a `lang` that an edit of the title or body left unchanged (an older
+/// server's edit), and an `UPDATE` of `lang` alone does not fire it.
+fn set_lang(db: &mut dyn Sql, id: i64, title: &str, body: &str) -> Result<(), StoreError> {
+    let lang = lang::stored(lang::detect(title, body));
+    db.execute("UPDATE notes SET lang = ?2 WHERE id = ?1", args![id, lang])?;
+
+    Ok(())
+}
+
+/// Whether a note has no `lang` yet (written by a server that does not know the column).
+pub(super) fn has_pending_lang(db: &mut dyn Sql) -> Result<bool, StoreError> {
+    let pending: Option<i64> = db.value("SELECT 1 FROM notes WHERE lang IS NULL LIMIT 1", args![])?;
+
+    Ok(pending.is_some())
+}
+
+/// Fills `lang` of up to `page` notes that have none, and returns how many it filled. Meant for a
+/// write transaction, so a note is not edited between its read and its `lang`.
+pub(super) fn fill_lang(db: &mut dyn Sql, page: usize) -> Result<usize, StoreError> {
+    let rows = db.query(
+        "SELECT id, title, body FROM notes WHERE lang IS NULL ORDER BY id LIMIT ?1",
+        args![i64::try_from(page).unwrap_or(i64::MAX)],
+    )?;
+
+    for row in &rows {
+        set_lang_if_missing(db, row.get(0)?, &row.get::<String>(1)?, &row.get::<String>(2)?)?;
+    }
+
+    Ok(rows.len())
+}
+
+fn set_lang_if_missing(db: &mut dyn Sql, id: i64, title: &str, body: &str) -> Result<(), StoreError> {
+    let lang = lang::stored(lang::detect(title, body));
+    db.execute(
+        "UPDATE notes SET lang = ?2 WHERE id = ?1 AND lang IS NULL",
+        args![id, lang],
+    )?;
+
+    Ok(())
 }
 
 /// The visible notes among `ids`, each read as it was before this read's hit (when `count`).

@@ -41,12 +41,15 @@ const BUSY_RETRY: Duration = Duration::from_millis(50);
 pub struct LibsqlStore {
     client: Client,
     newer: bool,
+    /// The additive schema extensions are in place (see [`engine::install`]).
+    extensions: bool,
 }
 
 impl std::fmt::Debug for LibsqlStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LibsqlStore")
             .field("newer", &self.newer)
+            .field("extensions", &self.extensions)
             .finish_non_exhaustive()
     }
 }
@@ -57,10 +60,26 @@ impl LibsqlStore {
     /// server connects, but every operation then fails with [`StoreError::NewerSchema`].
     pub fn connect(url: &str, token: Option<&str>) -> Result<Self, StoreError> {
         let client = Client::new(endpoint::parse(url)?, token)?;
-        let mut store = Self { client, newer: false };
+        let mut store = Self {
+            client,
+            newer: false,
+            extensions: false,
+        };
 
         store.newer = store.migrate()? == SchemaState::Newer;
+
+        if !store.newer {
+            store.extensions = engine::install(&mut store);
+            engine::backfill(&mut store);
+        }
+
         Ok(store)
+    }
+
+    /// True when the database has the additive schema extensions (English index, `lang`,
+    /// settings); false when it is newer or refused them.
+    pub fn has_extensions(&self) -> bool {
+        self.extensions
     }
 
     /// True when the database was written by a newer server.
@@ -144,6 +163,10 @@ impl Engine for LibsqlStore {
         self.check_version()?;
         op(&mut self.client.single())
     }
+
+    fn extensions(&self) -> bool {
+        self.extensions
+    }
 }
 
 impl MemoryStore for LibsqlStore {
@@ -197,6 +220,14 @@ impl MemoryStore for LibsqlStore {
 
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
         engine::find_by_title(self, target, title)
+    }
+
+    fn english_notes(&mut self) -> Result<bool, StoreError> {
+        engine::english_notes(self)
+    }
+
+    fn set_english_notes(&mut self, on: bool) -> Result<(), StoreError> {
+        engine::set_english_notes(self, on)
     }
 }
 

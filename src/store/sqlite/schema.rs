@@ -180,8 +180,9 @@ CREATE INDEX hooks_repo ON hooks (repo, created_at, id);
 /// Version 5: the routines a team shares (see [`crate::store::routines`]), with the columns and
 /// index of `hooks` (used in a libSQL team database only, like `hooks`). Only adds a table, so
 /// the rows of version 4 are untouched. `IF NOT EXISTS`, so a database whose version was set back
-/// by hand without dropping the table still migrates.
-const V5: &str = "
+/// by hand without dropping the table still migrates. Public so tests can build a current database
+/// without the extensions.
+pub const V5: &str = "
 CREATE TABLE IF NOT EXISTS routines (
     id TEXT PRIMARY KEY,
     repo TEXT,
@@ -245,4 +246,129 @@ pub(crate) fn upgrade(db: &mut dyn Sql, version: i64) -> Result<(), StoreError> 
     }
 
     db.batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+}
+
+/// The objects [`ensure_extensions`] adds, by name in `sqlite_master`.
+const EXTENSION_OBJECTS: [&str; 6] = [
+    "notes_fts_en",
+    "notes_fts_en_insert",
+    "notes_fts_en_delete",
+    "notes_fts_en_update",
+    "settings",
+    "notes_lang_reset",
+];
+
+/// The English full-text index of the notes (Porter stemming over the same columns and content
+/// table as `notes_fts`), kept current by the triggers an older server also fires.
+const ENGLISH_INDEX: &str = "
+CREATE VIRTUAL TABLE notes_fts_en USING fts5(
+    title, body, tags,
+    content = 'notes', content_rowid = 'id',
+    tokenize = 'porter unicode61 remove_diacritics 2'
+);
+";
+
+/// Triggers mirroring `notes_fts_insert`, `notes_fts_delete` and `notes_fts_update` (version 1).
+const ENGLISH_TRIGGERS: &str = "
+CREATE TRIGGER IF NOT EXISTS notes_fts_en_insert AFTER INSERT ON notes BEGIN
+    INSERT INTO notes_fts_en (rowid, title, body, tags) VALUES (new.id, new.title, new.body, new.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS notes_fts_en_delete AFTER DELETE ON notes BEGIN
+    INSERT INTO notes_fts_en (notes_fts_en, rowid, title, body, tags)
+        VALUES ('delete', old.id, old.title, old.body, old.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS notes_fts_en_update AFTER UPDATE OF title, body, tags ON notes BEGIN
+    INSERT INTO notes_fts_en (notes_fts_en, rowid, title, body, tags)
+        VALUES ('delete', old.id, old.title, old.body, old.tags);
+    INSERT INTO notes_fts_en (rowid, title, body, tags) VALUES (new.id, new.title, new.body, new.tags);
+END;
+";
+
+/// `lang` is `en`, `other` or `unknown` once a server looked at the note, and NULL until then. An
+/// older server edits the title or body without knowing the column, so the trigger clears a `lang`
+/// such an edit left as it was; a server that knows `lang` writes it in a statement of its own
+/// after the edit, which the trigger (it fires on `title` or `body` being set) does not see.
+const LANG_RESET: &str = "
+CREATE TRIGGER IF NOT EXISTS notes_lang_reset AFTER UPDATE OF title, body ON notes
+WHEN new.lang IS old.lang AND new.lang IS NOT NULL
+BEGIN
+    UPDATE notes SET lang = NULL WHERE id = new.id;
+END;
+";
+
+/// True when every object of [`ensure_extensions`] exists (existence only, not the version).
+pub(crate) fn extensions_present(db: &mut dyn Sql) -> Result<bool, StoreError> {
+    Ok(inspect(db)?.is_complete())
+}
+
+/// What of the extensions a database has.
+struct Found {
+    names: Vec<String>,
+    lang: bool,
+}
+
+impl Found {
+    fn has(&self, name: &str) -> bool {
+        self.names.iter().any(|found| found == name)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.lang && EXTENSION_OBJECTS.iter().all(|name| self.has(name))
+    }
+}
+
+fn inspect(db: &mut dyn Sql) -> Result<Found, StoreError> {
+    let names = db.column(
+        &format!(
+            "SELECT name FROM sqlite_master WHERE name IN ({})",
+            EXTENSION_OBJECTS.map(|name| format!("'{name}'")).join(", ")
+        ),
+        args![],
+    )?;
+
+    let lang: Option<i64> = db.value("SELECT 1 FROM pragma_table_info('notes') WHERE name = 'lang'", args![])?;
+
+    Ok(Found {
+        names,
+        lang: lang.is_some(),
+    })
+}
+
+/// Adds what the database lacks of the English index with its triggers, the `lang` column with
+/// its reset trigger and the `settings` table, inside the caller's write transaction. Existing
+/// objects are left as they are, so it can run on every open, also at once from several servers
+/// (the second finds everything in place). The index is rebuilt when it or its triggers were
+/// missing. The schema version is neither read nor written.
+pub(crate) fn ensure_extensions(db: &mut dyn Sql) -> Result<(), StoreError> {
+    let found = inspect(db)?;
+
+    if found.is_complete() {
+        return Ok(());
+    }
+
+    let index_complete = [
+        "notes_fts_en",
+        "notes_fts_en_insert",
+        "notes_fts_en_delete",
+        "notes_fts_en_update",
+    ]
+    .iter()
+    .all(|name| found.has(name));
+
+    if !found.has("notes_fts_en") {
+        db.batch(ENGLISH_INDEX)?;
+    }
+
+    db.batch(ENGLISH_TRIGGERS)?;
+
+    if !index_complete {
+        db.execute("INSERT INTO notes_fts_en (notes_fts_en) VALUES ('rebuild')", args![])?;
+    }
+
+    if !found.lang {
+        db.batch("ALTER TABLE notes ADD COLUMN lang TEXT")?;
+    }
+
+    db.batch("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")?;
+    db.batch(LANG_RESET)
 }

@@ -242,3 +242,75 @@ pub(super) fn stored_version(client: &mut impl GenericClient) -> Result<Option<i
 
     row.map(|row| column(&row, 0)).transpose()
 }
+
+/// What [`ensure_extensions`] adds, as one existence check of every object (in the schema the
+/// tables are in): the English search column and its index, `lang`, the reset trigger with its
+/// function.
+const EXTENSIONS_PRESENT: &str = "
+SELECT
+    EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('notes') AND attname = 'search_en'
+                AND NOT attisdropped)
+    AND to_regclass('notes_search_en') IS NOT NULL
+    AND EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('notes') AND attname = 'lang'
+                    AND NOT attisdropped)
+    AND to_regprocedure('harness_memory_lang_reset()') IS NOT NULL
+    AND EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass('notes') AND tgname = 'notes_lang_reset'
+                    AND NOT tgisinternal)
+";
+
+/// `search_en` is `search` (version 1) with the `english` configuration, so words are stemmed and
+/// stop words dropped; the weights are the same (title A, tags B, body D). `lang` is `en`, `other`
+/// or `unknown` once a server looked at the note, and NULL until then. An older server edits the
+/// title or body without knowing the column, so the trigger clears a `lang` such an edit left as it
+/// was; a server that knows `lang` writes it in a statement of its own after the edit, which the
+/// trigger (it fires on `title` or `body` being set) does not see.
+const EXTENSIONS: &str = "
+ALTER TABLE notes ADD COLUMN IF NOT EXISTS search_en TSVECTOR GENERATED ALWAYS AS (
+    setweight(to_tsvector('english'::regconfig, search_title), 'A')
+    || setweight(to_tsvector('english'::regconfig, translate(tags, '-_', '  ')), 'B')
+    || setweight(to_tsvector('english'::regconfig, search_body), 'D')
+) STORED;
+CREATE INDEX IF NOT EXISTS notes_search_en ON notes USING GIN (search_en);
+ALTER TABLE notes ADD COLUMN IF NOT EXISTS lang TEXT;
+CREATE OR REPLACE FUNCTION harness_memory_lang_reset() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.lang := NULL;
+    RETURN NEW;
+END
+$$;
+DROP TRIGGER IF EXISTS notes_lang_reset ON notes;
+CREATE TRIGGER notes_lang_reset BEFORE UPDATE OF title, body ON notes FOR EACH ROW
+    WHEN (NEW.lang IS NOT DISTINCT FROM OLD.lang AND NEW.lang IS NOT NULL)
+    EXECUTE FUNCTION harness_memory_lang_reset();
+";
+
+/// True when every object of [`ensure_extensions`] exists (existence only, not the version).
+pub(super) fn extensions_present(client: &mut impl GenericClient) -> Result<bool, StoreError> {
+    let row = client.query_one(EXTENSIONS_PRESENT, &[]).map_err(backend)?;
+
+    column(&row, 0)
+}
+
+/// Adds the objects the database lacks of the English search column with its index, `lang` with
+/// its reset trigger. The schema version is neither read nor written. Everything runs in one
+/// transaction under the migration lock, after a first look without it, so a database that has
+/// the extensions is only read, and servers starting together add them once.
+pub(super) fn ensure_extensions(client: &mut Client) -> Result<(), StoreError> {
+    if extensions_present(client)? {
+        return Ok(());
+    }
+
+    let mut tx = client.transaction().map_err(backend)?;
+    tx.execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATE_LOCK])
+        .map_err(backend)?;
+
+    // Rebuilding the index of a large table can outlast the session's statement limit.
+    tx.batch_execute("SET LOCAL statement_timeout = '10min'")
+        .map_err(backend)?;
+
+    if !extensions_present(&mut tx)? {
+        tx.batch_execute(EXTENSIONS).map_err(backend)?;
+    }
+
+    tx.commit().map_err(backend)
+}

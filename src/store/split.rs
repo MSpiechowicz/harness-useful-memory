@@ -156,6 +156,21 @@ impl SplitStore {
         }
     }
 
+    /// The stores some scope saves new notes to, the team database first: where the English notes
+    /// setting lives.
+    fn settings_sides(&self) -> Vec<Side> {
+        let writes = |side: Side| {
+            [Scope::Repo, Scope::Global]
+                .into_iter()
+                .any(|scope| self.write_side(scope) == side)
+        };
+
+        [Side::Team, Side::Local]
+            .into_iter()
+            .filter(|side| writes(*side))
+            .collect()
+    }
+
     /// The stores read for some scope, the ones of the repository scope first (this computer's
     /// before the team's when both are).
     fn order(&self) -> Vec<Side> {
@@ -963,6 +978,22 @@ impl MemoryStore for SplitStore {
             })),
             None => Ok(None),
         }
+    }
+
+    /// The setting of the store new notes go to: the team database when a scope saves there, else
+    /// this computer's file.
+    fn english_notes(&mut self) -> Result<bool, StoreError> {
+        let side = self.settings_sides().first().copied().unwrap_or(Side::Local);
+        self.store(side).english_notes()
+    }
+
+    /// Stores the setting in every store a scope saves to.
+    fn set_english_notes(&mut self, on: bool) -> Result<(), StoreError> {
+        for side in self.settings_sides() {
+            self.store(side).set_english_notes(on)?;
+        }
+
+        Ok(())
     }
 
     fn origin(&self, id: i64, scope: Scope) -> NoteOrigin {

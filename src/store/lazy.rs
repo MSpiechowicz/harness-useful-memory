@@ -135,6 +135,14 @@ impl MemoryStore for Lazy<dyn MemoryStore> {
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
         self.store()?.find_by_title(target, title)
     }
+
+    fn english_notes(&mut self) -> Result<bool, StoreError> {
+        self.store()?.english_notes()
+    }
+
+    fn set_english_notes(&mut self, on: bool) -> Result<(), StoreError> {
+        self.store()?.set_english_notes(on)
+    }
 }
 
 impl TrustStore for Lazy<dyn TrustStore> {

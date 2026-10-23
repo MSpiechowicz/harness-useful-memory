@@ -10,6 +10,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use mongodb::bson::{Bson, Document, doc};
+use rust_stemmers::{Algorithm, Stemmer};
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 
@@ -230,6 +231,24 @@ pub(super) fn terms(title: &str, body: &str, tags: &[String]) -> Vec<String> {
             if seen.insert(word.clone()) {
                 out.push(word);
             }
+        }
+    }
+
+    out
+}
+
+/// The Snowball English stems of `terms` (the words [`terms`] returns), each once: what the English
+/// keyword search matches the stems of a query against.
+pub(super) fn english_terms(terms: &[String]) -> Vec<String> {
+    let stemmer = Stemmer::create(Algorithm::English);
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+
+    for word in terms {
+        let stem = stemmer.stem(word).into_owned();
+
+        if seen.insert(stem.clone()) {
+            out.push(stem);
         }
     }
 
