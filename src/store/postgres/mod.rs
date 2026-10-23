@@ -261,15 +261,18 @@ impl MemoryStore for PostgresStore {
     }
 
     fn get(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
-        self.write(|tx| notes::get(tx, view, ids, true))
+        let extensions = self.extensions;
+        self.write(|tx| notes::get(tx, view, ids, true, extensions))
     }
 
     fn peek(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
-        self.read(|client| notes::get(client, view, ids, false))
+        let extensions = self.extensions;
+        self.read(|client| notes::get(client, view, ids, false, extensions))
     }
 
     fn list_notes(&mut self, query: &NoteListQuery) -> Result<NotePage, StoreError> {
-        self.read(|client| listing::list(client, query))
+        let extensions = self.extensions;
+        self.read(|client| listing::list(client, query, extensions))
     }
 
     fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
@@ -309,7 +312,8 @@ impl MemoryStore for PostgresStore {
 
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
         let title = clean::title(title)?;
-        self.read(|client| notes::find_by_title(client, target, &title))
+        let extensions = self.extensions;
+        self.read(|client| notes::find_by_title(client, target, &title, extensions))
     }
 
     fn english_notes(&mut self) -> Result<bool, StoreError> {
@@ -413,6 +417,9 @@ fn cut(expression: &str, max: usize) -> String {
 
 /// The longest kind name (`optimisation`), with room to spare.
 const KIND_MAX: usize = 16;
+
+/// The longest language name (`unknown`), with room to spare.
+const LANG_MAX: usize = 16;
 
 /// The longest note source ([`clean::source`]).
 const SOURCE_MAX: usize = 64;

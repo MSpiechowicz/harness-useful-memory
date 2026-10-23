@@ -30,6 +30,15 @@ impl Lang {
             Self::Other => "other",
         }
     }
+
+    /// The language a stored value names; `None` for `unknown`, a missing value or anything else.
+    pub fn parse(stored: &str) -> Option<Self> {
+        match stored {
+            "en" => Some(Self::En),
+            "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
 }
 
 /// The value a store keeps in a note's `lang` column or field for [`detect`]'s answer: `en`,

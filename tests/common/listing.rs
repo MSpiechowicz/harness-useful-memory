@@ -6,9 +6,10 @@
 //! updated-time sorts against the rows' own times and ids, and exact orders for title sorts.
 
 use harness_memory::store::{
-    Forgotten, Link, MemoryStore, NoteDraft, NoteKind, NoteListQuery, NotePage, NoteRow, NoteSort, Scope, SearchQuery,
-    StoreError, Target, View,
+    Forgotten, LangFilter, Link, MemoryStore, NoteDraft, NoteKind, NoteListQuery, NotePage, NoteRow, NoteSort, Scope,
+    SearchQuery, StoreError, Target, View,
 };
+use harness_memory::support::lang::Lang;
 use pretty_assertions::assert_eq;
 
 use super::{both, draft, global_only, query, repo, repo_only};
@@ -20,7 +21,7 @@ pub const OTHER: &str = "github.com/acme/gadget";
 pub type Case = fn(&mut dyn MemoryStore);
 
 /// Every case, by name.
-pub const CASES: [(&str, Case); 12] = [
+pub const CASES: [(&str, Case); 13] = [
     ("lists_visible_notes_newest_first", lists_visible_notes_newest_first),
     (
         "excluded_ids_leave_lists_and_searches",
@@ -48,6 +49,7 @@ pub const CASES: [(&str, Case); 12] = [
         "scope_text_and_kind_filter_together_and_count",
         scope_text_and_kind_filter_together_and_count,
     ),
+    ("lang_shows_filters_and_pages", lang_shows_filters_and_pages),
 ];
 
 /// The first page (of up to 200) of `view`, newest first.
@@ -59,6 +61,7 @@ pub fn listing(view: View) -> NoteListQuery {
         scope: None,
         place: None,
         entity: None,
+        lang: None,
         sort: NoteSort::Updated,
         descending: true,
         offset: 0,
@@ -878,4 +881,125 @@ pub fn scope_text_and_kind_filter_together_and_count(store: &mut dyn MemoryStore
     );
     assert_eq!((global_view.total, global_view.rows.len()), (0, 0));
     assert_eq!(scope_count(&global_view, Scope::Global), 2);
+}
+
+const ENGLISH_BODY: &str = "The sync job reads every changed note from the team database, then writes the new revision \
+                            to the local cache so the next search finds it without another round trip.";
+
+const POLISH_BODY: &str = "Zadanie synchronizacji czyta każdą zmienioną notatkę z bazy zespołu, a potem zapisuje nową \
+                           wersję w lokalnej pamięci podręcznej, żeby następne wyszukiwanie znalazło ją od razu.";
+
+/// Rows show the language a note was saved with, `--lang` filters the page and every count in the
+/// database, and the filtered list pages like the unfiltered one (here over 200 notes).
+pub fn lang_shows_filters_and_pages(store: &mut dyn MemoryStore) {
+    const ENGLISH: usize = 15;
+    const OTHER: usize = 205;
+
+    for index in 0..ENGLISH {
+        let target = if index % 3 == 0 { Target::Global } else { repo(REPO) };
+        save(
+            store,
+            &target,
+            &draft(&format!("Sync note {index}"), ENGLISH_BODY, NoteKind::Note),
+        );
+    }
+
+    for index in 0..OTHER {
+        let target = if index % 5 == 0 { Target::Global } else { repo(REPO) };
+        let note = tagged(
+            &format!("Notatka synchronizacji {index}"),
+            POLISH_BODY,
+            NoteKind::Fix,
+            &[],
+            &[],
+        );
+        save(store, &target, &note);
+    }
+
+    save(store, &repo(REPO), &draft("ok", "x", NoteKind::Note));
+
+    let with_lang = |lang: Option<LangFilter>| NoteListQuery {
+        lang,
+        ..listing(both(REPO))
+    };
+
+    let everything = list(store, &with_lang(None));
+    assert_eq!(everything.total, ENGLISH + OTHER + 1);
+
+    for row in &everything.rows {
+        let expected = if row.title.starts_with("Sync note") {
+            Some(Lang::En)
+        } else if row.title.starts_with("Notatka") {
+            Some(Lang::Other)
+        } else {
+            None
+        };
+
+        assert_eq!(row.lang, expected, "{}", row.title);
+    }
+
+    let english = list(store, &with_lang(Some(LangFilter::En)));
+    assert_eq!(english.total, ENGLISH);
+    assert_eq!(english.rows.len(), ENGLISH);
+    assert!(english.rows.iter().all(|row| row.lang == Some(Lang::En)));
+    assert_eq!(english.kinds.iter().map(|(_, count)| count).sum::<usize>(), ENGLISH);
+    assert_eq!(english.scopes.iter().map(|(_, count)| count).sum::<usize>(), ENGLISH);
+
+    let unknown = list(store, &with_lang(Some(LangFilter::Unknown)));
+    assert_eq!(unknown.total, 1);
+    assert_eq!(unknown.rows[0].title, "ok");
+    assert_eq!(unknown.rows[0].lang, None);
+
+    // The filtered list is paged from the database: the pages cover it once, in order.
+    let other = with_lang(Some(LangFilter::Other));
+    let whole = list(store, &other);
+    assert_eq!(whole.total, OTHER);
+    assert_eq!(whole.rows.len(), 200, "a page holds at most 200 rows");
+
+    let rest = list(
+        store,
+        &NoteListQuery {
+            offset: 200,
+            ..other.clone()
+        },
+    );
+    assert_eq!((rest.total, rest.rows.len()), (OTHER, OTHER - 200));
+
+    let mut paged: Vec<i64> = whole.rows.iter().chain(&rest.rows).map(|row| row.id).collect();
+    assert!(
+        whole
+            .rows
+            .iter()
+            .chain(&rest.rows)
+            .all(|row| row.lang == Some(Lang::Other))
+    );
+    paged.sort_unstable();
+    paged.dedup();
+    assert_eq!(paged.len(), OTHER);
+
+    // It combines with the other filters and sorts like the kind filter does.
+    let combined = list(
+        store,
+        &NoteListQuery {
+            scope: Some(Scope::Global),
+            kind: Some(NoteKind::Fix),
+            sort: NoteSort::Title,
+            descending: false,
+            ..other
+        },
+    );
+    assert_eq!(combined.total, OTHER / 5);
+    assert!(combined.rows.windows(2).all(|pair| pair[0].title <= pair[1].title));
+    assert_eq!(
+        combined
+            .scopes
+            .iter()
+            .find(|(scope, _)| *scope == Scope::Repo)
+            .map(|(_, count)| *count),
+        Some(OTHER - OTHER / 5),
+        "the counts per scope follow the language filter but not the scope"
+    );
+
+    let note = store.peek(&both(REPO), &[whole.rows[0].id]).expect("peek");
+    assert_eq!(note[0].lang, Some(Lang::Other));
 }

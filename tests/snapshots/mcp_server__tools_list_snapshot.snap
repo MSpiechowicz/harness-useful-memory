@@ -6,7 +6,7 @@ expression: "replies[0][\"result\"]"
   "tools": [
     {
       "name": "note_save",
-      "description": "Call before you finish: save what you learned for later sessions, after finishing work, fixing a non-obvious problem, finding where something lives, or an optimisation. Save only what a later agent or teammate cannot get from the code or git history (a root cause and fix, a decision and why, a gotcha); never routine setup, installs or progress. Use repo-relative paths. A note with the same title in the scope is updated (a repository note written from another checkout, or reached through project_path, is reported instead: replace it with note_update). Similar notes are listed so you can update or delete outdated ones (those marked team, read-only cannot be changed from here). Never store secrets.",
+      "description": "Call before you finish: save what you learned for later sessions, after finishing work, fixing a non-obvious problem, finding where something lives, or an optimisation. Save only what a later agent or teammate cannot get from the code or git history (a root cause and fix, a decision and why, a gotcha); never routine setup, installs or progress. Use repo-relative paths. A note with the same title in the scope is updated (a repository note written from another checkout, or reached through project_path, is reported instead: replace it with note_update). Similar notes are listed so you can update or delete outdated ones (those marked team, read-only cannot be changed from here). Add 3-5 tags: synonyms and other words a later search might use. Never store secrets.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -39,7 +39,7 @@ expression: "replies[0][\"result\"]"
               "maxLength": 32
             },
             "maxItems": 8,
-            "description": "Lowercase tags"
+            "description": "Lowercase tags: 3-5 synonyms and other words a later search might use"
           },
           "entities": {
             "type": "array",
@@ -116,7 +116,7 @@ expression: "replies[0][\"result\"]"
               "maxLength": 32
             },
             "maxItems": 8,
-            "description": "Lowercase tags"
+            "description": "Lowercase tags: 3-5 synonyms and other words a later search might use"
           },
           "scope": {
             "type": "string",

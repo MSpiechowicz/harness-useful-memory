@@ -586,3 +586,23 @@ fn a_held_update_saved_as_shown_keeps_only_what_was_held() {
         "{shown}"
     );
 }
+
+#[test]
+fn a_held_note_the_user_edits_into_another_language_is_saved_with_a_warning() {
+    let polish = "Zadanie synchronizacji czyta każdą zmienioną notatkę z bazy zespołu, a potem zapisuje nową \
+                  wersję w lokalnej pamięci podręcznej, żeby następne wyszukiwanie znalazło ją od razu.";
+    let guarded = asking();
+    let mut chat = guarded.chat_server();
+    let held = held_id(&tool(&mut chat, "note_save", note("Held note")));
+
+    let draft = json!({ "title": "Synchronizacja notatek", "body": polish });
+    let output = cli(&guarded, &["held", "save", &held, "--json"], &draft.to_string());
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let saved: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(saved["saved"]["warning"], "not-english", "{saved}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("this note is not in English"));
+
+    let found = tool(&mut chat, "note_get", json!({ "ids": [saved["saved"]["id"]] }));
+    assert!(text(&found).contains("Synchronizacja notatek"), "{found}");
+}

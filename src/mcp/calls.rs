@@ -5,13 +5,14 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use super::Server;
-use super::blocks::{FRAME, hit_block, note_block, saved_line, similar_line};
+use super::blocks::{FRAME, hit_block, note_block, rewrite_line, saved_line, similar_line};
 use super::reply::{Capped, now};
 use super::scope::{kind, own_root, provenance, scope_arg, target, view};
 use crate::limits::{
     DEPTH_MAX, GET_REPLY_MAX, LIST_REPLY_MAX, NEIGHBORS_LIMIT_DEFAULT, SEARCH_LIMIT_DEFAULT, SIMILAR_MAX,
 };
 use crate::store::{Forget, Link, NoteDraft, NoteOrigin, NotePatch, Saved, SearchQuery, Target, View, clean};
+use crate::support::lang::Lang;
 
 /// A tool result.
 pub(super) struct Reply {
@@ -23,6 +24,11 @@ pub(super) struct Reply {
 
 /// Runs tool `name`; `None` when there is no such tool.
 pub(super) fn call(server: &mut Server, name: &str, arguments: Value) -> Option<Reply> {
+    // A note that is not in English is refused before the guards, so it is never held for review.
+    if let Some(reply) = super::english::gate(server, name, &arguments) {
+        return Some(reply);
+    }
+
     // The save guards refuse or hold a write before any tool body runs.
     if let Some(reply) = super::guards::gate(server, name, &arguments) {
         return Some(reply);
@@ -298,8 +304,18 @@ fn get(server: &mut Server, args: GetArgs, reserved: usize) -> Result<String, St
         reply.push(&format!("not found: {}", missing.join(", ")));
     }
 
+    // The setting is read only when a note could use the hint; one that cannot be read gives none.
+    let flagged = notes.iter().any(|note| note.lang == Some(Lang::Other));
+    let rewrite = flagged && server.store.english_notes().unwrap_or(false);
+
     for (index, note) in notes.iter().enumerate() {
-        let block = note_block(note, now, &home);
+        let mut block = note_block(note, now, &home);
+
+        if rewrite && note.lang == Some(Lang::Other) {
+            block.push('\n');
+            block.push_str(&rewrite_line(note));
+        }
+
         let block = if index == 0 { block } else { format!("\n{block}") };
         reply.push_cut(&block);
     }

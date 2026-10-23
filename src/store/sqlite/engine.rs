@@ -40,16 +40,19 @@ pub(crate) fn update(engine: &mut impl Engine, view: &View, id: i64, patch: &Not
 
 /// A write: reading counts a hit on each note.
 pub(crate) fn get(engine: &mut impl Engine, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
-    engine.write(|db| notes::get(db, view, ids, true))
+    let extensions = engine.extensions();
+    engine.write(|db| notes::get(db, view, ids, true, extensions))
 }
 
 /// A read: counts no hit.
 pub(crate) fn peek(engine: &mut impl Engine, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
-    engine.read(|db| notes::get(db, view, ids, false))
+    let extensions = engine.extensions();
+    engine.read(|db| notes::get(db, view, ids, false, extensions))
 }
 
 pub(crate) fn list_notes(engine: &mut impl Engine, query: &NoteListQuery) -> Result<NotePage, StoreError> {
-    engine.read(|db| listing::list(db, query))
+    let extensions = engine.extensions();
+    engine.read(|db| listing::list(db, query, extensions))
 }
 
 pub(crate) fn search(engine: &mut impl Engine, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
@@ -111,7 +114,8 @@ pub(crate) fn find_by_title(
     title: &str,
 ) -> Result<Option<Note>, StoreError> {
     let title = clean::title(title)?;
-    engine.read(|db| notes::find_by_title(db, target, &title))
+    let extensions = engine.extensions();
+    engine.read(|db| notes::find_by_title(db, target, &title, extensions))
 }
 
 /// Adds the schema extensions the database lacks (see [`schema::ensure_extensions`]) and reports

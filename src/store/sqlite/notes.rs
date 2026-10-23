@@ -12,13 +12,25 @@ use crate::store::clean::{self, CleanDraft, CleanPatch};
 use crate::store::{Forgotten, Note, NoteKind, Provenance, Saved, Scope, StoreError, Target, View};
 use crate::support::lang;
 
-/// The columns [`note_from_row`] reads, from `notes n LEFT JOIN projects p`.
-const NOTE_COLUMNS: &str = "n.id, n.project_id, p.key, n.kind, n.title, n.body, n.tags, n.source, \
-                            n.created_at, n.updated_at, n.revision, n.hits, n.writer_root, n.via_override";
+/// The columns [`note_from_row`] reads, from `notes n LEFT JOIN projects p`; the last is the
+/// language, which a database without the schema extensions has no column for.
+pub(super) fn note_columns(extensions: bool) -> String {
+    columns("n.body", extensions)
+}
 
-/// [`NOTE_COLUMNS`] with an empty body, for lists.
-pub(super) const ROW_COLUMNS: &str = "n.id, n.project_id, p.key, n.kind, n.title, '', n.tags, n.source, \
-                                      n.created_at, n.updated_at, n.revision, n.hits, n.writer_root, n.via_override";
+/// [`note_columns`] with an empty body, for lists.
+pub(super) fn row_columns(extensions: bool) -> String {
+    columns("''", extensions)
+}
+
+fn columns(body: &str, extensions: bool) -> String {
+    let lang = if extensions { "n.lang" } else { "NULL" };
+
+    format!(
+        "n.id, n.project_id, p.key, n.kind, n.title, {body}, n.tags, n.source, \
+         n.created_at, n.updated_at, n.revision, n.hits, n.writer_root, n.via_override, {lang}"
+    )
+}
 
 /// The visibility condition of a view (`?2` the project id, `?3` whether global is visible).
 pub(super) const VISIBLE: &str =
@@ -119,7 +131,7 @@ pub(super) fn update(
     patch: &CleanPatch,
     extensions: bool,
 ) -> Result<Saved, StoreError> {
-    let Some(note) = load(db, view, id)? else {
+    let Some(note) = load(db, view, id, false)? else {
         return Err(not_found(id));
     };
 
@@ -200,7 +212,13 @@ fn set_lang_if_missing(db: &mut dyn Sql, id: i64, title: &str, body: &str) -> Re
 }
 
 /// The visible notes among `ids`, each read as it was before this read's hit (when `count`).
-pub(super) fn get(db: &mut dyn Sql, view: &View, ids: &[i64], count: bool) -> Result<Vec<Note>, StoreError> {
+pub(super) fn get(
+    db: &mut dyn Sql,
+    view: &View,
+    ids: &[i64],
+    count: bool,
+    extensions: bool,
+) -> Result<Vec<Note>, StoreError> {
     if ids.is_empty() || ids.len() > GET_IDS_MAX {
         return Err(StoreError::Invalid(format!("ids must list 1-{GET_IDS_MAX} note ids")));
     }
@@ -212,7 +230,7 @@ pub(super) fn get(db: &mut dyn Sql, view: &View, ids: &[i64], count: bool) -> Re
             continue;
         }
 
-        let Some(note) = load(db, view, id)? else {
+        let Some(note) = load(db, view, id, extensions)? else {
             continue;
         };
 
@@ -227,7 +245,7 @@ pub(super) fn get(db: &mut dyn Sql, view: &View, ids: &[i64], count: bool) -> Re
 }
 
 pub(super) fn forget(db: &mut dyn Sql, view: &View, id: i64) -> Result<usize, StoreError> {
-    if load(db, view, id)?.is_none() {
+    if load(db, view, id, false)?.is_none() {
         return Err(not_found(id));
     }
 
@@ -276,14 +294,20 @@ pub(super) fn forget_all(db: &mut dyn Sql, view: &View, exclude: &str) -> Result
 
 /// The note titled like `title` (a [`clean::title`]) in the scope `target`, without counting a
 /// hit.
-pub(super) fn find_by_title(db: &mut dyn Sql, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
+pub(super) fn find_by_title(
+    db: &mut dyn Sql,
+    target: &Target,
+    title: &str,
+    extensions: bool,
+) -> Result<Option<Note>, StoreError> {
     let Some(project) = target_project_existing(db, target)? else {
         return Ok(None);
     };
 
     let sql = format!(
-        "SELECT {NOTE_COLUMNS} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
-         WHERE ifnull(n.project_id, 0) = ?1 AND n.title_norm = ?2"
+        "SELECT {} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
+         WHERE ifnull(n.project_id, 0) = ?1 AND n.title_norm = ?2",
+        note_columns(extensions)
     );
 
     let Some(mut note) = db.row(
@@ -299,12 +323,13 @@ pub(super) fn find_by_title(db: &mut dyn Sql, target: &Target, title: &str) -> R
     Ok(Some(note))
 }
 
-/// The note `id` when it is visible in `view`.
-pub(super) fn load(db: &mut dyn Sql, view: &View, id: i64) -> Result<Option<Note>, StoreError> {
+/// The note `id` when it is visible in `view`; its language is read only when `extensions`.
+pub(super) fn load(db: &mut dyn Sql, view: &View, id: i64, extensions: bool) -> Result<Option<Note>, StoreError> {
     let (repo, global) = view_params(db, view)?;
     let sql = format!(
-        "SELECT {NOTE_COLUMNS} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
-         WHERE n.id = ?1 AND {VISIBLE}"
+        "SELECT {} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
+         WHERE n.id = ?1 AND {VISIBLE}",
+        note_columns(extensions)
     );
 
     let note = db.row(&sql, args![id, repo, global], note_from_row)?;
@@ -362,6 +387,7 @@ pub(super) fn note_from_row(row: &Row) -> Result<Note, StoreError> {
         updated_at: row.get(9)?,
         revision: row.get(10)?,
         hits: row.get(11)?,
+        lang: row.get::<Option<String>>(14)?.as_deref().and_then(lang::Lang::parse),
     })
 }
 

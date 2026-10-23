@@ -1059,6 +1059,9 @@ fn strings(document: &Document, key: &str) -> Vec<String> {
 /// The longest kind name (`optimisation`), with room to spare.
 const KIND_MAX: usize = 16;
 
+/// The longest language name (`unknown`), with room to spare.
+const LANG_MAX: usize = 16;
+
 /// The longest note source ([`super::clean::source`]).
 const SOURCE_MAX: usize = 64;
 
@@ -1089,6 +1092,7 @@ fn note_fields() -> Document {
         "updated_at": number("$updated_at"),
         "revision": number("$revision"),
         "hits": number("$hits"),
+        "lang": cut("$lang", LANG_MAX),
     }
 }
 

@@ -480,6 +480,7 @@ pub(super) fn stored(document: &Document) -> Stored {
         updated_at: int(document, "updated_at"),
         revision: int(document, "revision"),
         hits: int(document, "hits"),
+        lang: text(document, "lang").as_deref().and_then(lang::Lang::parse),
     };
 
     Stored {

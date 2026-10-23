@@ -7,7 +7,9 @@
 //!   (camelCase, as written), of chat `KEY` only when given, newest first.
 //! - `harness-memory held save <heldId> --json [--expect REVISION]` saves held item `heldId` and
 //!   removes it, printing `{"saved": {"kind": "note", "id": N}}` or
-//!   `{"saved": {"kind": "script", "name": "..."}}`. It claims the item first (see
+//!   `{"saved": {"kind": "script", "name": "..."}}`; a note that is clearly not English, with the
+//!   English notes setting on, is saved all the same and the object gets `"warning":
+//!   "not-english"` (and a line on stderr). It claims the item first (see
 //!   [`crate::held`]), so two saves of one item save it once, and puts it back when the save
 //!   fails. With `--expect` it saves only the item of that `revision` (what the user saw): a
 //!   held item replaced since is error `changed`.
@@ -438,7 +440,7 @@ fn saved_item(saver: &mut Saver, item: &HeldItem, edited: Option<Map<String, Val
     match item.tool {
         HeldTool::NoteSave => {
             let saved = user::save_note(server, Value::Object(arguments)).map_err(refused)?;
-            Ok(json!({ "kind": "note", "id": saved.id }))
+            Ok(note_saved(server, saved.id))
         }
         HeldTool::NoteUpdate => {
             let id = arguments.get("id").and_then(Value::as_i64).unwrap_or_default();
@@ -449,13 +451,27 @@ fn saved_item(saver: &mut Saver, item: &HeldItem, edited: Option<Map<String, Val
             }
 
             let saved = user::update_note(server, Value::Object(arguments)).map_err(refused)?;
-            Ok(json!({ "kind": "note", "id": saved.id }))
+            Ok(note_saved(server, saved.id))
         }
         HeldTool::ScriptSave => {
             let saved = user::save_held_script(server, Value::Object(arguments)).map_err(refused)?;
             Ok(json!({ "kind": "script", "name": saved["script"]["name"] }))
         }
     }
+}
+
+/// `{"kind": "note", "id": N}` for the note the user saved, with `"warning": "not-english"` (and
+/// the same line on stderr) when it is clearly not English and the store keeps English notes. The
+/// user's save is never refused for it.
+fn note_saved(server: &mut Server, id: i64) -> Value {
+    let mut saved = json!({ "kind": "note", "id": id });
+
+    if user::not_english(server, id, None) {
+        eprintln!("harness-memory: {}", user::NOT_ENGLISH_WARNING);
+        saved["warning"] = json!("not-english");
+    }
+
+    saved
 }
 
 /// The held id of `held save|skip <heldId> --json`, as parsed; `None` for anything else.

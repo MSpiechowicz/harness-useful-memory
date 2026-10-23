@@ -4,7 +4,7 @@ use std::io::{self, BufRead, Write};
 
 use serde_json::{Value, json};
 
-use super::tools::INSTRUCTIONS;
+use super::tools::instructions;
 
 /// Protocol versions this server speaks; a client asking for another gets the first.
 pub const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -96,8 +96,9 @@ pub fn error(id: &Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-/// The `initialize` result: the client's protocol version when supported, else the newest.
-pub fn initialize_result(params: &Value) -> Value {
+/// The `initialize` result: the client's protocol version when supported, else the newest. The
+/// instructions ask for English notes when `english` (the English notes setting is on).
+pub fn initialize_result(params: &Value, english: bool) -> Value {
     let asked = params.get("protocolVersion").and_then(Value::as_str);
     let version = asked
         .filter(|asked| PROTOCOL_VERSIONS.contains(asked))
@@ -107,6 +108,6 @@ pub fn initialize_result(params: &Value) -> Value {
         "protocolVersion": version,
         "capabilities": { "tools": { "listChanged": false } },
         "serverInfo": { "name": SERVER_NAME, "version": env!("HARNESS_MEMORY_VERSION") },
-        "instructions": INSTRUCTIONS,
+        "instructions": instructions(english),
     })
 }
