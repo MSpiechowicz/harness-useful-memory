@@ -60,6 +60,42 @@ pub fn private_folder(folder: &Path, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Creates the single folder `folder` (its parent must exist) as `0700`, for a path in a shared
+/// folder such as the temporary one, where another user may race to put something there first.
+/// Nothing is created recursively and no mode is set by path (which would follow a symbolic
+/// link): a folder that is already there must be a real folder of this user that only this user
+/// can enter, else it is refused.
+#[cfg(unix)]
+pub fn private_leaf_folder(folder: &Path, name: &str) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    match std::fs::DirBuilder::new().mode(0o700).create(folder) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("creating the {name} failed: {error}")),
+    }
+
+    let metadata = std::fs::symlink_metadata(folder).map_err(|error| format!("the {name} cannot be read: {error}"))?;
+
+    if !metadata.file_type().is_dir() {
+        return Err(format!("the {name} is not a folder"));
+    }
+
+    if metadata.uid() != nix::unistd::getuid().as_raw() {
+        return Err(format!("the {name} belongs to another user"));
+    }
+
+    if metadata.mode() & 0o022 != 0 {
+        return Err(format!("other users may write to the {name}"));
+    }
+
+    if metadata.mode() & 0o077 != 0 {
+        return Err(format!("other users may read the {name}"));
+    }
+
+    Ok(())
+}
+
 /// Fails unless each of `folders` (a path and its name in errors) is a folder (not a symbolic
 /// link) owned by this user that no one else may write to, so no other user can read or swap a
 /// file in it.
@@ -273,6 +309,44 @@ mod tests {
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).expect("chmod");
         assert!(read_private(&path, 16).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_leaf_folder_is_never_a_link_and_never_chmodded_by_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let leaf = dir.path().join("socket");
+        private_leaf_folder(&leaf, "socket folder").expect("created");
+        private_leaf_folder(&leaf, "socket folder").expect("again");
+        assert_eq!(
+            std::fs::metadata(&leaf).expect("meta").permissions().mode() & 0o777,
+            0o700
+        );
+
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).expect("mkdir");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("link");
+
+        assert!(private_leaf_folder(&link, "socket folder").is_err());
+        assert_eq!(
+            std::fs::metadata(&target).expect("meta").permissions().mode() & 0o777,
+            0o755
+        );
+
+        let open = dir.path().join("open");
+        std::fs::create_dir(&open).expect("mkdir");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(private_leaf_folder(&open, "socket folder").is_err());
+        assert_eq!(
+            std::fs::metadata(&open).expect("meta").permissions().mode() & 0o777,
+            0o755
+        );
+
+        assert!(private_leaf_folder(&dir.path().join("no/such/parent"), "socket folder").is_err());
     }
 
     #[test]

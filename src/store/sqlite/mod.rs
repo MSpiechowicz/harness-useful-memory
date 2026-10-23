@@ -8,6 +8,7 @@
 //! through [`sql::Sql`] and the operations through [`engine::Engine`], so the libSQL backend
 //! ([`crate::store::libsql`]) shares them: one SQL dialect, one behaviour.
 
+pub(crate) mod embed;
 pub(crate) mod engine;
 mod graph;
 mod held_back;
@@ -17,6 +18,7 @@ mod notes;
 pub mod schema;
 pub(crate) mod scripts;
 mod search;
+mod settings;
 pub(crate) mod sql;
 pub(crate) mod team_docs;
 
@@ -26,8 +28,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, TransactionBehavior};
 
+use super::VectorTarget;
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, ProjectKey};
-use super::{Forgotten, NoteListQuery, NotePage, Saved, Scope, SearchQuery, StoreError, Target, View};
+use super::{Forgotten, NoteListQuery, NotePage, NoteText, Saved, Scope, SearchQuery, StoreError, Target, View};
+use crate::backend::Place;
 use engine::Engine;
 use local::Local;
 use schema::SchemaState;
@@ -43,12 +47,15 @@ const BUSY_RETRY: Duration = Duration::from_millis(20);
 pub struct SqliteStore {
     conn: Connection,
     newer: bool,
+    /// The additive schema extensions are in place (see [`engine::install`]).
+    extensions: bool,
 }
 
 impl std::fmt::Debug for SqliteStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteStore")
             .field("newer", &self.newer)
+            .field("extensions", &self.extensions)
             .finish_non_exhaustive()
     }
 }
@@ -75,10 +82,24 @@ impl SqliteStore {
             }
         };
 
-        Ok(Self {
+        let mut store = Self {
             conn,
             newer: state == SchemaState::Newer,
-        })
+            extensions: false,
+        };
+
+        if !store.newer {
+            store.extensions = engine::install(&mut store);
+            engine::backfill(&mut store);
+        }
+
+        Ok(store)
+    }
+
+    /// True when the database has the additive schema extensions (English index, `lang`,
+    /// settings); false when it is newer or refused them.
+    pub fn has_extensions(&self) -> bool {
+        self.extensions
     }
 
     /// True when the database was written by a newer server.
@@ -143,6 +164,10 @@ impl Engine for SqliteStore {
     fn read<T>(&mut self, op: impl FnOnce(&mut dyn Sql) -> Result<T, StoreError>) -> Result<T, StoreError> {
         op(&mut Local(self.conn()?))
     }
+
+    fn extensions(&self) -> bool {
+        self.extensions
+    }
 }
 
 impl MemoryStore for SqliteStore {
@@ -170,12 +195,28 @@ impl MemoryStore for SqliteStore {
         engine::search(self, query)
     }
 
+    fn vector_targets(&mut self, view: &View) -> Vec<VectorTarget> {
+        VectorTarget::of_view(Place::Local, view, 0).into_iter().collect()
+    }
+
+    fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
+        embed::hits_for(self, query, ids)
+    }
+
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {
         engine::similar(self, view, id, limit)
     }
 
     fn similar_text(&mut self, view: &View, text: (&str, &str), limit: usize) -> Result<Vec<Hit>, StoreError> {
         engine::similar_text(self, view, text, limit)
+    }
+
+    fn notes_since(&mut self, cursor: i64, limit: usize) -> Result<Vec<NoteText>, StoreError> {
+        embed::notes_since(self, cursor, limit)
+    }
+
+    fn note_ids(&mut self) -> Result<Vec<i64>, StoreError> {
+        embed::note_ids(self)
     }
 
     fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {
@@ -196,6 +237,14 @@ impl MemoryStore for SqliteStore {
 
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
         engine::find_by_title(self, target, title)
+    }
+
+    fn english_notes(&mut self) -> Result<bool, StoreError> {
+        engine::english_notes(self)
+    }
+
+    fn set_english_notes(&mut self, on: bool) -> Result<(), StoreError> {
+        engine::set_english_notes(self, on)
     }
 }
 

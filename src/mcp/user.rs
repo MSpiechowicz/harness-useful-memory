@@ -9,6 +9,7 @@ use super::Server;
 use super::calls::{self, parse};
 use super::calls_scripts::{self, Trusting};
 use crate::store::{Note, Saved};
+use crate::support::lang::{self, Lang};
 
 /// Saves the note `arguments` describe (`note_save`'s arguments).
 pub(crate) fn save_note(server: &mut Server, arguments: Value) -> Result<Saved, String> {
@@ -59,4 +60,22 @@ pub(crate) fn note_current(note: &Note) -> Value {
         "entities": note.entities,
         "scope": note.scope.as_str(),
     })
+}
+
+/// What the user is told on stderr when their own note is not in English and the store keeps
+/// English notes.
+pub(crate) const NOT_ENGLISH_WARNING: &str = "this note is not in English, and this store keeps notes in English. It was saved as written: rewriting it in English helps agents find it";
+
+/// True when note `id` (in `scope`) is clearly not English and the English notes setting is on.
+/// The user's save is never refused for it, so this only tells them. A setting that cannot be read
+/// gives no warning.
+pub(crate) fn not_english(server: &mut Server, id: i64, scope: Option<&str>) -> bool {
+    if !server.store.english_notes().unwrap_or(false) {
+        return false;
+    }
+
+    match note(server, id, scope) {
+        Ok(Some(note)) => lang::detect(&note.title, &note.body) == Some(Lang::Other),
+        _ => false,
+    }
 }

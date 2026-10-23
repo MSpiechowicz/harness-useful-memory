@@ -3,7 +3,7 @@
 //! team database, opens the local notes store it never reads).
 
 use super::{Edge, Forget, Forgotten, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NoteListQuery, NotePage};
-use super::{NotePatch, Saved, SearchQuery};
+use super::{NotePatch, NoteText, Saved, SearchQuery, VectorTarget};
 use super::{PreviousVersion, TrustRecord, TrustStore, TrustedVersion, View};
 use super::{
     SavedScript, Script, ScriptDraft, ScriptOrigin, ScriptRef, ScriptStore, ScriptSummary, StoreError, Target,
@@ -108,12 +108,28 @@ impl MemoryStore for Lazy<dyn MemoryStore> {
         self.store()?.search(query)
     }
 
+    fn vector_targets(&mut self, view: &View) -> Vec<VectorTarget> {
+        self.store().map(|store| store.vector_targets(view)).unwrap_or_default()
+    }
+
+    fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
+        self.store()?.hits_for(query, ids)
+    }
+
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {
         self.store()?.similar(view, id, limit)
     }
 
     fn similar_text(&mut self, view: &View, text: (&str, &str), limit: usize) -> Result<Vec<Hit>, StoreError> {
         self.store()?.similar_text(view, text, limit)
+    }
+
+    fn notes_since(&mut self, cursor: i64, limit: usize) -> Result<Vec<NoteText>, StoreError> {
+        self.store()?.notes_since(cursor, limit)
+    }
+
+    fn note_ids(&mut self) -> Result<Vec<i64>, StoreError> {
+        self.store()?.note_ids()
     }
 
     fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {
@@ -134,6 +150,14 @@ impl MemoryStore for Lazy<dyn MemoryStore> {
 
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
         self.store()?.find_by_title(target, title)
+    }
+
+    fn english_notes(&mut self) -> Result<bool, StoreError> {
+        self.store()?.english_notes()
+    }
+
+    fn set_english_notes(&mut self, on: bool) -> Result<(), StoreError> {
+        self.store()?.set_english_notes(on)
     }
 }
 

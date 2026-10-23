@@ -304,3 +304,27 @@ fn index(keys: Document, name: &str, unique: bool) -> IndexModel {
         .options(IndexOptions::builder().name(name.to_owned()).unique(unique).build())
         .build()
 }
+
+/// The index on the English stems of a note, the sibling of `notes_terms`.
+const TERMS_EN_INDEX: &str = "notes_terms_en";
+
+/// Adds the `terms_en` index when the database lacks it, without a schema version (an older server
+/// ignores the index and the `terms_en`, `lang` and `en_rev` fields). The existing `notes_text`
+/// index is not touched. Creating an index that exists with the same keys is a no-op for the
+/// server, so servers starting together need no lock.
+pub(super) fn ensure_extensions(db: &Database, documentdb: bool) -> Result<(), StoreError> {
+    let failed = |error: mongodb::error::Error| driver_error(&error, documentdb);
+    let notes = db.collection::<Document>(NOTES);
+
+    let names = notes.list_index_names().run().map_err(failed)?;
+
+    if names.iter().any(|name| name == TERMS_EN_INDEX) {
+        return Ok(());
+    }
+
+    notes
+        .create_index(index(doc! { "project": 1, "terms_en": 1 }, TERMS_EN_INDEX, false))
+        .run()
+        .map(drop)
+        .map_err(failed)
+}

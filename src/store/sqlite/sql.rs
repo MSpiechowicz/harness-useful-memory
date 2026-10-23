@@ -76,6 +76,16 @@ impl FromValue for i64 {
     }
 }
 
+impl FromValue for f64 {
+    fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::Real(number) => Some(*number),
+            Value::Integer(number) => Some(*number as f64),
+            _ => None,
+        }
+    }
+}
+
 impl FromValue for bool {
     fn from_value(value: &Value) -> Option<Self> {
         i64::from_value(value).map(|number| number != 0)

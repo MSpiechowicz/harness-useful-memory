@@ -16,6 +16,8 @@
 //! types of [`MemoryStore::list_notes`].
 
 pub mod clean;
+pub(crate) mod extensions;
+pub(crate) mod fuse;
 pub mod hidden;
 pub mod hooks;
 pub mod lazy;
@@ -23,6 +25,7 @@ pub mod libsql;
 pub mod listing;
 pub mod mongo;
 pub mod postgres;
+pub(crate) mod rank;
 pub mod routines;
 pub mod scripts;
 pub mod split;
@@ -32,11 +35,13 @@ pub mod team_docs;
 
 use std::path::PathBuf;
 
+use crate::support::lang::Lang;
+
 pub use hidden::{HiddenEntry, HiddenNote, HiddenNotes, HiddenScripts};
 pub use hooks::{HookDelete, HookDraft, HookPage, HookPut, HookStore, TeamHook, checked_hook, hook_sha256};
 pub use lazy::Lazy;
 pub use libsql::LibsqlStore;
-pub use listing::{NoteListQuery, NotePage, NoteRow, NoteSort};
+pub use listing::{LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort};
 pub use mongo::MongoStore;
 pub use postgres::PostgresStore;
 pub use routines::{RoutineDelete, RoutineDraft, RoutinePage, RoutinePut, RoutineStore, TeamRoutine, checked_routine};
@@ -257,6 +262,9 @@ pub struct Note {
     pub updated_at: i64,
     pub revision: i64,
     pub hits: i64,
+    /// The language a store looked at: `None` when it did not (an older server wrote the note, or
+    /// the database has no `lang`) or was not certain.
+    pub lang: Option<Lang>,
 }
 
 /// The result of a write to a note.
@@ -288,6 +296,20 @@ pub struct SearchQuery {
     pub exclude: Vec<i64>,
 }
 
+/// The text of a stored note and where it belongs, as the embedder reads it
+/// ([`MemoryStore::notes_since`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteText {
+    pub id: i64,
+    /// The repository key, `None` for a global note.
+    pub project: Option<String>,
+    pub title: String,
+    pub body: String,
+    pub tags: Vec<String>,
+    /// Unix seconds.
+    pub updated_at: i64,
+}
+
 /// One search row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
@@ -301,6 +323,58 @@ pub struct Hit {
     pub updated_at: i64,
     pub entities: Vec<String>,
     pub provenance: Provenance,
+    /// The search score in thousandths (see `rank`), 0 for a list of recent notes or of similar
+    /// notes. Hits of one query compare by it, also across databases.
+    pub score_milli: u32,
+    /// The factor in thousandths the score was multiplied by for the repository and for a query
+    /// word naming the note (see `rank`): 1000 for none, and for a list that is not ranked. A
+    /// hybrid search takes it off to rank by the keyword relevance alone, then applies it once
+    /// to the fused score.
+    pub boost_milli: u32,
+}
+
+impl Hit {
+    /// [`Hit::boost_milli`] of a hit no boost applies to.
+    pub const NO_BOOST: u32 = 1000;
+}
+
+/// Where the vectors of one physical store are searched: the notes of the repositories `projects`
+/// lists (`None` is the global notes) of the store in `place`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorTarget {
+    /// The local file or the team database. The embedder names a store by a key that only the
+    /// caller knows (see `crate::embed::store_key_local`).
+    pub place: crate::backend::Place,
+    pub projects: Vec<Option<String>>,
+    /// Added to the store's own note id to get the id this store shows (see
+    /// [`crate::store::SplitStore`]).
+    pub id_offset: i64,
+}
+
+impl VectorTarget {
+    /// The target for the notes `view` shows in the store at `place`; `None` when it shows none
+    /// the embedder can name (a view of every repository reads without a list of them).
+    pub fn of_view(place: crate::backend::Place, view: &View, id_offset: i64) -> Option<Self> {
+        if view.sees_every_repo() {
+            return None;
+        }
+
+        let mut projects: Vec<Option<String>> = Vec::new();
+
+        if let Some(repo) = &view.repo {
+            projects.push(Some(repo.key.clone()));
+        }
+
+        if view.global {
+            projects.push(None);
+        }
+
+        (!projects.is_empty()).then_some(Self {
+            place,
+            projects,
+            id_offset,
+        })
+    }
 }
 
 /// A relation between two entities (`from relation to`).
@@ -449,6 +523,23 @@ pub trait MemoryStore: Send {
     /// Ranked notes: the repository first, then relevance, then the most recently updated.
     fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError>;
 
+    /// Where the vectors of the notes `view` shows are searched: one target per physical store
+    /// that is read for it. The default has none (no vectors to search).
+    fn vector_targets(&mut self, view: &View) -> Vec<VectorTarget> {
+        let _ = view;
+        Vec::new()
+    }
+
+    /// The notes among `ids` (as this store shows them) that `query` may see: its view, kind,
+    /// checkout and exclusions, none of them ranked. The snippet is the start of the body and the
+    /// score is 0 with [`Hit::boost_milli`] set for the words of `query` (see
+    /// [`MemoryStore::search`]). A hybrid search reads the notes the embedder finds this way. The
+    /// default finds none.
+    fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
+        let _ = (query, ids);
+        Ok(Vec::new())
+    }
+
     /// Up to `limit` notes in `view` resembling note `id` (which is left out).
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError>;
 
@@ -457,6 +548,24 @@ pub trait MemoryStore: Send {
     fn similar_text(&mut self, view: &View, text: (&str, &str), limit: usize) -> Result<Vec<Hit>, StoreError> {
         let _ = (view, text, limit);
         Ok(Vec::new())
+    }
+
+    /// Up to `limit` notes last updated at `cursor` (Unix seconds) or later, oldest first, every
+    /// repository's and the global ones, for the embedder to index. Several notes can share one
+    /// second, so a caller pages by moving the cursor to the last note's `updated_at`. The default
+    /// fails: only a store over one database has one id space to read.
+    fn notes_since(&mut self, cursor: i64, limit: usize) -> Result<Vec<NoteText>, StoreError> {
+        let _ = (cursor, limit);
+        Err(StoreError::Invalid(
+            "this store cannot list its notes for indexing".to_owned(),
+        ))
+    }
+
+    /// The id of every note, for the embedder to find the ones that were deleted.
+    fn note_ids(&mut self) -> Result<Vec<i64>, StoreError> {
+        Err(StoreError::Invalid(
+            "this store cannot list its notes for indexing".to_owned(),
+        ))
     }
 
     /// Where note `id` of `scope` (as this store shows it) lives, and whether it can be changed
@@ -520,5 +629,18 @@ pub trait MemoryStore: Send {
             Some(hit) => Ok(self.get(&view, &[hit.id])?.into_iter().next()),
             None => Ok(None),
         }
+    }
+
+    /// Whether notes have to be English (the English notes setting, kept in the database so a
+    /// team shares it). On when nothing is stored. The default is on, for a store that keeps no
+    /// settings.
+    fn english_notes(&mut self) -> Result<bool, StoreError> {
+        Ok(true)
+    }
+
+    /// Stores the English notes setting. The default keeps nothing.
+    fn set_english_notes(&mut self, on: bool) -> Result<(), StoreError> {
+        let _ = on;
+        Ok(())
     }
 }

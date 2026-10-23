@@ -7,13 +7,14 @@ use std::path::PathBuf;
 
 use mongodb::bson::{Bson, Document, doc};
 
-use super::search::terms;
+use super::search::{english_terms, terms};
 use super::{Ctx, ENTITIES, Fail, NOTES, RELATIONS, graph, int, now, project_of, scope_of, scope_value, strings};
 use super::{PATH_MAX, cut, flag, id_only, note_fields, number, text, visible};
 use crate::limits::{BODY_MAX, ENTITY_MAX, GET_IDS_MAX};
 use crate::store::{
     Forgotten, Note, NoteDraft, NoteKind, NotePatch, Provenance, Saved, StoreError, Target, View, clean,
 };
+use crate::support::lang;
 use crate::support::redact::redact_text;
 
 /// A [`NoteDraft`] cleaned and checked.
@@ -114,7 +115,25 @@ pub(super) fn check_ids(ids: &[i64]) -> Result<(), StoreError> {
     Ok(())
 }
 
-pub(super) fn remember(ctx: &mut Ctx<'_>, target: &Target, draft: &CleanDraft) -> Result<Saved, Fail> {
+/// The fields the English search and the language setting read: the English stems of the note's
+/// `terms`, its `lang`, and `en_rev`, the revision these describe. An older server edits a note
+/// without them and raises `revision`, which is how the backfill finds the notes whose stems and
+/// language are stale.
+pub(super) fn english_fields(title: &str, body: &str, terms: &[String], revision: i64) -> Document {
+    doc! {
+        "terms_en": english_terms(terms),
+        "lang": lang::stored(lang::detect(title, body)),
+        "en_rev": revision,
+    }
+}
+
+/// Saves the draft. With `extensions` the English fields are stored too.
+pub(super) fn remember(
+    ctx: &mut Ctx<'_>,
+    target: &Target,
+    draft: &CleanDraft,
+    extensions: bool,
+) -> Result<Saved, Fail> {
     let project = project_of(target);
     let scope = scope_value(project.as_deref());
     let now = now();
@@ -131,12 +150,13 @@ pub(super) fn remember(ctx: &mut Ctx<'_>, target: &Target, draft: &CleanDraft) -
     )?;
 
     let writer = &draft.writer;
+    let words = terms(&draft.title, &draft.body, &draft.tags);
     let mut fields = doc! {
         "title": &draft.title,
         "body": &draft.body,
         "kind": draft.kind.as_str(),
         "tags": &draft.tags,
-        "terms": terms(&draft.title, &draft.body, &draft.tags),
+        "terms": words.clone(),
         "updated_at": now,
     };
     fields.extend(writer.fields());
@@ -157,6 +177,11 @@ pub(super) fn remember(ctx: &mut Ctx<'_>, target: &Target, draft: &CleanDraft) -
             }
 
             let revision = int(&note, "revision");
+
+            if extensions {
+                fields.extend(english_fields(&draft.title, &draft.body, &words, revision + 1));
+            }
+
             let changed = ctx.update_one(
                 NOTES,
                 doc! { "_id": id, "revision": revision },
@@ -181,6 +206,11 @@ pub(super) fn remember(ctx: &mut Ctx<'_>, target: &Target, draft: &CleanDraft) -
                 "entities": Vec::<String>::new(),
             };
             note.extend(fields);
+
+            if extensions {
+                note.extend(english_fields(&draft.title, &draft.body, &words, 1));
+            }
+
             ctx.insert_one(NOTES, note)?;
 
             (id, true, 1)
@@ -212,7 +242,13 @@ pub(super) fn remember(ctx: &mut Ctx<'_>, target: &Target, draft: &CleanDraft) -
 
 /// Applies `patch` at the revision it read. The body is masked after `append` is joined to it, so
 /// a secret split across the two is masked as a whole (see [`clean::join_masked`]).
-pub(super) fn update(ctx: &mut Ctx<'_>, view: &View, id: i64, patch: &CleanPatch) -> Result<Saved, Fail> {
+pub(super) fn update(
+    ctx: &mut Ctx<'_>,
+    view: &View,
+    id: i64,
+    patch: &CleanPatch,
+    extensions: bool,
+) -> Result<Saved, Fail> {
     let Some(Stored { note, .. }) = load(ctx, view, id)? else {
         return Err(Fail::Store(not_found(id)));
     };
@@ -237,16 +273,21 @@ pub(super) fn update(ctx: &mut Ctx<'_>, view: &View, id: i64, patch: &CleanPatch
     let kind = patch.kind.unwrap_or(note.kind);
     let tags = patch.tags.clone().unwrap_or_else(|| note.tags.clone());
 
+    let words = terms(&title, &body, &tags);
     let mut fields = doc! {
         "title": &title,
         "title_norm": &title_norm,
-        "terms": terms(&title, &body, &tags),
-        "body": body,
+        "terms": words.clone(),
+        "body": &body,
         "kind": kind.as_str(),
         "tags": tags,
         "updated_at": now(),
     };
     fields.extend(patch.writer.fields());
+
+    if extensions {
+        fields.extend(english_fields(&title, &body, &words, note.revision + 1));
+    }
 
     let changed = ctx.update_one(
         NOTES,
@@ -439,6 +480,7 @@ pub(super) fn stored(document: &Document) -> Stored {
         updated_at: int(document, "updated_at"),
         revision: int(document, "revision"),
         hits: int(document, "hits"),
+        lang: text(document, "lang").as_deref().and_then(lang::Lang::parse),
     };
 
     Stored {

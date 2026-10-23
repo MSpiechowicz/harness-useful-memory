@@ -5,6 +5,9 @@
 //! - `notes save --json [--project PATH] [--client NAME]` reads `{title, body, kind, tags, entities, scope}`
 //!   (`scope` `repo`, the default, or `global`) on standard input and prints `{"id": N, "title":
 //!   "...", "scope": "repo"}`.
+//! - A note the user saves is never refused for its language. When the English notes setting is on
+//!   and the note is clearly not English, the line `harness-memory: this note is not in English
+//!   ...` goes to stderr and the JSON gets `"warning": "not-english"`.
 //! - `notes update <id> --json [--project PATH] [--client NAME]` reads `{title, body, kind, tags}` (the fields to
 //!   change) and prints `{"id": N, "title": "..."}`; a note that is not visible is `notFound`.
 //!
@@ -56,10 +59,10 @@ pub(super) fn save(args: &[Option<&str>]) -> ExitCode {
     };
 
     let title = title_of(&mut saver, saved.id);
-    println!(
-        "{}",
-        json!({ "id": saved.id, "title": title, "scope": saved.scope.as_str() })
-    );
+    let mut shown = json!({ "id": saved.id, "title": title, "scope": saved.scope.as_str() });
+    warn_not_english(&mut saver, saved.id, &mut shown);
+
+    println!("{shown}");
     ExitCode::SUCCESS
 }
 
@@ -97,7 +100,10 @@ pub(super) fn update(args: &[Option<&str>]) -> ExitCode {
     };
 
     let title = title_of(&mut saver, saved.id);
-    println!("{}", json!({ "id": saved.id, "title": title }));
+    let mut shown = json!({ "id": saved.id, "title": title });
+    warn_not_english(&mut saver, saved.id, &mut shown);
+
+    println!("{shown}");
     ExitCode::SUCCESS
 }
 
@@ -135,6 +141,15 @@ fn draft(fields: &[(&str, &str)]) -> Result<Map<String, Value>, ExitCode> {
             "the draft goes on standard input, as a JSON object",
         )),
         Err(message) => Err(refused(Code::Invalid, &message)),
+    }
+}
+
+/// Tells the user, on stderr and as `"warning": "not-english"` in `shown`, when note `id` is not
+/// in English and the store keeps English notes. The note is saved either way.
+fn warn_not_english(saver: &mut Saver, id: i64, shown: &mut Value) {
+    if user::not_english(&mut saver.server, id, None) {
+        eprintln!("harness-memory: {}", user::NOT_ENGLISH_WARNING);
+        shown["warning"] = json!("not-english");
     }
 }
 

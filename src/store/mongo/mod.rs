@@ -13,6 +13,11 @@
 //!   language `none`: no stemming and no stopwords, like FTS5's `unicode61`). A database set up
 //!   for Amazon DocumentDB ([`Flavor::DocumentDb`]) has no text index, at the same schema version:
 //!   nothing else reads it.
+//!   Added without a schema version (`schema::ensure_extensions`, `backfill`): `terms_en`,
+//!   the Snowball English stems of `terms` (index `(project, terms_en)`), `lang` (`en`, `other` or
+//!   `unknown`) and `en_rev`, the `revision` those two describe. A server that does not know them
+//!   inserts a note without them and edits it without refreshing them, which `en_rev` tells apart
+//!   from a current note, so the next open fills them in.
 //! - `entities`: unique `(project, name_norm)`; the first spelling is kept in `name`.
 //! - `relations`: unique `(project, src, rel, dst)` over normalized entity names, with the
 //!   entities' spellings copied in, plus `(project, dst)` and `note_id` indexes.
@@ -22,8 +27,8 @@
 //!   key (`null` for global hooks), the file bytes in `body`; index `(repo, created_at, _id)`.
 //! - `routines` (schema 4): the team routines, laid out like `hooks`; index
 //!   `(repo, created_at, _id)`.
-//! - `meta`: the schema version (`_id: "schema"`), the note and script id counters and the
-//!   migration lock.
+//! - `meta`: the schema version (`_id: "schema"`), the note and script id counters, the
+//!   migration lock and the team's settings (`_id: "settings"`, `english_notes`).
 //!
 //! # Writes
 //!
@@ -40,37 +45,42 @@
 //!
 //! # Search ranking compared with SQLite
 //!
-//! Words are matched with `$text` (case- and diacritic-insensitive) and ranked by `textScore` with
-//! the title, body and tag weights of the SQLite store; the order is the repository first, then
-//! relevance, then the most recently updated (then hits, then id), with the same filters and
-//! limits. Differences from FTS5:
+//! A search for words takes a pool of candidates and ranks it in this crate like every other
+//! backend (`store::rank`): stopwords left out, English stems, a note has to match at least half
+//! of the query's stems, one order for repository and global notes (a repository boost), a
+//! relevance floor. The pool is the notes the `$text` index finds (case- and diacritic-insensitive,
+//! whole words), the notes with a stem of a query word in `terms_en` (best by the number of
+//! stems they have) and the notes with a word or stem the last query word starts. Differences from
+//! FTS5:
 //!
-//! - `textScore` is not BM25: it weighs how often a word occurs in a field, not how rare the word
-//!   is across all notes, so a rare word does not outrank a common one by itself.
-//! - `$text` matches whole words only. The prefix match of the last word (`hard` finds
-//!   `hardening`) is a second query on the indexed `terms`, scored with MongoDB's own formula and
-//!   added to `textScore`.
-//! - At most 100 candidates of each query are ranked, which only matters when more than 100
-//!   notes match.
+//! - The relevance is MongoDB's `textScore` formula computed here over the words of each field,
+//!   matched by stem (title, body and tag weights of the SQLite store): it weighs how often a
+//!   word occurs in a field, not how rare the word is across all notes, so a rare word does not
+//!   outrank a common one by itself. The `$text` index and `terms_en` only choose the pool.
+//! - At most as many candidates as the pool size (see `store::rank`) come from each source, which
+//!   only matters when more notes match.
 //! - Snippets are cut around the first matching word of the body by this module, not by
 //!   FTS5's `snippet()`, so the excerpt can start a few words earlier or later.
+//! - Notes an older server wrote have no `terms_en` yet. They are found through `$text` (or
+//!   `terms`), until the next open fills in the stems.
 //!
 //! # Search on Amazon DocumentDB
 //!
 //! [`Flavor::DocumentDb`] has no text index (see [`documentdb`]). The words are folded like the
-//! indexed `terms` (lowercase, no diacritics) and matched against them, and the score is
-//! MongoDB's `textScore` formula computed here over the folded words of each field: per matched
-//! word, `weight * frequency * (0.5 * count / words + 0.5)` with the 5 : 1 : 3 weights, where each
-//! repeat of a word counts half the one before. The order, filters, limits, prefix match and
-//! snippets are the ones above. Differences from the MongoDB search:
+//! indexed `terms` (lowercase, no diacritics) and matched against them, and `terms_en` finds the
+//! other forms of the words. The relevance and the ranking are the ones above. Differences from
+//! the MongoDB search:
 //!
-//! - The candidates are the 100 most recently updated matching notes (repository first), not the
-//!   100 best scored, which only matters when more than 100 notes match.
+//! - The candidates are the most recently updated matching notes, not the best scored ones, which
+//!   only matters when more notes match.
 //! - A field's words are the ones this module splits it into (at every character that is not a
 //!   letter or a digit), not the ones MongoDB's tokenizer finds, so the score of a field with
 //!   punctuation inside words can differ slightly.
 //! - A note is found by the `terms` this server stored with it, so a note changed in the database
 //!   behind this server's back is found by the words it was last saved with.
+//!
+//! The similar-note lookup keeps the order of the first versions: the repository first, then
+//! `textScore` (or the same formula computed here on DocumentDB), then the most recently updated.
 //!
 //! # Connection
 //!
@@ -93,14 +103,17 @@
 //! whatever read preference the URL sets: transactions only run there, and a replica could miss a
 //! note saved a moment earlier.
 
+mod backfill;
 mod connection;
 pub mod documentdb;
+mod embed;
 mod graph;
 mod listing;
 mod notes;
 pub mod schema;
 mod scripts;
 mod search;
+mod settings;
 mod team_docs;
 
 use std::thread;
@@ -114,8 +127,10 @@ use mongodb::options::{ClientOptions, ReadConcern, ReturnDocument, WriteConcern}
 use mongodb::sync::{Client, ClientSession, Collection, Database};
 
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, Saved, SearchQuery};
-use super::{Forgotten, NoteListQuery, NotePage, Scope, StoreError, Target, View};
+use super::{Forgotten, NoteListQuery, NotePage, NoteText, Scope, StoreError, Target, VectorTarget, View};
+use crate::backend::Place;
 use crate::limits::{BODY_MAX, ENTITY_MAX, TAG_MAX, TAGS_MAX, TITLE_MAX};
+use crate::store::extensions;
 use crate::store::listing::checked_exclude;
 use schema::SchemaState;
 
@@ -158,6 +173,8 @@ pub struct MongoStore {
     /// Amazon DocumentDB: reads run as aggregations (see [`Ctx`]), and errors of a server that
     /// cannot be reached carry the VPN hint (see [`driver_error`]).
     documentdb: bool,
+    /// The additive schema extensions are in place (see [`schema::ensure_extensions`]).
+    extensions: bool,
 }
 
 impl std::fmt::Debug for MongoStore {
@@ -168,6 +185,7 @@ impl std::fmt::Debug for MongoStore {
             .field("newer", &self.newer)
             .field("text_index", &self.text_index)
             .field("documentdb", &self.documentdb)
+            .field("extensions", &self.extensions)
             .finish_non_exhaustive()
     }
 }
@@ -212,14 +230,37 @@ impl MongoStore {
         let transactions = probe(&client, documentdb)?;
         let state = schema::migrate(&db, documentdb)?;
 
-        Ok(Self {
+        let mut store = Self {
             client,
             db,
             transactions,
             newer: state == SchemaState::Newer,
             text_index: !documentdb,
             documentdb,
-        })
+            extensions: false,
+        };
+
+        if !store.newer {
+            store.extensions = match schema::ensure_extensions(&store.db, documentdb) {
+                Ok(()) => true,
+                Err(error) => {
+                    extensions::warn_unavailable(&error);
+                    false
+                }
+            };
+
+            if store.extensions {
+                backfill::fill(&store.db, documentdb);
+            }
+        }
+
+        Ok(store)
+    }
+
+    /// True when the database has the additive schema extensions (the `terms_en` index); false
+    /// when it is newer or refused them.
+    pub fn has_extensions(&self) -> bool {
+        self.extensions
     }
 
     /// True when the database was written by a newer server.
@@ -331,12 +372,14 @@ impl MongoStore {
 impl MemoryStore for MongoStore {
     fn remember(&mut self, target: &Target, draft: &NoteDraft) -> Result<Saved, StoreError> {
         let draft = notes::prepare(draft)?;
-        self.write(|ctx| notes::remember(ctx, target, &draft))
+        let extensions = self.extensions;
+        self.write(|ctx| notes::remember(ctx, target, &draft, extensions))
     }
 
     fn update(&mut self, view: &View, id: i64, patch: &NotePatch) -> Result<Saved, StoreError> {
         let patch = notes::prepare_patch(patch)?;
-        self.write(|ctx| notes::update(ctx, view, id, &patch))
+        let extensions = self.extensions;
+        self.write(|ctx| notes::update(ctx, view, id, &patch, extensions))
     }
 
     fn get(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
@@ -357,8 +400,16 @@ impl MemoryStore for MongoStore {
     }
 
     fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
-        let text_index = self.text_index;
-        search::search(&mut self.reader()?, query, text_index).map_err(|fail| self.failed(fail))
+        let (text_index, extensions) = (self.text_index, self.extensions);
+        search::search(&mut self.reader()?, query, text_index, extensions).map_err(|fail| self.failed(fail))
+    }
+
+    fn vector_targets(&mut self, view: &View) -> Vec<VectorTarget> {
+        VectorTarget::of_view(Place::Remote, view, 0).into_iter().collect()
+    }
+
+    fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
+        search::by_ids(&mut self.reader()?, query, ids).map_err(|fail| self.failed(fail))
     }
 
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {
@@ -369,6 +420,14 @@ impl MemoryStore for MongoStore {
     fn similar_text(&mut self, view: &View, text: (&str, &str), limit: usize) -> Result<Vec<Hit>, StoreError> {
         let text_index = self.text_index;
         search::resembling(&mut self.reader()?, view, text, None, limit, text_index).map_err(|fail| self.failed(fail))
+    }
+
+    fn notes_since(&mut self, cursor: i64, limit: usize) -> Result<Vec<NoteText>, StoreError> {
+        embed::notes_since(&mut self.reader()?, cursor, limit).map_err(|fail| self.failed(fail))
+    }
+
+    fn note_ids(&mut self) -> Result<Vec<i64>, StoreError> {
+        embed::note_ids(&mut self.reader()?).map_err(|fail| self.failed(fail))
     }
 
     fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {
@@ -398,6 +457,16 @@ impl MemoryStore for MongoStore {
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
         let title = super::clean::title(title)?;
         notes::find_by_title(&mut self.reader()?, target, &title).map_err(|fail| self.failed(fail))
+    }
+
+    fn english_notes(&mut self) -> Result<bool, StoreError> {
+        self.check_version()?;
+        settings::english_notes(&self.db).map_err(|error| driver_error(&error, self.documentdb))
+    }
+
+    fn set_english_notes(&mut self, on: bool) -> Result<(), StoreError> {
+        self.check_version()?;
+        settings::set_english_notes(&self.db, on).map_err(|error| driver_error(&error, self.documentdb))
     }
 }
 
@@ -1013,6 +1082,9 @@ fn strings(document: &Document, key: &str) -> Vec<String> {
 /// The longest kind name (`optimisation`), with room to spare.
 const KIND_MAX: usize = 16;
 
+/// The longest language name (`unknown`), with room to spare.
+const LANG_MAX: usize = 16;
+
 /// The longest note source ([`super::clean::source`]).
 const SOURCE_MAX: usize = 64;
 
@@ -1043,7 +1115,19 @@ fn note_fields() -> Document {
         "updated_at": number("$updated_at"),
         "revision": number("$revision"),
         "hits": number("$hits"),
+        "lang": fresh_lang(),
     }
+}
+
+/// True when the English fields of a note describe its current revision. An older server edits a
+/// note and raises `revision` without refreshing `lang` and `en_rev`, until the next backfill.
+fn lang_is_fresh() -> Bson {
+    Bson::Document(doc! { "$eq": [number("$en_rev"), number("$revision")] })
+}
+
+/// The stored `lang` of a note, or `null` (unknown) while it is stale.
+fn fresh_lang() -> Bson {
+    Bson::Document(doc! { "$cond": [lang_is_fresh(), cut("$lang", LANG_MAX), Bson::Null] })
 }
 
 /// Only the `_id` of a note (0 when it is not a number).

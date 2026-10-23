@@ -7,12 +7,14 @@
 #![allow(dead_code)]
 
 pub mod approval;
+pub mod embedder;
 pub mod guards;
 pub mod hooks;
 pub mod listing;
 pub mod mcp;
 pub mod routines;
 pub mod scripts;
+pub mod search_cases;
 pub mod stdio;
 
 use std::path::PathBuf;

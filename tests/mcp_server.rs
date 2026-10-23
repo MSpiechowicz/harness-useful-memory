@@ -47,7 +47,8 @@ fn initialize_negotiates_the_version_and_sends_instructions() {
     assert_eq!(replies[2]["result"], json!({}));
 
     let instructions = replies[0]["result"]["instructions"].as_str().expect("instructions");
-    assert!(instructions.chars().count() <= 1600);
+    // Claude Code keeps the first 2048 characters of a server's instructions.
+    assert!(instructions.chars().count() <= 2000);
     for tool in [
         "note_search",
         "note_save",

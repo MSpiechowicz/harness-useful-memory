@@ -50,10 +50,29 @@ tempfile = "3.27.0"
 # The id of a script run request, from the operating system's random source (the version the
 # MongoDB driver's DNS resolver already pulls in).
 getrandom = "0.4.3"
+# Language detection of a note (English or not) and the Snowball English stems the MongoDB `terms_en` holds.
+whatlang = "0.18.0"
+rust-stemmers = "1.2.0"
+# The embedder (`harness-memory embedder`): the multilingual MiniLM model runs on tract (pure Rust,
+# no native runtime to download), its tokenizer on `tokenizers` without the Oniguruma C library,
+# and every `harness-memory mcp` asks it over a local socket.
+tract-onnx = "0.23.9"
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+interprocess = "2.4.6"
+# SIGTERM and SIGHUP besides Ctrl-C (and the Windows console events) stop `embedder run` cleanly: the
+# socket is removed and the lock released.
+ctrlc = { version = "3.5.2", features = ["termination"] }
+# Returns the freed model memory to the operating system (glibc keeps it), so the embedder's idle
+# unload gives it back.
+mimalloc = "0.1"
 
 # Kills a timed-out git together with its process group (`killpg`).
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["signal", "process", "user"] }
+
+# The security descriptor string of the embedder's named pipe (see `src/embed/pipe.rs`).
+[target.'cfg(windows)'.dependencies]
+widestring = "1.2.1"
 
 [dev-dependencies]
 insta = { version = "1.49.0", features = ["json"] }

@@ -11,8 +11,10 @@
 [MCP](https://modelcontextprotocol.io) server that Claude Code, Codex, OMP, PI, OpenCode and any other MCP client can
 start. Agents search it at the start of a task and save what they learn (fixes, decisions, where things live) before they
 finish, so the next session in the same repository starts better informed. Notes and a small entity and relation graph
-live in a local SQLite database with full-text search (FTS5), keyed per git repository. There are no embeddings, and the server
-opens no network connection unless you configure a team database. Notes are treated as untrusted data written by agents, and secrets are redacted before anything is
+live in a local SQLite database with full-text search (FTS5), keyed per git repository. Search is stemmed English keyword
+search everywhere. Optional vector search adds notes close in meaning, through one local embedder per computer (see
+[Search](#search)). The server opens no network connection unless you configure a team database, and the embedder
+downloads its model once when you turn vector search on. Notes are treated as untrusted data written by agents, and secrets are redacted before anything is
 stored. A team can point the server at one shared database instead (see [Team memory](#team-memory)).
 
 ## Install
@@ -320,6 +322,13 @@ Scripts need team database schema 2 (PostgreSQL, MongoDB) or 3 (libSQL), [team h
 adds tables and collections), and from then on every tool of an older `harness-memory` fails on it, notes included
 (`check` says `update it`): when you upgrade, the whole team upgrades together.
 
+The English search objects, the `lang` of a note and the [English notes](#english-notes) setting are different. They
+are additive extensions that every backend adds on open to what is missing, and they do not raise the schema version.
+An older `harness-memory` keeps reading, searching and writing an upgraded database. What it misses: it searches with
+the old, unstemmed index, it does not set `lang` (a note it writes or edits is looked at again by the next newer
+server), and it does not know the English notes setting. A database that gives this server no right to change its schema
+is used without the extensions, with one line on stderr: English stemming and the setting are then off for it.
+
 ### Browsing notes
 
 Harness Desktop shows and deletes notes with these commands (they are for people and programs acting for them, not
@@ -432,6 +441,90 @@ or in `project_path`. The repository key is the normalized `origin` remote (`hos
 every clone of a repository shares its notes, and the repository path when there is no remote (so a path key matches only on one machine). A home or filesystem-root
 directory is no project. The `global` scope is shared by all repositories.
 
+### Search
+
+`note_search` ranks with stemmed English keyword search on every backend (SQLite, libSQL, PostgreSQL, MongoDB,
+DocumentDB). Stopwords are dropped from the query, and a query that is only stopwords finds no notes. A note has to match
+at least half (rounded up) of the remaining query stems and pass a per-backend score floor. Repository and global notes
+are ranked together, with a boost for the repository's notes and for notes whose entities or path segments equal a word
+of the query. `similar` (the list `note_save` returns) is unchanged.
+
+With vector search on, the keyword list is fused with a list of notes close in meaning (reciprocal rank fusion, k = 60).
+The vectors come from the [embedder](#the-embedder), and a note has to reach a cosine floor to count. Vector search is
+off until `harness-memory embedder enable` (Harness Desktop turns it on by default, with a switch in Settings). While
+it is on and the embedder does not answer, the search returns the keyword results with the first line `(vector search
+unavailable: keyword results only)`, once per session. While it is off, search is silent and the same as keyword-only.
+
+The vectors of the notes live only in a cache on this computer (`vectors.sqlite3`). They are never written to a team
+database. A note saved or changed through this server is sent to the embedder at once, and the embedder also finds what
+was missed, so a note saved by a teammate gets its vector here within minutes.
+
+### The embedder
+
+One `harness-memory embedder` runs per computer and every `harness-memory mcp` asks it over a local socket. It holds the
+model, embeds the notes of the stores this computer is set up for (the local file and the team database, as the
+[routing](#which-notes-are-shared) says) and answers searches. Harness Desktop starts it, and you can run it by hand:
+
+```sh
+harness-memory embedder enable          # {"enabled": true}, writes embedder.toml (missing = disabled)
+harness-memory embedder run             # serve in the foreground (the default of `embedder`)
+harness-memory embedder status --json   # {"enabled", "running", "active_model", "pending_model", "model_present", "vectors"}
+harness-memory embedder disable         # {"enabled": false}
+harness-memory embedder remove-model    # delete the model files and the vectors, refused while it runs
+```
+
+`enabled` only decides whether `harness-memory mcp` asks the embedder. `disable` does not stop a running embedder.
+
+- **One instance.** A second `embedder run` finds `embedder.lock` held, prints `{"event":"busy"}` and exits 0. The
+  embedder exits when its standard input closes (the program that started it is gone) and on SIGTERM.
+- **Events.** It prints one JSON object per line: `download` (`received`, `total`), `verifying`, `loading`, `ready`
+  (`model`, `dim`), `backfill` and `reembed` (`store`, `done`, `total`), `model-update` (`from`, `to`), `switched`,
+  `cleanup-done`, `idle`, `busy` and `error` (`message`).
+- **Socket.** On Linux and macOS it listens on `embedder.sock` in the data folder, mode 0600. When that path is longer
+  than 100 bytes it uses `harness-memory-<hash>.sock` in the temporary folder instead. A client refuses a socket that is
+  not a socket or not yours. On Windows it is a named pipe, `harness-memory-embedder-<hash>`. Requests are one line of
+  JSON per connection (`ping`, `search`, `upsert`, `forget`). A search waits at most 2 s and an update 200 ms.
+- **Memory.** The model and tokenizer are unloaded after 10 idle minutes (`idle`) and loaded again by the next search.
+  The vectors stay loaded.
+- **Vector cache.** `vectors.sqlite3` keeps one vector per note and model, with a hash of the note text, plus the position
+  it has read to in each store. The cache is local, and a store is named in it by a key that holds no secret (a hash of
+  the file path, or of the team URL without its credentials and the database name).
+- **The model.** `paraphrase-multilingual-MiniLM-L12-v2`, int8, 384 dimensions, read with tract. On the first start the
+  embedder downloads two files, `model_quantized.onnx` (about 118 MB) and `tokenizer.json` (about 17 MB), from the
+  harness-useful-memory GitHub release named in the build. Each file's SHA-256 and size are compiled in, and a file that
+  does not match is not used. They are kept in `models/<id>/` in the data folder. Nothing else is downloaded, and it
+  never reads from Hugging Face.
+- **Mirror.** `HARNESS_MEMORY_MODEL_BASE_URL` replaces the folder URL the files are fetched from (`<base>/<file name>`),
+  for an offline mirror or a test. It has to be `https://`, or `http://` to `127.0.0.1` or `localhost`. The hashes stay
+  pinned, so a mirror cannot change the model.
+- **Model updates.** A release that names a new model id downloads and verifies it in the background while the old one
+  keeps answering. It then embeds every note again under the new id (`reembed`), switches in one step (`switched`) and
+  deletes the old files and vectors (`cleanup-done`). If a step fails, the old model keeps serving, and the update is
+  tried again at the next start and every hour.
+
+### English notes
+
+A store can ask agents to write notes in English, which the search and the stemming work best with. The setting is kept
+in the store, so on a team database it is team-wide, and it is on when nothing is stored.
+
+```sh
+harness-memory settings get --json                    # {"english_notes": true}
+harness-memory settings set english_notes=false --json
+```
+
+`set` writes every store a note scope saves to. A database this server could not extend (no right to change the schema)
+has no settings storage and the command exits 1 with the reason.
+
+With the setting on, an agent's `note_save` or `note_update` whose title and body are clearly not English is refused
+before the save guards run, with "Rewrite the title and body in English and call the tool again. Nothing was saved.".
+Nothing is held for review. Detection is conservative: it needs a reliable verdict over at least 40 letters of prose,
+and code, paths and identifiers do not count, so short and technical notes pass. Your own saves (`notes save`, `held
+save`) are never refused and only print a warning. `push` is not checked. A note already stored in another language gets
+`lang` = `other`, and `note_get` adds a line asking the agent to rewrite it with `note_update`.
+
+`notes list --json` gives each note a `lang` (`en`, `other` or `null` when it is not known), and `--lang en|other|unknown`
+keeps one of them.
+
 ## Where data lives
 
 One SQLite file, `memory.sqlite3`, in the `harness-memory` folder of your user data directory:
@@ -451,6 +544,10 @@ run from `run` inside it, and the script approvals pass through `requests` there
 `<data dir>/com.mspiechowicz.harness-useful-desktop/memory/memory.sqlite3`. On first run, when there is no database in
 the new place yet, the server copies that file over. The old one is left untouched. Harness Desktop versions that still
 bundle their own server keep writing the old file, so notes saved through them after the copy stay there.
+
+The embedder adds these files to the same folder: `embedder.toml` (`enabled = true|false`), `embedder.lock` (held while
+it runs), `embedder.sock` (its socket, or in the temporary folder when the path is long), `vectors.sqlite3` (the note
+vectors, for this computer only) and `models/<id>/` (the model files).
 
 ## Team memory
 
@@ -943,7 +1040,9 @@ object has `scripts` totals instead of `notes`, no `relations` or `entitiesCut`,
 ```
 
 `harness-memory features` lists what this build supports, one per line (`push-json`, `scripts-remote-local`,
-`scripts-hide` and `scripts-push-json` among them), so a tool can check before it asks for them.
+`scripts-hide`, `scripts-push-json`, `settings`, `notes-lang` and `embedder` among them), so a tool can check before it
+asks for them. `settings` is the `settings` command, `notes-lang` the `lang` of a note and the `--lang` filter, and
+`embedder` the `embedder` command.
 
 ### Security and backups
 
@@ -960,7 +1059,9 @@ object has `scripts` totals instead of `notes`, no `relations` or `entitiesCut`,
 
 ## Privacy and trust
 
-- **Local by default.** Without a team database the server opens no network connection. It talks MCP to the process that
+- **Local by default.** Without a team database the server opens no network connection, except that the embedder
+  downloads its search model once when vector search is on (and again when a release names a new model), from a
+  harness-useful-memory GitHub release, checked against a SHA-256 compiled into the build. It talks MCP to the process that
   started it, and the only other programs it runs are `git`, to find the repository (see above), and the scripts agents
   save and run with `script_run` (see [Scripts](#scripts)). It reads no other file of
   your project. When you configure a [team database](#team-memory), it connects to that one server and every note, global
@@ -1046,3 +1147,10 @@ works on its own.
 ## License
 
 [GPL-3.0-or-later](LICENSE). The logo font is Inter, under the SIL Open Font License (`docs/brand/OFL.txt`).
+
+### Search model notice
+
+The embedder's model is `paraphrase-multilingual-MiniLM-L12-v2` from
+[sentence-transformers](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2), under the
+Apache License 2.0. The int8 ONNX export is by [Xenova](https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2).
+It is not part of the binary. It is downloaded as release assets when vector search is turned on.

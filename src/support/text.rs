@@ -66,6 +66,20 @@ pub const STOPWORDS: &[&str] = &[
     "were", "what", "when", "where", "which", "why", "will", "with", "within", "without", "would", "you", "your",
 ];
 
+/// Short function words the keyword search leaves out of a query on top of [`STOPWORDS`]. They are
+/// not in [`STOPWORDS`] because the similar-note lookup already skips every word under three or
+/// four letters, and its word list must not change.
+pub const SHORT_STOPWORDS: &[&str] = &[
+    "a", "an", "as", "at", "be", "been", "by", "do", "he", "i", "if", "in", "is", "it", "me", "my", "of", "on", "or",
+    "she", "so", "to", "we", "who",
+];
+
+/// True for a lowercase `word` the keyword search leaves out of a query ([`STOPWORDS`] and
+/// [`SHORT_STOPWORDS`]).
+pub fn is_query_stopword(word: &str) -> bool {
+    STOPWORDS.contains(&word) || SHORT_STOPWORDS.contains(&word)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

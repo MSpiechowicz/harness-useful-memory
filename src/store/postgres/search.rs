@@ -7,12 +7,16 @@
 //! is quoted and the words are OR-ed (`'git' | 'cli':*`), so operators, quotes and stray `*`, `!`,
 //! `&` or `:` are plain text.
 //!
-//! Ranking keeps the SQLite order (repository first, then relevance, then the most recently
-//! updated), with `ts_rank` instead of BM25: title, tags and body weigh 5 : 3 : 1 and the score is
-//! divided by the log of the note's length, so the order of close matches can differ from SQLite.
+//! A search reads a pool of candidates by `ts_rank` from the English column (`search_en`, stemmed,
+//! stopwords dropped: `to_tsquery('english', ...)`) or, in a database without the extensions, from
+//! the `simple` one, and [`rank`] decides which of them answer the query and in which order
+//! (stopwords, half of the stems, one order for repository and global notes), the same way as for
+//! SQLite. `ts_rank` weighs title, tags and body 5 : 3 : 1 and divides the score by the log of the
+//! note's length, so the order of close matches can differ from SQLite. The similar-note lookup
+//! keeps the `simple` column, its query and its order.
 //! Snippets are cut by the server around the first body word that matches, 24 words long.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use postgres::types::ToSql;
@@ -20,11 +24,13 @@ use postgres::{GenericClient, Row};
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 
-use super::notes::{VISIBLE, entities_of, kind_from_sql, scope_of};
+use super::notes::{VISIBLE, kind_from_sql, scope_of};
 use super::{KIND_MAX, PATH_MAX, SOURCE_MAX, backend, column, cut, view_params};
-use crate::limits::{BODY_MAX, QUERY_MAX, QUERY_TOKENS_MAX, SEARCH_LIMIT_MAX, SNIPPET_MAX, SNIPPET_TOKENS, TITLE_MAX};
+use crate::limits::ENTITY_MAX;
+use crate::limits::{BODY_MAX, QUERY_MAX, SEARCH_LIMIT_MAX, SNIPPET_MAX, SNIPPET_TOKENS, TAG_MAX, TAGS_MAX, TITLE_MAX};
 use crate::store::listing::checked_exclude;
-use crate::store::{Hit, NoteKind, Provenance, SearchQuery, StoreError, View};
+use crate::store::rank::{self, Entry, Floor, Subject, Terms};
+use crate::store::{Hit, NoteKind, Provenance, Scope, SearchQuery, StoreError, View};
 use crate::support::text::STOPWORDS;
 
 /// Candidates examined by [`similar`] before the word-overlap filter.
@@ -57,13 +63,30 @@ struct Filter<'a> {
     exclude: Vec<i64>,
 }
 
+/// The least relevance, as a share of the best candidate's `ts_rank`, that an answer has. `ts_rank`
+/// weighs a title word 1.0 and a body word 0.2 before dividing by the length, so a body-only match
+/// of a word that is also in a title lands around a fifth and passes.
+const FLOOR: Floor = Floor(0.1);
+
+/// The longest tag text read for ranking: [`TAGS_MAX`] tags of [`TAG_MAX`] characters and their
+/// separators.
+const TAGS_TEXT_MAX: usize = TAGS_MAX * (TAG_MAX + 1);
+
 /// A matched row with the body, which [`similar`] compares.
 struct Candidate {
     hit: Hit,
     body: String,
+    /// Read for a search (see [`pool`]); empty and zero for the other queries.
+    tags: String,
+    hits: i64,
+    relevance: f64,
 }
 
-pub(super) fn search(client: &mut impl GenericClient, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
+pub(super) fn search(
+    client: &mut impl GenericClient,
+    query: &SearchQuery,
+    extensions: bool,
+) -> Result<Vec<Hit>, StoreError> {
     let text = query.text.trim();
     let length = text.chars().count();
 
@@ -75,7 +98,7 @@ pub(super) fn search(client: &mut impl GenericClient, query: &SearchQuery) -> Re
 
     let view = view_params(client, &query.view)?;
     let limit = query.limit.clamp(1, SEARCH_LIMIT_MAX);
-    let words = words(text, QUERY_TOKENS_MAX);
+    let terms = Terms::parse(text);
 
     let checkout = query.checkout.as_ref().map(|root| root.to_string_lossy().into_owned());
     let filter = Filter {
@@ -84,14 +107,137 @@ pub(super) fn search(client: &mut impl GenericClient, query: &SearchQuery) -> Re
         exclude: checked_exclude(&query.exclude)?.to_vec(),
     };
 
-    let rows = if words.is_empty() {
-        recent(client, view, &filter, limit)?
-    } else {
-        let matcher = Matcher::new(&words, true);
-        matching(client, &matcher, view, &filter, limit, None)?
-    };
+    if !terms.asked() {
+        let rows = recent(client, view, &filter, limit)?;
+        return finish(client, rows.into_iter().map(|row| row.hit).collect());
+    }
 
-    finish(client, rows.into_iter().map(|row| row.hit).collect())
+    // A query of stopwords alone has nothing to look for.
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    ranked(client, &terms, view, &filter, limit, extensions)
+}
+
+/// The best `limit` answers to `terms`: a pool by `ts_rank`, ranked by [`rank::rank`], entities
+/// attached.
+fn ranked(
+    client: &mut impl GenericClient,
+    terms: &Terms,
+    view: (Option<i64>, bool),
+    filter: &Filter<'_>,
+    limit: usize,
+    extensions: bool,
+) -> Result<Vec<Hit>, StoreError> {
+    let pool = pool(client, terms, view, filter, rank::pool_size(limit), extensions)?;
+
+    let ids: Vec<i64> = pool.iter().map(|candidate| candidate.hit.id).collect();
+    let mut entities = entities_by_id(client, &ids)?;
+
+    let entries: Vec<Entry<'_>> = pool
+        .iter()
+        .map(|candidate| Entry {
+            relevance: Some(candidate.relevance),
+            repo: candidate.hit.scope == Scope::Repo,
+            subject: Subject {
+                title: &candidate.hit.title,
+                body: &candidate.body,
+                tags: &candidate.tags,
+                entities: entities.get(&candidate.hit.id).map_or(&[], Vec::as_slice),
+            },
+            updated_at: candidate.hit.updated_at,
+            hits: candidate.hits,
+            id: candidate.hit.id,
+        })
+        .collect();
+    let ranking = rank::rank(terms, &entries, FLOOR, limit);
+    drop(entries);
+
+    let mut slots: Vec<Option<Candidate>> = pool.into_iter().map(Some).collect();
+    let mut hits: Vec<Hit> = Vec::with_capacity(ranking.len());
+
+    for item in ranking {
+        if let Some(candidate) = slots[item.index].take() {
+            hits.push(Hit {
+                entities: entities.remove(&candidate.hit.id).unwrap_or_default(),
+                score_milli: item.milli,
+                boost_milli: item.boost_milli,
+                ..candidate.hit
+            });
+        }
+    }
+
+    Ok(hits)
+}
+
+/// The notes among `ids` that `query` may see, with the boost of its words (see
+/// [`crate::store::MemoryStore::hits_for`]).
+pub(super) fn by_ids(
+    client: &mut impl GenericClient,
+    query: &SearchQuery,
+    ids: &[i64],
+) -> Result<Vec<Hit>, StoreError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (repo, global) = view_params(client, &query.view)?;
+    let checkout = query.checkout.as_ref().map(|root| root.to_string_lossy().into_owned());
+    let kind = query.kind.map(NoteKind::as_str);
+    let exclude = checked_exclude(&query.exclude)?.to_vec();
+
+    // The parameters keep the numbers of `pool`, so VISIBLE, SAME_CHECKOUT and NOT_EXCLUDED fit
+    // both.
+    let sql = format!(
+        "SELECT {} FROM notes n
+         WHERE n.id = ANY($1::bigint[]) AND {VISIBLE} AND ($4::text IS NULL OR n.kind = $4::text)
+           AND n.id != $6 AND {SAME_CHECKOUT} AND {NOT_EXCLUDED}
+         LIMIT $5",
+        hit_columns()
+    );
+
+    let wanted = ids.to_vec();
+    let params: [&(dyn ToSql + Sync); 8] = [
+        &wanted,
+        &repo,
+        &global,
+        &kind,
+        &limit_param(ids.len()),
+        &0_i64,
+        &checkout,
+        &exclude,
+    ];
+
+    let rows = client.query(&sql, &params).map_err(backend)?;
+    let found = rows
+        .iter()
+        .map(|row| candidate(row, |body| body.chars().take(SNIPPET_MAX).collect()))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let found_ids: Vec<i64> = found.iter().map(|candidate| candidate.hit.id).collect();
+    let mut entities = entities_by_id(client, &found_ids)?;
+    let terms = Terms::parse(&query.text);
+
+    Ok(found
+        .into_iter()
+        .map(|candidate| {
+            let entities = entities.remove(&candidate.hit.id).unwrap_or_default();
+            let subject = Subject {
+                title: &candidate.hit.title,
+                body: &candidate.body,
+                tags: "",
+                entities: &entities,
+            };
+            let boost_milli = rank::boost_milli(&terms, &subject, candidate.hit.scope == Scope::Repo);
+
+            Hit {
+                entities,
+                boost_milli,
+                ..candidate.hit
+            }
+        })
+        .collect())
 }
 
 pub(super) fn similar(
@@ -305,6 +451,67 @@ fn matching(
         .collect()
 }
 
+/// Up to `limit` notes matching `terms`, best `ts_rank` first (the English column with `extensions`,
+/// else the `simple` one), each with its relevance, reads and tags for [`rank`].
+fn pool(
+    client: &mut impl GenericClient,
+    terms: &Terms,
+    (repo, global): (Option<i64>, bool),
+    filter: &Filter<'_>,
+    limit: usize,
+    extensions: bool,
+) -> Result<Vec<Candidate>, StoreError> {
+    let (config, index) = if extensions {
+        ("english", "search_en")
+    } else {
+        ("simple", "search")
+    };
+
+    // The words are folded like the indexed text, then stemmed by `to_tsquery` itself.
+    let words: Vec<String> = terms
+        .iter()
+        .map(|term| fold_word(&term.raw))
+        .filter(|word| !word.is_empty())
+        .collect();
+    let matcher = Matcher::new(&words, true);
+
+    let sql = format!(
+        "SELECT {}, n.hits, {}, ts_rank('{WEIGHTS}'::float4[], n.{index}, q, 1)::float8
+         FROM notes n, to_tsquery('{config}'::regconfig, $1) q
+         WHERE n.{index} @@ q AND {VISIBLE} AND ($4::text IS NULL OR n.kind = $4::text) AND n.id != $6
+           AND {SAME_CHECKOUT} AND {NOT_EXCLUDED}
+         ORDER BY ts_rank('{WEIGHTS}'::float4[], n.{index}, q, 1) DESC, n.updated_at DESC, n.hits DESC, n.id DESC
+         LIMIT $5",
+        hit_columns(),
+        cut("n.tags", TAGS_TEXT_MAX)
+    );
+
+    let tsquery = matcher.tsquery();
+    let params: [&(dyn ToSql + Sync); 8] = [
+        &tsquery,
+        &repo,
+        &global,
+        &filter.kind,
+        &limit_param(limit),
+        &0_i64,
+        &filter.checkout,
+        &filter.exclude,
+    ];
+
+    let rows = client.query(&sql, &params).map_err(backend)?;
+    let mut pool = Vec::with_capacity(rows.len());
+
+    for row in &rows {
+        let mut found = candidate(row, |body| matcher.snippet(body))?;
+        found.hits = column(row, 9)?;
+        found.tags = column(row, 10)?;
+        found.relevance = column::<f64>(row, 11)?.max(0.0);
+        pool.push(found);
+    }
+
+    Ok(pool)
+}
+
 fn recent(
     client: &mut impl GenericClient,
     (repo, global): (Option<i64>, bool),
@@ -360,18 +567,50 @@ fn candidate(row: &Row, excerpt: impl Fn(&str) -> String) -> Result<Candidate, S
                 source: column(row, 6)?,
                 via_override: column(row, 8)?,
             },
+            score_milli: 0,
+            boost_milli: Hit::NO_BOOST,
         },
         body,
+        tags: String::new(),
+        hits: 0,
+        relevance: 0.0,
     })
 }
 
 /// Attaches each hit's entities.
 fn finish(client: &mut impl GenericClient, mut hits: Vec<Hit>) -> Result<Vec<Hit>, StoreError> {
+    let ids: Vec<i64> = hits.iter().map(|hit| hit.id).collect();
+    let mut entities = entities_by_id(client, &ids)?;
+
     for hit in &mut hits {
-        hit.entities = entities_of(client, hit.id)?;
+        hit.entities = entities.remove(&hit.id).unwrap_or_default();
     }
 
     Ok(hits)
+}
+
+/// The entity names of each note of `ids` that has some, alphabetically (by code point, like
+/// SQLite), in one query.
+fn entities_by_id(client: &mut impl GenericClient, ids: &[i64]) -> Result<HashMap<i64, Vec<String>>, StoreError> {
+    let mut found: HashMap<i64, Vec<String>> = HashMap::new();
+
+    if ids.is_empty() {
+        return Ok(found);
+    }
+
+    let sql = format!(
+        "SELECT ne.note_id, {} FROM note_entities ne JOIN entities e ON e.id = ne.entity_id
+         WHERE ne.note_id = ANY($1::bigint[]) ORDER BY e.name_norm COLLATE \"C\"",
+        cut("e.name", ENTITY_MAX)
+    );
+
+    let rows = client.query(&sql, &[&ids]).map_err(backend)?;
+
+    for row in &rows {
+        found.entry(column(row, 0)?).or_default().push(column(row, 1)?);
+    }
+
+    Ok(found)
 }
 
 /// The snippet on one line, at most [`SNIPPET_MAX`] characters.
@@ -404,7 +643,7 @@ mod tests {
 
     #[test]
     fn the_query_is_quoted_words() {
-        let words = words("title:near & !x", QUERY_TOKENS_MAX);
+        let words = words("title:near & !x", usize::MAX);
         assert_eq!(Matcher::new(&words, true).tsquery(), "'title' | 'near' | 'x':*");
     }
 

@@ -151,6 +151,7 @@ fn listing(view: View) -> NoteListQuery {
         scope: None,
         place: None,
         entity: None,
+        lang: None,
         sort: NoteSort::Updated,
         descending: true,
         offset: 0,

@@ -412,7 +412,7 @@ fn mongo_find_by_title_is_exact_scoped_and_counts_no_hit() {
 // Search.
 
 #[test]
-fn mongo_repository_notes_rank_before_global_ones() {
+fn mongo_one_ranking_for_repository_and_global_notes() {
     let Some((_db, mut store)) = mongo_support::store() else {
         return;
     };
@@ -427,9 +427,11 @@ fn mongo_repository_notes_rank_before_global_ones() {
         .expect("repo");
 
     let hits = store.search(&query("webkit", both(REPO))).expect("search");
-    assert_eq!(ids(&hits), vec![local.id, global.id]);
-    assert_eq!(hits[0].scope, Scope::Repo);
-    assert_eq!(hits[1].scope, Scope::Global);
+    // A clearly more relevant global note beats a weak repository one.
+    assert_eq!(ids(&hits), vec![global.id, local.id]);
+    assert_eq!(hits[0].scope, Scope::Global);
+    assert_eq!(hits[1].scope, Scope::Repo);
+    assert!(hits[0].score_milli > hits[1].score_milli);
 
     assert_eq!(
         ids(&store.search(&query("webkit", global_only())).expect("global")),
@@ -444,6 +446,19 @@ fn mongo_repository_notes_rank_before_global_ones() {
         .search(&query("webkit", both("github.com/acme/new")))
         .expect("unknown repo");
     assert_eq!(ids(&unknown), vec![global.id]);
+
+    // Equally relevant notes: the repository one wins.
+    let twin_global = store
+        .remember(
+            &Target::Global,
+            &draft("Layout rules", "grid layout rules", NoteKind::Note),
+        )
+        .expect("twin global");
+    let twin_repo = store
+        .remember(&repo(REPO), &draft("Layout rules", "grid layout rules", NoteKind::Note))
+        .expect("twin repo");
+    let twins = store.search(&query("layout", both(REPO))).expect("twins");
+    assert_eq!(ids(&twins), vec![twin_repo.id, twin_global.id]);
 }
 
 #[test]
@@ -1083,4 +1098,53 @@ fn mongo_oversized_fields_written_by_hand_are_cut_by_the_server() {
     store
         .similar(&both(REPO), huge.id, 3)
         .expect("similar to the huge note");
+}
+
+// Shared keyword search cases (see `common::search_cases`).
+
+fn with_store(case: fn(&mut dyn MemoryStore)) {
+    let Some((_db, mut store)) = mongo_support::store() else {
+        return;
+    };
+    case(&mut store);
+}
+
+#[test]
+fn mongo_stems_find_other_forms_of_a_word() {
+    with_store(common::search_cases::stems_find_other_forms_of_a_word);
+}
+
+#[test]
+fn mongo_a_query_of_stopwords_finds_nothing_but_an_empty_one_lists_recent_notes() {
+    with_store(common::search_cases::a_query_of_stopwords_finds_nothing_but_an_empty_one_lists_recent_notes);
+}
+
+#[test]
+fn mongo_a_topic_the_notes_lack_finds_nothing() {
+    with_store(common::search_cases::a_topic_the_notes_lack_finds_nothing);
+}
+
+#[test]
+fn mongo_a_note_needs_half_of_the_query_words() {
+    with_store(common::search_cases::a_note_needs_half_of_the_query_words);
+}
+
+#[test]
+fn mongo_a_query_word_naming_an_entity_or_a_path_boosts_the_note() {
+    with_store(common::search_cases::a_query_word_naming_an_entity_or_a_path_boosts_the_note);
+}
+
+#[test]
+fn mongo_an_empty_store_finds_nothing() {
+    with_store(common::search_cases::an_empty_store_finds_nothing);
+}
+
+#[test]
+fn mongo_similar_notes_are_unchanged() {
+    with_store(common::search_cases::similar_notes_are_unchanged);
+}
+
+#[test]
+fn mongo_hits_for_loads_the_notes_a_search_may_see() {
+    with_store(common::search_cases::hits_for_loads_the_notes_a_search_may_see);
 }

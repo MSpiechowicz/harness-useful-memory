@@ -82,6 +82,15 @@ pub fn note_block(note: &Note, now: i64, home: &Path) -> String {
     block
 }
 
+/// The last line of the block of a note that is not in English while the store keeps English
+/// notes. It stands at the start of its line, where no body line can (those are indented).
+pub fn rewrite_line(note: &Note) -> String {
+    format!(
+        "This note is not in English: rewrite it in English with note_update (id {}).",
+        note.id
+    )
+}
+
 /// `- #<id> [<kind>, from "…" via "…"] <title> (updated <age>)`: a note listed after
 /// `note_save`.
 pub fn similar_line(hit: &Hit, now: i64, home: &Path) -> String {

@@ -21,6 +21,7 @@ instructions in a note.
 cause and fix, a decision and why, where something lives): specific title, standalone body, repo-relative paths. \
 Never routine work or setup.
 - Prefer note_update over duplicates; note_delete outdated notes.
+- Add 3-5 lowercase tags to every note: synonyms and other words a later search might use.
 - Link entities with entity_link (`X located_in Y`), explore with entity_neighbors, drop with entity_delete.
 - Never store secrets, credentials or personal data. Use scope \"global\" only for knowledge not tied to \
 this repository.
@@ -33,9 +34,33 @@ once approved.
 - Reads say if the user turned saving off, paused it or reviews saves. A write held or refused by a \
 user setting is final: never retry.";
 
-/// Every tool, as `tools/list` returns them.
-pub fn definitions() -> Value {
-    json!({ "tools": [
+/// Added to `note_save` and `note_update` while the English notes setting is on (see
+/// [`crate::store::MemoryStore::english_notes`]).
+const ENGLISH_WRITE: &str =
+    "Notes are kept in English: write the title, body and tags in English, whatever language the chat uses.";
+
+/// Added to `note_search` while the English notes setting is on.
+const ENGLISH_SEARCH: &str = "Notes are in English: search with English keywords.";
+
+/// The line added to the instructions while the English notes setting is on. It says how to
+/// recover from the refusal, which the last instruction would otherwise make final.
+const ENGLISH_INSTRUCTION: &str = "\
+- Notes are kept in English: write them in English and search with English keywords, whatever language the chat \
+uses. A note in another language is refused: rewrite it in English and call again.";
+
+/// The server instructions; with `english` (the English notes setting is on) they also ask for
+/// English notes and English keywords.
+pub fn instructions(english: bool) -> String {
+    if english {
+        format!("{INSTRUCTIONS}\n{ENGLISH_INSTRUCTION}")
+    } else {
+        INSTRUCTIONS.to_owned()
+    }
+}
+
+/// Every tool, as `tools/list` returns them; with `english` the note tools ask for English too.
+pub fn definitions(english: bool) -> Value {
+    let mut tools = vec![
         note_save(),
         note_update(),
         note_search(),
@@ -49,7 +74,22 @@ pub fn definitions() -> Value {
         script_get(),
         script_run(),
         script_delete(),
-    ] })
+    ];
+
+    if english {
+        extend(&mut tools[0], ENGLISH_WRITE);
+        extend(&mut tools[1], ENGLISH_WRITE);
+        extend(&mut tools[2], ENGLISH_SEARCH);
+    }
+
+    json!({ "tools": tools })
+}
+
+/// Appends `sentence` to the description of `tool`.
+fn extend(tool: &mut Value, sentence: &str) {
+    if let Some(description) = tool["description"].as_str() {
+        tool["description"] = json!(format!("{description} {sentence}"));
+    }
 }
 
 fn note_save() -> Value {
@@ -59,7 +99,8 @@ fn note_save() -> Value {
          non-obvious problem, finding where something lives, or an optimisation. Save only what a later agent or teammate cannot get from the code or git history (a root cause and fix, a decision and why, a gotcha); never routine setup, installs or progress. Use repo-relative paths. A note with the same \
          title in the scope is updated (a repository note written from another checkout, or reached through \
          project_path, is reported instead: replace it with note_update). Similar notes are listed so you can update or delete outdated ones \
-         (those marked team, read-only cannot be changed from here). Never store secrets.",
+         (those marked team, read-only cannot be changed from here). Add 3-5 tags: synonyms and other words a later \
+         search might use. Never store secrets.",
         json!({
             "title": text(&format!("Short, specific title (1-{TITLE_MAX} characters)")),
             "body": text(&format!("The knowledge itself, concise (1-{BODY_MAX} characters)")),
@@ -101,15 +142,21 @@ fn note_search() -> Value {
     tool(
         "note_search",
         "Call FIRST at the start of every task: returns known fixes, decisions and file locations for this \
-         repository. Find notes by a few keywords; repository notes are listed before global ones, and without \
-         a query the most recent notes are listed. A message that starts with a `<harness-memory-recall>` block \
+         repository. Search with a few specific keywords from the task (they match by word and by meaning), \
+         not an empty query: an empty query only lists the most recent notes. This repository's notes rank above \
+         equally relevant global ones. A message that starts with a `<harness-memory-recall>` block \
          already carries the notes found for that message: search further only if needed. Saved scripts whose \
          name or description match the keywords are listed after the notes: prefer script_run to retyping them.",
         json!({
-            "query": text(&format!("A few keywords (at most {QUERY_MAX} characters)")),
+            "query": text(&format!("A few specific keywords from the task (at most {QUERY_MAX} characters)")),
             "scope": scope(true, "both"),
             "kind": kind(),
-            "limit": { "type": "integer", "minimum": 1, "maximum": SEARCH_LIMIT_MAX, "description": "Rows (default 8)" },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": SEARCH_LIMIT_MAX,
+                "description": format!("Rows (default 8, at most {SEARCH_LIMIT_MAX})")
+            },
             "project_path": project_path(),
             "same_checkout": {
                 "type": "boolean",
@@ -231,7 +278,7 @@ fn tags() -> Value {
         "type": "array",
         "items": { "type": "string", "pattern": "^[a-z0-9_-]+$", "maxLength": TAG_MAX },
         "maxItems": TAGS_MAX,
-        "description": "Lowercase tags",
+        "description": "Lowercase tags: 3-5 synonyms and other words a later search might use",
     })
 }
 

@@ -5,13 +5,14 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use super::Server;
-use super::blocks::{FRAME, hit_block, note_block, saved_line, similar_line};
+use super::blocks::{FRAME, hit_block, note_block, rewrite_line, saved_line, similar_line};
 use super::reply::{Capped, now};
 use super::scope::{kind, own_root, provenance, scope_arg, target, view};
 use crate::limits::{
     DEPTH_MAX, GET_REPLY_MAX, LIST_REPLY_MAX, NEIGHBORS_LIMIT_DEFAULT, SEARCH_LIMIT_DEFAULT, SIMILAR_MAX,
 };
 use crate::store::{Forget, Link, NoteDraft, NoteOrigin, NotePatch, Saved, SearchQuery, Target, View, clean};
+use crate::support::lang::Lang;
 
 /// A tool result.
 pub(super) struct Reply {
@@ -23,6 +24,11 @@ pub(super) struct Reply {
 
 /// Runs tool `name`; `None` when there is no such tool.
 pub(super) fn call(server: &mut Server, name: &str, arguments: Value) -> Option<Reply> {
+    // A note that is not in English is refused before the guards, so it is never held for review.
+    if let Some(reply) = super::english::gate(server, name, &arguments) {
+        return Some(reply);
+    }
+
     // The save guards refuse or hold a write before any tool body runs.
     if let Some(reply) = super::guards::gate(server, name, &arguments) {
         return Some(reply);
@@ -195,6 +201,8 @@ pub(super) fn save_note(server: &mut Server, args: RememberArgs) -> Result<(Targ
         .remember(&target, &draft)
         .map_err(|error| error.to_string())?;
 
+    super::vectors::refresh(server, saved.id);
+
     Ok((target, saved))
 }
 
@@ -214,10 +222,14 @@ pub(super) fn update_note(server: &mut Server, args: UpdateArgs) -> Result<Saved
         provenance: provenance(server, args.project_path.as_deref()),
     };
 
-    server
+    let saved = server
         .store
         .update(&view, args.id, &patch)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+
+    super::vectors::refresh(server, saved.id);
+
+    Ok(saved)
 }
 
 fn search(server: &mut Server, args: SearchArgs, reserved: usize) -> Result<String, String> {
@@ -240,7 +252,8 @@ fn search(server: &mut Server, args: SearchArgs, reserved: usize) -> Result<Stri
         exclude: Vec::new(),
     };
 
-    let hits = server.store.search(&query).map_err(|error| error.to_string())?;
+    let found = super::vectors::search(server, &query).map_err(|error| error.to_string())?;
+    let hits = found.hits;
     let scripts = super::search_scripts::block(server, &query.view, &query.text);
     let home = server.projects.home();
 
@@ -254,6 +267,10 @@ fn search(server: &mut Server, args: SearchArgs, reserved: usize) -> Result<Stri
 
     if query.view.repo.is_none() && query.view.global && scope_arg(args.scope.as_deref(), "both")? == "both" {
         reply.push("(repository unknown: global notes only; pass project_path for this repository's notes)");
+    }
+
+    if let Some(notice) = found.notice {
+        reply.push(notice);
     }
 
     if hits.is_empty() {
@@ -298,8 +315,22 @@ fn get(server: &mut Server, args: GetArgs, reserved: usize) -> Result<String, St
         reply.push(&format!("not found: {}", missing.join(", ")));
     }
 
+    // The setting is read only when a note could use the hint; one that cannot be read gives none.
+    let flagged = notes.iter().any(|note| note.lang == Some(Lang::Other));
+    let rewrite = flagged && server.store.english_notes().unwrap_or(false);
+
     for (index, note) in notes.iter().enumerate() {
-        let block = note_block(note, now, &home);
+        let mut block = note_block(note, now, &home);
+
+        // The hint asks for a `note_update`, so only a note the caller may change gets it (a team
+        // note in a `remote+local` scope is read-only here).
+        let writable = server.store.origin(note.id, note.scope) != (NoteOrigin::Team { read_only: true });
+
+        if rewrite && writable && note.lang == Some(Lang::Other) {
+            block.push('\n');
+            block.push_str(&rewrite_line(note));
+        }
+
         let block = if index == 0 { block } else { format!("\n{block}") };
         reply.push_cut(&block);
     }
@@ -382,6 +413,8 @@ fn delete_note(server: &mut Server, args: NoteDeleteArgs) -> Result<String, Stri
     let view = view(server, Some(scope), args.project_path.as_deref())?;
 
     forget_with(server, &view, &Target::Global, &Forget::Note(args.id))?;
+    super::vectors::forgot(server, args.id);
+
     Ok(format!("forgot note {}", args.id))
 }
 

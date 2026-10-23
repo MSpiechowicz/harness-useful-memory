@@ -123,8 +123,12 @@ fn text_written_by_hand_comes_back_cut_to_the_limits() {
     assert!(note.body.chars().count() <= BODY_MAX + 1, "{}", note.body.len());
     assert!(note.entities[0].chars().count() <= ENTITY_MAX + 1);
 
-    // The search columns still hold the words the server wrote.
-    let hits = store.search(&query("teammate", both(REPO))).expect("search");
+    // A search checks the words of the text it reads, not only the index, so the inflated note no
+    // longer answers the words the server saw when it saved it; the list of recent notes still
+    // shows it cut to the limits.
+    assert!(store.search(&query("teammate", both(REPO))).expect("search").is_empty());
+
+    let hits = store.search(&query("", both(REPO))).expect("recent");
     assert_eq!(hits.len(), 1);
     assert!(hits[0].title.chars().count() <= TITLE_MAX + 1);
 }

@@ -21,6 +21,58 @@ use std::cmp::Ordering;
 use crate::backend::Place;
 use crate::limits::{HIDDEN_MAX, LIST_PAGE_MAX, QUERY_MAX};
 use crate::store::{Note, NoteKind, Provenance, Scope, StoreError, View, clean};
+use crate::support::lang::Lang;
+
+/// Which notes a listing keeps by their language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LangFilter {
+    /// Notes looked at and found English.
+    En,
+    /// Notes looked at and found in another language.
+    Other,
+    /// Notes not looked at yet or not certain (no `lang`, or `unknown`).
+    Unknown,
+}
+
+impl LangFilter {
+    /// Parses `en`, `other` or `unknown`.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "en" => Some(Self::En),
+            "other" => Some(Self::Other),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    /// True when a note of language `lang` (`None` when not looked at or not certain) is kept.
+    pub fn keeps(filter: Option<Self>, lang: Option<Lang>) -> bool {
+        match filter {
+            None => true,
+            Some(Self::En) => lang == Some(Lang::En),
+            Some(Self::Other) => lang == Some(Lang::Other),
+            Some(Self::Unknown) => lang.is_none(),
+        }
+    }
+
+    /// The SQL condition on the `lang` column `column` keeping these notes (`1 = 1` for no
+    /// filter). Without the schema extensions there is no column: no note was looked at.
+    pub(crate) fn condition(filter: Option<Self>, column: &str, extensions: bool) -> String {
+        let Some(filter) = filter else {
+            return "1 = 1".to_owned();
+        };
+
+        if !extensions {
+            return if filter == Self::Unknown { "1 = 1" } else { "1 = 0" }.to_owned();
+        }
+
+        match filter {
+            Self::En => format!("{column} = 'en'"),
+            Self::Other => format!("{column} = 'other'"),
+            Self::Unknown => format!("({column} IS NULL OR {column} NOT IN ('en', 'other'))"),
+        }
+    }
+}
 
 /// One page of notes to list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +89,9 @@ pub struct NoteListQuery {
     pub place: Option<Place>,
     /// Keeps the notes linked to the entity of this name (compared like entity names are).
     pub entity: Option<String>,
+    /// Keeps the notes of this language (see [`LangFilter`]); `None` keeps every note. It narrows
+    /// the page and every count.
+    pub lang: Option<LangFilter>,
     pub sort: NoteSort,
     pub descending: bool,
     /// Rows skipped before the page.
@@ -83,6 +138,8 @@ pub struct NoteRow {
     pub updated_at: i64,
     pub revision: i64,
     pub hits: i64,
+    /// The language, when a store looked at the note and was certain.
+    pub lang: Option<Lang>,
 }
 
 impl From<Note> for NoteRow {
@@ -100,6 +157,7 @@ impl From<Note> for NoteRow {
             updated_at: note.updated_at,
             revision: note.revision,
             hits: note.hits,
+            lang: note.lang,
         }
     }
 }

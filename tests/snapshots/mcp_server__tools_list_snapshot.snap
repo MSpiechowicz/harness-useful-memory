@@ -6,7 +6,7 @@ expression: "replies[0][\"result\"]"
   "tools": [
     {
       "name": "note_save",
-      "description": "Call before you finish: save what you learned for later sessions, after finishing work, fixing a non-obvious problem, finding where something lives, or an optimisation. Save only what a later agent or teammate cannot get from the code or git history (a root cause and fix, a decision and why, a gotcha); never routine setup, installs or progress. Use repo-relative paths. A note with the same title in the scope is updated (a repository note written from another checkout, or reached through project_path, is reported instead: replace it with note_update). Similar notes are listed so you can update or delete outdated ones (those marked team, read-only cannot be changed from here). Never store secrets.",
+      "description": "Call before you finish: save what you learned for later sessions, after finishing work, fixing a non-obvious problem, finding where something lives, or an optimisation. Save only what a later agent or teammate cannot get from the code or git history (a root cause and fix, a decision and why, a gotcha); never routine setup, installs or progress. Use repo-relative paths. A note with the same title in the scope is updated (a repository note written from another checkout, or reached through project_path, is reported instead: replace it with note_update). Similar notes are listed so you can update or delete outdated ones (those marked team, read-only cannot be changed from here). Add 3-5 tags: synonyms and other words a later search might use. Never store secrets.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -39,7 +39,7 @@ expression: "replies[0][\"result\"]"
               "maxLength": 32
             },
             "maxItems": 8,
-            "description": "Lowercase tags"
+            "description": "Lowercase tags: 3-5 synonyms and other words a later search might use"
           },
           "entities": {
             "type": "array",
@@ -116,7 +116,7 @@ expression: "replies[0][\"result\"]"
               "maxLength": 32
             },
             "maxItems": 8,
-            "description": "Lowercase tags"
+            "description": "Lowercase tags: 3-5 synonyms and other words a later search might use"
           },
           "scope": {
             "type": "string",
@@ -141,13 +141,13 @@ expression: "replies[0][\"result\"]"
     },
     {
       "name": "note_search",
-      "description": "Call FIRST at the start of every task: returns known fixes, decisions and file locations for this repository. Find notes by a few keywords; repository notes are listed before global ones, and without a query the most recent notes are listed. A message that starts with a `<harness-memory-recall>` block already carries the notes found for that message: search further only if needed. Saved scripts whose name or description match the keywords are listed after the notes: prefer script_run to retyping them.",
+      "description": "Call FIRST at the start of every task: returns known fixes, decisions and file locations for this repository. Search with a few specific keywords from the task (they match by word and by meaning), not an empty query: an empty query only lists the most recent notes. This repository's notes rank above equally relevant global ones. A message that starts with a `<harness-memory-recall>` block already carries the notes found for that message: search further only if needed. Saved scripts whose name or description match the keywords are listed after the notes: prefer script_run to retyping them.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "query": {
             "type": "string",
-            "description": "A few keywords (at most 256 characters)"
+            "description": "A few specific keywords from the task (at most 256 characters)"
           },
           "scope": {
             "type": "string",
@@ -176,7 +176,7 @@ expression: "replies[0][\"result\"]"
             "type": "integer",
             "minimum": 1,
             "maximum": 20,
-            "description": "Rows (default 8)"
+            "description": "Rows (default 8, at most 20)"
           },
           "project_path": {
             "type": "string",

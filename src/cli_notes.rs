@@ -6,7 +6,7 @@
 //! hidden on this computer are left out as they are for the agent.
 //!
 //! - `harness-memory notes list --json [--project PATH | --repo KEY | --all-repos] [--kind KIND] [--scope repo|global]
-//!   [--place local|team] [--query TEXT] [--sort updated|title|kind|scope|place] [--order asc|desc]
+//!   [--place local|team] [--lang en|other|unknown] [--query TEXT] [--sort updated|title|kind|scope|place] [--order asc|desc]
 //!   [--offset N] [--limit N]` prints `{"total": N, "kinds": [{"kind", "count"}], "scopes":
 //!   {"repo": N, "global": N}, "places": {"local": N, "team": N}, "notes": [...]}`: one page of the
 //!   notes (see [`crate::store::listing`] for the matching and the order). `--query` keeps the
@@ -23,7 +23,10 @@
 //!   `local`: where this note is kept), `readOnly` (a team note of a scope routed
 //!   `remote+local`, which cannot be changed from here), `hidden` (hidden on this computer),
 //!   `tags`, `entities`, `author` (`source` and `root`, shown like a script's writer),
-//!   `createdAt` and `updatedAt` (RFC 3339), `revision` and `hits`. With a team database the
+//!   `createdAt` and `updatedAt` (RFC 3339), `revision`, `hits` and `lang` (`en`, `other`, or
+//!   `null` when the note was not looked at yet or its language is not certain). `--lang` keeps
+//!   the notes of one language (`unknown`: those with a `null` lang), narrowing the page and
+//!   every count like `--query` does. With a team database the
 //!   object also has `hiddenCount` (the team notes of the view hidden on this computer) and
 //!   `localCounts` (`{"repo": N, "global": N}`: the notes in the local file per scope, every
 //!   repository's, 0 without the file). `--hidden` lists only the hidden team notes of the view
@@ -73,16 +76,20 @@ mod save;
 use crate::backend::{Backend, NotesPlace, Place, Secrets, Selection};
 use crate::cli::{self, Args, Delete, PAGE_OPTIONS, PICK_VALUED, Page, Repos};
 use crate::limits::{LIST_PAGE_MAX, NEIGHBORS_LIMIT_MAX};
+use crate::mcp::Vectors;
 use crate::mcp::{author_json, place_label, repo_label};
 use crate::open::{lone_notes_place, notes_place, open_hidden, open_notes};
-use crate::store::{Forget, HiddenNotes, MemoryStore, Note, NoteKind, NoteListQuery, NoteOrigin, NoteRow, NoteSort};
+use crate::store::{
+    Forget, HiddenNotes, LangFilter, MemoryStore, Note, NoteKind, NoteListQuery, NoteOrigin, NoteRow, NoteSort,
+};
 use crate::store::{ProjectKey, Scope, SqliteStore, StoreError, Target, View, clean};
 use crate::support::Env;
+use crate::support::lang::Lang;
 use crate::support::time::rfc3339;
 
 /// The usage of these commands, for the executable's usage line.
 pub const USAGE: &str = "notes list --json [--project PATH | --repo KEY | --all-repos] [--kind KIND] [--scope repo|global] \
-                         [--place local|team] [--query TEXT] [--sort updated|title|kind|scope|place] [--order asc|desc] [--offset N] [--limit N] \
+                         [--place local|team] [--lang en|other|unknown] [--query TEXT] [--sort updated|title|kind|scope|place] [--order asc|desc] [--offset N] [--limit N] \
                          [--hidden] | notes repos --json | notes repos --json | notes get <id> --json [--project PATH | --repo KEY | --all-repos] [--hidden] | notes hide <id> \
                          [--project PATH | --repo KEY | --all-repos] [--json] | notes unhide <id> [--project PATH | --repo KEY | --all-repos] [--json] | notes delete \
                          <id> [--project PATH | --repo KEY | --all-repos] | notes delete --all --yes [--project PATH | --repo KEY] [--json] | notes \
@@ -202,6 +209,7 @@ fn repos(args: &[Option<&str>]) -> ExitCode {
             scope: None,
             place: None,
             entity: None,
+            lang: None,
             sort: NoteSort::Updated,
             descending: true,
             offset,
@@ -303,6 +311,10 @@ fn delete_one(id: i64, pick: &Repos) -> ExitCode {
 
     match opened.store.forget(&opened.view, &Target::Global, &Forget::Note(id)) {
         Ok(_) => {
+            if let Some(vectors) = Vectors::for_selection(&opened.env, &opened.selection) {
+                vectors.forget(opened.store.origin(id, note.scope), id);
+            }
+
             println!("deleted note {id} {}", clean::line(&note.title));
             ExitCode::SUCCESS
         }
@@ -361,7 +373,7 @@ fn parse_list(args: &[Option<&str>]) -> Option<(Repos, NoteListQuery, bool)> {
     let valued = [
         &PAGE_OPTIONS[..],
         &PICK_VALUED[..],
-        &["--kind", "--scope", "--place", "--sort"],
+        &["--kind", "--scope", "--place", "--sort", "--lang"],
     ]
     .concat();
     let parsed = Args::parse(args, &["--json", "--hidden", "--all-repos"], &valued)?;
@@ -376,6 +388,11 @@ fn parse_list(args: &[Option<&str>]) -> Option<(Repos, NoteListQuery, bool)> {
     };
 
     let scope = parsed.scope().ok()?;
+
+    let lang = match parsed.value("--lang") {
+        Some(raw) => Some(LangFilter::parse(raw)?),
+        None => None,
+    };
 
     let sort = match parsed.value("--sort") {
         None | Some("updated") => NoteSort::Updated,
@@ -403,6 +420,7 @@ fn parse_list(args: &[Option<&str>]) -> Option<(Repos, NoteListQuery, bool)> {
         scope,
         place: parsed.place().ok()?,
         entity: None,
+        lang,
         sort,
         descending: descending.unwrap_or(sort == NoteSort::Updated),
         offset,
@@ -498,6 +516,7 @@ impl Opened {
             scope: None,
             place: None,
             entity: None,
+            lang: None,
             sort: NoteSort::Updated,
             descending: true,
             offset: 0,
@@ -538,6 +557,7 @@ impl Opened {
             "updatedAt": rfc3339(row.updated_at),
             "revision": row.revision,
             "hits": row.hits,
+            "lang": row.lang.map(Lang::as_str),
         })
     }
 
@@ -616,6 +636,7 @@ impl Opened {
             scope: None,
             place: None,
             entity: Some(name.to_owned()),
+            lang: None,
             sort: NoteSort::Updated,
             descending: true,
             offset: 0,

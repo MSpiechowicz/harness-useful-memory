@@ -10,20 +10,40 @@ use super::{graph, now, target_project, target_project_existing, view_params};
 use crate::limits::GET_IDS_MAX;
 use crate::store::clean::{self, CleanDraft, CleanPatch};
 use crate::store::{Forgotten, Note, NoteKind, Provenance, Saved, Scope, StoreError, Target, View};
+use crate::support::lang;
 
-/// The columns [`note_from_row`] reads, from `notes n LEFT JOIN projects p`.
-const NOTE_COLUMNS: &str = "n.id, n.project_id, p.key, n.kind, n.title, n.body, n.tags, n.source, \
-                            n.created_at, n.updated_at, n.revision, n.hits, n.writer_root, n.via_override";
+/// The columns [`note_from_row`] reads, from `notes n LEFT JOIN projects p`; the last is the
+/// language, which a database without the schema extensions has no column for.
+pub(super) fn note_columns(extensions: bool) -> String {
+    columns("n.body", extensions)
+}
 
-/// [`NOTE_COLUMNS`] with an empty body, for lists.
-pub(super) const ROW_COLUMNS: &str = "n.id, n.project_id, p.key, n.kind, n.title, '', n.tags, n.source, \
-                                      n.created_at, n.updated_at, n.revision, n.hits, n.writer_root, n.via_override";
+/// [`note_columns`] with an empty body, for lists.
+pub(super) fn row_columns(extensions: bool) -> String {
+    columns("''", extensions)
+}
+
+fn columns(body: &str, extensions: bool) -> String {
+    let lang = if extensions { "n.lang" } else { "NULL" };
+
+    format!(
+        "n.id, n.project_id, p.key, n.kind, n.title, {body}, n.tags, n.source, \
+         n.created_at, n.updated_at, n.revision, n.hits, n.writer_root, n.via_override, {lang}"
+    )
+}
 
 /// The visibility condition of a view (`?2` the project id, `?3` whether global is visible).
 pub(super) const VISIBLE: &str =
     "(n.project_id = ?2 OR (?2 = -1 AND n.project_id IS NOT NULL) OR (?3 AND n.project_id IS NULL))";
 
-pub(super) fn remember(db: &mut dyn Sql, target: &Target, draft: &CleanDraft) -> Result<Saved, StoreError> {
+/// Saves the draft. With `extensions` the note's `lang` is stored too, in a statement after the
+/// content (see [`set_lang`]).
+pub(super) fn remember(
+    db: &mut dyn Sql,
+    target: &Target,
+    draft: &CleanDraft,
+    extensions: bool,
+) -> Result<Saved, StoreError> {
     let project = target_project(db, target)?;
     let now = now();
 
@@ -87,6 +107,10 @@ pub(super) fn remember(db: &mut dyn Sql, target: &Target, draft: &CleanDraft) ->
         }
     };
 
+    if extensions {
+        set_lang(db, id, &draft.title, &draft.body)?;
+    }
+
     for name in &draft.entities {
         let entity = graph::ensure_entity(db, project, name)?;
         db.execute(
@@ -100,8 +124,14 @@ pub(super) fn remember(db: &mut dyn Sql, target: &Target, draft: &CleanDraft) ->
 
 /// Applies `patch`. The body is masked after `append` is joined to it, so a secret split across
 /// the two is masked as a whole (see [`clean::patched_body`]).
-pub(super) fn update(db: &mut dyn Sql, view: &View, id: i64, patch: &CleanPatch) -> Result<Saved, StoreError> {
-    let Some(note) = load(db, view, id)? else {
+pub(super) fn update(
+    db: &mut dyn Sql,
+    view: &View,
+    id: i64,
+    patch: &CleanPatch,
+    extensions: bool,
+) -> Result<Saved, StoreError> {
+    let Some(note) = load(db, view, id, false)? else {
         return Err(not_found(id));
     };
 
@@ -120,9 +150,9 @@ pub(super) fn update(db: &mut dyn Sql, view: &View, id: i64, patch: &CleanPatch)
          WHERE id = ?1",
         args![
             id,
-            title,
+            &title,
             title_norm,
-            body,
+            &body,
             kind.as_str(),
             tags.join(" "),
             now(),
@@ -132,11 +162,63 @@ pub(super) fn update(db: &mut dyn Sql, view: &View, id: i64, patch: &CleanPatch)
         ],
     )?;
 
+    if extensions {
+        set_lang(db, id, &title, &body)?;
+    }
+
     saved(db, id, false)
 }
 
+/// Stores the language of the note `id`. It is a statement of its own after the content one:
+/// `notes_lang_reset` clears a `lang` that an edit of the title or body left unchanged (an older
+/// server's edit), and an `UPDATE` of `lang` alone does not fire it.
+fn set_lang(db: &mut dyn Sql, id: i64, title: &str, body: &str) -> Result<(), StoreError> {
+    let lang = lang::stored(lang::detect(title, body));
+    db.execute("UPDATE notes SET lang = ?2 WHERE id = ?1", args![id, lang])?;
+
+    Ok(())
+}
+
+/// Whether a note has no `lang` yet (written by a server that does not know the column).
+pub(super) fn has_pending_lang(db: &mut dyn Sql) -> Result<bool, StoreError> {
+    let pending: Option<i64> = db.value("SELECT 1 FROM notes WHERE lang IS NULL LIMIT 1", args![])?;
+
+    Ok(pending.is_some())
+}
+
+/// Fills `lang` of up to `page` notes that have none, and returns how many it filled. Meant for a
+/// write transaction, so a note is not edited between its read and its `lang`.
+pub(super) fn fill_lang(db: &mut dyn Sql, page: usize) -> Result<usize, StoreError> {
+    let rows = db.query(
+        "SELECT id, title, body FROM notes WHERE lang IS NULL ORDER BY id LIMIT ?1",
+        args![i64::try_from(page).unwrap_or(i64::MAX)],
+    )?;
+
+    for row in &rows {
+        set_lang_if_missing(db, row.get(0)?, &row.get::<String>(1)?, &row.get::<String>(2)?)?;
+    }
+
+    Ok(rows.len())
+}
+
+fn set_lang_if_missing(db: &mut dyn Sql, id: i64, title: &str, body: &str) -> Result<(), StoreError> {
+    let lang = lang::stored(lang::detect(title, body));
+    db.execute(
+        "UPDATE notes SET lang = ?2 WHERE id = ?1 AND lang IS NULL",
+        args![id, lang],
+    )?;
+
+    Ok(())
+}
+
 /// The visible notes among `ids`, each read as it was before this read's hit (when `count`).
-pub(super) fn get(db: &mut dyn Sql, view: &View, ids: &[i64], count: bool) -> Result<Vec<Note>, StoreError> {
+pub(super) fn get(
+    db: &mut dyn Sql,
+    view: &View,
+    ids: &[i64],
+    count: bool,
+    extensions: bool,
+) -> Result<Vec<Note>, StoreError> {
     if ids.is_empty() || ids.len() > GET_IDS_MAX {
         return Err(StoreError::Invalid(format!("ids must list 1-{GET_IDS_MAX} note ids")));
     }
@@ -148,7 +230,7 @@ pub(super) fn get(db: &mut dyn Sql, view: &View, ids: &[i64], count: bool) -> Re
             continue;
         }
 
-        let Some(note) = load(db, view, id)? else {
+        let Some(note) = load(db, view, id, extensions)? else {
             continue;
         };
 
@@ -163,7 +245,7 @@ pub(super) fn get(db: &mut dyn Sql, view: &View, ids: &[i64], count: bool) -> Re
 }
 
 pub(super) fn forget(db: &mut dyn Sql, view: &View, id: i64) -> Result<usize, StoreError> {
-    if load(db, view, id)?.is_none() {
+    if load(db, view, id, false)?.is_none() {
         return Err(not_found(id));
     }
 
@@ -212,14 +294,20 @@ pub(super) fn forget_all(db: &mut dyn Sql, view: &View, exclude: &str) -> Result
 
 /// The note titled like `title` (a [`clean::title`]) in the scope `target`, without counting a
 /// hit.
-pub(super) fn find_by_title(db: &mut dyn Sql, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
+pub(super) fn find_by_title(
+    db: &mut dyn Sql,
+    target: &Target,
+    title: &str,
+    extensions: bool,
+) -> Result<Option<Note>, StoreError> {
     let Some(project) = target_project_existing(db, target)? else {
         return Ok(None);
     };
 
     let sql = format!(
-        "SELECT {NOTE_COLUMNS} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
-         WHERE ifnull(n.project_id, 0) = ?1 AND n.title_norm = ?2"
+        "SELECT {} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
+         WHERE ifnull(n.project_id, 0) = ?1 AND n.title_norm = ?2",
+        note_columns(extensions)
     );
 
     let Some(mut note) = db.row(
@@ -235,12 +323,13 @@ pub(super) fn find_by_title(db: &mut dyn Sql, target: &Target, title: &str) -> R
     Ok(Some(note))
 }
 
-/// The note `id` when it is visible in `view`.
-pub(super) fn load(db: &mut dyn Sql, view: &View, id: i64) -> Result<Option<Note>, StoreError> {
+/// The note `id` when it is visible in `view`; its language is read only when `extensions`.
+pub(super) fn load(db: &mut dyn Sql, view: &View, id: i64, extensions: bool) -> Result<Option<Note>, StoreError> {
     let (repo, global) = view_params(db, view)?;
     let sql = format!(
-        "SELECT {NOTE_COLUMNS} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
-         WHERE n.id = ?1 AND {VISIBLE}"
+        "SELECT {} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
+         WHERE n.id = ?1 AND {VISIBLE}",
+        note_columns(extensions)
     );
 
     let note = db.row(&sql, args![id, repo, global], note_from_row)?;
@@ -298,6 +387,7 @@ pub(super) fn note_from_row(row: &Row) -> Result<Note, StoreError> {
         updated_at: row.get(9)?,
         revision: row.get(10)?,
         hits: row.get(11)?,
+        lang: row.get::<Option<String>>(14)?.as_deref().and_then(lang::Lang::parse),
     })
 }
 

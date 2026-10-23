@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::Server;
 use crate::backend::{self, Backend, NotesPlace, Place, Selection};
 use crate::location::{DIR_VAR, Migration, legacy_database_path, migrate_legacy, override_is_relative};
+use crate::mcp::Vectors;
 use crate::project::ProjectResolver;
 use crate::store::{
     HiddenNotes, HiddenScripts, Lazy, MemoryStore, Scope, ScriptStore, SplitScripts, SplitStore, SqliteStore,
@@ -30,6 +31,10 @@ pub fn open_server(env: &Env, selection: &Selection, cwd: Option<PathBuf>) -> Op
 
     if let Some(other) = other_scripts {
         server = server.with_other_scripts(other);
+    }
+
+    if let Some(vectors) = Vectors::for_selection(env, selection) {
+        server = server.with_vectors(vectors);
     }
 
     Some(server)

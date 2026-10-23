@@ -5,18 +5,30 @@
 //! Agent text never reaches `$search` as syntax: it is split into alphanumeric words joined by
 //! spaces, so quotes and `-` (phrase and negation in `$text`) cannot appear. The prefix pattern
 //! of the last word is built from the same alphanumeric word, escaped.
+//!
+//! A search reads a pool of candidates and [`rank`] decides which of them answer the query and in
+//! which order (stopwords, half of the stems, one order for repository and global notes), the
+//! same way as for every backend. The pool is the union of the notes the `$text` index finds
+//! (where there is one: exact words, scored by the server), the notes that have a stem of a query
+//! word in `terms_en` (ranked by how many of the stems they have), the notes with a word or stem
+//! the last query word starts and, on DocumentDB or without the extensions, the notes with one of
+//! the words in `terms`. Every candidate is then scored from its own text, whichever index found it
+//! (the formula of `$text`, over stems, in [`rank`]), so the notes an older server wrote, without
+//! `terms_en`, rank like the others. The similar-note lookup keeps its own index, query and order.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use mongodb::bson::{Bson, Document, doc};
+use rust_stemmers::{Algorithm, Stemmer};
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 
 use super::notes::{entities_of, kind_of, provenance_of};
 use super::{Ctx, Fail, NOTES, cut, error_code, int, note_fields, scope_of, strings, text, visible};
-use crate::limits::{BODY_MAX, QUERY_MAX, QUERY_TOKENS_MAX, SEARCH_LIMIT_MAX, SNIPPET_MAX, SNIPPET_TOKENS, TITLE_MAX};
+use crate::limits::{BODY_MAX, QUERY_MAX, SEARCH_LIMIT_MAX, SNIPPET_MAX, SNIPPET_TOKENS, TITLE_MAX};
 use crate::store::listing::checked_exclude;
+use crate::store::rank::{self, Floor, Subject, Terms};
 use crate::store::{Hit, NoteKind, Provenance, SearchQuery, StoreError, View};
 use crate::support::text::STOPWORDS;
 
@@ -37,9 +49,19 @@ const TITLE_WEIGHT: f64 = 5.0;
 const BODY_WEIGHT: f64 = 1.0;
 const TAGS_WEIGHT: f64 = 3.0;
 
-/// The recency order (repository first, as `null` sorts before any key).
+/// The least relevance, as a share of the best candidate's, that an answer has. The relevance is the
+/// text one of [`rank`] (title 5, tags 3, body 1, no weight for rarity), which spreads wider than
+/// BM25 and `ts_rank`: a body-only match of a word that is also in a title can be a twentieth.
+const FLOOR: Floor = Floor(0.05);
+
+/// The recency order of the recent notes (repository first, as `null` sorts before any key).
 fn recent_order() -> Document {
     doc! { "project": -1, "updated_at": -1, "hits": -1, "_id": -1 }
+}
+
+/// The recency order of a pool of candidates, which any scope may fill.
+fn pool_order() -> Document {
+    doc! { "updated_at": -1, "hits": -1, "_id": -1 }
 }
 
 /// A matched note.
@@ -54,16 +76,16 @@ struct Candidate {
     hits: i64,
     norms: Vec<String>,
     provenance: Provenance,
+    /// The order of the similar notes (see [`word_score`]); a search scores in [`rank::rank`].
     score: f64,
+    /// The search score in thousandths once ranked.
+    milli: u32,
+    /// The boost that score includes, in thousandths.
+    boost_milli: u32,
 }
 
 impl Candidate {
     fn new(document: &Document) -> Self {
-        let score = match document.get("score") {
-            Some(Bson::Double(score)) => *score,
-            _ => 0.0,
-        };
-
         Self {
             id: int(document, "_id"),
             project: text(document, "project"),
@@ -75,13 +97,21 @@ impl Candidate {
             hits: int(document, "hits"),
             norms: strings(document, "entities"),
             provenance: provenance_of(document),
-            score,
+            score: 0.0,
+            milli: 0,
+            boost_milli: Hit::NO_BOOST,
         }
     }
 }
 
-/// Searches with the text index (`text_index`) or, on Amazon DocumentDB, over the `terms`.
-pub(super) fn search(ctx: &mut Ctx<'_>, query: &SearchQuery, text_index: bool) -> Result<Vec<Hit>, Fail> {
+/// Searches with the text index (`text_index`) or, on Amazon DocumentDB, without; `extensions` when
+/// the database has `terms_en`.
+pub(super) fn search(
+    ctx: &mut Ctx<'_>,
+    query: &SearchQuery,
+    text_index: bool,
+    extensions: bool,
+) -> Result<Vec<Hit>, Fail> {
     let text = query.text.trim();
     let length = text.chars().count();
 
@@ -92,10 +122,10 @@ pub(super) fn search(ctx: &mut Ctx<'_>, query: &SearchQuery, text_index: bool) -
     }
 
     let limit = query.limit.clamp(1, SEARCH_LIMIT_MAX);
-    let words = words(text, QUERY_TOKENS_MAX);
+    let terms = Terms::parse(text);
     let filter = filter(query)?;
 
-    let Some(last) = words.last() else {
+    if !terms.asked() {
         let found = ctx.find(
             NOTES,
             filter,
@@ -114,40 +144,135 @@ pub(super) fn search(ctx: &mut Ctx<'_>, query: &SearchQuery, text_index: bool) -
             .collect();
 
         return finish(ctx, rows);
+    }
+
+    // A query of stopwords alone has nothing to look for.
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let size = i64::try_from(rank::pool_size(limit)).unwrap_or(CANDIDATES);
+    let pool = pool(ctx, filter, &terms, (text_index, extensions), size)?;
+
+    ranked(ctx, &terms, pool, limit)
+}
+
+/// The notes that may answer `terms`, each once (see the module docs for where they come from),
+/// at most `size` from each source.
+fn pool(
+    ctx: &mut Ctx<'_>,
+    filter: Document,
+    terms: &Terms,
+    (text_index, extensions): (bool, bool),
+    size: i64,
+) -> Result<Vec<Candidate>, Fail> {
+    let words = terms.raws();
+    let mut pool: Vec<Candidate> = Vec::new();
+    let mut known: HashSet<i64> = HashSet::new();
+
+    let mut add = |found: Vec<Candidate>| {
+        for candidate in found {
+            if known.insert(candidate.id) {
+                pool.push(candidate);
+            }
+        }
     };
 
-    let prefix = fold(last);
-    let mut candidates = matching(ctx, filter.clone(), &words, None, CANDIDATES, text_index)?;
-    let known: HashSet<i64> = candidates.iter().map(|candidate| candidate.id).collect();
+    if text_index {
+        let order = doc! { "score": -1, "updated_at": -1, "hits": -1, "_id": -1 };
+        add(by_text_index(ctx, filter.clone(), &words, size, order)?);
+    }
 
-    let mut by_prefix = filter;
-    by_prefix.insert("terms", doc! { "$regex": format!("^{}", regex::escape(&prefix)) });
-    let extra = ctx.find(NOTES, by_prefix, recent_order(), CANDIDATES, note_fields())?;
+    // Notes an older server wrote have no stems yet: their words are found through `terms`, which
+    // is the only index of DocumentDB without the extensions.
+    if !text_index || !extensions {
+        let wanted = folded_terms(&words);
+        add(by_words(ctx, filter.clone(), &wanted, size)?);
+    }
 
-    for document in &extra {
-        let candidate = Candidate::new(document);
+    if extensions {
+        let stems = english_terms(&folded_terms(&words));
+        add(by_stems(ctx, filter.clone(), &stems, size)?);
+    }
 
-        if !known.contains(&candidate.id) {
-            candidates.push(candidate);
+    add(by_prefix(ctx, filter, terms, extensions, size)?);
+
+    Ok(pool)
+}
+
+/// The best `limit` of `pool` that answer `terms`, scored by [`rank::rank`] from their own text (the
+/// formula of `$text`, over stems), with the snippets cut around the words that matched.
+fn ranked(ctx: &mut Ctx<'_>, terms: &Terms, pool: Vec<Candidate>, limit: usize) -> Result<Vec<Hit>, Fail> {
+    let stemmer = rank::stemmer();
+
+    let tags: Vec<String> = pool.iter().map(|candidate| candidate.tags.join(" ")).collect();
+    let entries: Vec<rank::Entry<'_>> = pool
+        .iter()
+        .zip(&tags)
+        .map(|(candidate, tags)| rank::Entry {
+            relevance: None,
+            repo: candidate.project.is_some(),
+            subject: Subject {
+                title: &candidate.title,
+                body: &candidate.body,
+                tags,
+                entities: &candidate.norms,
+            },
+            updated_at: candidate.updated_at,
+            hits: candidate.hits,
+            id: candidate.id,
+        })
+        .collect();
+    let ranking = rank::rank(terms, &entries, FLOOR, limit);
+    drop(entries);
+
+    let mut slots: Vec<Option<Candidate>> = pool.into_iter().map(Some).collect();
+    let mut rows: Vec<(Candidate, String)> = Vec::with_capacity(ranking.len());
+
+    for item in ranking {
+        if let Some(mut candidate) = slots[item.index].take() {
+            candidate.milli = item.milli;
+            candidate.boost_milli = item.boost_milli;
+            let snippet = snippet(&candidate.body, |word| terms.matches(&stemmer, word));
+            rows.push((candidate, snippet));
         }
     }
 
-    for candidate in &mut candidates {
-        candidate.score += prefix_score(candidate, &prefix);
+    finish(ctx, rows)
+}
+
+/// The notes among `ids` that `query` may see, with the boost of its words (see
+/// [`crate::store::MemoryStore::hits_for`]).
+pub(super) fn by_ids(ctx: &mut Ctx<'_>, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, Fail> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
     }
 
-    candidates.sort_by(rank);
-    candidates.truncate(limit);
+    let wanted: Vec<i64> = ids.to_vec();
+    let filter = doc! { "$and": [filter(query)?, doc! { "_id": { "$in": wanted } }] };
+    let limit = i64::try_from(ids.len()).unwrap_or(i64::MAX);
+    let found = ctx.find(NOTES, filter, pool_order(), limit, note_fields())?;
 
-    let rows = candidates
-        .into_iter()
-        .map(|candidate| {
-            let snippet = snippet(&candidate.body, &words, Some(&prefix));
-            (candidate, snippet)
-        })
-        .collect();
+    let terms = Terms::parse(&query.text);
+    let mut hits: Vec<Hit> = Vec::with_capacity(found.len());
 
-    finish(ctx, rows)
+    for document in &found {
+        let mut candidate = Candidate::new(document);
+        let start: String = candidate.body.chars().take(SNIPPET_MAX).collect();
+        let snippet = shorten(&start);
+
+        let subject = Subject {
+            title: &candidate.title,
+            body: &candidate.body,
+            tags: "",
+            entities: &candidate.norms,
+        };
+        candidate.boost_milli = rank::boost_milli(&terms, &subject, candidate.project.is_some());
+
+        hits.extend(finish(ctx, vec![(candidate, snippet)])?);
+    }
+
+    Ok(hits)
 }
 
 pub(super) fn similar(
@@ -202,6 +327,8 @@ pub(super) fn resembling(
     let candidates = matching(ctx, visible(view), &keys, skip, SIMILAR_CANDIDATES, text_index)?;
     let needed = keys.len().min(2);
 
+    let wanted: HashSet<String> = keys.iter().map(|key| fold(key)).collect();
+
     let rows = candidates
         .into_iter()
         .filter(|candidate| {
@@ -212,7 +339,7 @@ pub(super) fn resembling(
         })
         .take(limit)
         .map(|candidate| {
-            let snippet = snippet(&candidate.body, &keys, None);
+            let snippet = snippet(&candidate.body, |word| wanted.contains(word));
             (candidate, snippet)
         })
         .collect();
@@ -230,6 +357,24 @@ pub(super) fn terms(title: &str, body: &str, tags: &[String]) -> Vec<String> {
             if seen.insert(word.clone()) {
                 out.push(word);
             }
+        }
+    }
+
+    out
+}
+
+/// The Snowball English stems of `terms` (the words [`terms`] returns), each once: what the English
+/// keyword search matches the stems of a query against.
+pub(super) fn english_terms(terms: &[String]) -> Vec<String> {
+    let stemmer = Stemmer::create(Algorithm::English);
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+
+    for word in terms {
+        let stem = stemmer.stem(word).into_owned();
+
+        if seen.insert(stem.clone()) {
+            out.push(stem);
         }
     }
 
@@ -277,15 +422,16 @@ fn matching(
     }
 
     if text_index {
-        by_text_index(ctx, filter, words, limit)
+        let order = doc! { "project": -1, "score": -1, "updated_at": -1, "hits": -1, "_id": -1 };
+        by_text_index(ctx, filter, words, limit, order)
     } else {
         by_terms(ctx, filter, words, limit)
     }
 }
 
-/// The search order: the repository first, then relevance, then the most recently updated (then
-/// hits, then id).
-fn rank(a: &Candidate, b: &Candidate) -> Ordering {
+/// The order of similar notes: the repository first, then relevance, then the most recently
+/// updated (then hits, then id). A search ranks with [`rank::rank`] instead.
+fn similar_order(a: &Candidate, b: &Candidate) -> Ordering {
     a.project
         .is_none()
         .cmp(&b.project.is_none())
@@ -295,12 +441,13 @@ fn rank(a: &Candidate, b: &Candidate) -> Ordering {
         .then(b.id.cmp(&a.id))
 }
 
-/// [`matching`] with `$text`, scored by `textScore`.
+/// [`matching`] with `$text`, scored by `textScore` and sorted by `order`.
 fn by_text_index(
     ctx: &mut Ctx<'_>,
     mut filter: Document,
     words: &[String],
     limit: i64,
+    order: Document,
 ) -> Result<Vec<Candidate>, Fail> {
     filter.insert("$text", doc! { "$search": words.join(" ") });
 
@@ -311,7 +458,7 @@ fn by_text_index(
     let pipeline = vec![
         doc! { "$match": filter },
         doc! { "$project": fields },
-        doc! { "$sort": { "project": -1, "score": -1, "updated_at": -1, "hits": -1, "_id": -1 } },
+        doc! { "$sort": order },
         doc! { "$limit": limit },
     ];
 
@@ -329,7 +476,22 @@ fn by_text_index(
 
 /// [`matching`] without a text index (Amazon DocumentDB): the [`CANDIDATES`] most recently
 /// updated notes holding one of the folded `words` in their `terms`, scored by [`word_score`].
-fn by_terms(ctx: &mut Ctx<'_>, mut filter: Document, words: &[String], limit: i64) -> Result<Vec<Candidate>, Fail> {
+fn by_terms(ctx: &mut Ctx<'_>, filter: Document, words: &[String], limit: i64) -> Result<Vec<Candidate>, Fail> {
+    let wanted = folded_terms(words);
+    let mut candidates = by_words(ctx, filter, &wanted, CANDIDATES)?;
+
+    for candidate in &mut candidates {
+        candidate.score = word_score(candidate, &wanted);
+    }
+
+    candidates.sort_by(similar_order);
+    candidates.truncate(usize::try_from(limit).unwrap_or(0));
+
+    Ok(candidates)
+}
+
+/// The folded words of `words`, each once.
+fn folded_terms(words: &[String]) -> Vec<String> {
     let mut wanted: Vec<String> = Vec::new();
 
     for word in words.iter().flat_map(|word| folded_words(word)) {
@@ -338,31 +500,76 @@ fn by_terms(ctx: &mut Ctx<'_>, mut filter: Document, words: &[String], limit: i6
         }
     }
 
-    filter.insert("terms", doc! { "$in": wanted.clone() });
+    wanted
+}
 
-    let found = ctx.find(NOTES, filter, recent_order(), CANDIDATES, note_fields())?;
-    let mut candidates: Vec<Candidate> = found.iter().map(Candidate::new).collect();
+/// The `size` most recently updated notes under `filter` that hold one of the folded `wanted`
+/// words in their `terms`, unscored.
+fn by_words(ctx: &mut Ctx<'_>, mut filter: Document, wanted: &[String], size: i64) -> Result<Vec<Candidate>, Fail> {
+    filter.insert("terms", doc! { "$in": wanted });
 
-    for candidate in &mut candidates {
-        candidate.score = word_score(candidate, &wanted);
+    let found = ctx.find(NOTES, filter, pool_order(), size, note_fields())?;
+
+    Ok(found.iter().map(Candidate::new).collect())
+}
+
+/// The `size` notes under `filter` that have the most of the `stems` in `terms_en`, then the most
+/// recently updated: the notes of a word's other forms (`caching` for `cache`), and the ones that
+/// have several of the words come first, which is what keeps the half-of-the-stems rule from
+/// missing them behind a flood of notes with one common word.
+fn by_stems(ctx: &mut Ctx<'_>, mut filter: Document, stems: &[String], size: i64) -> Result<Vec<Candidate>, Fail> {
+    filter.insert("terms_en", doc! { "$in": stems });
+
+    // Fields are cut before the sort, like in `by_text_index`.
+    let mut fields = note_fields();
+    fields.insert(
+        "matched",
+        doc! { "$size": { "$setIntersection": ["$terms_en", stems] } },
+    );
+
+    let pipeline = vec![
+        doc! { "$match": filter },
+        doc! { "$project": fields },
+        doc! { "$sort": { "matched": -1, "updated_at": -1, "hits": -1, "_id": -1 } },
+        doc! { "$limit": size },
+    ];
+
+    let found = ctx.aggregate(NOTES, pipeline)?;
+
+    Ok(found.iter().map(Candidate::new).collect())
+}
+
+/// The `size` most recently updated notes under `filter` with a word the last query word starts
+/// (in `terms`) or, with the extensions, a stem the last query stem starts (in `terms_en`, which
+/// finds `scheduling` for `schedule`).
+fn by_prefix(
+    ctx: &mut Ctx<'_>,
+    filter: Document,
+    terms: &Terms,
+    extensions: bool,
+    size: i64,
+) -> Result<Vec<Candidate>, Fail> {
+    let Some(last) = terms.iter().last() else {
+        return Ok(Vec::new());
+    };
+
+    let word = fold(&last.raw);
+    let mut clauses = vec![doc! { "terms": { "$regex": format!("^{}", regex::escape(&word)) } }];
+
+    if extensions {
+        let stem = english_terms(&[word]).into_iter().next().unwrap_or_default();
+        clauses.push(doc! { "terms_en": { "$regex": format!("^{}", regex::escape(&stem)) } });
     }
 
-    candidates.sort_by(rank);
-    candidates.truncate(usize::try_from(limit).unwrap_or(0));
+    let by_prefix = doc! { "$and": [filter, { "$or": clauses }] };
+    let found = ctx.find(NOTES, by_prefix, pool_order(), size, note_fields())?;
 
-    Ok(candidates)
+    Ok(found.iter().map(Candidate::new).collect())
 }
 
 /// MongoDB's text score of `candidate` for the folded `words` (see [`field_score`]).
 fn word_score(candidate: &Candidate, words: &[String]) -> f64 {
     score_fields(candidate, |word| words.iter().any(|wanted| wanted == word))
-}
-
-/// MongoDB's text score of the words of `candidate` that start with `prefix` and are longer
-/// (equal words are in `textScore` already): per field, `weight * frequency * (0.5 * count /
-/// words + 0.5)`, where each repeat of a word counts half the one before.
-fn prefix_score(candidate: &Candidate, prefix: &str) -> f64 {
-    score_fields(candidate, |word| word.len() > prefix.len() && word.starts_with(prefix))
 }
 
 /// The sum of [`field_score`] over the title, body and tags of `candidate`, with their weights.
@@ -402,17 +609,11 @@ fn field_score(words: &[String], weight: f64, matches: impl Fn(&str) -> bool) ->
         .sum()
 }
 
-/// Up to [`SNIPPET_TOKENS`] words of `body` from just before the first word matching `words`
-/// (or starting with `prefix`), on one line; the start of the body when nothing matches.
-fn snippet(body: &str, words: &[String], prefix: Option<&str>) -> String {
+/// Up to [`SNIPPET_TOKENS`] words of `body` from just before the first token with a folded word
+/// that `matches`, on one line; the start of the body when nothing matches.
+fn snippet(body: &str, matches: impl Fn(&str) -> bool) -> String {
     let tokens: Vec<&str> = body.split_whitespace().collect();
-    let wanted: HashSet<String> = words.iter().map(|word| fold(word)).collect();
-
-    let matches = |token: &&str| {
-        folded_words(token)
-            .iter()
-            .any(|part| wanted.contains(part) || prefix.is_some_and(|prefix| part.starts_with(prefix)))
-    };
+    let matches = |token: &&str| folded_words(token).iter().any(|part| matches(part));
 
     let start = tokens
         .iter()
@@ -450,6 +651,8 @@ fn finish(ctx: &mut Ctx<'_>, rows: Vec<(Candidate, String)>) -> Result<Vec<Hit>,
             updated_at: candidate.updated_at,
             entities,
             provenance: candidate.provenance,
+            score_milli: candidate.milli,
+            boost_milli: candidate.boost_milli,
         });
     }
 
@@ -508,6 +711,8 @@ mod tests {
             norms: Vec::new(),
             provenance: Provenance::default(),
             score: 0.0,
+            milli: 0,
+            boost_milli: Hit::NO_BOOST,
         }
     }
 
@@ -551,14 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn the_prefix_score_leaves_out_the_word_itself() {
-        let candidate = note("hard hardening", "", &[]);
-        assert_eq!(prefix_score(&candidate, "hard"), 3.75);
-        assert_eq!(score(&candidate, &["hard"]), 3.75);
-    }
-
-    #[test]
-    fn the_repository_ranks_first_then_the_score_then_the_most_recent() {
+    fn similar_notes_rank_the_repository_first_then_the_score_then_the_most_recent() {
         let mut global = note("a", "", &[]);
         global.project = None;
         global.score = 10.0;
@@ -575,7 +773,7 @@ mod tests {
         tied.updated_at = 5;
 
         let mut ranked = [global, weak, strong, tied];
-        ranked.sort_by(rank);
+        ranked.sort_by(similar_order);
 
         let titles: Vec<&str> = ranked.iter().map(|candidate| candidate.title.as_str()).collect();
         assert_eq!(titles, ["d", "c", "b", "a"]);
