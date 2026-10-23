@@ -102,10 +102,11 @@ impl Fixture {
 
 type Case = fn(&Fixture);
 
-const CASES: [Case; 6] = [
+const CASES: [Case; 7] = [
     writes_go_to_the_store_of_their_scope,
     ids_stay_unique_and_route_by_origin,
-    search_lists_repository_notes_first_within_the_limit,
+    search_lists_equally_relevant_repository_notes_first_within_the_limit,
+    search_merges_the_stores_by_score,
     relations_stay_in_their_scope_and_merge_around_an_entity,
     conflicts_titles_and_similar_notes_show_the_shown_ids,
     forgetting_entities_and_relations_follows_the_target,
@@ -257,7 +258,7 @@ fn ids_stay_unique_and_route_by_origin(fixture: &Fixture) {
     );
 }
 
-fn search_lists_repository_notes_first_within_the_limit(fixture: &Fixture) {
+fn search_lists_equally_relevant_repository_notes_first_within_the_limit(fixture: &Fixture) {
     let mut split = fixture.split();
 
     for title in ["Deploy staging", "Deploy production", "Deploy rollback"] {
@@ -319,6 +320,35 @@ fn search_lists_repository_notes_first_within_the_limit(fixture: &Fixture) {
         )),
         Err(StoreError::Invalid(_))
     ));
+}
+
+fn search_merges_the_stores_by_score(fixture: &Fixture) {
+    let mut split = fixture.split();
+
+    // A clearly better global note beats a weak repository one, the stores being one ranking.
+    split
+        .remember(&repo(REPO), &draft("Sidebar", "mentions rollout once", NoteKind::Note))
+        .expect("weak repository note");
+    split
+        .remember(
+            &Target::Global,
+            &draft("Rollout rollout checklist", "rollout rollout rollout", NoteKind::Note),
+        )
+        .expect("strong global note");
+
+    let hits = split.search(&query("rollout", both(REPO))).expect("search");
+    let titles: Vec<&str> = hits.iter().map(|hit| hit.title.as_str()).collect();
+    assert_eq!(titles, ["Rollout rollout checklist", "Sidebar"]);
+    assert!(hits[0].score_milli > hits[1].score_milli);
+
+    // Stemmed matches and the stopword rule hold across the stores too.
+    assert_eq!(split.search(&query("rollouts", both(REPO))).expect("stemmed").len(), 2);
+    assert!(
+        split
+            .search(&query("what is the", both(REPO)))
+            .expect("stopwords")
+            .is_empty()
+    );
 }
 
 fn relations_stay_in_their_scope_and_merge_around_an_entity(fixture: &Fixture) {

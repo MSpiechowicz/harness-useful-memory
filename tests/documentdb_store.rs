@@ -97,7 +97,7 @@ fn documentdb_search_folds_case_and_diacritics_and_matches_prefixes() {
 }
 
 #[test]
-fn documentdb_global_notes_rank_after_repository_ones() {
+fn documentdb_one_ranking_for_repository_and_global_notes() {
     let Some((_db, mut store)) = mongo_support::documentdb_store() else {
         return;
     };
@@ -109,8 +109,21 @@ fn documentdb_global_notes_rank_after_repository_ones() {
         .expect("global");
     let local = save(&mut store, "Sidebar", "mentions webkit once", &[]);
 
+    // A clearly more relevant global note beats a weak repository one.
     let hits = store.search(&query("webkit", both(REPO))).expect("search");
-    assert_eq!(ids(&hits), vec![local, global.id]);
+    assert_eq!(ids(&hits), vec![global.id, local]);
+    assert!(hits[0].score_milli > hits[1].score_milli);
+
+    // Equally relevant notes: the repository one wins.
+    let twin_global = store
+        .remember(
+            &Target::Global,
+            &draft("Layout rules", "grid layout rules", NoteKind::Note),
+        )
+        .expect("twin global");
+    let twin_repo = save(&mut store, "Layout rules", "grid layout rules", &[]);
+    let twins = store.search(&query("layout", both(REPO))).expect("twins");
+    assert_eq!(ids(&twins), vec![twin_repo, twin_global.id]);
 }
 
 #[test]
@@ -454,4 +467,48 @@ fn documentdb_listing_script_hook_and_routine_cases_send_no_projection_expressio
     }
 
     assert_eq!(sent, Vec::<Document>::new());
+}
+
+// Shared keyword search cases (see `common::search_cases`).
+
+fn with_store(case: fn(&mut dyn MemoryStore)) {
+    let Some((_db, mut store)) = mongo_support::documentdb_store() else {
+        return;
+    };
+    case(&mut store);
+}
+
+#[test]
+fn documentdb_stems_find_other_forms_of_a_word() {
+    with_store(common::search_cases::stems_find_other_forms_of_a_word);
+}
+
+#[test]
+fn documentdb_a_query_of_stopwords_finds_nothing_but_an_empty_one_lists_recent_notes() {
+    with_store(common::search_cases::a_query_of_stopwords_finds_nothing_but_an_empty_one_lists_recent_notes);
+}
+
+#[test]
+fn documentdb_a_topic_the_notes_lack_finds_nothing() {
+    with_store(common::search_cases::a_topic_the_notes_lack_finds_nothing);
+}
+
+#[test]
+fn documentdb_a_note_needs_half_of_the_query_words() {
+    with_store(common::search_cases::a_note_needs_half_of_the_query_words);
+}
+
+#[test]
+fn documentdb_a_query_word_naming_an_entity_or_a_path_boosts_the_note() {
+    with_store(common::search_cases::a_query_word_naming_an_entity_or_a_path_boosts_the_note);
+}
+
+#[test]
+fn documentdb_an_empty_store_finds_nothing() {
+    with_store(common::search_cases::an_empty_store_finds_nothing);
+}
+
+#[test]
+fn documentdb_similar_notes_are_unchanged() {
+    with_store(common::search_cases::similar_notes_are_unchanged);
 }

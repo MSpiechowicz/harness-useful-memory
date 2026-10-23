@@ -24,6 +24,7 @@ pub mod libsql;
 pub mod listing;
 pub mod mongo;
 pub mod postgres;
+pub(crate) mod rank;
 pub mod routines;
 pub mod scripts;
 pub mod split;
@@ -302,6 +303,9 @@ pub struct Hit {
     pub updated_at: i64,
     pub entities: Vec<String>,
     pub provenance: Provenance,
+    /// The search score in thousandths (see `rank`), 0 for a list of recent notes or of similar
+    /// notes. Hits of one query compare by it, also across databases.
+    pub score_milli: u32,
 }
 
 /// A relation between two entities (`from relation to`).

@@ -273,7 +273,8 @@ impl MemoryStore for PostgresStore {
     }
 
     fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
-        self.read(|client| search::search(client, query))
+        let extensions = self.extensions;
+        self.read(|client| search::search(client, query, extensions))
     }
 
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {

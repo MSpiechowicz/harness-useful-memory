@@ -53,7 +53,8 @@ pub(crate) fn list_notes(engine: &mut impl Engine, query: &NoteListQuery) -> Res
 }
 
 pub(crate) fn search(engine: &mut impl Engine, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
-    engine.read(|db| search::search(db, query))
+    let extensions = engine.extensions();
+    engine.read(|db| search::search(db, query, extensions))
 }
 
 pub(crate) fn similar(engine: &mut impl Engine, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {

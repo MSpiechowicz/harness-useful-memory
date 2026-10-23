@@ -171,7 +171,7 @@ fn a_dropped_connection_is_opened_again() {
     assert_eq!(ended, 1);
 
     let hits = store
-        .search(&query("before", both(REPO)))
+        .search(&query("written", both(REPO)))
         .expect("search after the drop");
     assert_eq!(hits.len(), 1);
     store

@@ -13,6 +13,7 @@ pub mod listing;
 pub mod mcp;
 pub mod routines;
 pub mod scripts;
+pub mod search_cases;
 pub mod stdio;
 
 use std::path::PathBuf;

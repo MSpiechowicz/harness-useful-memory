@@ -31,9 +31,11 @@
 //! than routed to the wrong store. Relations only point at notes of their own store, so a note id
 //! given with a link has to belong to the store the link's scope writes to.
 //!
-//! **Merging.** A search lists the repository notes first, as a single store does: per scope, the
-//! hits of the stores reading it take turns, up to the limit. The relations around an entity list
-//! the repository store's first too (a single store orders them by distance across both scopes).
+//! **Merging.** A search for words ranks the hits of the stores by score ([`Hit::score_milli`]),
+//! repository and global notes together, as a single store does (see `store::rank` for
+//! what the score is and why scores of two databases only roughly compare). The recent notes of an
+//! empty query list the repository first: per scope, the hits of the stores reading it take
+//! turns, up to the limit. The relations around an entity list the repository store's first too (a single store orders them by distance across both scopes).
 //! Similar notes come from the store of the note they resemble, and in a `remote+local` scope from
 //! the other store too, taking turns. A list of notes merges the two stores' sorted pages: a page at
 //! offset N reads the first N rows of both stores (in pages of [`LIST_PAGE_MAX`]) to find where it
@@ -43,12 +45,13 @@
 //! Each store only sees the scopes it is read for: notes of another scope left in it (written
 //! before the routing changed) are not shown.
 
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::VecDeque;
 
 use crate::backend::{NotesPlace, Place};
 use crate::limits::{GET_IDS_MAX, LIST_PAGE_MAX, NEIGHBOR_NOTES_MAX, NEIGHBORS_LIMIT_MAX, SEARCH_LIMIT_MAX};
 use crate::store::listing::{compare, directed, page_limit, per_place};
+use crate::store::rank::Terms;
 use crate::store::{
     Edge, Forget, Forgotten, HiddenNotes, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NoteListQuery,
     NoteOrigin, NotePage, NotePatch, NoteRow, NoteSort, Saved, Scope, SearchQuery, StoreError, Target, View,
@@ -396,6 +399,28 @@ impl SplitStore {
         };
 
         encode_hits(side, self.store(side).search(&part)?)
+    }
+
+    /// The best `limit` hits of `query` over `readers` (each store with the part of the view it is
+    /// read for), merged by score: one store's notes of any scope rank as a single store ranks them,
+    /// and the stores compare by [`Hit::score_milli`], then the most recently updated, then the
+    /// higher id.
+    fn search_ranked(
+        &mut self,
+        readers: &[(Side, View)],
+        query: &SearchQuery,
+        limit: usize,
+    ) -> Result<Vec<Hit>, StoreError> {
+        let mut hits: Vec<Hit> = Vec::new();
+
+        for (side, view) in readers {
+            hits.extend(self.search_side(*side, query, view.clone(), limit)?);
+        }
+
+        hits.sort_by_key(|hit| (Reverse(hit.score_milli), Reverse(hit.updated_at), Reverse(hit.id)));
+        hits.truncate(limit);
+
+        Ok(hits)
     }
 
     /// Up to `limit` notes in `view` of the store `side` resembling `source`, the hidden ones left
@@ -767,6 +792,12 @@ impl MemoryStore for SplitStore {
             return self.search_side(*side, query, view.clone(), limit);
         }
 
+        // A search for words is ranked by score across scopes and stores; only the recent notes
+        // of an empty query list the repository first.
+        if Terms::parse(&query.text).asked() && !readers.is_empty() {
+            return self.search_ranked(&readers, query, limit);
+        }
+
         let mut hits: Vec<Hit> = Vec::new();
         let mut asked = false;
 
@@ -1056,6 +1087,7 @@ mod tests {
             updated_at: 0,
             entities: Vec::new(),
             provenance: crate::store::Provenance::default(),
+            score_milli: 0,
         };
         let ids = |hits: Vec<Hit>| hits.into_iter().map(|hit| hit.id).collect::<Vec<_>>();
 
