@@ -27,9 +27,10 @@ mod notes;
 pub mod schema;
 mod scripts;
 mod search;
+mod settings;
 mod team_docs;
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use postgres::config::SslMode;
 use postgres::types::FromSql;
@@ -37,6 +38,7 @@ use postgres::{Client, GenericClient, NoTls, Row, Transaction};
 
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, ProjectKey};
 use super::{Forgotten, NoteListQuery, NotePage, Saved, SearchQuery, StoreError, Target, View, clean};
+use crate::store::extensions;
 use crate::store::listing::checked_exclude;
 pub use connect::UrlError;
 use schema::SchemaState;
@@ -54,12 +56,15 @@ pub struct PostgresStore {
     settings: connect::Settings,
     client: Client,
     newer: bool,
+    /// The additive schema extensions are in place (see [`schema::ensure_extensions`]).
+    extensions: bool,
 }
 
 impl std::fmt::Debug for PostgresStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PostgresStore")
             .field("newer", &self.newer)
+            .field("extensions", &self.extensions)
             .finish_non_exhaustive()
     }
 }
@@ -73,11 +78,62 @@ impl PostgresStore {
         let mut client = open(&settings)?;
         let state = schema::migrate(&mut client)?;
 
-        Ok(Self {
+        let mut store = Self {
             settings,
             client,
             newer: state == SchemaState::Newer,
-        })
+            extensions: false,
+        };
+
+        if !store.newer {
+            store.extensions = store.install_extensions();
+            store.backfill_lang();
+        }
+
+        Ok(store)
+    }
+
+    /// True when the database has the additive schema extensions (English search column, `lang`);
+    /// false when it is newer or refused them. The settings need none.
+    pub fn has_extensions(&self) -> bool {
+        self.extensions
+    }
+
+    /// Adds the schema extensions the database lacks and reports whether it has them now. A
+    /// database that refuses them (no right to change the schema) is used without, with one line on
+    /// stderr.
+    fn install_extensions(&mut self) -> bool {
+        match schema::ensure_extensions(&mut self.client) {
+            Ok(()) => true,
+            Err(error) => {
+                extensions::warn_unavailable(&error);
+                false
+            }
+        }
+    }
+
+    /// Fills `lang` of the notes an older server wrote, a page at a time and for at most
+    /// [`extensions::BACKFILL_BUDGET`]; what is left waits for the next open.
+    fn backfill_lang(&mut self) {
+        if !self.extensions {
+            return;
+        }
+
+        let deadline = Instant::now() + extensions::BACKFILL_BUDGET;
+
+        while Instant::now() < deadline {
+            let step = match self.read(notes::has_pending_lang) {
+                Ok(true) => self.write(|tx| notes::fill_lang(tx, extensions::BACKFILL_PAGE)),
+                Ok(false) => return,
+                Err(error) => Err(error),
+            };
+
+            match step {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(error) => return extensions::warn_backfill(&error),
+            }
+        }
     }
 
     /// True when the database was written by a newer server.
@@ -194,12 +250,14 @@ fn uncertain(error: StoreError) -> StoreError {
 impl MemoryStore for PostgresStore {
     fn remember(&mut self, target: &Target, draft: &NoteDraft) -> Result<Saved, StoreError> {
         let draft = clean::draft(draft)?;
-        self.write(|tx| notes::remember(tx, target, &draft))
+        let extensions = self.extensions;
+        self.write(|tx| notes::remember(tx, target, &draft, extensions))
     }
 
     fn update(&mut self, view: &View, id: i64, patch: &NotePatch) -> Result<Saved, StoreError> {
         let patch = clean::patch(patch)?;
-        self.write(|tx| notes::update(tx, view, id, &patch))
+        let extensions = self.extensions;
+        self.write(|tx| notes::update(tx, view, id, &patch, extensions))
     }
 
     fn get(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
@@ -252,6 +310,14 @@ impl MemoryStore for PostgresStore {
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
         let title = clean::title(title)?;
         self.read(|client| notes::find_by_title(client, target, &title))
+    }
+
+    fn english_notes(&mut self) -> Result<bool, StoreError> {
+        self.read(settings::english_notes)
+    }
+
+    fn set_english_notes(&mut self, on: bool) -> Result<(), StoreError> {
+        self.write(|tx| settings::set_english_notes(tx, on))
     }
 }
 

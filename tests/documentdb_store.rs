@@ -44,7 +44,14 @@ fn documentdb_migration_creates_no_text_index() {
     assert_eq!(db.schema_version(), SCHEMA_VERSION);
     assert_eq!(
         db.index_names("notes"),
-        ["_id_", "notes_entities", "notes_recent", "notes_terms", "notes_title"]
+        [
+            "_id_",
+            "notes_entities",
+            "notes_recent",
+            "notes_terms",
+            "notes_terms_en",
+            "notes_title"
+        ]
     );
     assert!(db.index_names("scripts").contains(&"scripts_name".to_owned()));
     assert!(db.index_names("hooks").contains(&"hooks_repo".to_owned()));

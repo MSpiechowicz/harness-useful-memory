@@ -13,6 +13,11 @@
 //!   language `none`: no stemming and no stopwords, like FTS5's `unicode61`). A database set up
 //!   for Amazon DocumentDB ([`Flavor::DocumentDb`]) has no text index, at the same schema version:
 //!   nothing else reads it.
+//!   Added without a schema version (`schema::ensure_extensions`, `backfill`): `terms_en`,
+//!   the Snowball English stems of `terms` (index `(project, terms_en)`), `lang` (`en`, `other` or
+//!   `unknown`) and `en_rev`, the `revision` those two describe. A server that does not know them
+//!   inserts a note without them and edits it without refreshing them, which `en_rev` tells apart
+//!   from a current note, so the next open fills them in.
 //! - `entities`: unique `(project, name_norm)`; the first spelling is kept in `name`.
 //! - `relations`: unique `(project, src, rel, dst)` over normalized entity names, with the
 //!   entities' spellings copied in, plus `(project, dst)` and `note_id` indexes.
@@ -22,8 +27,8 @@
 //!   key (`null` for global hooks), the file bytes in `body`; index `(repo, created_at, _id)`.
 //! - `routines` (schema 4): the team routines, laid out like `hooks`; index
 //!   `(repo, created_at, _id)`.
-//! - `meta`: the schema version (`_id: "schema"`), the note and script id counters and the
-//!   migration lock.
+//! - `meta`: the schema version (`_id: "schema"`), the note and script id counters, the
+//!   migration lock and the team's settings (`_id: "settings"`, `english_notes`).
 //!
 //! # Writes
 //!
@@ -93,6 +98,7 @@
 //! whatever read preference the URL sets: transactions only run there, and a replica could miss a
 //! note saved a moment earlier.
 
+mod backfill;
 mod connection;
 pub mod documentdb;
 mod graph;
@@ -101,6 +107,7 @@ mod notes;
 pub mod schema;
 mod scripts;
 mod search;
+mod settings;
 mod team_docs;
 
 use std::thread;
@@ -116,6 +123,7 @@ use mongodb::sync::{Client, ClientSession, Collection, Database};
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, Saved, SearchQuery};
 use super::{Forgotten, NoteListQuery, NotePage, Scope, StoreError, Target, View};
 use crate::limits::{BODY_MAX, ENTITY_MAX, TAG_MAX, TAGS_MAX, TITLE_MAX};
+use crate::store::extensions;
 use crate::store::listing::checked_exclude;
 use schema::SchemaState;
 
@@ -158,6 +166,8 @@ pub struct MongoStore {
     /// Amazon DocumentDB: reads run as aggregations (see [`Ctx`]), and errors of a server that
     /// cannot be reached carry the VPN hint (see [`driver_error`]).
     documentdb: bool,
+    /// The additive schema extensions are in place (see [`schema::ensure_extensions`]).
+    extensions: bool,
 }
 
 impl std::fmt::Debug for MongoStore {
@@ -168,6 +178,7 @@ impl std::fmt::Debug for MongoStore {
             .field("newer", &self.newer)
             .field("text_index", &self.text_index)
             .field("documentdb", &self.documentdb)
+            .field("extensions", &self.extensions)
             .finish_non_exhaustive()
     }
 }
@@ -212,14 +223,37 @@ impl MongoStore {
         let transactions = probe(&client, documentdb)?;
         let state = schema::migrate(&db, documentdb)?;
 
-        Ok(Self {
+        let mut store = Self {
             client,
             db,
             transactions,
             newer: state == SchemaState::Newer,
             text_index: !documentdb,
             documentdb,
-        })
+            extensions: false,
+        };
+
+        if !store.newer {
+            store.extensions = match schema::ensure_extensions(&store.db, documentdb) {
+                Ok(()) => true,
+                Err(error) => {
+                    extensions::warn_unavailable(&error);
+                    false
+                }
+            };
+
+            if store.extensions {
+                backfill::fill(&store.db, documentdb);
+            }
+        }
+
+        Ok(store)
+    }
+
+    /// True when the database has the additive schema extensions (the `terms_en` index); false
+    /// when it is newer or refused them.
+    pub fn has_extensions(&self) -> bool {
+        self.extensions
     }
 
     /// True when the database was written by a newer server.
@@ -331,12 +365,14 @@ impl MongoStore {
 impl MemoryStore for MongoStore {
     fn remember(&mut self, target: &Target, draft: &NoteDraft) -> Result<Saved, StoreError> {
         let draft = notes::prepare(draft)?;
-        self.write(|ctx| notes::remember(ctx, target, &draft))
+        let extensions = self.extensions;
+        self.write(|ctx| notes::remember(ctx, target, &draft, extensions))
     }
 
     fn update(&mut self, view: &View, id: i64, patch: &NotePatch) -> Result<Saved, StoreError> {
         let patch = notes::prepare_patch(patch)?;
-        self.write(|ctx| notes::update(ctx, view, id, &patch))
+        let extensions = self.extensions;
+        self.write(|ctx| notes::update(ctx, view, id, &patch, extensions))
     }
 
     fn get(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
@@ -398,6 +434,16 @@ impl MemoryStore for MongoStore {
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
         let title = super::clean::title(title)?;
         notes::find_by_title(&mut self.reader()?, target, &title).map_err(|fail| self.failed(fail))
+    }
+
+    fn english_notes(&mut self) -> Result<bool, StoreError> {
+        self.check_version()?;
+        settings::english_notes(&self.db).map_err(|error| driver_error(&error, self.documentdb))
+    }
+
+    fn set_english_notes(&mut self, on: bool) -> Result<(), StoreError> {
+        self.check_version()?;
+        settings::set_english_notes(&self.db, on).map_err(|error| driver_error(&error, self.documentdb))
     }
 }
 

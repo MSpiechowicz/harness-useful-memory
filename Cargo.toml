@@ -50,6 +50,9 @@ tempfile = "3.27.0"
 # The id of a script run request, from the operating system's random source (the version the
 # MongoDB driver's DNS resolver already pulls in).
 getrandom = "0.4.3"
+# Language detection of a note (English or not) and the Snowball English stems the MongoDB `terms_en` holds.
+whatlang = "0.18.0"
+rust-stemmers = "1.2.0"
 
 # Kills a timed-out git together with its process group (`killpg`).
 [target.'cfg(unix)'.dependencies]

@@ -10,6 +10,7 @@ use super::{target_project_existing, view_params};
 use crate::limits::{BODY_MAX, ENTITY_MAX, GET_IDS_MAX, TAG_MAX, TAGS_MAX, TITLE_MAX};
 use crate::store::clean::{self, CleanDraft, CleanPatch};
 use crate::store::{Forgotten, Note, NoteKind, Provenance, Saved, Scope, StoreError, Target, View};
+use crate::support::lang;
 
 /// The columns [`note_from_row`] reads, from `notes n LEFT JOIN projects p`, with the text cut to
 /// the limits (see [`cut`]).
@@ -39,7 +40,14 @@ fn columns(body: &str) -> String {
 /// The visibility condition of a view (`$2` the project id, `$3` whether global is visible).
 pub(super) const VISIBLE: &str = "(n.project_id = $2::bigint OR ($2::bigint = -1 AND n.project_id IS NOT NULL) OR ($3::boolean AND n.project_id IS NULL))";
 
-pub(super) fn remember(tx: &mut Transaction<'_>, target: &Target, draft: &CleanDraft) -> Result<Saved, StoreError> {
+/// Saves the draft. With `extensions` the note's `lang` is stored too, in a statement after the
+/// content (see [`set_lang`]).
+pub(super) fn remember(
+    tx: &mut Transaction<'_>,
+    target: &Target,
+    draft: &CleanDraft,
+    extensions: bool,
+) -> Result<Saved, StoreError> {
     let project = target_project(tx, target)?;
     let now = now();
     let writer = &draft.writer;
@@ -118,6 +126,10 @@ pub(super) fn remember(tx: &mut Transaction<'_>, target: &Target, draft: &CleanD
         }
     };
 
+    if extensions {
+        set_lang(tx, id, &draft.title, &draft.body)?;
+    }
+
     for name in &draft.entities {
         let entity = graph::ensure_entity(tx, project, name)?;
         tx.execute(
@@ -131,7 +143,13 @@ pub(super) fn remember(tx: &mut Transaction<'_>, target: &Target, draft: &CleanD
 }
 
 /// Applies `patch` (the body is masked after `append` is joined, see [`clean::patched_body`]).
-pub(super) fn update(tx: &mut Transaction<'_>, view: &View, id: i64, patch: &CleanPatch) -> Result<Saved, StoreError> {
+pub(super) fn update(
+    tx: &mut Transaction<'_>,
+    view: &View,
+    id: i64,
+    patch: &CleanPatch,
+    extensions: bool,
+) -> Result<Saved, StoreError> {
     let Some(note) = load(tx, view, id)? else {
         return Err(not_found(id));
     };
@@ -167,7 +185,60 @@ pub(super) fn update(tx: &mut Transaction<'_>, view: &View, id: i64, patch: &Cle
     )
     .map_err(backend)?;
 
+    if extensions {
+        set_lang(tx, id, &title, &body)?;
+    }
+
     saved(tx, id, false)
+}
+
+/// Stores the language of the note `id`. It is a statement of its own after the content one:
+/// `notes_lang_reset` clears a `lang` that an edit of the title or body left unchanged (an older
+/// server's edit), and an `UPDATE` of `lang` alone does not fire it.
+fn set_lang(tx: &mut Transaction<'_>, id: i64, title: &str, body: &str) -> Result<(), StoreError> {
+    let lang = lang::stored(lang::detect(title, body));
+    tx.execute("UPDATE notes SET lang = $2 WHERE id = $1", &[&id, &lang])
+        .map_err(backend)?;
+
+    Ok(())
+}
+
+/// Whether a note has no `lang` yet (written by a server that does not know the column).
+pub(super) fn has_pending_lang(client: &mut impl GenericClient) -> Result<bool, StoreError> {
+    let row = client
+        .query_one("SELECT EXISTS (SELECT 1 FROM notes WHERE lang IS NULL)", &[])
+        .map_err(backend)?;
+
+    column(&row, 0)
+}
+
+/// Fills `lang` of up to `page` notes that have none, and returns how many it filled. Meant for a
+/// write transaction (which holds the write lock), so a note is not edited between its read and
+/// its `lang`.
+pub(super) fn fill_lang(tx: &mut Transaction<'_>, page: usize) -> Result<usize, StoreError> {
+    let sql = format!(
+        "SELECT id, {}, {} FROM notes WHERE lang IS NULL ORDER BY id LIMIT $1",
+        cut("title", TITLE_MAX),
+        cut("body", BODY_MAX)
+    );
+    let rows = tx
+        .query(&sql, &[&i64::try_from(page).unwrap_or(i64::MAX)])
+        .map_err(backend)?;
+
+    for row in &rows {
+        let id: i64 = column(row, 0)?;
+        let title: String = column(row, 1)?;
+        let body: String = column(row, 2)?;
+        let lang = lang::stored(lang::detect(&title, &body));
+
+        tx.execute(
+            "UPDATE notes SET lang = $2 WHERE id = $1 AND lang IS NULL",
+            &[&id, &lang],
+        )
+        .map_err(backend)?;
+    }
+
+    Ok(rows.len())
 }
 
 /// The visible notes among `ids`, each read as it was before this read's hit (when `count`).

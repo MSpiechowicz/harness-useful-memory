@@ -16,6 +16,7 @@
 //! types of [`MemoryStore::list_notes`].
 
 pub mod clean;
+pub(crate) mod extensions;
 pub mod hidden;
 pub mod hooks;
 pub mod lazy;
@@ -520,5 +521,18 @@ pub trait MemoryStore: Send {
             Some(hit) => Ok(self.get(&view, &[hit.id])?.into_iter().next()),
             None => Ok(None),
         }
+    }
+
+    /// Whether notes have to be English (the English notes setting, kept in the database so a
+    /// team shares it). On when nothing is stored. The default is on, for a store that keeps no
+    /// settings.
+    fn english_notes(&mut self) -> Result<bool, StoreError> {
+        Ok(true)
+    }
+
+    /// Stores the English notes setting. The default keeps nothing.
+    fn set_english_notes(&mut self, on: bool) -> Result<(), StoreError> {
+        let _ = on;
+        Ok(())
     }
 }
