@@ -6,9 +6,10 @@
 mod common;
 mod mongo_support;
 
+use common::listing::listing;
 use common::{both, draft, query, repo};
 use harness_memory::store::mongo::schema::SCHEMA_VERSION;
-use harness_memory::store::{MemoryStore, NoteKind, NotePatch};
+use harness_memory::store::{LangFilter, MemoryStore, NoteKind, NoteListQuery, NotePatch};
 use mongo_support::{TestDb, store};
 use mongodb::bson::{Bson, Document, doc};
 use pretty_assertions::assert_eq;
@@ -205,6 +206,63 @@ fn an_older_servers_edit_makes_the_stems_stale_and_the_next_open_refreshes_them(
     let refreshed = note(&db, id);
     assert_eq!(refreshed.get_i64("en_rev"), refreshed.get_i64("revision"));
     assert_eq!(refreshed.get_str("lang"), Ok("en"), "{refreshed:?}");
+}
+
+/// An older server's edit leaves the stored `lang` describing the previous text until the next
+/// open backfills it: until then the note shows no language, and the filters and counts agree.
+#[test]
+fn a_note_an_older_server_edited_has_no_language_until_the_backfill() {
+    let Some((db, mut store)) = store() else { return };
+    let id = store
+        .remember(&repo(REPO), &draft("Sync job", ENGLISH, NoteKind::Note))
+        .expect("remember")
+        .id;
+    store
+        .remember(&repo(REPO), &draft("Zadanie", POLISH, NoteKind::Note))
+        .expect("remember");
+
+    notes(&db)
+        .update_one(
+            doc! { "_id": id },
+            doc! { "$set": { "body": POLISH }, "$inc": { "revision": 1_i64 } },
+        )
+        .run()
+        .expect("an older server's edit");
+
+    let with = |lang| NoteListQuery {
+        lang,
+        ..listing(both(REPO))
+    };
+    let titles = |store: &mut dyn MemoryStore, lang| -> (usize, Vec<String>) {
+        let page = store.list_notes(&with(lang)).expect("list");
+        let mut titles: Vec<String> = page.rows.into_iter().map(|row| row.title).collect();
+        titles.sort();
+        (page.total, titles)
+    };
+
+    let stale = store.list_notes(&with(None)).expect("list");
+    let row = stale.rows.iter().find(|row| row.title == "Sync job").expect("the row");
+    assert_eq!(row.lang, None, "stale: its language is unknown");
+
+    assert_eq!(titles(&mut store, Some(LangFilter::En)), (0, vec![]));
+    assert_eq!(
+        titles(&mut store, Some(LangFilter::Other)),
+        (1, vec!["Zadanie".to_owned()])
+    );
+    assert_eq!(
+        titles(&mut store, Some(LangFilter::Unknown)),
+        (1, vec!["Sync job".to_owned()])
+    );
+
+    drop(store);
+    let mut store = db.connect();
+
+    assert_eq!(titles(&mut store, Some(LangFilter::Unknown)), (0, vec![]));
+    assert_eq!(titles(&mut store, Some(LangFilter::En)), (0, vec![]));
+    assert_eq!(
+        titles(&mut store, Some(LangFilter::Other)),
+        (2, vec!["Sync job".to_owned(), "Zadanie".to_owned()])
+    );
 }
 
 #[test]

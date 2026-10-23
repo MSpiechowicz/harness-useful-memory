@@ -3,6 +3,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::time::Duration;
 
+use interprocess::local_socket::ListenerOptions;
+use interprocess::local_socket::traits::ListenerExt as _;
 use tempfile::TempDir;
 
 use super::support::{Notes, World, fake_manifest, ids, install, target};
@@ -267,4 +269,96 @@ fn a_silent_connection_does_not_stop_others_from_being_served() {
     let _silent = running.client_stream();
 
     assert!(running.client.ping().is_ok());
+}
+
+/// The calls to an embedder that accepts and never answers (a stuck one) give up at their own
+/// timeouts on every platform: the streams' timeouts are not relied on (named pipes have none).
+#[test]
+fn a_stuck_embedder_costs_each_call_no_more_than_its_timeout() {
+    const CALLS: usize = 4;
+
+    let dir = TempDir::new().expect("temp dir");
+    let endpoint = Endpoint::of(dir.path(), &std::env::temp_dir());
+    let listener = ListenerOptions::new()
+        .name(endpoint.name().expect("name"))
+        .create_sync()
+        .expect("listen");
+
+    // Accepts the calls and keeps their connections open without a word.
+    let stuck = std::thread::spawn(move || listener.incoming().take(CALLS).flatten().collect::<Vec<_>>());
+
+    let client = EmbedderClient::from_endpoint(endpoint);
+    let timed = |call: &dyn Fn() -> Result<(), ClientError>| {
+        let started = std::time::Instant::now();
+        let result = call();
+
+        assert!(matches!(result, Err(ClientError::Unreachable(_))), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    };
+
+    let note = NoteInput {
+        id: 1,
+        project: None,
+        title: "Stuck".to_owned(),
+        body: "nobody answers".to_owned(),
+        tags: Vec::new(),
+    };
+
+    timed(&|| client.ping().map(drop));
+    timed(&|| client.warm());
+    timed(&|| client.upsert("local:x", std::slice::from_ref(&note)));
+    timed(&|| client.forget("local:x", &[1]));
+
+    drop(stuck.join().expect("the stuck embedder"));
+}
+
+#[test]
+fn warming_loads_a_model_the_idle_unload_dropped() {
+    let running = running();
+    let service = &running.world.service;
+    let loads = || running.world.fake.loads.load(std::sync::atomic::Ordering::SeqCst);
+
+    assert_eq!(loads(), 1);
+    assert!(
+        crate::embed::locked(&service.active)
+            .as_mut()
+            .expect("active")
+            .resident
+            .unload_if_idle(Duration::ZERO)
+    );
+
+    running.client.warm().expect("warm");
+
+    let started = std::time::Instant::now();
+    while !crate::embed::locked(&service.active)
+        .as_ref()
+        .is_some_and(|active| active.resident.is_loaded())
+    {
+        assert!(started.elapsed() < Duration::from_secs(5), "the model was never loaded");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(loads(), 2);
+
+    // Warm again with the model loaded: nothing is loaded twice.
+    running.client.warm().expect("warm again");
+    assert_eq!(loads(), 2);
+}
+
+#[test]
+fn a_status_probe_holding_the_lock_for_an_instant_does_not_make_an_embedder_exit_as_busy() {
+    let dir = TempDir::new().expect("temp dir");
+    drop(Lock::take(dir.path()).expect("creates the lock file"));
+
+    // What `Lock::is_held` does, held for longer than a real probe.
+    let file = std::fs::File::open(dir.path().join(crate::embed::LOCK_FILE)).expect("lock file");
+    file.lock_shared().expect("shared lock");
+
+    let releasing = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        drop(file);
+    });
+
+    assert!(Lock::take(dir.path()).is_ok(), "waited for the probe to let go");
+    releasing.join().expect("probe");
 }

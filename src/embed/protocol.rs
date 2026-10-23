@@ -4,6 +4,8 @@
 //! A reply is `{"ok":true,...}` or `{"ok":false,"error":"..."}`:
 //!
 //! - `ping` answers `{ok, model, ready, pending}`;
+//! - `warm` answers `{ok}` at once and then loads the model if it was unloaded (an embedder that
+//!   does not know it refuses, which a client ignores);
 //! - `search {text, targets:[{store, projects}], limit, floor}` answers `{ok, model, hits:[{store,
 //!   id, cosine}]}`, where `projects` lists repository keys and `null` for the global notes;
 //! - `upsert {store, notes:[{id, project, title, body, tags}]}` and `forget {store, ids}` answer
@@ -45,6 +47,8 @@ pub struct NoteInput {
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum Request {
     Ping,
+    /// Loads the model in the background so a search a moment later does not wait for it.
+    Warm,
     Search {
         text: String,
         targets: Vec<Target>,
@@ -158,5 +162,6 @@ mod tests {
         assert!(Request::parse("{\"v\":1,\"op\":\"shell\"}").is_err());
         assert!(Request::parse("nope").is_err());
         assert_eq!(Request::parse("{\"v\":1,\"op\":\"ping\"}"), Ok(Request::Ping));
+        assert_eq!(Request::parse("{\"v\":1,\"op\":\"warm\"}"), Ok(Request::Warm));
     }
 }

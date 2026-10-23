@@ -268,6 +268,42 @@ fn nothing_changes_while_embedding_is_off() {
     assert_eq!(embedder.requests(), Vec::<Value>::new());
 }
 
+fn initialize(server: &mut Server) -> Value {
+    server
+        .handle(json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "t", "version": "1" } } }))
+        .expect("an answer")
+}
+
+#[test]
+fn a_session_asks_the_embedder_to_warm_up_when_it_starts_and_only_when_embedding_is_on() {
+    let dir = TempDir::new().expect("temp dir");
+    seed(&mut store(dir.path()), &[LOGIN]);
+    let embedder = FakeEmbedder::start(dir.path(), answering(&[]));
+
+    initialize(&mut hybrid(&dir));
+    assert_eq!(embedder.requests(), Vec::<Value>::new(), "off");
+
+    set_enabled(dir.path(), true).expect("enable");
+    let reply = initialize(&mut hybrid(&dir));
+
+    assert!(reply["result"].is_object(), "{reply}");
+    assert_eq!(embedder.ops("warm").len(), 1);
+    assert_eq!(embedder.requests().len(), 1);
+}
+
+#[test]
+fn a_session_starts_without_an_embedder_to_warm() {
+    let dir = TempDir::new().expect("temp dir");
+    set_enabled(dir.path(), true).expect("enable");
+
+    let started = std::time::Instant::now();
+    let reply = initialize(&mut hybrid(&dir));
+
+    assert!(reply["result"].is_object(), "{reply}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
 #[test]
 fn a_query_without_words_never_asks_the_embedder() {
     let dir = TempDir::new().expect("temp dir");

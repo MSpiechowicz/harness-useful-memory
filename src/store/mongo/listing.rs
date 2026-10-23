@@ -6,7 +6,9 @@ use mongodb::bson::{Bson, Document, doc};
 
 use super::notes::{Stored, stored};
 use super::scripts::literal_pattern;
-use super::{Ctx, ENTITIES, ENTITY_NORM_MAX, Fail, NOTES, cut, int, note_fields, scope_value, text, visible};
+use super::{
+    Ctx, ENTITIES, ENTITY_NORM_MAX, Fail, NOTES, cut, int, lang_is_fresh, note_fields, scope_value, text, visible,
+};
 use crate::limits::{ENTITY_MAX, TITLE_MAX};
 use crate::store::listing::{
     LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort, checked_exclude, page_limit, query_entity, query_text,
@@ -39,20 +41,6 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage,
         kept.insert("entities", entity);
     }
 
-    match query.lang {
-        None => {}
-        Some(LangFilter::En) => {
-            kept.insert("lang", "en");
-        }
-        Some(LangFilter::Other) => {
-            kept.insert("lang", "other");
-        }
-        // Matches a missing field and null too.
-        Some(LangFilter::Unknown) => {
-            kept.insert("lang", doc! { "$nin": ["en", "other"] });
-        }
-    }
-
     let exclude = checked_exclude(&query.exclude)?;
 
     if !exclude.is_empty() {
@@ -62,19 +50,17 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage,
     let mut counts_filter = visible(&query.view);
     counts_filter.extend(kept.clone());
 
+    let mut counting = vec![doc! { "$match": counts_filter }];
+    counting.extend(lang_stages(query.lang));
+    counting.push(doc! { "$group": {
+        "_id": { "kind": "$kind", "project": "$project" },
+        "count": { "$sum": 1_i64 },
+    } });
+
     // A view shows one repository at most, so a group's project tells its scope: a key, or
     // `null` (or no project at all) for a global note.
     let counted: Vec<(NoteKind, Scope, usize)> = ctx
-        .aggregate(
-            NOTES,
-            vec![
-                doc! { "$match": counts_filter },
-                doc! { "$group": {
-                    "_id": { "kind": "$kind", "project": "$project" },
-                    "count": { "$sum": 1_i64 },
-                } },
-            ],
-        )?
+        .aggregate(NOTES, counting)?
         .iter()
         .map(|group| {
             let id = group.get_document("_id").ok();
@@ -114,21 +100,49 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage,
     fields.remove("body");
     fields.insert("title_norm", cut("$title_norm", TITLE_NORM_MAX));
 
-    let found = ctx.aggregate(
-        NOTES,
-        vec![
-            doc! { "$match": page_filter },
-            doc! { "$sort": sort.clone() },
-            doc! { "$skip": i64::try_from(query.offset).unwrap_or(i64::MAX) },
-            doc! { "$limit": i64::try_from(page_limit(query)).unwrap_or(1) },
-            doc! { "$project": fields },
-            doc! { "$sort": sort },
-        ],
-    )?;
+    let mut paging = vec![doc! { "$match": page_filter }];
+    paging.extend(lang_stages(query.lang));
+    paging.extend([
+        doc! { "$sort": sort.clone() },
+        doc! { "$skip": i64::try_from(query.offset).unwrap_or(i64::MAX) },
+        doc! { "$limit": i64::try_from(page_limit(query)).unwrap_or(1) },
+        doc! { "$project": fields },
+        doc! { "$sort": sort },
+    ]);
+
+    let found = ctx.aggregate(NOTES, paging)?;
 
     let stored: Vec<Stored> = found.iter().map(stored).collect();
     let rows = with_entities(ctx, stored)?;
     Ok(NotePage::new(counted, query, rows))
+}
+
+/// The stages that keep the notes of the language `filter` (none for no filter). A note whose
+/// `lang` an older server's edit left stale (its `en_rev` is not its `revision`) counts as
+/// unknown, so the three filters partition the notes the same way in the counts and on the page.
+/// The freshness is computed in a stage of its own, not with `$expr` in the `$match`, which older
+/// Amazon DocumentDB engines may lack.
+fn lang_stages(filter: Option<LangFilter>) -> Vec<Document> {
+    const FRESH: &str = "lang_fresh";
+
+    let Some(filter) = filter else {
+        return Vec::new();
+    };
+
+    let keep = match filter {
+        LangFilter::En => doc! { "lang": "en", FRESH: true },
+        LangFilter::Other => doc! { "lang": "other", FRESH: true },
+        // Also matches a missing field and null.
+        LangFilter::Unknown => doc! { "$or": [
+            { "lang": { "$nin": ["en", "other"] } },
+            { FRESH: false },
+        ] },
+    };
+
+    vec![
+        doc! { "$addFields": { FRESH: lang_is_fresh() } },
+        doc! { "$match": keep },
+    ]
 }
 
 /// The rows of `stored` with their entity names (alphabetically by normalized name, as a

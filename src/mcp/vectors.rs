@@ -104,6 +104,14 @@ impl Vectors {
         }
     }
 
+    /// Asks the embedder to have its model loaded, so the first search of the session does not
+    /// wait for it after an idle unload. Best effort, with a short timeout.
+    pub fn warm(&self) {
+        if self.enabled() {
+            let _ = self.client.warm();
+        }
+    }
+
     /// Tells the embedder about `note` (shown as `note.id` by a store that says `origin`).
     pub fn upsert(&self, origin: NoteOrigin, note: &Note) {
         if !self.enabled() {

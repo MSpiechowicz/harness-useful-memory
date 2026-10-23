@@ -215,6 +215,13 @@ fn run() -> ExitCode {
         stopper.stop().stop();
     });
 
+    // SIGINT, SIGTERM and SIGHUP (the console events on Windows) end the run like a closed stdin.
+    let signalled = Arc::clone(&service);
+
+    if let Err(error) = ctrlc::set_handler(move || signalled.stop().stop()) {
+        eprintln!("harness-memory: cannot watch for termination signals ({error})");
+    }
+
     let working = Arc::clone(&service);
     std::thread::spawn(move || working.lifecycle());
 

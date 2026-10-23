@@ -1,22 +1,34 @@
 //! What `harness-memory mcp` calls to ask the embedder, which may not run: every call fails fast
 //! (the socket is missing or refuses) or within its timeout, and the caller falls back to keyword
 //! results. A failure is never fatal and `upsert` and `forget` are safe to fire and ignore.
+//!
+//! The timeout of a call covers all of it (connect, request, reply) and is kept by waiting for
+//! the exchange, which runs on a thread of its own, for that long: the operating system's socket
+//! timeouts alone would not do (Windows named pipes have none). A thread that outlives its call
+//! is abandoned, and ends when the embedder answers or closes the connection (on Unix at the
+//! socket timeout).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use super::protocol::{MAX_REQUEST, NoteInput, Pong, Reply, Request, Target, VectorHit};
 use super::server::Endpoint;
 
-/// How long a search may take.
-pub const SEARCH_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a search may take: room for the model to load when a search is the first call after
+/// the embedder unloaded it (about two seconds at worst), though [`EmbedderClient::warm`]
+/// normally has it loaded already.
+pub const SEARCH_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// How long an upsert or a forget may take.
 pub const WRITE_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// How long a ping may take.
 pub const PING_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long a warm request may take: the embedder answers it before it loads anything.
+pub const WARM_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// The longest reply read: 200 hits at about 80 bytes each, with room to spare.
 const MAX_REPLY: u64 = 256 * 1024;
@@ -60,6 +72,12 @@ impl EmbedderClient {
             ready: reply.ready,
             pending: reply.pending,
         })
+    }
+
+    /// Asks the embedder to load its model now if it unloaded it, best effort: the answer comes
+    /// at once and the load goes on in the embedder.
+    pub fn warm(&self) -> Result<(), ClientError> {
+        self.call(&Request::Warm, WARM_TIMEOUT).map(drop)
     }
 
     /// The notes of `targets` closest in meaning to `text`, closest first, with a cosine of at
@@ -143,18 +161,11 @@ impl EmbedderClient {
             return Err(ClientError::Refused("the request is too large".to_owned()));
         }
 
-        let unreachable = |error: std::io::Error| ClientError::Unreachable(error.kind().to_string());
-        let mut stream = self.endpoint.connect(timeout).map_err(unreachable)?;
+        let endpoint = self.endpoint.clone();
 
-        writeln!(stream, "{line}")
-            .and_then(|()| stream.flush())
-            .map_err(unreachable)?;
-
-        let mut answer = String::new();
-        BufReader::new(&stream)
-            .take(MAX_REPLY)
-            .read_line(&mut answer)
-            .map_err(unreachable)?;
+        let answer = within(timeout, move || exchange(&endpoint, &line, timeout))
+            .ok_or_else(|| ClientError::Unreachable(std::io::ErrorKind::TimedOut.to_string()))?
+            .map_err(|error| ClientError::Unreachable(error.kind().to_string()))?;
 
         let reply: Reply = serde_json::from_str(answer.trim_end())
             .map_err(|_| ClientError::Unreachable("an unreadable reply".to_owned()))?;
@@ -167,6 +178,34 @@ impl EmbedderClient {
     }
 }
 
+/// Sends `line` to the embedder and reads its one line of reply.
+fn exchange(endpoint: &Endpoint, line: &str, timeout: Duration) -> std::io::Result<String> {
+    let mut stream = endpoint.connect(timeout)?;
+
+    writeln!(stream, "{line}")?;
+    stream.flush()?;
+
+    let mut answer = String::new();
+    BufReader::new(&stream).take(MAX_REPLY).read_line(&mut answer)?;
+
+    Ok(answer)
+}
+
+/// The result of `work`, run on a thread of its own; `None` when it did not finish within
+/// `timeout` (the thread is left to end by itself) or could not be started.
+fn within<T: Send + 'static>(timeout: Duration, work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (sender, receiver) = mpsc::channel();
+
+    std::thread::Builder::new()
+        .name("embedder-call".to_owned())
+        .spawn(move || {
+            let _ = sender.send(work());
+        })
+        .ok()?;
+
+    receiver.recv_timeout(timeout).ok()
+}
+
 fn line_of(store: &str, notes: &[NoteInput]) -> usize {
     Request::Upsert {
         store: store.to_owned(),
@@ -174,4 +213,22 @@ fn line_of(store: &str, notes: &[NoteInput]) -> usize {
     }
     .to_line()
     .len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn work_that_outlasts_its_timeout_is_given_up_on_at_the_timeout() {
+        let started = std::time::Instant::now();
+        let finished = within(Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_secs(3));
+            1
+        });
+
+        assert_eq!(finished, None);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert_eq!(within(Duration::from_secs(5), || 7), Some(7));
+    }
 }

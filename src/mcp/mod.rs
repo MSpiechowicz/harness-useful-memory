@@ -234,6 +234,11 @@ impl Server {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 self.english = self.store.english_notes().unwrap_or(false);
+
+                if let Some(vectors) = &self.vectors {
+                    vectors.warm();
+                }
+
                 protocol::result(id, protocol::initialize_result(&params, self.english))
             }
             "ping" => protocol::result(id, json!({})),

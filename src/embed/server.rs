@@ -28,6 +28,10 @@ const SOCKET_PATH_MAX: usize = 100;
 /// How many connections are served at once.
 const CONNECTIONS_MAX: usize = 32;
 
+/// How many times, and over how long, [`Lock::take`] tries before it reports the lock busy.
+const LOCK_TRIES: u32 = 6;
+const LOCK_PATIENCE: Duration = Duration::from_millis(300);
+
 /// How long a client may take to send its request and read the reply.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -75,26 +79,36 @@ impl Endpoint {
     }
 
     #[cfg(unix)]
-    fn name(&self) -> std::io::Result<interprocess::local_socket::Name<'_>> {
+    pub(crate) fn name(&self) -> std::io::Result<interprocess::local_socket::Name<'_>> {
         use interprocess::local_socket::{GenericFilePath, ToFsName};
         self.path.as_os_str().to_fs_name::<GenericFilePath>()
     }
 
     #[cfg(windows)]
-    fn name(&self) -> std::io::Result<interprocess::local_socket::Name<'_>> {
+    pub(crate) fn name(&self) -> std::io::Result<interprocess::local_socket::Name<'_>> {
         use interprocess::local_socket::{GenericNamespaced, ToNsName};
         self.path.as_os_str().to_ns_name::<GenericNamespaced>()
     }
 
-    /// Connects to the embedder; the streams time out after `timeout`.
+    /// Connects to the embedder; where the operating system can, the streams time out after
+    /// `timeout`. Windows named pipes cannot (the call is `Unsupported` there), so a caller that
+    /// must not wait longer enforces its own deadline (see [`super::client`]).
     pub fn connect(&self, timeout: Duration) -> std::io::Result<Stream> {
         #[cfg(unix)]
         check_socket_owner(&self.path)?;
 
         let stream = Stream::connect(self.name()?)?;
-        stream.set_recv_timeout(Some(timeout))?;
-        stream.set_send_timeout(Some(timeout))?;
+        without_unsupported(stream.set_recv_timeout(Some(timeout)))?;
+        without_unsupported(stream.set_send_timeout(Some(timeout)))?;
         Ok(stream)
+    }
+}
+
+/// `result`, except that a stream without timeouts (`Unsupported`) is not a failure.
+fn without_unsupported(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+        other => other,
     }
 }
 
@@ -145,13 +159,23 @@ impl Lock {
             .open(root.join(LOCK_FILE))
             .map_err(|error| LockError::Failed(format!("cannot open the lock file: {}", error.kind())))?;
 
-        match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
-            Err(std::fs::TryLockError::WouldBlock) => Err(LockError::Busy),
-            Err(std::fs::TryLockError::Error(error)) => {
-                Err(LockError::Failed(format!("cannot lock: {}", error.kind())))
+        // A `status` probe holds a shared lock for an instant ([`Lock::is_held`]): a few tries
+        // over [`LOCK_PATIENCE`] tell it from an embedder that runs.
+        for attempt in 0..LOCK_TRIES {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(LockError::Failed(format!("cannot lock: {}", error.kind())));
+                }
+            }
+
+            if attempt + 1 < LOCK_TRIES {
+                std::thread::sleep(LOCK_PATIENCE / LOCK_TRIES);
             }
         }
+
+        Err(LockError::Busy)
     }
 
     /// Whether an embedder holds the lock of `root` (without creating anything).
@@ -269,17 +293,27 @@ fn serve(connection: Stream, service: &Service) {
     let mut reader = BufReader::new(&connection).take(MAX_REQUEST as u64 + 1);
     let mut line = String::new();
 
+    let mut warm = false;
+
     let answer = match reader.read_line(&mut line) {
         Ok(0) => return,
         Ok(read) if read > MAX_REQUEST => error_reply("the request is too large"),
         Ok(_) => match Request::parse(line.trim_end()) {
-            Ok(request) => service.handle(request),
+            Ok(request) => {
+                warm = request == Request::Warm;
+                service.handle(request)
+            }
             Err(message) => error_reply(&message),
         },
         Err(_) => return,
     };
 
     let _ = reply(connection, &answer);
+
+    // After the reply: the caller does not wait for the model, only this thread does.
+    if warm {
+        service.warm();
+    }
 }
 
 fn reply(mut connection: Stream, answer: &serde_json::Value) -> std::io::Result<()> {

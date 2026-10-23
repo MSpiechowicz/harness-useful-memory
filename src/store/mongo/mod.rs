@@ -1115,8 +1115,19 @@ fn note_fields() -> Document {
         "updated_at": number("$updated_at"),
         "revision": number("$revision"),
         "hits": number("$hits"),
-        "lang": cut("$lang", LANG_MAX),
+        "lang": fresh_lang(),
     }
+}
+
+/// True when the English fields of a note describe its current revision. An older server edits a
+/// note and raises `revision` without refreshing `lang` and `en_rev`, until the next backfill.
+fn lang_is_fresh() -> Bson {
+    Bson::Document(doc! { "$eq": [number("$en_rev"), number("$revision")] })
+}
+
+/// The stored `lang` of a note, or `null` (unknown) while it is stale.
+fn fresh_lang() -> Bson {
+    Bson::Document(doc! { "$cond": [lang_is_fresh(), cut("$lang", LANG_MAX), Bson::Null] })
 }
 
 /// Only the `_id` of a note (0 when it is not a number).

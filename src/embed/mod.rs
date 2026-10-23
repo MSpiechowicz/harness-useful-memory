@@ -303,6 +303,8 @@ impl Service {
                 let model = self.active_model();
                 json!({ "ok": true, "ready": model.is_some(), "model": model, "pending": self.pending_model() })
             }
+            // The load itself follows the reply (see [`Service::warm`]).
+            Request::Warm => json!({ "ok": true }),
             Request::Search {
                 text,
                 targets,
@@ -314,6 +316,15 @@ impl Service {
                 Ok(()) => json!({ "ok": true }),
                 Err(error) => error_reply(&error),
             },
+        }
+    }
+
+    /// Loads the model when it was dropped for being idle, and starts its idle time again; waits
+    /// for the load, so the caller of a `warm` request runs it after its reply. A search that
+    /// comes meanwhile waits for the model like it would have loaded it.
+    pub fn warm(&self) {
+        if let Some(active) = locked(&self.active).as_mut() {
+            let _ = active.resident.ensure();
         }
     }
 

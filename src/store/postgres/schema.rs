@@ -294,13 +294,19 @@ pub(super) fn extensions_present(client: &mut impl GenericClient) -> Result<bool
 /// Adds the objects the database lacks of the English search column with its index, `lang` with
 /// its reset trigger. The schema version is neither read nor written. Everything runs in one
 /// transaction under the migration lock, after a first look without it, so a database that has
-/// the extensions is only read, and servers starting together add them once.
+/// the extensions is only read, and servers starting together add them once. A lock that cannot be
+/// had within five seconds is an error, like a refused right.
 pub(super) fn ensure_extensions(client: &mut Client) -> Result<(), StoreError> {
     if extensions_present(client)? {
         return Ok(());
     }
 
     let mut tx = client.transaction().map_err(backend)?;
+
+    // `ALTER TABLE` waits for every open transaction on `notes` and, while it waits, queues every
+    // other statement behind it. A short wait gives up instead (the caller opens without the
+    // extensions and tries again at the next open).
+    tx.batch_execute("SET LOCAL lock_timeout = '5s'").map_err(backend)?;
     tx.execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATE_LOCK])
         .map_err(backend)?;
 

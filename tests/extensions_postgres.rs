@@ -333,6 +333,45 @@ fn a_role_that_cannot_change_the_schema_runs_without_the_extensions() {
     assert_eq!(count(&mut admin, "SELECT count(*) FROM notes"), 1);
 }
 
+/// A table lock another session holds (a long transaction, a dump) makes the `ALTER TABLE` wait
+/// and block everything queued behind it: the open gives up after a few seconds, works without the
+/// extensions, and adds them at the next open once the lock is gone.
+#[test]
+fn a_table_lock_held_elsewhere_makes_the_open_run_without_the_extensions_for_now() {
+    let Some(db) = database() else { return };
+    drop(open(&db));
+
+    let mut admin = db.admin();
+    without_extensions(&mut admin);
+
+    let mut holder = db.admin();
+    holder
+        .batch_execute("BEGIN; SELECT count(*) FROM notes;")
+        .expect("a transaction that has read notes");
+
+    let started = std::time::Instant::now();
+    let mut store = open(&db);
+
+    assert!(!store.has_extensions());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(9),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(objects(&mut admin), 0, "nothing was added");
+    assert!(
+        store.search(&query("anything", both(REPO))).is_ok(),
+        "searches work as before"
+    );
+    drop(store);
+
+    holder.batch_execute("COMMIT").expect("release");
+    let store = open(&db);
+
+    assert!(store.has_extensions());
+    assert_eq!(objects(&mut admin), 5);
+}
+
 fn count_text(client: &mut Client, sql: &str) -> String {
     client.query_one(sql, &[]).expect("query").get(0)
 }

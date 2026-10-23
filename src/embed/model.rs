@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
-use ureq::Agent;
 use ureq::tls::{Certificate, RootCerts, TlsConfig, TlsProvider};
+use ureq::{Agent, Proxy};
 
 use super::manifest::{Manifest, ModelFile, Spec};
 use super::{Event, Events};
@@ -112,6 +112,7 @@ pub fn ensure(
     }
 
     private_folder(&dir, "model folder").map_err(ModelError::Write)?;
+    remove_partial_files(&dir);
     let agent = agent(base);
     let total = manifest.total_size();
     let mut received = 0;
@@ -134,6 +135,23 @@ pub fn ensure(
     write_atomic(&dir, &dir.join(INSTALLED), &marker, "installed", "model marker").map_err(ModelError::Write)?;
 
     Ok(dir)
+}
+
+/// Deletes the `*.part` files an interrupted download left in `dir` (a killed embedder cannot clean
+/// up after itself). Only one embedder runs per computer, so none of them is in use.
+fn remove_partial_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let partial = entry.file_name().to_string_lossy().ends_with(".part");
+        let file = entry.file_type().is_ok_and(|kind| kind.is_file());
+
+        if partial && file {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Accepts `https://` and `http://127.0.0.1` or `http://localhost` (for tests and mirrors on this
@@ -161,9 +179,12 @@ pub fn check_base(base: &str) -> Result<(), ModelError> {
 }
 
 /// The HTTP client: TLS with the ring provider and the platform's roots, https only unless the
-/// base is a local mirror (which then gets no redirects either).
+/// base is a local mirror (which then gets no redirects either). The standard proxy variables
+/// (`ALL_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`) are honoured, except for a local mirror,
+/// which is reached directly.
 fn agent(base: Option<&str>) -> Agent {
     let local = base.is_some_and(|base| base.trim().to_ascii_lowercase().starts_with("http://"));
+    let proxy = if local { None } else { Proxy::try_from_env() };
 
     let tls = TlsConfig::builder()
         .provider(TlsProvider::Rustls)
@@ -177,7 +198,7 @@ fn agent(base: Option<&str>) -> Agent {
         .max_redirects(if local { 0 } else { 5 })
         .timeout_global(Some(DOWNLOAD_TIMEOUT))
         .timeout_connect(Some(CONNECT_TIMEOUT))
-        .proxy(None)
+        .proxy(proxy)
         .user_agent(concat!("harness-memory/", env!("HARNESS_MEMORY_VERSION")))
         .build()
         .new_agent()

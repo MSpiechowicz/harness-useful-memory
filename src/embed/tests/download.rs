@@ -214,3 +214,31 @@ fn the_compiled_in_files_are_the_pinned_release_assets() {
     );
     assert_eq!(MODEL.id, "paraphrase-multilingual-minilm-l12-v2-int8@1");
 }
+
+#[test]
+fn partial_files_of_an_interrupted_download_are_removed_when_the_next_one_starts() {
+    let root = TempDir::new().expect("temp dir");
+    let manifest = fake_manifest("fake@1");
+    let fixture = Fixture::serving(&manifest);
+
+    let dir = model::model_dir(root.path(), manifest.id);
+    std::fs::create_dir_all(&dir).expect("model folder");
+    std::fs::write(dir.join(format!("{ONNX_FILE}.aB3dE9.part")), b"half a model").expect("stale part");
+    std::fs::write(dir.join("notes.txt"), b"not ours to touch").expect("other file");
+
+    model::ensure(
+        root.path(),
+        &manifest,
+        Some(&fixture.url()),
+        &Collect::default(),
+        &|| false,
+    )
+    .expect("download");
+
+    assert!(
+        folder_listing(&dir).iter().all(|name| !name.ends_with(".part")),
+        "{:?}",
+        folder_listing(&dir)
+    );
+    assert!(dir.join("notes.txt").exists());
+}

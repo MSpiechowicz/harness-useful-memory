@@ -38,7 +38,11 @@ Non-goals: vectors in team databases, ANN indexes, translating notes, changing t
   `$TMPDIR/harness-memory-<hash>.sock`), Windows named pipe `harness-memory-embedder-<user hash>`. Newline JSON, one
   request per connection, `"v":1`. Ops: `ping` → `{ok,model,ready,pending}`; `search {text,targets:[{store,projects}],
   limit,floor}` → `{ok,model,hits:[{store,id,cosine}]}`; `upsert {store,notes:[{id,project,title,body,tags}]}`;
-  `forget {store,ids}`. Client timeouts: search 2 s, upsert 200 ms.
+  `forget {store,ids}`; `warm` → `{ok}` at once, then the embedder loads the model if it was unloaded (`mcp` sends it
+  at `initialize` when embedding is on, so the first search does not pay the 0.7-1.7 s reload). Client timeouts cover
+  the whole call and are kept by the client itself (a helper thread, since Windows named pipes have no socket
+  timeouts): search 4 s, ping 500 ms, upsert/forget 200 ms, warm 250 ms. A model download honours `ALL_PROXY`,
+  `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`, and removes stale `*.part` files first.
 - Store key: `local:` + first 16 hex of sha256(canonical path); team: `<kind>:` + first 16 hex of sha256(normalised
   URL without userinfo + database name). No secrets in keys or logs.
 - Vector cache `<data>/harness-memory/vectors.sqlite3`: `vectors(store, note_id, project_id, content_hash, model, dim,
@@ -91,3 +95,14 @@ session before release):
 
 - `model_quantized.onnx`: 118308126 bytes, sha256 `66fc00f5f29afcaff34092e1bdd20008ca3918265a82fb9695a551e510cc4ebc`
 - `tokenizer.json`: 17082913 bytes, sha256 `b60b6b43406a48bf3638526314f3d232d97058bc93472ff2de930d43686fa441`
+
+## Known deviations
+
+Accepted after review, not fixed:
+
+- SQLite and libSQL stem English with FTS5's `porter`, PostgreSQL and MongoDB with Snowball, so inflections can differ
+  between backends (for example `ties` does not match `tie` on SQLite). The vectors cover such misses.
+- `set_english_notes` on a split store writes its two stores one after the other: if the second write fails the stores
+  disagree until the setting is saved again.
+- On Windows the embedder's server side has no per-connection read timeout either (named pipes), so a client that
+  connects and never sends holds one of its 32 connection slots until it disconnects.

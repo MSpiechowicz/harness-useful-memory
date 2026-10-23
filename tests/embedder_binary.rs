@@ -134,3 +134,31 @@ fn a_second_embedder_says_busy_and_the_first_stops_when_its_input_closes() {
     assert_eq!(status(memory.path())["running"], false);
     assert!(!memory.path().join("embedder.sock").exists(), "the socket is removed");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_termination_signal_stops_the_embedder_cleanly() {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    let memory = TempDir::new().expect("temp dir");
+
+    let mut child = embedder(memory.path(), &["run"])
+        .env("HARNESS_MEMORY_MODEL_BASE_URL", "http://127.0.0.1:9")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the embedder");
+
+    // Its first event comes after the socket is up and the signal handler is set.
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+    lines.next().expect("the embedder stays up").expect("an event");
+    assert!(memory.path().join("embedder.sock").exists());
+
+    kill(Pid::from_raw(i32::try_from(child.id()).expect("pid")), Signal::SIGTERM).expect("signal");
+
+    assert!(child.wait().expect("exit").success());
+    assert!(!memory.path().join("embedder.sock").exists(), "the socket is removed");
+    assert_eq!(status(memory.path())["running"], false, "the lock is released");
+}

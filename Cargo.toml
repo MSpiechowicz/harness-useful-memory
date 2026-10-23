@@ -59,6 +59,9 @@ rust-stemmers = "1.2.0"
 tract-onnx = "0.23.9"
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 interprocess = "2.4.6"
+# SIGTERM and SIGHUP besides Ctrl-C (and the Windows console events) stop `embedder run` cleanly: the
+# socket is removed and the lock released.
+ctrlc = { version = "3.5.2", features = ["termination"] }
 # Returns the freed model memory to the operating system (glibc keeps it), so the embedder's idle
 # unload gives it back.
 mimalloc = "0.1"
