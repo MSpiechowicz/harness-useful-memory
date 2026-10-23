@@ -11,8 +11,9 @@
 //! `held list|save|skip` save the user's notes and scripts and the held items past the save guards
 //! ([`harness_memory::cli_held`]), `harness-memory hooks config|list|get|put|delete` and
 //! `harness-memory routines config|list|get|put|delete` share Harness Desktop hooks and routines
-//! with the team ([`harness_memory::cli_team_docs`]), `harness-memory --version` prints the
-//! version.
+//! with the team ([`harness_memory::cli_team_docs`]), `harness-memory settings get|set` reads and
+//! changes the English notes setting ([`harness_memory::cli_settings`]), `harness-memory --version`
+//! prints the version.
 
 use std::collections::BTreeSet;
 use std::io::{BufReader, Write};
@@ -28,7 +29,7 @@ use harness_memory::store::Scope;
 use harness_memory::support::Env;
 use harness_memory::support::runner::Stop;
 use harness_memory::support::time::rfc3339;
-use harness_memory::{cli_held, cli_notes, cli_team_docs, cli_trust};
+use harness_memory::{cli_held, cli_notes, cli_settings, cli_team_docs, cli_trust};
 use harness_memory::{database_path, serve};
 use serde_json::{Value, json};
 
@@ -43,7 +44,7 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--o
                      scripts push [--dry-run] [--json] [--overwrite none|all|ID[,ID...]|-] [--delete-copied] [--scope \
                      repo|global] [--repo <key|.>] [--no-global] | trust <id>[=<sha256>]... [--repo KEY | --all-repos] | --all [--project PATH | --repo KEY] \
                      | notes list --json [--project PATH | --repo KEY | --all-repos] [--kind KIND] [--scope repo|global] \
-                     [--place local|team] [--query TEXT] [--sort updated|title|kind|scope|place] [--order asc|desc] [--offset N] [--limit N] [--hidden] | notes \
+                     [--place local|team] [--lang en|other|unknown] [--query TEXT] [--sort updated|title|kind|scope|place] [--order asc|desc] [--offset N] [--limit N] [--hidden] | notes \
                      get <id> --json [--project PATH | --repo KEY | --all-repos] [--hidden] | notes hide <id> [--project PATH | --repo KEY | --all-repos] [--json] | notes \
                      unhide <id> [--project PATH | --repo KEY | --all-repos] [--json] | notes delete <id> [--project PATH | --repo KEY | --all-repos] | notes delete --all \
                      --yes [--project PATH | --repo KEY] [--json] | notes repos --json | scripts repos --json | notes discard-local (--all | ID[,ID...] | -) [--scope \
@@ -56,15 +57,17 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--o
                      [--author NAME] --json | notes save --json [--project PATH] [--client NAME] < note.json | notes update <id> --json \
                      [--project PATH] [--client NAME] < patch.json | scripts save --json [--project PATH] [--client NAME] \
                      < script.json | held list --json \
-                     [--chat KEY] | held save <heldId> --json [< draft.json] | held skip <heldId> --json | --version]";
+                     [--chat KEY] | held save <heldId> --json [< draft.json] | held skip <heldId> --json | settings get --json | \
+                     settings set english_notes=true|false --json | --version]";
 
 /// What this build can do that older ones could not, as `harness-memory features` lists it: the
 /// `remote+local` note routing, hiding team notes on this computer, `push --json`, and the same for
 /// scripts (`scripts = "remote+local"`, `scripts hide`, `scripts push --json`), and reading every
 /// repository at once (`--all-repos`, `--repo KEY`, `notes repos`, `scripts repos`), and the save
 /// guards with their held items and user-only saves (`notes save`, `notes update`, `scripts save`,
-/// `held list|save|skip`).
-const FEATURES: [&str; 8] = [
+/// `held list|save|skip`), the `settings` command, and the notes language (`notes list --lang`, the
+/// `lang` of a note, the English notes setting).
+const FEATURES: [&str; 10] = [
     "notes-remote-local",
     "notes-hide",
     "push-json",
@@ -73,6 +76,8 @@ const FEATURES: [&str; 8] = [
     "scripts-push-json",
     "all-repos",
     "save-guards",
+    "settings",
+    "notes-lang",
 ];
 
 fn main() -> ExitCode {
@@ -109,6 +114,7 @@ fn main() -> ExitCode {
         [Some("trust"), rest @ ..] => cli_trust::trust(rest),
         [Some("notes"), rest @ ..] => cli_notes::notes(rest),
         [Some("held"), rest @ ..] => cli_held::held(rest),
+        [Some("settings"), rest @ ..] => cli_settings::settings(rest),
         [Some("hooks"), rest @ ..] => cli_team_docs::hooks(rest),
         [Some("routines"), rest @ ..] => cli_team_docs::routines(rest),
         [Some("--version")] => {

@@ -40,16 +40,19 @@ pub(crate) fn update(engine: &mut impl Engine, view: &View, id: i64, patch: &Not
 
 /// A write: reading counts a hit on each note.
 pub(crate) fn get(engine: &mut impl Engine, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
-    engine.write(|db| notes::get(db, view, ids, true))
+    let extensions = engine.extensions();
+    engine.write(|db| notes::get(db, view, ids, true, extensions))
 }
 
 /// A read: counts no hit.
 pub(crate) fn peek(engine: &mut impl Engine, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
-    engine.read(|db| notes::get(db, view, ids, false))
+    let extensions = engine.extensions();
+    engine.read(|db| notes::get(db, view, ids, false, extensions))
 }
 
 pub(crate) fn list_notes(engine: &mut impl Engine, query: &NoteListQuery) -> Result<NotePage, StoreError> {
-    engine.read(|db| listing::list(db, query))
+    let extensions = engine.extensions();
+    engine.read(|db| listing::list(db, query, extensions))
 }
 
 pub(crate) fn search(engine: &mut impl Engine, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
@@ -112,7 +115,70 @@ pub(crate) fn find_by_title(
     title: &str,
 ) -> Result<Option<Note>, StoreError> {
     let title = clean::title(title)?;
-    engine.read(|db| notes::find_by_title(db, target, &title))
+    let extensions = engine.extensions();
+    engine.read(|db| notes::find_by_title(db, target, &title, extensions))
+}
+
+/// Adds the schema extensions the database lacks (see [`schema::ensure_extensions`]) and reports
+/// whether it has them now. A database that refuses them is used without, with one line on stderr.
+pub(crate) fn install(engine: &mut impl Engine) -> bool {
+    match engine.read(schema::extensions_present) {
+        Ok(true) => return true,
+        Ok(false) => {}
+        Err(error) => {
+            warn_unavailable(&error);
+            return false;
+        }
+    }
+
+    match engine.write(schema::ensure_extensions) {
+        Ok(()) => true,
+        Err(error) => {
+            warn_unavailable(&error);
+            false
+        }
+    }
+}
+
+/// Fills `lang` of the notes an older server wrote, a page at a time and for at most
+/// [`BACKFILL_BUDGET`]; what is left waits for the next open. A failure is reported once.
+pub(crate) fn backfill(engine: &mut impl Engine) {
+    if !engine.extensions() {
+        return;
+    }
+
+    let deadline = Instant::now() + BACKFILL_BUDGET;
+
+    while Instant::now() < deadline {
+        let step = match engine.read(notes::has_pending_lang) {
+            Ok(true) => engine.write(|db| notes::fill_lang(db, BACKFILL_PAGE)),
+            Ok(false) => return,
+            Err(error) => Err(error),
+        };
+
+        match step {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error) => return warn_backfill(&error),
+        }
+    }
+}
+
+/// The English notes setting; on without extensions.
+pub(crate) fn english_notes(engine: &mut impl Engine) -> Result<bool, StoreError> {
+    if !engine.extensions() {
+        return Ok(true);
+    }
+
+    engine.read(settings::english_notes)
+}
+
+pub(crate) fn set_english_notes(engine: &mut impl Engine, on: bool) -> Result<(), StoreError> {
+    if !engine.extensions() {
+        return Err(unavailable_setting());
+    }
+
+    engine.write(|db| settings::set_english_notes(db, on))
 }
 
 /// Adds the schema extensions the database lacks (see [`schema::ensure_extensions`]) and reports

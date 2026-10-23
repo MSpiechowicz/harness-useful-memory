@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use postgres::{GenericClient, Row, Transaction};
 
 use super::search::fold;
-use super::{KIND_MAX, PATH_MAX, SOURCE_MAX, backend, column, cut, graph, now, target_project};
+use super::{KIND_MAX, LANG_MAX, PATH_MAX, SOURCE_MAX, backend, column, cut, graph, now, target_project};
 use super::{target_project_existing, view_params};
 use crate::limits::{BODY_MAX, ENTITY_MAX, GET_IDS_MAX, TAG_MAX, TAGS_MAX, TITLE_MAX};
 use crate::store::clean::{self, CleanDraft, CleanPatch};
@@ -13,21 +13,28 @@ use crate::store::{Forgotten, Note, NoteKind, Provenance, Saved, Scope, StoreErr
 use crate::support::lang;
 
 /// The columns [`note_from_row`] reads, from `notes n LEFT JOIN projects p`, with the text cut to
-/// the limits (see [`cut`]).
-fn note_columns() -> String {
-    columns(&cut("n.body", BODY_MAX))
+/// the limits (see [`cut`]). The last is the language, which a database without the schema
+/// extensions has no column for.
+fn note_columns(extensions: bool) -> String {
+    columns(&cut("n.body", BODY_MAX), extensions)
 }
 
 /// [`note_columns`] with an empty body, for lists.
-pub(super) fn row_columns() -> String {
-    columns("''")
+pub(super) fn row_columns(extensions: bool) -> String {
+    columns("''", extensions)
 }
 
 /// The columns of a note with `body` as its body.
-fn columns(body: &str) -> String {
+fn columns(body: &str, extensions: bool) -> String {
+    let lang = if extensions {
+        cut("n.lang", LANG_MAX)
+    } else {
+        "NULL::text".to_owned()
+    };
+
     format!(
         "n.id, n.project_id, {key}, {kind}, {title}, {body}, {tags}, {source}, \
-         n.created_at, n.updated_at, n.revision, n.hits, {root}, n.via_override",
+         n.created_at, n.updated_at, n.revision, n.hits, {root}, n.via_override, {lang}",
         key = cut("p.key", PATH_MAX),
         kind = cut("n.kind", KIND_MAX),
         title = cut("n.title", TITLE_MAX),
@@ -150,7 +157,7 @@ pub(super) fn update(
     patch: &CleanPatch,
     extensions: bool,
 ) -> Result<Saved, StoreError> {
-    let Some(note) = load(tx, view, id)? else {
+    let Some(note) = load(tx, view, id, false)? else {
         return Err(not_found(id));
     };
 
@@ -247,6 +254,7 @@ pub(super) fn get(
     view: &View,
     ids: &[i64],
     count: bool,
+    extensions: bool,
 ) -> Result<Vec<Note>, StoreError> {
     if ids.is_empty() || ids.len() > GET_IDS_MAX {
         return Err(StoreError::Invalid(format!("ids must list 1-{GET_IDS_MAX} note ids")));
@@ -259,7 +267,7 @@ pub(super) fn get(
             continue;
         }
 
-        let Some(note) = load(client, view, id)? else {
+        let Some(note) = load(client, view, id, extensions)? else {
             continue;
         };
 
@@ -276,7 +284,7 @@ pub(super) fn get(
 }
 
 pub(super) fn forget(tx: &mut Transaction<'_>, view: &View, id: i64) -> Result<usize, StoreError> {
-    if load(tx, view, id)?.is_none() {
+    if load(tx, view, id, false)?.is_none() {
         return Err(not_found(id));
     }
 
@@ -335,6 +343,7 @@ pub(super) fn find_by_title(
     client: &mut impl GenericClient,
     target: &Target,
     title: &str,
+    extensions: bool,
 ) -> Result<Option<Note>, StoreError> {
     let Some(project) = target_project_existing(client, target)? else {
         return Ok(None);
@@ -343,7 +352,7 @@ pub(super) fn find_by_title(
     let sql = format!(
         "SELECT {} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
          WHERE coalesce(n.project_id, 0) = $1 AND n.title_norm = $2",
-        note_columns()
+        note_columns(extensions)
     );
 
     let row = client
@@ -359,13 +368,18 @@ pub(super) fn find_by_title(
     Ok(Some(note))
 }
 
-/// The note `id` when it is visible in `view`.
-pub(super) fn load(client: &mut impl GenericClient, view: &View, id: i64) -> Result<Option<Note>, StoreError> {
+/// The note `id` when it is visible in `view`; its language is read only when `extensions`.
+pub(super) fn load(
+    client: &mut impl GenericClient,
+    view: &View,
+    id: i64,
+    extensions: bool,
+) -> Result<Option<Note>, StoreError> {
     let (repo, global) = view_params(client, view)?;
     let sql = format!(
         "SELECT {} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
          WHERE n.id = $1 AND {VISIBLE}",
-        note_columns()
+        note_columns(extensions)
     );
 
     let row = client.query_opt(&sql, &[&id, &repo, &global]).map_err(backend)?;
@@ -428,6 +442,9 @@ pub(super) fn note_from_row(row: &Row) -> Result<Note, StoreError> {
         updated_at: column(row, 9)?,
         revision: column(row, 10)?,
         hits: column(row, 11)?,
+        lang: column::<Option<String>>(row, 14)?
+            .as_deref()
+            .and_then(lang::Lang::parse),
     })
 }
 

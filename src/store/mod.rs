@@ -34,11 +34,13 @@ pub mod team_docs;
 
 use std::path::PathBuf;
 
+use crate::support::lang::Lang;
+
 pub use hidden::{HiddenEntry, HiddenNote, HiddenNotes, HiddenScripts};
 pub use hooks::{HookDelete, HookDraft, HookPage, HookPut, HookStore, TeamHook, checked_hook, hook_sha256};
 pub use lazy::Lazy;
 pub use libsql::LibsqlStore;
-pub use listing::{NoteListQuery, NotePage, NoteRow, NoteSort};
+pub use listing::{LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort};
 pub use mongo::MongoStore;
 pub use postgres::PostgresStore;
 pub use routines::{RoutineDelete, RoutineDraft, RoutinePage, RoutinePut, RoutineStore, TeamRoutine, checked_routine};
@@ -259,6 +261,9 @@ pub struct Note {
     pub updated_at: i64,
     pub revision: i64,
     pub hits: i64,
+    /// The language a store looked at: `None` when it did not (an older server wrote the note, or
+    /// the database has no `lang`) or was not certain.
+    pub lang: Option<Lang>,
 }
 
 /// The result of a write to a note.

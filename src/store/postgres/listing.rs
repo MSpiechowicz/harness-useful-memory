@@ -9,8 +9,8 @@ use super::notes::{VISIBLE, kind_from_sql, note_from_row, row_columns};
 use super::{KIND_MAX, backend, column, cut, view_params};
 use crate::limits::ENTITY_MAX;
 use crate::store::listing::{
-    NoteListQuery, NotePage, NoteRow, NoteSort, checked_exclude, direction, page_limit, query_entity, query_text,
-    scoped,
+    LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort, checked_exclude, direction, page_limit, query_entity,
+    query_text, scoped,
 };
 use crate::store::{NoteKind, Scope, StoreError};
 
@@ -20,14 +20,19 @@ const KEPT: &str = "($1::text IS NULL OR strpos(lower(n.title), lower($1::text))
                     AND ($4::text IS NULL OR EXISTS (SELECT 1 FROM note_entities ne JOIN entities e ON e.id = ne.entity_id
                                                      WHERE ne.note_id = n.id AND e.name_norm = $4::text))";
 
-pub(super) fn list(client: &mut impl GenericClient, query: &NoteListQuery) -> Result<NotePage, StoreError> {
+pub(super) fn list(
+    client: &mut impl GenericClient,
+    query: &NoteListQuery,
+    extensions: bool,
+) -> Result<NotePage, StoreError> {
     let text = query_text(query)?;
     let entity = query_entity(query);
     let exclude = checked_exclude(&query.exclude)?.to_vec();
     let (repo, global) = view_params(client, &query.view)?;
+    let lang = LangFilter::condition(query.lang, "n.lang", extensions);
 
     let counts_sql = format!(
-        "SELECT {}, n.project_id IS NULL, count(*) FROM notes n WHERE {VISIBLE} AND {KEPT}
+        "SELECT {}, n.project_id IS NULL, count(*) FROM notes n WHERE {VISIBLE} AND {KEPT} AND {lang}
            AND n.id <> ALL($5::bigint[])
          GROUP BY n.kind, n.project_id IS NULL",
         cut("n.kind", KIND_MAX)
@@ -55,9 +60,9 @@ pub(super) fn list(client: &mut impl GenericClient, query: &NoteListQuery) -> Re
     };
     let sql = format!(
         "SELECT {} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
-         WHERE {VISIBLE} AND {KEPT} AND ($5::text IS NULL OR n.kind = $5::text) AND n.id <> ALL($8::bigint[])
+         WHERE {VISIBLE} AND {KEPT} AND {lang} AND ($5::text IS NULL OR n.kind = $5::text) AND n.id <> ALL($8::bigint[])
          ORDER BY {order} LIMIT $6 OFFSET $7",
-        row_columns()
+        row_columns(extensions)
     );
 
     let limit = i64::try_from(page_limit(query)).unwrap_or(1);

@@ -13,7 +13,9 @@ use crate::cli;
 use crate::limits::GET_IDS_MAX;
 use crate::store::listing::{compare, page_limit};
 use crate::store::split::is_local_id;
-use crate::store::{HiddenNote, MemoryStore, Note, NoteListQuery, NotePage, NoteRow, Scope, StoreError, clean};
+use crate::store::{
+    HiddenNote, LangFilter, MemoryStore, Note, NoteListQuery, NotePage, NoteRow, Scope, StoreError, clean,
+};
 
 /// `notes hide <id>`.
 pub(super) fn hide(args: &[Option<&str>]) -> ExitCode {
@@ -167,6 +169,7 @@ pub(super) fn page(opened: &mut Opened, query: &NoteListQuery) -> Result<NotePag
     let kept: Vec<Note> = notes
         .into_iter()
         .filter(|note| text.is_empty() || contains(note, &text))
+        .filter(|note| LangFilter::keeps(query.lang, note.lang))
         .filter(|note| {
             entity
                 .as_ref()

@@ -16,6 +16,7 @@ mod approval;
 mod blocks;
 mod calls;
 mod calls_scripts;
+mod english;
 mod guard_repos;
 mod guards;
 mod hold;
@@ -68,6 +69,9 @@ pub struct Server {
     trust_team_scripts: bool,
     projects: ProjectResolver,
     client: Option<String>,
+    /// Whether the English notes setting was on when the client initialized (`false` when it was
+    /// off or could not be read); the instructions and tool descriptions follow it.
+    english: bool,
     /// Stops the script running now ([`input`]).
     stop: Stop,
 }
@@ -100,6 +104,7 @@ impl Server {
             trust_team_scripts: false,
             projects,
             client: None,
+            english: false,
             stop: Stop::default(),
         }
     }
@@ -212,10 +217,11 @@ impl Server {
                     .pointer("/clientInfo/name")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                protocol::result(id, protocol::initialize_result(&params))
+                self.english = self.store.english_notes().unwrap_or(false);
+                protocol::result(id, protocol::initialize_result(&params, self.english))
             }
             "ping" => protocol::result(id, json!({})),
-            "tools/list" => protocol::result(id, tools::definitions()),
+            "tools/list" => protocol::result(id, tools::definitions(self.english)),
             "tools/call" => self.tools_call(id, &params),
             _ => protocol::error(id, METHOD_NOT_FOUND, "Method not found"),
         };

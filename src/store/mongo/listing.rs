@@ -9,7 +9,8 @@ use super::scripts::literal_pattern;
 use super::{Ctx, ENTITIES, ENTITY_NORM_MAX, Fail, NOTES, cut, int, note_fields, scope_value, text, visible};
 use crate::limits::{ENTITY_MAX, TITLE_MAX};
 use crate::store::listing::{
-    NoteListQuery, NotePage, NoteRow, NoteSort, checked_exclude, page_limit, query_entity, query_text, scoped,
+    LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort, checked_exclude, page_limit, query_entity, query_text,
+    scoped,
 };
 use crate::store::{NoteKind, Scope, View};
 
@@ -36,6 +37,20 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage,
 
     if let Some(entity) = query_entity(query) {
         kept.insert("entities", entity);
+    }
+
+    match query.lang {
+        None => {}
+        Some(LangFilter::En) => {
+            kept.insert("lang", "en");
+        }
+        Some(LangFilter::Other) => {
+            kept.insert("lang", "other");
+        }
+        // Matches a missing field and null too.
+        Some(LangFilter::Unknown) => {
+            kept.insert("lang", doc! { "$nin": ["en", "other"] });
+        }
     }
 
     let exclude = checked_exclude(&query.exclude)?;

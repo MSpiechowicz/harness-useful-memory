@@ -275,7 +275,8 @@ fn lists_gets_and_deletes(folders: &Folders, repo_place: &str, global_place: &st
             "createdAt",
             "updatedAt",
             "revision",
-            "hits"
+            "hits",
+            "lang"
         ]
     );
     assert_eq!(flaky_row["id"], flaky);
@@ -860,6 +861,17 @@ fn bad_usage_exits_2() {
         &["notes", "list", "--json", "--place", "Local"],
         &["notes", "list", "--json", "--place"],
         &["notes", "list", "--json", "--place", "local", "--place", "local"],
+        &["notes", "list", "--json", "--lang", "polish"],
+        &["notes", "list", "--json", "--lang", "EN"],
+        &["notes", "list", "--json", "--lang"],
+        &["notes", "list", "--json", "--lang", "en", "--lang", "en"],
+        &["settings"],
+        &["settings", "get"],
+        &["settings", "set", "english_notes=true"],
+        &["settings", "set", "english_notes=maybe", "--json"],
+        &["settings", "set", "english_notes", "--json"],
+        &["settings", "set", "other=true", "--json"],
+        &["settings", "get", "extra", "--json"],
         &["notes", "get", "1"],
         &["notes", "get", "x", "--json"],
         &["notes", "delete"],
@@ -879,7 +891,7 @@ fn bad_usage_exits_2() {
         let output = folders.cli(args);
         assert_eq!(output.status.code(), Some(2), "{args:?}");
         assert!(
-            stderr(&output).starts_with("usage: harness-memory notes"),
+            stderr(&output).starts_with("usage: harness-memory"),
             "{}",
             stderr(&output)
         );
@@ -1300,4 +1312,167 @@ fn keeps_hidden_notes_when_unreadable(url: &str) {
     let shown = folders.widget_list(&[]);
     assert_eq!(titles(&shown), ["Shown here"]);
     assert_eq!(shown["hiddenCount"], 1, "the hidden team note is still there");
+}
+
+const ENGLISH_BODY: &str = "The sync job reads every changed note from the team database, then writes the new revision \
+                            to the local cache so the next search finds it without another round trip.";
+
+const POLISH_BODY: &str = "Zadanie synchronizacji czyta każdą zmienioną notatkę z bazy zespołu, a potem zapisuje nową \
+                           wersję w lokalnej pamięci podręcznej, żeby następne wyszukiwanie znalazło ją od razu.";
+
+/// `notes save --json --project <widget>` of a global note.
+fn user_saves(folders: &Folders, title: &str, body: &str) -> (Value, String) {
+    let note = json!({ "title": title, "body": body, "kind": "note", "scope": "global" });
+    let output = folders.cli_with_input(
+        &["notes", "save", "--json", "--project", &folders.widget_project()],
+        &note.to_string(),
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    (serde_json::from_str(&stdout(&output)).expect("JSON"), stderr(&output))
+}
+
+fn languages(listing: &Value) -> Vec<(&str, Value)> {
+    listing["notes"]
+        .as_array()
+        .expect("notes")
+        .iter()
+        .map(|note| (note["title"].as_str().expect("title"), note["lang"].clone()))
+        .collect()
+}
+
+/// A user's note that is not in English is saved with a warning, never refused, and lists with its
+/// `lang`; `--lang` keeps one language; the setting off silences the warning.
+fn user_saves_and_lists_by_language(folders: &Folders) {
+    assert_eq!(
+        folders.json(&["settings", "get", "--json"]),
+        json!({ "english_notes": true })
+    );
+
+    let (polish, warned) = user_saves(folders, "Synchronizacja notatek", POLISH_BODY);
+    assert_eq!(polish["warning"], "not-english", "{polish}");
+    assert!(
+        warned.contains("harness-memory: this note is not in English"),
+        "{warned}"
+    );
+
+    let (english, quiet) = user_saves(folders, "Sync job", ENGLISH_BODY);
+    assert!(english.get("warning").is_none(), "{english}");
+    assert!(!quiet.contains("not in English"), "{quiet}");
+
+    let (short, quiet) = user_saves(folders, "ok", "x");
+    assert!(short.get("warning").is_none() && !quiet.contains("not in English"));
+
+    let listing = folders.widget_list(&["--sort", "title"]);
+    assert_eq!(
+        languages(&listing),
+        [
+            ("ok", Value::Null),
+            ("Sync job", json!("en")),
+            ("Synchronizacja notatek", json!("other")),
+        ]
+    );
+
+    for (lang, expected) in [
+        ("en", "Sync job"),
+        ("other", "Synchronizacja notatek"),
+        ("unknown", "ok"),
+    ] {
+        let kept = folders.widget_list(&["--lang", lang]);
+        assert_eq!(titles(&kept), [expected], "--lang {lang}");
+        assert_eq!(kept["total"], 1);
+        assert_eq!(kind_count(&kept, "note"), 1);
+    }
+
+    let id = polish["id"].to_string();
+    let got = folders.json(&["notes", "get", &id, "--json", "--project", &folders.widget_project()]);
+    assert_eq!(got["note"]["lang"], "other");
+
+    let off = folders.json(&["settings", "set", "english_notes=false", "--json"]);
+    assert_eq!(off, json!({ "english_notes": false }));
+    assert_eq!(
+        folders.json(&["settings", "get", "--json"]),
+        json!({ "english_notes": false })
+    );
+
+    let (silent, quiet) = user_saves(folders, "Inna notatka", POLISH_BODY);
+    assert!(silent.get("warning").is_none() && !quiet.contains("not in English"));
+
+    // The list still tells the language.
+    assert_eq!(folders.widget_list(&["--lang", "other"])["total"], 2);
+
+    let on = folders.json(&["settings", "set", "english_notes=true", "--json"]);
+    assert_eq!(on, json!({ "english_notes": true }));
+}
+
+#[test]
+fn user_notes_in_another_language_warn_and_list_by_language() {
+    user_saves_and_lists_by_language(&folders());
+
+    for (url, _kept) in team_urls() {
+        user_saves_and_lists_by_language(&folders().on_team(&url, None));
+    }
+}
+
+#[test]
+fn the_setting_is_kept_where_notes_are_saved() {
+    let split = |url: &str| folders().on_team(url, Some(("local", "remote")));
+
+    for (url, _kept) in team_urls() {
+        let folders = split(&url);
+        folders.json(&["settings", "set", "english_notes=false", "--json"]);
+
+        // A split store keeps it in the team database (global notes go there) and the local file.
+        let mut local = SqliteStore::open(&folders.data.join("memory.sqlite3")).expect("local");
+        assert!(!local.english_notes().expect("local setting"));
+
+        let again = split(&url);
+        assert_eq!(
+            again.json(&["settings", "get", "--json"]),
+            json!({ "english_notes": false })
+        );
+    }
+}
+
+#[test]
+fn the_language_filter_pages_over_many_notes() {
+    let folders = folders();
+    let mut store = SqliteStore::open(&folders.data.join("memory.sqlite3")).expect("store");
+
+    for index in 0..230 {
+        let polish = index % 10 != 0;
+        let draft = NoteDraft {
+            title: format!("Note {index}"),
+            body: if polish { POLISH_BODY } else { ENGLISH_BODY }.to_owned(),
+            kind: NoteKind::Note,
+            tags: Vec::new(),
+            entities: Vec::new(),
+            provenance: Provenance::default(),
+        };
+        store.remember(&Target::Global, &draft).expect("remember");
+    }
+    drop(store);
+
+    let first = folders.json(&["notes", "list", "--json", "--lang", "other", "--limit", "200"]);
+    let second = folders.json(&[
+        "notes", "list", "--json", "--lang", "other", "--offset", "200", "--limit", "200",
+    ]);
+    assert_eq!(
+        (first["total"].clone(), second["total"].clone()),
+        (json!(207), json!(207))
+    );
+    assert_eq!(
+        (
+            first["notes"].as_array().map(Vec::len),
+            second["notes"].as_array().map(Vec::len)
+        ),
+        (Some(200), Some(7))
+    );
+
+    let english = folders.json(&["notes", "list", "--json", "--lang", "en", "--limit", "200"]);
+    assert_eq!(english["total"], 23);
+    assert_eq!(
+        folders.json(&["notes", "list", "--json", "--lang", "unknown"])["total"],
+        0
+    );
 }
