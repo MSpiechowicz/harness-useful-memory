@@ -3,9 +3,12 @@
 
 mod common;
 
+#[cfg(unix)]
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+#[cfg(unix)]
+use std::process::Stdio;
+use std::process::{Command, Output};
 
 use common::stdio::{BINARY, without_team_settings};
 use serde_json::Value;

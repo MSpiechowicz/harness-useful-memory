@@ -398,22 +398,34 @@ impl Server {
 
 /// Starts listening at `endpoint`: the socket is `0600` on Unix, the pipe open to this user and
 /// SYSTEM only on Windows.
+#[cfg(unix)]
 fn listen(endpoint: &Endpoint) -> std::io::Result<interprocess::local_socket::Listener> {
-    let options = ListenerOptions::new().name(endpoint.name()?);
+    use interprocess::os::unix::local_socket::ListenerOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
 
-    #[cfg(unix)]
-    let options = {
-        use interprocess::os::unix::local_socket::ListenerOptionsExt;
-        options.mode(0o600)
-    };
+    match ListenerOptions::new().name(endpoint.name()?).mode(0o600).create_sync() {
+        // macOS cannot set a socket's mode before `bind()`. The socket's folder is already private
+        // to this user (the data folder or a 0700 folder of its own), so the mode is set right after.
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+            let listener = ListenerOptions::new().name(endpoint.name()?).create_sync()?;
+            std::fs::set_permissions(endpoint.path(), std::fs::Permissions::from_mode(0o600))?;
 
-    #[cfg(windows)]
-    let options = {
-        use interprocess::os::windows::local_socket::ListenerOptionsExt;
-        options.security_descriptor(super::pipe::only_this_user()?)
-    };
+            Ok(listener)
+        }
+        result => result,
+    }
+}
 
-    options.create_sync()
+/// Starts listening at `endpoint`: the socket is `0600` on Unix, the pipe open to this user and
+/// SYSTEM only on Windows.
+#[cfg(windows)]
+fn listen(endpoint: &Endpoint) -> std::io::Result<interprocess::local_socket::Listener> {
+    use interprocess::os::windows::local_socket::ListenerOptionsExt;
+
+    ListenerOptions::new()
+        .name(endpoint.name()?)
+        .security_descriptor(super::pipe::only_this_user()?)
+        .create_sync()
 }
 
 /// Removes the socket file left by an embedder that was killed. Anything that is not a socket is
