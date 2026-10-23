@@ -142,15 +142,21 @@ fn note_search() -> Value {
     tool(
         "note_search",
         "Call FIRST at the start of every task: returns known fixes, decisions and file locations for this \
-         repository. Find notes by a few keywords; repository notes are listed before global ones, and without \
-         a query the most recent notes are listed. A message that starts with a `<harness-memory-recall>` block \
+         repository. Search with a few specific keywords from the task (they match by word and by meaning), \
+         not an empty query: an empty query only lists the most recent notes. This repository's notes rank above \
+         equally relevant global ones. A message that starts with a `<harness-memory-recall>` block \
          already carries the notes found for that message: search further only if needed. Saved scripts whose \
          name or description match the keywords are listed after the notes: prefer script_run to retyping them.",
         json!({
-            "query": text(&format!("A few keywords (at most {QUERY_MAX} characters)")),
+            "query": text(&format!("A few specific keywords from the task (at most {QUERY_MAX} characters)")),
             "scope": scope(true, "both"),
             "kind": kind(),
-            "limit": { "type": "integer", "minimum": 1, "maximum": SEARCH_LIMIT_MAX, "description": "Rows (default 8)" },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": SEARCH_LIMIT_MAX,
+                "description": format!("Rows (default 8, at most {SEARCH_LIMIT_MAX})")
+            },
             "project_path": project_path(),
             "same_checkout": {
                 "type": "boolean",
