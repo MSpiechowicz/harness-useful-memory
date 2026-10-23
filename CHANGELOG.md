@@ -1,3 +1,26 @@
+# [2.8.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.7.0...v2.8.0) (2026-10-23)
+
+
+### Bug Fixes
+
+* **embedder:** listen on macOS and build tests on Windows ([7a5f43c](https://github.com/MSpiechowicz/harness-useful-memory/commit/7a5f43c4d9e6ca74b560642051b866a6dc30bff0))
+* **embedder:** never chmod a socket folder by path, exact abandoned-call count ([d2d7d6d](https://github.com/MSpiechowicz/harness-useful-memory/commit/d2d7d6dfe2821530f51ddd421539f374cb9e7019))
+* **embedder:** open the lock file read-write so Windows can lock it ([dfdf27a](https://github.com/MSpiechowicz/harness-useful-memory/commit/dfdf27a31780c6de82ec494643891588749582f2))
+* **embedder:** review round 1 repairs ([19a8d16](https://github.com/MSpiechowicz/harness-useful-memory/commit/19a8d165e15a57e315c976b6a882a4d68de0d943))
+* **embedder:** security review repairs ([96e053a](https://github.com/MSpiechowicz/harness-useful-memory/commit/96e053ad98c059f9279380aab78d4bef11294465))
+* **mcp:** note_search asks for specific keywords, not an empty query ([b93001c](https://github.com/MSpiechowicz/harness-useful-memory/commit/b93001c2892aa74b0c8c0f077069c37855d40613))
+
+
+### Features
+
+* **embedder:** shared local embedder with vector cache and socket ([20c9840](https://github.com/MSpiechowicz/harness-useful-memory/commit/20c9840332f88718a58518d8ac1b7452db72adda))
+* **notes:** English notes setting, refusal of non-English agent saves and lang filter ([a30529c](https://github.com/MSpiechowicz/harness-useful-memory/commit/a30529c3b7c0d75926fe11921998c7e8919ead55))
+* **search:** hybrid memory search, shared embedder and English notes ([0cf13eb](https://github.com/MSpiechowicz/harness-useful-memory/commit/0cf13eba5beb0c423f893871e13ec9e688448a27))
+* **search:** hybrid note_search with the shared embedder ([edc0b0d](https://github.com/MSpiechowicz/harness-useful-memory/commit/edc0b0d7660c6f05cf45ac9f6fe5af1a24828b97))
+* **search:** stemmed keyword search, one ranking for repository and global notes ([cea196d](https://github.com/MSpiechowicz/harness-useful-memory/commit/cea196d340ccd9e7eb77329651bb7b03949f7ffa))
+* **store:** additive search extensions, note language and store settings ([c0a7e07](https://github.com/MSpiechowicz/harness-useful-memory/commit/c0a7e0772ec54edb269246806380388a6397f8c8))
+* **store:** additive search extensions, note language and store settings ([7a3750f](https://github.com/MSpiechowicz/harness-useful-memory/commit/7a3750fdbffea59c2c245112252a22e6a9c15df7))
+
 # [2.7.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.6.1...v2.7.0) (2026-10-21)
 
 
