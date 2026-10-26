@@ -163,6 +163,12 @@ fn a_repository_turned_off_refuses_its_chats_writes_global_ones_included() {
     named["project_path"] = json!(root);
     assert_eq!(reason(&tool(&mut elsewhere, "note_save", named)), "repo-off");
 
+    // A server that runs inside the repository (one shared by chats of several projects starts in
+    // the first's folder) does not turn off a call that names another project.
+    let mut other = note("Other project");
+    other["project_path"] = json!(guarded.work().to_string_lossy());
+    saved(&tool(&mut in_repo, "note_save", other));
+
     // Outside it, global notes save, and the repository's scripts are not turned off.
     saved(&tool(&mut elsewhere, "note_save", global));
     saved(&tool(&mut in_repo, "script_save", script("hello")));

@@ -1,8 +1,8 @@
 //! Whether a repository turned off in `guards/global.json` (`offRepos`) is the repository of a
 //! guarded call (see [`super::guards`]).
 //!
-//! The call's repositories are the git root of the resolved `project_path`, that of the server's
-//! working folder, and the chat's project root from its guard file. One is off when its canonical
+//! The call's repositories are the git root of the resolved `project_path` (the server's working
+//! folder when the call names none), and the chat's project root from its guard file. One is off when its canonical
 //! root is an `offRepos` entry (compared as canonical paths), or when its project key
 //! (`git:<remote>`, see [`crate::project`]) is that of an entry: another clone or a git worktree
 //! of a repository turned off is off too. A chat root at the home folder, which has no project
@@ -88,8 +88,9 @@ impl<'a> Repos<'a> {
     }
 }
 
-/// The projects of a call with `arguments`: that of its `project_path` (when given and usable),
-/// then that of the server's working folder, each once.
+/// The projects of a call with `arguments`: that of its `project_path` when given and usable, else
+/// that of the server's working folder. A server shared by chats of several projects runs in the
+/// folder of the first, which says nothing about a call that names its own project.
 pub(super) fn chat_repos(server: &mut Server, arguments: &Value) -> Vec<ProjectKey> {
     let project_path = arguments.get("project_path").and_then(Value::as_str);
     let mut projects: Vec<ProjectKey> = Vec::new();
@@ -100,8 +101,8 @@ pub(super) fn chat_repos(server: &mut Server, arguments: &Value) -> Vec<ProjectK
         projects.push(project);
     }
 
-    if let Ok(Some(project)) = server.projects.resolve(None)
-        && !projects.iter().any(|known| known.root == project.root)
+    if projects.is_empty()
+        && let Ok(Some(project)) = server.projects.resolve(None)
     {
         projects.push(project);
     }

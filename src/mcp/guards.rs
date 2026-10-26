@@ -9,8 +9,8 @@
 //!
 //! 1. `guards/global.json` next to the database: the kind paused everywhere, then the kind turned
 //!    off for the chat's repository (`offRepos`, canonical git roots). The chat's repository is
-//!    the git root of the resolved `project_path`, that of the server's working folder, and the
-//!    `repoRoot` of the chat's file (below): any one turned off, by its root or by its project
+//!    the git root of the resolved `project_path` (that of the server's working folder when the
+//!    call names none), and the `repoRoot` of the chat's file (below): any one turned off, by its root or by its project
 //!    key ([`super::guard_repos`]), refuses, so global-scope writes from that repository, and
 //!    writes from another clone or worktree of it, are refused too.
 //! 2. Without [`SESSION_VAR`] nothing more applies. A value that is not a lowercase UUID refuses.
