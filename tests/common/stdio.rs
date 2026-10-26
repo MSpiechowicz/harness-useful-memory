@@ -48,7 +48,14 @@ pub fn without_team_settings(command: &mut Command) {
     }
 
     let nowhere = std::env::temp_dir().join("harness-memory-tests-no-config");
-    for name in ["XDG_CONFIG_HOME", "APPDATA"] {
+    // macOS reads the config file from `~/Library/Application Support`, which only HOME moves.
+    let homes: &[&str] = if cfg!(target_os = "macos") {
+        &["XDG_CONFIG_HOME", "APPDATA", "HOME"]
+    } else {
+        &["XDG_CONFIG_HOME", "APPDATA"]
+    };
+
+    for name in homes {
         if unchosen(name) {
             command.env(name, &nowhere);
         }

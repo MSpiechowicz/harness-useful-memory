@@ -114,8 +114,7 @@ impl Opened {
 
     /// Prints `message` without the database credentials; exit 1.
     pub fn failed(&self, message: &str) -> ExitCode {
-        eprintln!("harness-memory: {}", self.secrets.scrub(message));
-        ExitCode::FAILURE
+        cli::failed(&self.secrets.scrub(message))
     }
 }
 

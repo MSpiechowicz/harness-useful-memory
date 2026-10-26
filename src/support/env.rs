@@ -47,6 +47,9 @@ pub const CAPTURED_VARS: &[&str] = &[
     // The same for team routines (see `crate::backend::ROUTINES_VAR`).
     "HARNESS_MEMORY_ROUTINES",
     "HARNESS_MEMORY_TRUST_TEAM_ROUTINES",
+    // Whether `remote` scopes fall back to this computer while the team database is unreachable
+    // (see `crate::backend::OFFLINE_FALLBACK_VAR`).
+    "HARNESS_MEMORY_OFFLINE_FALLBACK",
     // The user name, the default author of a team hook or routine (`hooks put`, `routines put`,
     // `routines delete --mine`).
     "USER",

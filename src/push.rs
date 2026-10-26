@@ -35,6 +35,8 @@
 //! (only added notes get the local ones; at most [`ENTITIES_PER_NOTE`] of them).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+
+use crate::store::pending::Entry;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags};
@@ -261,6 +263,29 @@ pub fn push(
     hidden: &[i64],
     options: &Options,
 ) -> Result<Summary, StoreError> {
+    push_ids(local, remote, hidden, options, None)
+}
+
+/// Like [`push`], but only the local notes `only` names (an id, scope and title that all match), with
+/// their relations: the offline fallback copies what it saved while the team database was
+/// unreachable (see [`crate::store::pending`]).
+pub fn push_only(
+    local: &Path,
+    remote: &mut dyn MemoryStore,
+    hidden: &[i64],
+    options: &Options,
+    only: &[Entry],
+) -> Result<Summary, StoreError> {
+    push_ids(local, remote, hidden, options, Some(only))
+}
+
+fn push_ids(
+    local: &Path,
+    remote: &mut dyn MemoryStore,
+    hidden: &[i64],
+    options: &Options,
+    only: Option<&[Entry]>,
+) -> Result<Summary, StoreError> {
     let (notes, links) = read_local(local)?;
     let mut summary = Summary::default();
     let mut remote_ids: HashMap<i64, i64> = HashMap::new();
@@ -268,7 +293,16 @@ pub fn push(
     let mut failed_notes: HashSet<i64> = HashSet::new();
     let mut left_hidden: HashSet<i64> = HashSet::new();
 
-    for note in notes.iter().filter(|note| options.takes(&note.target)) {
+    let chosen = |note: &LocalNote| {
+        only.is_none_or(|entries| {
+            entries.iter().any(|entry| {
+                entry.id == note.id && entry.name == note.title && entry.scope == scope_label(&note.target)
+            })
+        })
+    };
+    let chosen_ids: HashSet<i64> = notes.iter().filter(|note| chosen(note)).map(|note| note.id).collect();
+
+    for note in notes.iter().filter(|note| options.takes(&note.target) && chosen(note)) {
         summary.projects.insert(scope_label(&note.target));
 
         match push_note(remote, hidden, note, options, &mut summary) {
@@ -298,7 +332,9 @@ pub fn push(
 
     let mut relations_failed = false;
 
-    for local_link in links.iter().filter(|link| options.takes(&link.target)) {
+    for local_link in links.iter().filter(|link| {
+        options.takes(&link.target) && only.is_none_or(|_| link.link.note_id.is_some_and(|id| chosen_ids.contains(&id)))
+    }) {
         summary.projects.insert(scope_label(&local_link.target));
 
         let note_id = local_link.link.note_id;
@@ -680,7 +716,7 @@ fn relation_failure(link: &Link, error: &StoreError) -> Failure {
 }
 
 /// The repository key of `target`, or [`GLOBAL`].
-fn scope_label(target: &Target) -> String {
+pub(crate) fn scope_label(target: &Target) -> String {
     match target {
         Target::Repo(key) => key.key.clone(),
         Target::Global => GLOBAL.to_owned(),

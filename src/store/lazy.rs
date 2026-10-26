@@ -2,6 +2,7 @@
 //! to the team database for them nor creates the local file (nor, with every note scope in the
 //! team database, opens the local notes store it never reads).
 
+use super::Reach;
 use super::{Edge, Forget, Forgotten, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NoteListQuery, NotePage};
 use super::{NotePatch, NoteText, Saved, SearchQuery, VectorTarget};
 use super::{PreviousVersion, TrustRecord, TrustStore, TrustedVersion, View};
@@ -17,6 +18,7 @@ type Opener<S> = Box<dyn FnMut() -> Result<Box<S>, String> + Send>;
 pub struct Lazy<S: ?Sized> {
     open: Opener<S>,
     store: Option<Box<S>>,
+    reach: Option<Reach>,
 }
 
 impl<S: ?Sized> std::fmt::Debug for Lazy<S> {
@@ -33,17 +35,49 @@ impl<S: ?Sized> Lazy<S> {
         Self {
             open: Box::new(open),
             store: None,
+            reach: None,
         }
+    }
+
+    /// The store recording its opens in `reach`: a failed open starts the cooldown of the reach,
+    /// during which the open is not tried again and the failure is repeated at once.
+    pub fn with_reach(mut self, reach: Reach) -> Self {
+        self.reach = Some(reach);
+        self
     }
 
     /// The open store, opening it first when needed.
     fn store(&mut self) -> Result<&mut S, StoreError> {
         let store = match self.store.take() {
             Some(store) => store,
-            None => (self.open)().map_err(StoreError::Backend)?,
+            None => self.open_store()?,
         };
 
         Ok(&mut **self.store.insert(store))
+    }
+
+    /// Opens the store, unless the reach says the last open failed a moment ago.
+    fn open_store(&mut self) -> Result<Box<S>, StoreError> {
+        if let Some(message) = self.reach.as_ref().and_then(Reach::cooling) {
+            return Err(StoreError::Backend(message));
+        }
+
+        match (self.open)() {
+            Ok(store) => {
+                if let Some(reach) = &self.reach {
+                    reach.opened();
+                }
+
+                Ok(store)
+            }
+            Err(message) => {
+                if let Some(reach) = &self.reach {
+                    reach.failed(&message);
+                }
+
+                Err(StoreError::Backend(message))
+            }
+        }
     }
 }
 
@@ -80,6 +114,10 @@ impl ScriptStore for Lazy<dyn ScriptStore> {
         self.store
             .as_ref()
             .map_or(ScriptOrigin::Single, |store| store.origin(id))
+    }
+
+    fn ready(&mut self) -> bool {
+        self.store().is_ok()
     }
 }
 
@@ -158,6 +196,10 @@ impl MemoryStore for Lazy<dyn MemoryStore> {
 
     fn set_english_notes(&mut self, on: bool) -> Result<(), StoreError> {
         self.store()?.set_english_notes(on)
+    }
+
+    fn ready(&mut self) -> bool {
+        self.store().is_ok()
     }
 }
 

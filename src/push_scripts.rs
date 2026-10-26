@@ -33,6 +33,7 @@ use std::path::Path;
 use crate::backend::LOCAL_KEY;
 use crate::push::{Action, Failure, Options, Overwrite};
 use crate::store::hidden::view_of;
+use crate::store::pending::Entry;
 use crate::store::split::narrow_by;
 use crate::store::split_scripts::hidden_name_error;
 use crate::store::{
@@ -112,6 +113,28 @@ pub fn push_scripts(
     trust: &mut dyn TrustStore,
     options: &Options,
 ) -> Result<ScriptPush, StoreError> {
+    push_ids(local, team, trust, options, None)
+}
+
+/// Like [`push_scripts`], but only the local scripts `only` names (the offline fallback copies
+/// what it saved while the team database was unreachable; see [`crate::store::pending`]).
+pub fn push_scripts_only(
+    local: &Path,
+    team: &mut TeamScripts,
+    trust: &mut dyn TrustStore,
+    options: &Options,
+    only: &[Entry],
+) -> Result<ScriptPush, StoreError> {
+    push_ids(local, team, trust, options, Some(only))
+}
+
+fn push_ids(
+    local: &Path,
+    team: &mut TeamScripts,
+    trust: &mut dyn TrustStore,
+    options: &Options,
+    only: Option<&[Entry]>,
+) -> Result<ScriptPush, StoreError> {
     let scripts = read_local(local)?;
     let mut summary = ScriptPush::default();
 
@@ -121,7 +144,15 @@ pub fn push_scripts(
             None => Target::Global,
         };
 
-        if !options.takes(&target) {
+        let skipped = only.is_some_and(|entries| {
+            !entries.iter().any(|entry| {
+                entry.id == script.summary.id
+                    && entry.name == script.summary.name
+                    && entry.scope == crate::push::scope_label(&target)
+            })
+        });
+
+        if !options.takes(&target) || skipped {
             continue;
         }
 

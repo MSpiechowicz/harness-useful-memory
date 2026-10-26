@@ -104,6 +104,11 @@ pub(crate) fn list(args: &[Option<&str>]) -> ExitCode {
         return opened.failed(&error.to_string());
     }
 
+    // The scripts shown are this computer's while the team database cannot be reached.
+    if opened.scripts.offline() {
+        shown["offline"] = json!(true);
+    }
+
     println!("{shown}");
     ExitCode::SUCCESS
 }

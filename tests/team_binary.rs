@@ -92,20 +92,68 @@ fn stderr(output: &Output) -> String {
 }
 
 #[test]
-fn an_unreachable_team_database_stops_the_server_without_showing_the_password() {
+fn an_unreachable_team_database_keeps_the_server_up_and_fails_its_tools_without_the_password() {
     let machine = machine();
     let url = "postgres://alice:hunter2secret@127.0.0.1:1/memory?connect_timeout=2";
-    let output = run(binary(&machine, &["mcp"], Some(url)));
-
-    assert!(!output.status.success());
-    let message = stderr(&output);
-    assert!(
-        message.contains("cannot open the team database (PostgreSQL at postgres://alice@127.0.0.1:1/memory?…)"),
-        "{message}"
+    let input = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"note_search","arguments":{"query":"x"}}}"#,
+        "\n",
     );
-    assert!(!message.contains("hunter2secret"), "{message}");
-    assert!(output.stdout.is_empty());
+    let mut command = binary(&machine, &["mcp"], Some(url));
+    command.env("HARNESS_MEMORY_OFFLINE_FALLBACK", "0");
+    let output = run_with_input(command, input);
+
+    assert!(output.status.success(), "the server answers instead of exiting");
+    let replies = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        replies.contains(r#""id":1"#) && replies.contains("serverInfo"),
+        "{replies}"
+    );
+    assert!(
+        replies.contains("cannot open the team database (PostgreSQL at postgres://alice@127.0.0.1:1/memory?…)"),
+        "{replies}"
+    );
+    assert!(!replies.contains("hunter2secret"), "{replies}");
+    assert!(!stderr(&output).contains("hunter2secret"), "{}", stderr(&output));
     assert!(!machine.memory.exists(), "no local database is made instead");
+}
+
+#[test]
+fn an_unreachable_team_database_is_served_from_this_computer_by_default() {
+    let machine = machine();
+    let url = "postgres://alice:hunter2secret@127.0.0.1:1/memory?connect_timeout=2";
+    let call = |id: u32, name: &str, arguments: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{name}","arguments":{arguments}}}}}"#
+        )
+    };
+    let input = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#.to_owned(),
+        call(2, "note_save", r#"{"title":"offline note","body":"saved while the team database is down","kind":"note","scope":"global"}"#),
+        call(3, "note_search", r#"{"query":"offline note"}"#),
+    ]
+    .join("\n")
+        + "\n";
+
+    let output = run_with_input(binary(&machine, &["mcp"], Some(url)), &input);
+    let replies = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    assert!(output.status.success());
+    assert!(replies.contains("created note"), "{replies}");
+    assert!(replies.contains("offline note"), "{replies}");
+    assert!(
+        replies.contains("Offline: the team database is unreachable"),
+        "{replies}"
+    );
+    assert!(!replies.contains(r#""isError":true"#), "{replies}");
+    assert!(!replies.contains("hunter2secret"), "{replies}");
+    assert!(!stderr(&output).contains("hunter2secret"), "{}", stderr(&output));
+    assert!(
+        machine.memory.join("pending-sync.json").is_file(),
+        "the note waits to be copied"
+    );
 }
 
 #[test]
@@ -121,17 +169,22 @@ fn bad_team_settings_stop_the_server() {
     );
     assert!(!stderr(&scheme).contains("hunter2"));
 
-    let remote_plaintext = run(binary(
+    let search = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"note_search","arguments":{"query":"x"}}}"#,
+        "\n",
+    );
+    let mut plaintext = binary(
         &machine,
         &["mcp"],
         Some("postgres://u:hunter2@db.example.com/m?sslmode=disable"),
-    ));
-    assert!(!remote_plaintext.status.success());
-    assert!(
-        stderr(&remote_plaintext).contains("sslmode=disable is only allowed"),
-        "{}",
-        stderr(&remote_plaintext)
     );
+    plaintext.env("HARNESS_MEMORY_OFFLINE_FALLBACK", "0");
+    let remote_plaintext = run_with_input(plaintext, search);
+    let replies = String::from_utf8_lossy(&remote_plaintext.stdout).into_owned();
+    assert!(replies.contains("sslmode=disable is only allowed"), "{replies}");
+    assert!(!replies.contains("hunter2"), "{replies}");
 
     let file = config_file(&machine);
     std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
@@ -231,7 +284,7 @@ fn features_lists_what_this_build_can_do() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(
         stdout(&output),
-        "notes-remote-local\nnotes-hide\npush-json\nscripts-remote-local\nscripts-hide\nscripts-push-json\nall-repos\nsave-guards\nsettings\nnotes-lang\nembedder\n"
+        "notes-remote-local\nnotes-hide\npush-json\nscripts-remote-local\nscripts-hide\nscripts-push-json\nall-repos\nsave-guards\nsettings\nnotes-lang\nembedder\noffline-fallback\n"
     );
 }
 

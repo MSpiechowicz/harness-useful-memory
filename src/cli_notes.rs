@@ -181,6 +181,11 @@ fn list(args: &[Option<&str>]) -> ExitCode {
         return opened.failed(&error);
     }
 
+    // The notes shown are this computer's while the team database cannot be reached.
+    if opened.store.offline() {
+        shown["offline"] = json!(true);
+    }
+
     println!("{shown}");
     ExitCode::SUCCESS
 }
@@ -649,8 +654,7 @@ impl Opened {
 
     /// Prints `error` without the database credentials; exit 1.
     fn failed(&self, error: &StoreError) -> ExitCode {
-        eprintln!("harness-memory: {}", self.secrets.scrub(&error.to_string()));
-        ExitCode::FAILURE
+        cli::failed(&self.secrets.scrub(&error.to_string()))
     }
 }
 

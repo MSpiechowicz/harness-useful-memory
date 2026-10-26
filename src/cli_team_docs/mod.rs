@@ -442,7 +442,10 @@ impl Opened {
         if self.store.is_none() {
             match backend::open_team_docs(&self.selection.backend)? {
                 Ok(store) => self.store = Some(store),
-                Err(message) => return Some(Err(message)),
+                Err(message) => {
+                    let hint = crate::open::docs_hint(self.kind.table());
+                    return Some(Err(format!("{message}. {hint}")));
+                }
             }
         }
 
@@ -510,8 +513,7 @@ impl Opened {
 }
 
 fn failure(secrets: &Secrets, message: &str) -> ExitCode {
-    eprintln!("harness-memory: {}", secrets.scrub(message));
-    ExitCode::FAILURE
+    crate::cli::failed(&secrets.scrub(message))
 }
 
 #[cfg(test)]

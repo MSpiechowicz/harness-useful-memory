@@ -11,7 +11,7 @@ use crate::location::{DIR_VAR, Migration, legacy_database_path, migrate_legacy, 
 use crate::mcp::Vectors;
 use crate::project::ProjectResolver;
 use crate::store::{
-    HiddenNotes, HiddenScripts, Lazy, MemoryStore, Scope, ScriptStore, SplitScripts, SplitStore, SqliteStore,
+    HiddenNotes, HiddenScripts, Lazy, MemoryStore, Reach, Scope, ScriptStore, SplitScripts, SplitStore, SqliteStore,
     TrustStore,
 };
 use crate::support::Env;
@@ -52,9 +52,18 @@ pub fn open_scripts(env: &Env, selection: &Selection) -> Box<dyn ScriptStore> {
         return local;
     }
 
-    let team = team_scripts(&selection.backend);
+    let team = team_scripts(&selection.backend, Reach::default(), selection.offline_fallback);
     let hidden = open_hidden_scripts(env, selection);
-    Box::new(SplitScripts::new(team, local, place, hidden))
+    let split = SplitScripts::new(team, local, place, hidden);
+
+    match crate::database_path(env).filter(|_| selection.offline_fallback) {
+        Some(database) => {
+            let key = selection.scripts_trust_key(Place::Remote);
+            let secrets = selection.backend.secrets();
+            Box::new(split.with_offline_fallback(&database, open_trust(env), key, secrets))
+        }
+        None => Box::new(split),
+    }
 }
 
 /// The script store scripts are not read from, when there is one: the team database when they
@@ -71,7 +80,11 @@ pub fn open_other_scripts(env: &Env, selection: &Selection) -> Option<Box<dyn Sc
         NotesPlace::RemoteLocal => None,
         NotesPlace::Remote => Some(local_scripts(env)),
         NotesPlace::Local if selection.routing.is_all_local() => None,
-        NotesPlace::Local => Some(team_scripts(&selection.backend)),
+        NotesPlace::Local => Some(team_scripts(
+            &selection.backend,
+            Reach::default(),
+            selection.offline_fallback,
+        )),
     }
 }
 
@@ -97,13 +110,22 @@ fn local_scripts(env: &Env) -> Box<dyn ScriptStore> {
     }))
 }
 
-/// The scripts of the team database `backend`, opened on first use.
-fn team_scripts(backend: &Backend) -> Box<dyn ScriptStore> {
+/// The scripts of the team database `backend`, opened on first use; the failed open starts the
+/// cooldown of `reach`. Without the offline fallback the failure names what to change.
+fn team_scripts(backend: &Backend, reach: Reach, fallback: bool) -> Box<dyn ScriptStore> {
     let team = backend.clone();
 
-    Box::new(Lazy::new(move || {
-        backend::open_scripts(&team).unwrap_or_else(|| Err("no team database is set".to_owned()))
-    }))
+    let store = Lazy::new(move || match backend::open_scripts(&team) {
+        Some(Err(message)) if fallback => {
+            eprintln!("harness-memory: {message}");
+            Err(message)
+        }
+        Some(Err(message)) => Err(format!("{message}. {SCRIPTS_HINT}")),
+        Some(Ok(store)) => Ok(store),
+        None => Err("no team database is set".to_owned()),
+    });
+
+    Box::new(store.with_reach(reach))
 }
 
 /// The script versions this machine trusts: always the local SQLite file, wherever scripts are.
@@ -141,7 +163,8 @@ pub fn open_notes(env: &Env, selection: &Selection) -> Option<Box<dyn MemoryStor
         return open_local_notes(env);
     }
 
-    let team = open_team_notes(backend)?;
+    let reach = Reach::default();
+    let team = open_team_notes(backend, reach, selection.offline_fallback);
 
     let local: Box<dyn MemoryStore> = if routing.needs_both_stores() {
         open_local_notes(env)?
@@ -153,13 +176,16 @@ pub fn open_notes(env: &Env, selection: &Selection) -> Option<Box<dyn MemoryStor
     };
 
     let hidden = open_hidden(env, selection);
-    Some(Box::new(SplitStore::routed(
-        team,
-        local,
-        routing.repository,
-        routing.global,
-        hidden,
-    )))
+    let split = SplitStore::routed(team, local, routing.repository, routing.global, hidden);
+
+    match crate::database_path(env).filter(|_| selection.offline_fallback) {
+        Some(database) => {
+            let team_key = selection.backend.team_key();
+            let secrets = selection.backend.secrets();
+            Some(Box::new(split.with_offline_fallback(&database, team_key, secrets)))
+        }
+        None => Some(Box::new(split)),
+    }
 }
 
 /// Where the notes of `scope` are read and saved under `selection`, as [`open_notes`] opens them.
@@ -202,22 +228,59 @@ pub fn open_hidden(env: &Env, selection: &Selection) -> Option<HiddenNotes> {
     Some(HiddenNotes::new(path, selection.backend.team_key()))
 }
 
-/// The team database; `None` (with the reason printed) when it cannot be opened. That stops the
-/// server: an empty local database instead would look like the team's memory had gone.
-fn open_team_notes(backend: &Backend) -> Option<Box<dyn MemoryStore>> {
-    match backend::open(backend)? {
-        Ok(opened) => {
-            if opened.newer {
+/// The team database, opened by the first call that needs it, so an unreachable one (VPN off,
+/// server down) never stops the server. With `fallback` the [`SplitStore`] serves this computer's
+/// notes meanwhile; without it the calls that need the team database fail with the reason and
+/// what to change, and the next call tries again once `reach`'s cooldown has ended.
+fn open_team_notes(backend: &Backend, reach: Reach, fallback: bool) -> Box<dyn MemoryStore> {
+    let backend = backend.clone();
+    let mut warned_newer = false;
+
+    let team = Lazy::new(move || match backend::open(&backend) {
+        Some(Ok(opened)) => {
+            if opened.newer && !warned_newer {
+                warned_newer = true;
                 eprintln!("harness-memory: the team database is newer than this server; tools will fail");
             }
 
-            Some(opened.store)
+            Ok(opened.store)
         }
-        Err(message) => {
+        Some(Err(message)) if fallback => {
             eprintln!("harness-memory: {message}");
-            None
+            Err(message)
         }
-    }
+        Some(Err(message)) => {
+            eprintln!("harness-memory: {message}");
+            Err(format!("{message}. {OFFLINE_HINT}"))
+        }
+        None => Err("no team database is set".to_owned()),
+    });
+
+    Box::new(team.with_reach(reach))
+}
+
+/// What a user can do when the team database is unreachable (VPN off, server down), the notes are
+/// set to `remote` and `offline_fallback` is off.
+const OFFLINE_HINT: &str = "Notes in scopes set to \"remote\" are only in the team database, so they are \
+     unavailable until it is reachable again (connect to the VPN or network; the next call retries). \
+     To keep working now, turn on the offline fallback (offline_fallback in Harness Desktop's memory \
+     settings), which serves this computer's notes meanwhile, or set repository_notes and global_notes to \
+     \"local\"";
+
+/// The same for scripts set to `remote`.
+const SCRIPTS_HINT: &str = "Scripts set to \"remote\" are only in the team database, so they are \
+     unavailable until it is reachable again (connect to the VPN or network; the next call retries). \
+     To keep working now, turn on the offline fallback (offline_fallback in Harness Desktop's memory \
+     settings), which serves this computer's scripts meanwhile, or set scripts to \"local\"";
+
+/// The same for the team hooks or routines (`kind` is `hooks` or `routines`), which exist only in the
+/// team database.
+pub fn docs_hint(kind: &str) -> String {
+    format!(
+        "Team {kind} are shared through the team database, so they are unavailable until it is reachable \
+         again (connect to the VPN or network; the next call retries). To work without them, set {kind} to \
+         \"local\" in Harness Desktop's memory settings"
+    )
 }
 
 /// The local SQLite store, after the one-time move from Harness Desktop's folder; `None` (with

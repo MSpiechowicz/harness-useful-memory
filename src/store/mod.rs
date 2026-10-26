@@ -24,8 +24,10 @@ pub mod lazy;
 pub mod libsql;
 pub mod listing;
 pub mod mongo;
+pub mod pending;
 pub mod postgres;
 pub(crate) mod rank;
+pub mod reach;
 pub mod routines;
 pub mod scripts;
 pub mod split;
@@ -44,6 +46,7 @@ pub use libsql::LibsqlStore;
 pub use listing::{LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort};
 pub use mongo::MongoStore;
 pub use postgres::PostgresStore;
+pub use reach::Reach;
 pub use routines::{RoutineDelete, RoutineDraft, RoutinePage, RoutinePut, RoutineStore, TeamRoutine, checked_routine};
 pub use scripts::{
     Language, PreviousVersion, SavedScript, Script, ScriptDraft, ScriptOrigin, ScriptRef, ScriptStore, ScriptSummary,
@@ -642,5 +645,17 @@ pub trait MemoryStore: Send {
     fn set_english_notes(&mut self, on: bool) -> Result<(), StoreError> {
         let _ = on;
         Ok(())
+    }
+
+    /// Whether the store can be used now: `false` for a [`Lazy`] store whose database cannot be
+    /// opened (a failed open is not tried again for a while, see [`reach`]). The default is `true`.
+    fn ready(&mut self) -> bool {
+        true
+    }
+
+    /// Whether notes meant for the team database are served from this computer right now (the
+    /// offline fallback of a [`SplitStore`]). The default is `false`.
+    fn offline(&self) -> bool {
+        false
     }
 }

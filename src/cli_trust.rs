@@ -491,6 +491,7 @@ mod tests {
             trust_team_hooks: false,
             routines: Place::Local,
             trust_team_routines: false,
+            offline_fallback: true,
             warnings: Vec::new(),
         };
         let team = || Backend::Postgres {

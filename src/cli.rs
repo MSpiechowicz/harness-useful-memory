@@ -365,6 +365,16 @@ pub(crate) fn usage(commands: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
+/// Prints a failed read or write of the memory (a team database that cannot be reached, a refused
+/// input, ...) as `{"error": "failed", "message"}` on stdout, so Harness Desktop can show the
+/// message instead of waiting for a result, and the message on stderr; exit 1. `message` must carry
+/// no credentials.
+pub(crate) fn failed(message: &str) -> ExitCode {
+    println!("{}", serde_json::json!({ "error": "failed", "message": message }));
+    eprintln!("harness-memory: {message}");
+    ExitCode::FAILURE
+}
+
 /// The environment and the settings, after printing their warnings; `None`, with the reason
 /// printed, when the home folder is unknown or the settings are wrong.
 pub(crate) fn settings() -> Option<(Env, Selection)> {

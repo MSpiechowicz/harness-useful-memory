@@ -37,15 +37,28 @@ pub(super) fn call(server: &mut Server, name: &str, arguments: Value) -> Option<
     // A read says when the user does not plainly let agents save what it reads, in room its
     // capped reply keeps free.
     let notice = super::saving::notice(server, name, &arguments);
-    let reserved = notice.as_ref().map_or(0, super::saving::Notice::room);
+    // The notes store decides now whether it is offline, so the notice has room in a capped reply.
+    let _ = server.store.ready();
+    let offline = server.store.offline() || server.scripts.offline();
+    let reserved =
+        notice.as_ref().map_or(0, super::saving::Notice::room) + if offline { OFFLINE_NOTICE.len() } else { 0 };
     let mut reply = run(server, name, arguments, reserved)?;
 
     if let Some(notice) = notice {
         notice.add_to(&mut reply);
     }
 
+    // Said last, so the agent and the user know the notes and scripts they see are this computer's.
+    if !reply.is_error && (server.store.offline() || server.scripts.offline()) {
+        reply.text.push_str(OFFLINE_NOTICE);
+    }
+
     Some(reply)
 }
+
+/// Ends a reply while the offline fallback serves notes or scripts from this computer.
+const OFFLINE_NOTICE: &str = "\nOffline: the team database is unreachable, so this reply comes from this computer's \
+     notes and scripts. What is saved now is copied to the team database when it is back.";
 
 /// Runs the body of tool `name`, keeping `reserved` bytes of a capped reply free; `None` when
 /// there is no such tool.

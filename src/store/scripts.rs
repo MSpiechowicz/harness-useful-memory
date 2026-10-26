@@ -200,6 +200,18 @@ pub trait ScriptStore: Send {
     fn origin(&self, _id: i64) -> ScriptOrigin {
         ScriptOrigin::Single
     }
+
+    /// Whether the store can be used now: `false` for a [`super::Lazy`] store whose database
+    /// cannot be opened (a failed open is not tried again for a while). The default is `true`.
+    fn ready(&mut self) -> bool {
+        true
+    }
+
+    /// Whether scripts meant for the team database are served from this computer right now (the
+    /// offline fallback of a [`super::SplitScripts`]). The default is `false`.
+    fn offline(&self) -> bool {
+        false
+    }
 }
 
 /// How this machine came to trust a script version.

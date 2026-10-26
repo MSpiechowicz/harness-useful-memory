@@ -110,6 +110,12 @@ pub const ROUTINES_VAR: &str = "HARNESS_MEMORY_ROUTINES";
 /// config file; empty = unset.
 pub const TRUST_TEAM_ROUTINES_VAR: &str = "HARNESS_MEMORY_TRUST_TEAM_ROUTINES";
 
+/// Environment variable turning the offline fallback on (`1`, the default) or off (`0`): while the
+/// team database cannot be reached, scopes set to `remote` are served like `remote+local` (read
+/// this computer's notes and scripts, save here) and what was saved is copied to the team database
+/// when it is back. Wins over `offline_fallback` in the config file; empty = unset.
+pub const OFFLINE_FALLBACK_VAR: &str = "HARNESS_MEMORY_OFFLINE_FALLBACK";
+
 /// Environment variable naming the Harness Desktop chat this server's harness runs for (its
 /// `chatKey`, a lowercase UUID), whose save guards apply (see [`crate::mcp`]'s guards). Any other
 /// value makes every guarded call refuse; empty = unset.
@@ -137,6 +143,7 @@ struct ConfigFile {
     trust_team_hooks: Option<bool>,
     routines: Option<String>,
     trust_team_routines: Option<bool>,
+    offline_fallback: Option<bool>,
 }
 
 /// The selected store.
@@ -361,6 +368,9 @@ pub struct Selection {
     /// Whether Harness Desktop runs the team routines a person turned on without approval
     /// (`trust_team_routines`).
     pub trust_team_routines: bool,
+    /// Whether `remote` scopes fall back to this computer while the team database is unreachable
+    /// (`offline_fallback`, on by default).
+    pub offline_fallback: bool,
     pub warnings: Vec<String>,
 }
 
@@ -641,6 +651,7 @@ pub fn select(env: &Env) -> Result<Selection, BackendError> {
     let trust_team_hooks = flag(env, TRUST_TEAM_HOOKS_VAR, config.trust_team_hooks)?;
     let routines = place(env, ROUTINES_VAR, config.routines.as_deref(), "routines", Place::Local)?;
     let trust_team_routines = flag(env, TRUST_TEAM_ROUTINES_VAR, config.trust_team_routines)?;
+    let offline_fallback = flag_or(env, OFFLINE_FALLBACK_VAR, config.offline_fallback, true)?;
 
     Ok(Selection {
         backend,
@@ -650,6 +661,7 @@ pub fn select(env: &Env) -> Result<Selection, BackendError> {
         trust_team_hooks,
         routines,
         trust_team_routines,
+        offline_fallback,
         warnings,
     })
 }
@@ -669,8 +681,13 @@ fn database_kind(raw: Option<&str>, origin: &str) -> Result<Option<DatabaseKind>
 /// The switch from the environment variable `var` (`1`, `true`, `0` or `false`, any case), else
 /// from the config file (off when neither is set); an error naming `var` for another value.
 fn flag(env: &Env, var: &str, file: Option<bool>) -> Result<bool, BackendError> {
+    flag_or(env, var, file, false)
+}
+
+/// Like [`flag`], with `default` when neither the variable nor the file sets it.
+fn flag_or(env: &Env, var: &str, file: Option<bool>, default: bool) -> Result<bool, BackendError> {
     let Some(raw) = env.var(var) else {
-        return Ok(file.unwrap_or(false));
+        return Ok(file.unwrap_or(default));
     };
 
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -2008,6 +2025,33 @@ mod tests {
                 Backend::Postgres { .. }
             ));
         }
+    }
+
+    #[test]
+    fn the_offline_fallback_is_on_unless_the_settings_turn_it_off() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("config.toml");
+        let env = Env::for_tests("/home/u").with_var(CONFIG_VAR, path.to_string_lossy());
+
+        std::fs::write(&path, "database_url = \"postgres://file/m\"\n").expect("write");
+        assert!(select(&env).expect("default").offline_fallback);
+
+        std::fs::write(
+            &path,
+            "database_url = \"postgres://file/m\"\noffline_fallback = false\n",
+        )
+        .expect("write");
+        assert!(!select(&env).expect("file").offline_fallback);
+
+        let on = env.clone().with_var(OFFLINE_FALLBACK_VAR, "1");
+        assert!(select(&on).expect("env wins").offline_fallback);
+
+        std::fs::write(&path, "database_url = \"postgres://file/m\"\n").expect("write");
+        let off = env.clone().with_var(OFFLINE_FALLBACK_VAR, "0");
+        assert!(!select(&off).expect("env off").offline_fallback);
+
+        let error = select(&env.with_var(OFFLINE_FALLBACK_VAR, "maybe")).expect_err("bad value");
+        assert!(error.to_string().contains(OFFLINE_FALLBACK_VAR), "{error}");
     }
 
     #[cfg(unix)]

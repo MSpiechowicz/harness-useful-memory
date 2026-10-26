@@ -27,12 +27,22 @@
 //! [`crate::store::hidden::PRUNE_EVERY`] the rows of team scripts that are gone, or whose id the
 //! team database gave to a newer script, are dropped ([`HiddenScripts::prune_if_due`]).
 
-use crate::backend::{NotesPlace, Place};
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use crate::backend::{NotesPlace, Place, Secrets};
+use crate::push::{Options, scope_label};
+use crate::push_scripts::{TeamScripts, push_scripts_only};
+use crate::store::pending::{Entry, Kind, Pending};
 use crate::store::split::{Side, decode, encode_as, narrow_by, target_scope};
 use crate::store::{
     HiddenScripts, SavedScript, Scope, Script, ScriptDraft, ScriptOrigin, ScriptRef, ScriptStore, ScriptSummary,
-    StoreError, Target, View,
+    StoreError, Target, TrustStore, View,
 };
+
+/// How long a copy of the scripts saved offline that failed is not tried again.
+const RETRY_COPY: Duration = Duration::from_secs(60);
 
 /// The team database's scripts and this computer's, as `scripts` routes them. See the module docs.
 pub struct SplitScripts {
@@ -40,6 +50,28 @@ pub struct SplitScripts {
     local: Box<dyn ScriptStore>,
     place: NotesPlace,
     hidden: Option<HiddenScripts>,
+    fallback: Option<Fallback>,
+    /// True while the offline fallback serves the scripts from this computer.
+    down: bool,
+}
+
+/// The offline fallback of a [`SplitScripts`], see [`SplitScripts::with_offline_fallback`].
+struct Fallback {
+    /// The scripts saved on this computer for scripts set to `remote`.
+    pending: Pending,
+    /// The local database those scripts are copied from.
+    database: PathBuf,
+    /// This machine's script trust, carried along to the team database.
+    trust: Box<dyn TrustStore>,
+    /// The name the team database has in this machine's script trust, which names it in the
+    /// pending list too ([`crate::backend::Backend::team_key`]).
+    key: String,
+    /// Masks the database credentials out of what is printed.
+    secrets: Secrets,
+    /// Whether the pending scripts are copied when the team database is next reachable.
+    sync_due: bool,
+    /// Not before this time: a copy that failed is tried again after a while.
+    retry_at: Instant,
 }
 
 impl std::fmt::Debug for SplitScripts {
@@ -65,20 +97,207 @@ impl SplitScripts {
             local,
             place,
             hidden,
+            fallback: None,
+            down: false,
+        }
+    }
+
+    /// The store falling back to this computer while the team database cannot be opened: scripts
+    /// are then read and saved in the local database `database` (the team's are not shown), the
+    /// ones saved while scripts are set to `remote` are listed in [`Pending`], and they are copied
+    /// to the team database (named `key` in `trust`) when it is reachable again, at the next call
+    /// or when a later server starts. Without it an unreachable team database fails the calls that
+    /// need it.
+    pub fn with_offline_fallback(
+        mut self,
+        database: &Path,
+        trust: Box<dyn TrustStore>,
+        key: String,
+        secrets: Secrets,
+    ) -> Self {
+        self.fallback = Some(Fallback {
+            pending: Pending::beside(database),
+            database: database.to_owned(),
+            trust,
+            key,
+            secrets,
+            sync_due: true,
+            retry_at: Instant::now(),
+        });
+        self
+    }
+
+    /// Where scripts are read and saved now: the local database alone while the offline fallback
+    /// is serving.
+    fn effective(&self) -> NotesPlace {
+        match self.place {
+            NotesPlace::Remote | NotesPlace::RemoteLocal if self.down => NotesPlace::Local,
+            place => place,
+        }
+    }
+
+    /// Decides before a call whether the team database is reachable (a failed open is not tried
+    /// again for a while), and copies the scripts saved offline when it is back.
+    fn settle(&mut self) {
+        if self.fallback.is_none() || !self.place.reads_team() {
+            return;
+        }
+
+        let up = self.team.ready();
+
+        let Some(fallback) = self.fallback.as_mut() else {
+            return;
+        };
+
+        if !up {
+            if !self.down {
+                self.down = true;
+                eprintln!(
+                    "harness-memory: the team database is unreachable: scripts are read and saved on this computer \
+                     until it is back"
+                );
+            }
+
+            fallback.sync_due = true;
+            return;
+        }
+
+        self.down = false;
+
+        if fallback.sync_due && Instant::now() >= fallback.retry_at {
+            fallback.sync_due = false;
+            self.copy_offline_scripts();
+        }
+    }
+
+    /// Copies the scripts saved offline to the team database; the ones that were not copied stay
+    /// listed and are tried again after a while. Nothing is deleted from this computer.
+    fn copy_offline_scripts(&mut self) {
+        let Some(mut fallback) = self.fallback.take() else {
+            return;
+        };
+
+        // Only what is meant for this team database, while scripts are still set to `remote`.
+        let waiting = if self.place == NotesPlace::Remote {
+            fallback.pending.entries(Kind::Scripts, &fallback.key)
+        } else {
+            Vec::new()
+        };
+
+        if !waiting.is_empty() && !self.push_offline_scripts(&mut fallback, &waiting) {
+            fallback.sync_due = true;
+            fallback.retry_at = Instant::now() + RETRY_COPY;
+        }
+
+        self.fallback = Some(fallback);
+    }
+
+    /// Copies `waiting` to the team database; false when something has to be tried again.
+    fn push_offline_scripts(&mut self, fallback: &mut Fallback, waiting: &[Entry]) -> bool {
+        let secrets = fallback.secrets.clone();
+
+        let hidden = match self.hidden.as_mut().map(HiddenScripts::try_ids) {
+            Some(Ok(hidden)) => hidden,
+            Some(Err(error)) => {
+                eprintln!(
+                    "harness-memory: scripts saved offline were not copied to the team database: {}",
+                    secrets.scrub(&error.to_string())
+                );
+                return false;
+            }
+            None => Vec::new(),
+        };
+
+        let mut team = TeamScripts {
+            scripts: self.team.as_mut(),
+            key: &fallback.key,
+            hidden: &hidden,
+        };
+
+        let summary = match push_scripts_only(
+            &fallback.database,
+            &mut team,
+            fallback.trust.as_mut(),
+            &Options::default(),
+            waiting,
+        ) {
+            Ok(summary) => summary,
+            Err(error) => {
+                eprintln!(
+                    "harness-memory: scripts saved offline were not copied to the team database: {}",
+                    secrets.scrub(&error.to_string())
+                );
+                return false;
+            }
+        };
+
+        // A script that failed stays listed; one that is gone from this computer leaves the list.
+        let kept: BTreeSet<i64> = summary.failed.iter().filter_map(|failure| failure.local_id).collect();
+        let failed_without_script = summary.failed.iter().any(|failure| failure.local_id.is_none());
+
+        // Only a script the push took leaves the list: one renamed behind the list's back stays.
+        let matched: BTreeSet<i64> = summary.changes.iter().map(|change| change.local_id).collect();
+
+        let done: Vec<Entry> = waiting
+            .iter()
+            .filter(|entry| !failed_without_script && matched.contains(&entry.id) && !kept.contains(&entry.id))
+            .cloned()
+            .collect();
+
+        if let Err(error) = fallback.pending.remove(Kind::Scripts, &done) {
+            eprintln!("harness-memory: {}", secrets.scrub(&error));
+        }
+
+        let copied = summary
+            .changes
+            .iter()
+            .filter(|change| !kept.contains(&change.local_id) && change.action.copies())
+            .count();
+
+        if copied > 0 {
+            eprintln!("harness-memory: copied {copied} script(s) saved offline to the team database");
+        }
+
+        for failure in &summary.failed {
+            eprintln!("harness-memory: {}", secrets.scrub(&failure.message));
+        }
+
+        kept.is_empty() && !failed_without_script
+    }
+
+    /// Lists the local script `id` named `name`, saved in the scope of `target` while scripts are
+    /// set to `remote` and the team database was unreachable, as waiting to be copied.
+    fn record_offline(&self, target: &Target, id: i64, name: &str) {
+        let Some(fallback) = &self.fallback else {
+            return;
+        };
+
+        let entry = Entry {
+            team: fallback.key.clone(),
+            id,
+            scope: scope_label(target),
+            name: name.to_owned(),
+        };
+
+        if let Err(error) = fallback.pending.add(Kind::Scripts, entry) {
+            eprintln!(
+                "harness-memory: the script was saved here but could not be listed for copying: {}",
+                fallback.secrets.scrub(&error)
+            );
         }
     }
 
     /// True when the store `side` is read.
     fn reads(&self, side: Side) -> bool {
         match side {
-            Side::Team => self.place.reads_team(),
-            Side::Local => self.place.reads_local(),
+            Side::Team => self.effective().reads_team(),
+            Side::Local => self.effective().reads_local(),
         }
     }
 
     /// The store new scripts are saved to.
     fn write_side(&self) -> Side {
-        match self.place.writes() {
+        match self.effective().writes() {
             Place::Remote => Side::Team,
             Place::Local => Side::Local,
         }
@@ -86,7 +305,7 @@ impl SplitScripts {
 
     /// True when the team's scripts cannot be changed from here (`remote+local`).
     fn team_read_only(&self) -> bool {
-        self.place == NotesPlace::RemoteLocal
+        self.effective() == NotesPlace::RemoteLocal
     }
 
     fn store(&mut self, side: Side) -> &mut dyn ScriptStore {
@@ -227,6 +446,7 @@ pub fn read_only_error(id: i64, name: &str) -> StoreError {
 
 impl ScriptStore for SplitScripts {
     fn save_script(&mut self, target: &Target, draft: &ScriptDraft) -> Result<SavedScript, StoreError> {
+        self.settle();
         let side = self.write_side();
 
         if side == Side::Team {
@@ -235,6 +455,11 @@ impl ScriptStore for SplitScripts {
 
         let saved = self.store(side).save_script(target, draft)?;
 
+        // A save that replaced a script already kept here is not listed: that script stays here.
+        if side == Side::Local && saved.created && self.down && self.place == NotesPlace::Remote {
+            self.record_offline(target, saved.script.summary.id, &saved.script.summary.name);
+        }
+
         Ok(SavedScript {
             script: shown(side, saved.script)?,
             ..saved
@@ -242,6 +467,7 @@ impl ScriptStore for SplitScripts {
     }
 
     fn list_scripts(&mut self, view: &View, query: Option<&str>) -> Result<Vec<ScriptSummary>, StoreError> {
+        self.settle();
         let hidden = self.hidden_ids();
         let mut listed: Vec<ScriptSummary> = Vec::new();
 
@@ -265,6 +491,7 @@ impl ScriptStore for SplitScripts {
     }
 
     fn get_script(&mut self, view: &View, script: &ScriptRef) -> Result<Option<Script>, StoreError> {
+        self.settle();
         match script {
             ScriptRef::Id(id) => self.find_by_id(view, *id),
             ScriptRef::Name(name) => self.find_by_name(view, name),
@@ -275,6 +502,7 @@ impl ScriptStore for SplitScripts {
     /// script is refused in `remote+local`, and not found when the hidden list says so (read
     /// strictly).
     fn delete_script(&mut self, view: &View, script: &ScriptRef) -> Result<bool, StoreError> {
+        self.settle();
         let Some(found) = self.get_script(view, script)? else {
             return Ok(false);
         };
@@ -299,6 +527,7 @@ impl ScriptStore for SplitScripts {
     /// never a hidden one (nothing there when the hidden list cannot be read), this computer's in
     /// `remote+local`. A failure on the second store leaves the first's deletes.
     fn delete_scripts(&mut self, view: &View, ids: &[i64]) -> Result<usize, StoreError> {
+        self.settle();
         let mut team: Vec<i64> = Vec::new();
         let mut local: Vec<i64> = Vec::new();
 
@@ -327,6 +556,7 @@ impl ScriptStore for SplitScripts {
     /// The team's scripts in `view` the hidden list names; an error when the list cannot be read
     /// (read strictly: a check of the hidden scripts must not pass because none could be seen).
     fn hidden_scripts(&mut self, view: &View) -> Result<Vec<ScriptSummary>, StoreError> {
+        self.settle();
         if !self.reads(Side::Team) {
             return Ok(Vec::new());
         }
@@ -352,6 +582,7 @@ impl ScriptStore for SplitScripts {
     }
 
     fn record_run(&mut self, id: i64, exit_code: Option<i32>, at: i64) -> Result<(), StoreError> {
+        self.settle();
         let (side, raw) = decode(id);
 
         if !self.reads(side) {
@@ -369,6 +600,10 @@ impl ScriptStore for SplitScripts {
             },
             (Side::Local, raw) => ScriptOrigin::Local { raw },
         }
+    }
+
+    fn offline(&self) -> bool {
+        self.down
     }
 }
 
