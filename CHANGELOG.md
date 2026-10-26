@@ -1,3 +1,10 @@
+## [2.9.1](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.9.0...v2.9.1) (2026-10-26)
+
+
+### Bug Fixes
+
+* **offline:** share the unreachable team database cooldown between processes ([6fdce90](https://github.com/MSpiechowicz/harness-useful-memory/commit/6fdce90237ab12f97dfc67aa674f5762883885fc))
+
 # [2.9.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.8.0...v2.9.0) (2026-10-26)
 
 
