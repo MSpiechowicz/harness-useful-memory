@@ -1,3 +1,10 @@
+## [2.9.2](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.9.1...v2.9.2) (2026-10-26)
+
+
+### Bug Fixes
+
+* **guards:** a call that names its project is judged by that project, not the server's folder ([37a60c9](https://github.com/MSpiechowicz/harness-useful-memory/commit/37a60c99996eb3535ae409bb8183a60e9dda0cef))
+
 ## [2.9.1](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.9.0...v2.9.1) (2026-10-26)
 
 
