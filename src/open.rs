@@ -40,6 +40,16 @@ pub fn open_server(env: &Env, selection: &Selection, cwd: Option<PathBuf>) -> Op
     Some(server)
 }
 
+/// The reachability of the team database, remembered next to the local file so that every
+/// `harness-memory` process (the server, and each command Harness Desktop runs) shares one
+/// cooldown instead of waiting out the connection timeout itself.
+fn reach_of(env: &Env, selection: &Selection) -> Reach {
+    match crate::database_path(env) {
+        Some(database) => Reach::beside(&database, &selection.backend.team_key()),
+        None => Reach::default(),
+    }
+}
+
 /// The scripts: in the local SQLite file without a team database or with `scripts = "local"`
 /// ([`Selection::scripts_place`]), else a [`SplitScripts`] reading the team database (its own
 /// connection), and this computer's file too with `remote+local`, leaving out the team scripts
@@ -52,7 +62,7 @@ pub fn open_scripts(env: &Env, selection: &Selection) -> Box<dyn ScriptStore> {
         return local;
     }
 
-    let team = team_scripts(&selection.backend, Reach::default(), selection.offline_fallback);
+    let team = team_scripts(&selection.backend, reach_of(env, selection), selection.offline_fallback);
     let hidden = open_hidden_scripts(env, selection);
     let split = SplitScripts::new(team, local, place, hidden);
 
@@ -82,7 +92,7 @@ pub fn open_other_scripts(env: &Env, selection: &Selection) -> Option<Box<dyn Sc
         NotesPlace::Local if selection.routing.is_all_local() => None,
         NotesPlace::Local => Some(team_scripts(
             &selection.backend,
-            Reach::default(),
+            reach_of(env, selection),
             selection.offline_fallback,
         )),
     }
@@ -163,7 +173,7 @@ pub fn open_notes(env: &Env, selection: &Selection) -> Option<Box<dyn MemoryStor
         return open_local_notes(env);
     }
 
-    let reach = Reach::default();
+    let reach = reach_of(env, selection);
     let team = open_team_notes(backend, reach, selection.offline_fallback);
 
     let local: Box<dyn MemoryStore> = if routing.needs_both_stores() {
