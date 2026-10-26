@@ -1,3 +1,10 @@
+# [2.9.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.8.0...v2.9.0) (2026-10-26)
+
+
+### Features
+
+* **offline:** serve remote scopes from this computer while the team database is unreachable ([c2cc18b](https://github.com/MSpiechowicz/harness-useful-memory/commit/c2cc18bdfbde2bdac55c18b174a415ffb2f422d3))
+
 # [2.8.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.7.0...v2.8.0) (2026-10-23)
 
 
