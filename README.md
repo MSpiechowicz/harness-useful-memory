@@ -140,6 +140,7 @@ as the command instead.
 | `note_save` | Saves a note: title, body, kind (`outcome`, `problem`, `fix`, `optimisation`, `location`, `decision`, `note`), tags and the entities it is about. A note with the same title in the scope is updated, and similar notes are listed so outdated ones get fixed |
 | `note_update` | Changes a note by id: any of title, body, kind and tags, or appends text to the body |
 | `note_get` | Reads whole notes by id (up to 5) |
+| `note_feedback` | Tells which notes of a `note_search` helped with the next step: their ids (up to 20, or an empty list when none did) and, optionally, a few words why (only `ids` is required). Call it only after a search that returned notes. Each note named counts as found useful ([usefulness counters](#usefulness-counters)). It is not a save, so it works while saving is off, paused or reviewed. The optional reason is not stored by harness-memory (it stays in the agent's own transcript and tool-call history). Ids that are not visible to the caller (another repository's notes, team notes hidden on this computer) are reported as `not found` and not counted, and ids that could not be checked (the team database or the hidden list could not be read) are reported as `not checked` and not counted |
 | `note_delete` | Deletes a note by id |
 | `entity_link` | Relates two entities, `from relation to`, for example `ConfigLoader located_in src/config.rs`. Missing entities are created |
 | `entity_neighbors` | Shows the relations around an entity (one or two hops) and the notes linked to them |
@@ -322,12 +323,14 @@ Scripts need team database schema 2 (PostgreSQL, MongoDB) or 3 (libSQL), [team h
 adds tables and collections), and from then on every tool of an older `harness-memory` fails on it, notes included
 (`check` says `update it`): when you upgrade, the whole team upgrades together.
 
-The English search objects, the `lang` of a note and the [English notes](#english-notes) setting are different. They
-are additive extensions that every backend adds on open to what is missing, and they do not raise the schema version.
-An older `harness-memory` keeps reading, searching and writing an upgraded database. What it misses: it searches with
-the old, unstemmed index, it does not set `lang` (a note it writes or edits is looked at again by the next newer
-server), and it does not know the English notes setting. A database that gives this server no right to change its schema
-is used without the extensions, with one line on stderr: English stemming and the setting are then off for it.
+The English search objects, the `lang` of a note, the [English notes](#english-notes) setting and the
+[usefulness counters](#usefulness-counters) of a note are different. They are additive extensions that every backend
+adds on open to what is missing, and they do not raise the schema version. An older `harness-memory` keeps reading,
+searching and writing an upgraded database. What it misses: it searches with the old, unstemmed index, it does not set
+`lang` (a note it writes or edits is looked at again by the next newer server), it does not know the English notes
+setting, and it counts no usefulness. A database that gives this server no right to change its schema is used with
+what it has, with one line on stderr: English stemming, the setting and the counters are then off where they are
+missing (a note then lists with `null` counters).
 
 ### Browsing notes
 
@@ -359,11 +362,16 @@ repositories that have entries, by label, and how many global ones there are.
   counts every kind under the other filters, `scopes` both scopes under the other filters, `places` both places
   under the other filters, and `total` follows all four. Newest
   first unless `--sort title` (A to Z), `kind` (by kind name), `scope` (global notes first) or `place` (notes kept on
-  this computer first), all ascending. `--order asc|desc` turns any round and ties go by id, `--offset N` and
+  this computer first), all ascending, or `--sort useful` (the notes found useful most often first) and `lastUseful`
+  (the notes found useful most recently first, never useful ones last), both descending. `--useful ever|never` keeps
+  the notes found useful at least once, or those shown at least 3 times and never found useful (`any` keeps every
+  note), and narrows the counts like `--lang` does. `--order asc|desc` turns any round and ties go by id, `--offset N` and
   `--limit N` (1 to 200, 50 by default) pick the page. The database filters, sorts and cuts the page, and leaves the bodies there. A note
   object has `id`, `kind`, `title`, `scope` (`repo` or `global`), `repo` (`host/owner/repo`, a `path:` key whole, or
   `null` for a global note), `place` (`team` or `local`, where it is kept), `tags`, `entities`, `author` (`source` and
-  `root`, shown like a script's), `createdAt`, `updatedAt` (RFC 3339 UTC), `revision` and `hits`.
+  `root`, shown like a script's), `createdAt`, `updatedAt` (RFC 3339 UTC), `revision`, `hits`, and the
+  [usefulness counters](#usefulness-counters) `shown`, `useful` and `lastUsefulAt` (RFC 3339 UTC, `null` until the
+  note was found useful). All three are `null` when the database has no counters.
 - `notes get <id> --json` prints `{"note", "links"}`: the note object with its `body`, and up to 50 linked notes
   `{"id", "title", "kind", "relation", "direction"}`, the notes linked to the entity at the other end of a relation
   that touches one of this note's entities (`direction` is `out` when this note's entity is the relation's source,
@@ -525,6 +533,54 @@ save`) are never refused and only print a warning. `push` is not checked. A note
 `notes list --json` gives each note a `lang` (`en`, `other` or `null` when it is not known), and `--lang en|other|unknown`
 keeps one of them.
 
+### Usefulness counters
+
+Every note counts how often an agent was shown it (`shown`), how often an agent said it helped (`useful`) and when it
+last did (`lastUsefulAt`). The counters start at 0 on every note, also those written before they existed. They live in
+the same database as the note (the local file or the team database, also for a team note that is read-only here), and
+counting changes nothing else of a note: not its update time, revision, hits, search index or language. A database an
+older `harness-memory` made gets the columns on the first open of this version (`shown`, `useful`, `last_useful_at` on
+SQLite, libSQL and PostgreSQL, the same fields on MongoDB and DocumentDB, where a missing field counts as 0), so no
+schema version changes and the older version keeps working.
+
+`note_search` counts each note its reply really shows as shown (a note the reply cap cuts is not counted), except for
+the searches of Harness Desktop itself, which runs its own when saving or importing global notes (the MCP client named
+`harness-desktop`). Reading a note with `note_get`, recall blocks and `notes list` count nothing. Agents are told to
+call `note_feedback` after a search, which counts a note as found useful. The counters are advisory, a rough signal of
+which notes get used and not a measure to trust:
+
+- A note counts at most once as shown and once as useful per MCP session (one server process), however often it is
+  found or named again, so one chatty agent cannot inflate it.
+- Counting is best effort and never fails a call. The counter is written after the reply has gone out, in a single
+  attempt that is dropped instead of waited for, and it is bounded so the next call of the session is held up for
+  about a second at most. A dropped count is not retried later in the same session. A counter that cannot be written
+  (a read-only database, a team database that is down) is dropped the same way, and with a team database split from
+  this computer each side is counted on its own. The counting never opens the team database, nor copies notes saved
+  offline: the call that asked for it did. A request the client cancels counts nothing, and its notes count with the
+  next request that shows them. The bound per backend, while the server answers at all:
+  - SQLite: no wait for the write lock, so there is no delay.
+  - libSQL: 0.75 s per write. A counter is one self-closing request (the schema check, the counts, the commit and the
+    close of the stream together), so a counter that gives up leaves nothing open on the server to hold the write
+    lock. The server finishes such a request when it can, so a dropped count may still land a little later.
+  - PostgreSQL: per statement, each of the four waits for a lock or runs for 0.25 s at most, about 1 s in all, and a
+    closed connection is not opened again for a count. A server that drops packets silently is not bounded by that:
+    every PostgreSQL connection gives up on data nobody acknowledges after 15 s (`tcp_user_timeout`) and probes an idle
+    one with TCP keepalives (after 15 s, every 5 s, 3 times), so such a connection ends in about 20 to 30 s instead of
+    the system's two hours. This never cuts a healthy connection, also not one waiting for a long statement. A URL
+    parameter of the same name (`tcp_user_timeout`, `keepalives_idle`, `keepalives_interval`, `keepalives_retries`)
+    sets its own value.
+  - MongoDB and DocumentDB: 0.75 s per write, after which the write is left running on its own thread and the call
+    goes on. A count is dropped while such a late write still runs.
+- Shown counting reads the list of team notes hidden on this computer too: when it cannot be read, the team notes of
+  that search are not counted as shown (this computer's own notes still are), and a hidden note is never counted.
+  `note_feedback` does the same: team notes are then `not checked` and not counted.
+- The skip of the `harness-desktop` client is noise reduction, not a trust check: the client name is whatever the
+  client says it is, and any client can still call `note_feedback`.
+
+`notes list --json` shows them on every note, sorts by them (`--sort useful|lastUseful`) and filters by them
+(`--useful ever|never|any`). Never useful needs a note shown at least 3 times first, so a note nobody saw yet is not
+flagged.
+
 ## Where data lives
 
 One SQLite file, `memory.sqlite3`, in the `harness-memory` folder of your user data directory:
@@ -577,6 +633,10 @@ it sets `directConnection=true` (or `loadBalanced=true`), so the driver cannot f
 the clear. A token or password for libSQL never goes in the URL. Try them on one machine first with
 [`docs/team-memory/docker-compose.yml`](docs/team-memory/docker-compose.yml) (`docker compose -f
 docs/team-memory/docker-compose.yml up -d --wait postgres`, `libsql` or `mongo`; the URLs are in the file's header).
+
+A PostgreSQL connection to a network that goes silent ends in about 20 to 30 s (`tcp_user_timeout` 15 s, TCP keepalives
+after 15 s, every 5 s, 3 times) instead of hanging; a healthy connection, also one waiting for a long statement, is
+never cut. The URL parameters of the same names set your own values.
 
 ### Set up the database
 
@@ -1063,9 +1123,10 @@ object has `scripts` totals instead of `notes`, no `relations` or `entitiesCut`,
 ```
 
 `harness-memory features` lists what this build supports, one per line (`push-json`, `scripts-remote-local`,
-`scripts-hide`, `scripts-push-json`, `settings`, `notes-lang` and `embedder` among them), so a tool can check before it
-asks for them. `settings` is the `settings` command, `notes-lang` the `lang` of a note and the `--lang` filter, and
-`embedder` the `embedder` command.
+`scripts-hide`, `scripts-push-json`, `settings`, `notes-lang`, `notes-useful` and `embedder` among them), so a tool can
+check before it asks for them. `settings` is the `settings` command, `notes-lang` the `lang` of a note and the `--lang`
+filter, `notes-useful` the usefulness counters of a note with `--useful` and `--sort useful|lastUseful`, and `embedder`
+the `embedder` command.
 
 ### Security and backups
 

@@ -14,7 +14,7 @@ use crate::limits::GET_IDS_MAX;
 use crate::store::listing::{compare, page_limit};
 use crate::store::split::is_local_id;
 use crate::store::{
-    HiddenNote, LangFilter, MemoryStore, Note, NoteListQuery, NotePage, NoteRow, Scope, StoreError, clean,
+    HiddenNote, LangFilter, MemoryStore, Note, NoteListQuery, NotePage, NoteRow, Scope, StoreError, UsefulFilter, clean,
 };
 
 /// `notes hide <id>`.
@@ -170,6 +170,7 @@ pub(super) fn page(opened: &mut Opened, query: &NoteListQuery) -> Result<NotePag
         .into_iter()
         .filter(|note| text.is_empty() || contains(note, &text))
         .filter(|note| LangFilter::keeps(query.lang, note.lang))
+        .filter(|note| UsefulFilter::keeps(query.useful, note.usage))
         .filter(|note| {
             entity
                 .as_ref()

@@ -12,7 +12,8 @@
 //! folds it: the SQLite-dialect stores fold ASCII letters only (SQLite's `lower()`), PostgreSQL
 //! and MongoDB fold every letter. A sort by title compares the normalized titles
 //! ([`clean::normalize`]) byte by byte, a sort by kind the stored kind names (`decision` before
-//! `fix`); every sort breaks ties by note id in the same direction.
+//! `fix`), a sort by usefulness the number of times agents found the note useful (a note without
+//! counters counts as 0); every sort breaks ties by note id in the same direction.
 //!
 //! [`MemoryStore::list_notes`]: crate::store::MemoryStore::list_notes
 
@@ -20,7 +21,7 @@ use std::cmp::Ordering;
 
 use crate::backend::Place;
 use crate::limits::{HIDDEN_MAX, LIST_PAGE_MAX, QUERY_MAX};
-use crate::store::{Note, NoteKind, Provenance, Scope, StoreError, View, clean};
+use crate::store::{Note, NoteKind, NoteUsage, Provenance, Scope, StoreError, View, clean};
 use crate::support::lang::Lang;
 
 /// Which notes a listing keeps by their language.
@@ -74,6 +75,62 @@ impl LangFilter {
     }
 }
 
+/// Which notes a listing keeps by how useful agents found them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsefulFilter {
+    /// Notes an agent found useful at least once.
+    Ever,
+    /// Notes shown to agents at least [`Self::SHOWN_MIN`] times and never found useful.
+    Never,
+}
+
+impl UsefulFilter {
+    /// How often a note has to be shown before never being useful says something about it.
+    pub const SHOWN_MIN: i64 = 3;
+
+    /// Parses `ever` or `never`.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "ever" => Some(Self::Ever),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+
+    /// True when a note with `usage` (`None` when the database has no counters) is kept.
+    pub fn keeps(filter: Option<Self>, usage: Option<NoteUsage>) -> bool {
+        let Some(filter) = filter else {
+            return true;
+        };
+
+        let Some(usage) = usage else {
+            return false;
+        };
+
+        match filter {
+            Self::Ever => usage.useful >= 1,
+            Self::Never => usage.shown >= Self::SHOWN_MIN && usage.useful == 0,
+        }
+    }
+
+    /// The SQL condition on the counter columns `shown` and `useful` keeping these notes (`1 = 1`
+    /// for no filter). Without the columns no note qualifies.
+    pub(crate) fn condition(filter: Option<Self>, shown: &str, useful: &str, usage: bool) -> String {
+        let Some(filter) = filter else {
+            return "1 = 1".to_owned();
+        };
+
+        if !usage {
+            return "1 = 0".to_owned();
+        }
+
+        match filter {
+            Self::Ever => format!("{useful} >= 1"),
+            Self::Never => format!("({shown} >= {} AND {useful} = 0)", Self::SHOWN_MIN),
+        }
+    }
+}
+
 /// One page of notes to list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteListQuery {
@@ -92,6 +149,9 @@ pub struct NoteListQuery {
     /// Keeps the notes of this language (see [`LangFilter`]); `None` keeps every note. It narrows
     /// the page and every count.
     pub lang: Option<LangFilter>,
+    /// Keeps the notes agents found useful, or never useful (see [`UsefulFilter`]); `None` keeps
+    /// every note. It narrows the page and every count.
+    pub useful: Option<UsefulFilter>,
     pub sort: NoteSort,
     pub descending: bool,
     /// Rows skipped before the page.
@@ -118,6 +178,10 @@ pub enum NoteSort {
     /// keeps its notes in one place, so only [`crate::store::SplitStore`] orders by it; the
     /// others order by id alone.
     Place,
+    /// By how often agents found the note useful.
+    Useful,
+    /// By the time an agent last found the note useful.
+    LastUseful,
 }
 
 /// A listed note: a [`Note`] without its body.
@@ -140,6 +204,8 @@ pub struct NoteRow {
     pub hits: i64,
     /// The language, when a store looked at the note and was certain.
     pub lang: Option<Lang>,
+    /// The usefulness counters, when the database has them.
+    pub usage: Option<NoteUsage>,
 }
 
 impl From<Note> for NoteRow {
@@ -158,6 +224,7 @@ impl From<Note> for NoteRow {
             revision: note.revision,
             hits: note.hits,
             lang: note.lang,
+            usage: note.usage,
         }
     }
 }
@@ -334,10 +401,22 @@ pub(crate) fn compare(query: &NoteListQuery, a: &NoteRow, b: &NoteRow) -> Orderi
         NoteSort::Kind => a.kind.as_str().cmp(b.kind.as_str()),
         NoteSort::Scope => (a.scope == Scope::Repo).cmp(&(b.scope == Scope::Repo)),
         NoteSort::Place => Ordering::Equal,
+        NoteSort::Useful => useful_of(a).cmp(&useful_of(b)),
+        NoteSort::LastUseful => last_useful_of(a).cmp(&last_useful_of(b)),
     }
     .then(a.id.cmp(&b.id));
 
     directed(query, ascending)
+}
+
+/// How often `row` was found useful: 0 without counters, as the stores sort it.
+fn useful_of(row: &NoteRow) -> i64 {
+    row.usage.map_or(0, |usage| usage.useful)
+}
+
+/// When `row` was last found useful: 0 when never or without counters, as the stores sort it.
+fn last_useful_of(row: &NoteRow) -> i64 {
+    row.usage.and_then(|usage| usage.last_useful_at).unwrap_or(0)
 }
 
 /// `ascending` turned round when `query` is descending.

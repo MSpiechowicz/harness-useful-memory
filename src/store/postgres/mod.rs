@@ -41,13 +41,18 @@ use super::clean;
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, ProjectKey};
 use super::{Forgotten, NoteListQuery, NotePage, NoteText, Saved, SearchQuery, StoreError, Target, VectorTarget, View};
 use crate::backend::Place;
-use crate::store::extensions;
+use crate::store::extensions::{self, Columns};
 use crate::store::listing::checked_exclude;
 pub use connect::UrlError;
 use schema::SchemaState;
 
 /// The advisory lock every write transaction takes ("harness-memory write").
 const WRITE_LOCK: i64 = 0x6861_726e_6573_7302;
+
+/// The most one statement of a counter write may wait for a lock (a migration, a row) or run
+/// before the server cancels it. A counter write has four statements after `BEGIN`, so it takes
+/// 1 s at most while the server answers.
+const COUNT_STATEMENT_LIMIT: &str = "250ms";
 
 /// Session limits: how long a statement waits for a lock or runs, and how long a transaction may
 /// sit idle before the server ends it.
@@ -61,6 +66,9 @@ pub struct PostgresStore {
     newer: bool,
     /// The additive schema extensions are in place (see [`schema::ensure_extensions`]).
     extensions: bool,
+    /// The usefulness counters of a note are in place (kept apart: a read-only role can have the
+    /// other extensions without them).
+    usage: bool,
 }
 
 impl std::fmt::Debug for PostgresStore {
@@ -68,6 +76,7 @@ impl std::fmt::Debug for PostgresStore {
         f.debug_struct("PostgresStore")
             .field("newer", &self.newer)
             .field("extensions", &self.extensions)
+            .field("usage", &self.usage)
             .finish_non_exhaustive()
     }
 }
@@ -86,10 +95,11 @@ impl PostgresStore {
             client,
             newer: state == SchemaState::Newer,
             extensions: false,
+            usage: false,
         };
 
         if !store.newer {
-            store.extensions = store.install_extensions();
+            (store.extensions, store.usage) = store.install_extensions();
             store.backfill_lang();
         }
 
@@ -102,15 +112,18 @@ impl PostgresStore {
         self.extensions
     }
 
-    /// Adds the schema extensions the database lacks and reports whether it has them now. A
-    /// database that refuses them (no right to change the schema) is used without, with one line on
-    /// stderr.
-    fn install_extensions(&mut self) -> bool {
+    /// Adds the schema extensions the database lacks and reports whether it has them now, the
+    /// usage counters apart from the rest: `(extensions, usage)`. A database that refuses them (no
+    /// right to change the schema) is used with what it has, with one line on stderr.
+    fn install_extensions(&mut self) -> (bool, bool) {
         match schema::ensure_extensions(&mut self.client) {
-            Ok(()) => true,
+            Ok(()) => (true, true),
             Err(error) => {
                 extensions::warn_unavailable(&error);
-                false
+
+                let extensions = schema::extensions_present(&mut self.client).unwrap_or(false);
+                let usage = schema::usage_present(&mut self.client).unwrap_or(false);
+                (extensions, usage)
             }
         }
     }
@@ -142,6 +155,14 @@ impl PostgresStore {
     /// True when the database was written by a newer server.
     pub fn is_newer(&self) -> bool {
         self.newer
+    }
+
+    /// The optional columns of a note the database has.
+    fn columns(&self) -> Columns {
+        Columns {
+            lang: self.extensions,
+            usage: self.usage,
+        }
     }
 
     /// Fails once the database is known to be newer, and opens the connection again when it closed.
@@ -199,6 +220,42 @@ impl PostgresStore {
         }
 
         Err(error)
+    }
+}
+
+impl PostgresStore {
+    /// Runs the counter write `operation` once: it takes no [`WRITE_LOCK`] (an increment is atomic
+    /// on its own), only the migration lock, shared, and no statement of it waits or runs for
+    /// longer than [`COUNT_STATEMENT_LIMIT`], so a busy database drops the count (an error the
+    /// caller ignores) instead of holding the caller up. It is not tried again, and a closed
+    /// connection is not opened again for it (the next read does that).
+    fn count(
+        &mut self,
+        operation: impl FnOnce(&mut Transaction<'_>) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        if self.newer {
+            return Err(StoreError::NewerSchema);
+        }
+
+        if self.client.is_closed() {
+            return Err(StoreError::Backend("the connection is closed".to_owned()));
+        }
+
+        let mut tx = self.client.transaction().map_err(backend)?;
+        tx.batch_execute(&format!(
+            "SET LOCAL lock_timeout = '{COUNT_STATEMENT_LIMIT}'; SET LOCAL statement_timeout = '{COUNT_STATEMENT_LIMIT}'"
+        ))
+        .map_err(backend)?;
+        tx.execute("SELECT pg_advisory_xact_lock_shared($1)", &[&schema::MIGRATE_LOCK])
+            .map_err(backend)?;
+
+        if schema::stored_version(&mut tx)?.is_some_and(|found| found > schema::SCHEMA_VERSION) {
+            self.newer = true;
+            return Err(StoreError::NewerSchema);
+        }
+
+        operation(&mut tx)?;
+        tx.commit().map_err(backend)
     }
 }
 
@@ -264,18 +321,18 @@ impl MemoryStore for PostgresStore {
     }
 
     fn get(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
-        let extensions = self.extensions;
-        self.write(|tx| notes::get(tx, view, ids, true, extensions))
+        let columns = self.columns();
+        self.write(|tx| notes::get(tx, view, ids, true, columns))
     }
 
     fn peek(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
-        let extensions = self.extensions;
-        self.read(|client| notes::get(client, view, ids, false, extensions))
+        let columns = self.columns();
+        self.read(|client| notes::get(client, view, ids, false, columns))
     }
 
     fn list_notes(&mut self, query: &NoteListQuery) -> Result<NotePage, StoreError> {
-        let extensions = self.extensions;
-        self.read(|client| listing::list(client, query, extensions))
+        let columns = self.columns();
+        self.read(|client| listing::list(client, query, columns))
     }
 
     fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
@@ -289,6 +346,22 @@ impl MemoryStore for PostgresStore {
 
     fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
         self.read(|client| search::by_ids(client, query, ids))
+    }
+
+    fn record_shown(&mut self, ids: &[i64]) -> Result<(), StoreError> {
+        let Some(ids) = notes::unique_ids(ids).filter(|_| self.usage) else {
+            return Ok(());
+        };
+
+        self.count(|tx| notes::record_shown(tx, &ids))
+    }
+
+    fn record_useful(&mut self, ids: &[i64], at: i64) -> Result<(), StoreError> {
+        let Some(ids) = notes::unique_ids(ids).filter(|_| self.usage) else {
+            return Ok(());
+        };
+
+        self.count(|tx| notes::record_useful(tx, &ids, at))
     }
 
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {
@@ -332,8 +405,8 @@ impl MemoryStore for PostgresStore {
 
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
         let title = clean::title(title)?;
-        let extensions = self.extensions;
-        self.read(|client| notes::find_by_title(client, target, &title, extensions))
+        let columns = self.columns();
+        self.read(|client| notes::find_by_title(client, target, &title, columns))
     }
 
     fn english_notes(&mut self) -> Result<bool, StoreError> {

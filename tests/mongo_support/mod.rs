@@ -93,6 +93,11 @@ impl TestDb {
         names
     }
 
+    /// The test server's client, for sessions behind the store's back.
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
     /// The database itself, for checks behind the store's back.
     pub fn raw(&self) -> Database {
         self.client.database(&self.name)

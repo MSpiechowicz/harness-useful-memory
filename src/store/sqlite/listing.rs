@@ -6,9 +6,10 @@
 use super::notes::{VISIBLE, kind_from_sql, note_from_row, row_columns};
 use super::sql::{Sql, Value, args};
 use super::view_params;
+use crate::store::extensions::Columns;
 use crate::store::listing::{
-    LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort, direction, excluded_json, page_limit, query_entity,
-    query_text, scoped,
+    LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort, UsefulFilter, direction, excluded_json, page_limit,
+    query_entity, query_text, scoped,
 };
 use crate::store::{NoteKind, Scope, StoreError};
 
@@ -23,17 +24,18 @@ pub(super) fn not_excluded(mark: usize) -> String {
     format!("n.id NOT IN (SELECT value FROM json_each(?{mark}))")
 }
 
-pub(super) fn list(db: &mut dyn Sql, query: &NoteListQuery, extensions: bool) -> Result<NotePage, StoreError> {
+pub(super) fn list(db: &mut dyn Sql, query: &NoteListQuery, columns: Columns) -> Result<NotePage, StoreError> {
     let text = query_text(query)?;
     let entity = query_entity(query);
     let exclude = excluded_json(&query.exclude)?;
     let (repo, global) = view_params(db, &query.view)?;
-    let lang = LangFilter::condition(query.lang, "n.lang", extensions);
+    let lang = LangFilter::condition(query.lang, "n.lang", columns.lang);
+    let useful = UsefulFilter::condition(query.useful, "n.shown", "n.useful", columns.usage);
 
     let counted: Vec<(NoteKind, Scope, usize)> = db
         .query(
             &format!(
-                "SELECT n.kind, n.project_id IS NULL, count(*) FROM notes n WHERE {VISIBLE} AND {KEPT} AND {lang} AND {}
+                "SELECT n.kind, n.project_id IS NULL, count(*) FROM notes n WHERE {VISIBLE} AND {KEPT} AND {lang} AND {useful} AND {}
                  GROUP BY n.kind, n.project_id IS NULL",
                 not_excluded(5)
             ),
@@ -56,12 +58,16 @@ pub(super) fn list(db: &mut dyn Sql, query: &NoteListQuery, extensions: bool) ->
         NoteSort::Kind => format!("n.kind {dir}, n.id {dir}"),
         NoteSort::Scope => format!("(n.project_id IS NOT NULL) {dir}, n.id {dir}"),
         NoteSort::Place => format!("n.id {dir}"),
+        // Without the counters every note counts as 0, so only the id orders them.
+        NoteSort::Useful | NoteSort::LastUseful if !columns.usage => format!("n.id {dir}"),
+        NoteSort::Useful => format!("coalesce(n.useful, 0) {dir}, n.id {dir}"),
+        NoteSort::LastUseful => format!("coalesce(n.last_useful_at, 0) {dir}, n.id {dir}"),
     };
     let sql = format!(
         "SELECT {} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
-         WHERE {VISIBLE} AND {KEPT} AND {lang} AND (?5 IS NULL OR n.kind = ?5) AND {}
+         WHERE {VISIBLE} AND {KEPT} AND {lang} AND {useful} AND (?5 IS NULL OR n.kind = ?5) AND {}
          ORDER BY {order} LIMIT ?6 OFFSET ?7",
-        row_columns(extensions),
+        row_columns(columns),
         not_excluded(8)
     );
 

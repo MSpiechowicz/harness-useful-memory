@@ -2,6 +2,7 @@
 //! to the team database for them nor creates the local file (nor, with every note scope in the
 //! team database, opens the local notes store it never reads).
 
+use super::Countable;
 use super::Reach;
 use super::{Edge, Forget, Forgotten, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NoteListQuery, NotePage};
 use super::{NotePatch, NoteText, Saved, SearchQuery, VectorTarget};
@@ -152,6 +153,24 @@ impl MemoryStore for Lazy<dyn MemoryStore> {
 
     fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
         self.store()?.hits_for(query, ids)
+    }
+
+    fn countable(&mut self, view: &View, ids: &[i64]) -> Countable {
+        match self.store() {
+            Ok(store) => store.countable(view, ids),
+            Err(_) => Countable {
+                visible: Vec::new(),
+                unchecked: ids.to_vec(),
+            },
+        }
+    }
+
+    fn record_shown(&mut self, ids: &[i64]) -> Result<(), StoreError> {
+        self.store()?.record_shown(ids)
+    }
+
+    fn record_useful(&mut self, ids: &[i64], at: i64) -> Result<(), StoreError> {
+        self.store()?.record_useful(ids, at)
     }
 
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {

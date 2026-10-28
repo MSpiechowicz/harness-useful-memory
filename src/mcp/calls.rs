@@ -9,7 +9,8 @@ use super::blocks::{FRAME, hit_block, note_block, rewrite_line, saved_line, simi
 use super::reply::{Capped, now};
 use super::scope::{kind, own_root, provenance, scope_arg, target, view};
 use crate::limits::{
-    DEPTH_MAX, GET_REPLY_MAX, LIST_REPLY_MAX, NEIGHBORS_LIMIT_DEFAULT, SEARCH_LIMIT_DEFAULT, SIMILAR_MAX,
+    DEPTH_MAX, FEEDBACK_REASON_MAX, GET_REPLY_MAX, LIST_REPLY_MAX, NEIGHBORS_LIMIT_DEFAULT, SEARCH_LIMIT_DEFAULT,
+    SEARCH_LIMIT_MAX, SIMILAR_MAX,
 };
 use crate::store::{Forget, Link, NoteDraft, NoteOrigin, NotePatch, Saved, SearchQuery, Target, View, clean};
 use crate::support::lang::Lang;
@@ -69,6 +70,7 @@ fn run(server: &mut Server, name: &str, arguments: Value, reserved: usize) -> Op
         "note_search" => parse(arguments).and_then(|args| search(server, args, reserved)),
         "note_get" => parse(arguments).and_then(|args| get(server, args, reserved)),
         "note_delete" => parse(arguments).and_then(|args| delete_note(server, args)),
+        "note_feedback" => parse(arguments).and_then(|args| feedback(server, args)),
         "entity_link" => parse(arguments).and_then(|args| link(server, args)),
         "entity_neighbors" => parse(arguments).and_then(|args| neighbors(server, args, reserved)),
         "entity_delete" => parse(arguments).and_then(|args| delete_entity(server, args)),
@@ -152,6 +154,15 @@ struct NeighborsArgs {
 #[serde(deny_unknown_fields)]
 struct NoteDeleteArgs {
     id: i64,
+    scope: Option<String>,
+    project_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FeedbackArgs {
+    ids: Vec<i64>,
+    reason: Option<String>,
     scope: Option<String>,
     project_path: Option<String>,
 }
@@ -290,15 +301,95 @@ fn search(server: &mut Server, args: SearchArgs, reserved: usize) -> Result<Stri
         reply.push("no matching notes");
     }
 
+    // Only the notes the reply really shows are counted as shown: the cap can leave some out.
+    let mut shown: Vec<i64> = Vec::new();
+
     for hit in &hits {
-        reply.push(&hit_block(hit, &home));
+        if reply.push(&hit_block(hit, &home)) {
+            shown.push(hit.id);
+        }
     }
 
     let mut text = reply.finish();
 
+    // The desktop searches in the background (to save or import notes): that is not an agent
+    // being shown a note. The counter is written after the reply (see [`Server::after_reply`]) and never fails the search.
+    if server.client.as_deref() != Some(DESKTOP_CLIENT) && !shown.is_empty() {
+        server.queue_shown(&shown);
+    }
+
     if let Some(block) = scripts {
         text.push('\n');
         text.push_str(&block);
+    }
+
+    Ok(text)
+}
+
+/// The client name Harness Desktop initializes the server with.
+const DESKTOP_CLIENT: &str = "harness-desktop";
+
+/// The body of `note_feedback`: counts the notes among `args.ids` this caller can see as useful.
+/// The reason is for the agent to word its answer: harness-memory keeps none of it.
+fn feedback(server: &mut Server, args: FeedbackArgs) -> Result<String, String> {
+    if args.ids.len() > SEARCH_LIMIT_MAX {
+        return Err(format!("ids must list at most {SEARCH_LIMIT_MAX} note ids"));
+    }
+
+    if args
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.chars().count() > FEEDBACK_REASON_MAX)
+    {
+        return Err(format!("reason must be at most {FEEDBACK_REASON_MAX} characters"));
+    }
+
+    let view = view(server, args.scope.as_deref(), args.project_path.as_deref())?;
+
+    // Each id once, in the order asked.
+    let mut asked: Vec<i64> = Vec::with_capacity(args.ids.len());
+
+    for id in &args.ids {
+        if !asked.contains(id) {
+            asked.push(*id);
+        }
+    }
+
+    // A read that counts no hit: the notes hidden on this computer or out of the view are not found,
+    // and a note whose database (or hidden list) cannot be read is not checked, so not counted.
+    let checked = server.store.countable(&view, &asked);
+    let visible: Vec<i64> = asked
+        .iter()
+        .copied()
+        .filter(|id| checked.visible.contains(id))
+        .collect();
+
+    // Written after the reply, once per note and session; a counter never fails the call.
+    if !visible.is_empty() {
+        server.queue_useful(&visible, now());
+    }
+
+    let mut text = match visible.len() {
+        0 => "marked no notes useful".to_owned(),
+        1 => format!("marked 1 note useful: #{}", visible[0]),
+        count => {
+            let marked: Vec<String> = visible.iter().map(|id| format!("#{id}")).collect();
+            format!("marked {count} notes useful: {}", marked.join(", "))
+        }
+    };
+
+    let listed = |wanted: &dyn Fn(&i64) -> bool| -> Vec<String> {
+        asked.iter().filter(|id| wanted(id)).map(i64::to_string).collect()
+    };
+    let missing = listed(&|id| !checked.visible.contains(id) && !checked.unchecked.contains(id));
+    let unchecked = listed(&|id| !checked.visible.contains(id) && checked.unchecked.contains(id));
+
+    if !missing.is_empty() {
+        text.push_str(&format!("\nnot found: {}", missing.join(", ")));
+    }
+
+    if !unchecked.is_empty() {
+        text.push_str(&format!("\nnot checked: {}", unchecked.join(", ")));
     }
 
     Ok(text)

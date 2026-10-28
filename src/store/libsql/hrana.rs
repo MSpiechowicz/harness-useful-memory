@@ -11,7 +11,7 @@
 //! straight to the server, so the token never passes through a proxy, in clear for `http://`.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::json;
@@ -26,6 +26,9 @@ use crate::store::sqlite::sql::{Executed, Row, Sql, Value};
 /// How long one HTTP request may take, waiting for the write lock included (the server queues a
 /// writer for about 5 s before it takes the lock from an idle transaction).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a counter write may take (see [`Client::write_once`]).
+pub(super) const COUNT_BUDGET: Duration = Duration::from_millis(750);
 
 /// How long connecting may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -87,6 +90,7 @@ impl Client {
             baton: None,
             base: None,
             closed: false,
+            deadline: None,
         }
     }
 
@@ -95,6 +99,68 @@ impl Client {
         Stream {
             keep: true,
             ..self.single()
+        }
+    }
+
+    /// Runs the `statements` of a counter write as ONE request that ends itself: a `batch` that
+    /// begins a transaction, refuses a database whose schema version is above `newest`, runs the
+    /// statements, commits (or rolls back) and closes the stream. When this call gives up after
+    /// `budget`, or the reply is lost, the server still finishes the request alone, so nothing
+    /// stays open that would hold the write lock; the counts may then land late.
+    pub(super) fn write_once(&self, statements: &[Plain], newest: i64, budget: Duration) -> Result<(), StoreError> {
+        // Every step runs only when the one before it succeeded; so a failure skips the rest.
+        let mut steps = vec![
+            step("BEGIN IMMEDIATE", &[], false),
+            step("SELECT user_version FROM pragma_user_version", &[], true),
+            // Fails (malformed JSON) for a newer schema.
+            step(
+                &format!(
+                    "SELECT json(CASE WHEN user_version > {newest} THEN 'newer' ELSE '1' END) \
+                     FROM pragma_user_version"
+                ),
+                &[],
+                false,
+            ),
+        ];
+
+        for (sql, args) in statements {
+            steps.push(step(sql, args, false));
+        }
+
+        steps.push(step("COMMIT", &[], false));
+        let commit = steps.len() - 1;
+
+        for (index, step) in steps.iter_mut().enumerate().skip(1) {
+            step["condition"] = json!({ "type": "ok", "step": index - 1 });
+        }
+
+        // Unless the commit went through, whatever was begun is rolled back (an error when nothing was).
+        let mut rollback = step("ROLLBACK", &[], false);
+        rollback["condition"] = json!({ "type": "not", "cond": { "type": "ok", "step": commit } });
+        steps.push(rollback);
+
+        let mut stream = Stream {
+            deadline: Some(Instant::now() + budget),
+            ..self.single()
+        };
+        let request = json!({ "type": "batch", "batch": { "steps": steps } });
+
+        let Response::Batch { result } = stream.send(vec![request])?.remove(0).into_result()? else {
+            return Err(unexpected());
+        };
+
+        if result.version().is_some_and(|version| version > newest) {
+            return Err(StoreError::NewerSchema);
+        }
+
+        if result.step_results.get(commit).is_some_and(Option::is_some) {
+            return Ok(());
+        }
+
+        // The first error is the reason: the later steps were skipped, or only rolled back.
+        match result.step_errors.into_iter().flatten().next() {
+            Some(error) => Err(error.into_store_error()),
+            None => Err(unexpected()),
         }
     }
 
@@ -115,12 +181,32 @@ impl Client {
         Ok(base)
     }
 
-    fn post(&self, base: &str, baton: Option<&str>, requests: Vec<serde_json::Value>) -> Result<Reply, Failed> {
+    fn post(
+        &self,
+        base: &str,
+        baton: Option<&str>,
+        requests: Vec<serde_json::Value>,
+        deadline: Option<Instant>,
+    ) -> Result<Reply, Failed> {
         let body = json!({ "baton": baton, "requests": requests }).to_string();
         let mut request = self
             .agent
             .post(format!("{base}/v2/pipeline"))
             .header("content-type", "application/json");
+
+        // A bounded stream gets what is left of its budget for this request (connecting and
+        // reading the reply included), instead of the long timeout of the agent.
+        if let Some(deadline) = deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+
+            if left.is_zero() {
+                return Err(Failed::answered(backend(
+                    "the libSQL request ran out of time".to_owned(),
+                )));
+            }
+
+            request = request.config().timeout_global(Some(left)).build();
+        }
 
         if let Some(authorization) = &self.authorization {
             request = request.header("authorization", authorization);
@@ -200,6 +286,8 @@ pub(super) struct Stream<'c> {
     base: Option<String>,
     /// The server ended a kept stream; its transaction is gone.
     closed: bool,
+    /// When the request of a bounded stream (see [`Client::write_once`]) is given up.
+    deadline: Option<Instant>,
 }
 
 impl Stream<'_> {
@@ -220,7 +308,7 @@ impl Stream<'_> {
         }
 
         let base = self.base.as_deref().unwrap_or(&self.client.base);
-        let reply = self.client.post(base, self.baton.as_deref(), requests);
+        let reply = self.client.post(base, self.baton.as_deref(), requests, self.deadline);
         let reply = match reply {
             Ok(reply) => reply,
             Err(error) => {
@@ -258,7 +346,7 @@ impl Stream<'_> {
 
         match self.send(vec![request])?.remove(0).into_result()? {
             Response::Execute { result } => Ok(result),
-            Response::Other => Err(unexpected()),
+            Response::Batch { .. } | Response::Other => Err(unexpected()),
         }
     }
 
@@ -340,6 +428,42 @@ pub(super) fn execute(sql: &str) -> serde_json::Value {
     json!({ "type": "execute", "stmt": { "sql": sql, "want_rows": false } })
 }
 
+/// One step of a `batch`: `sql` with `args`.
+fn step(sql: &str, args: &[Value], want_rows: bool) -> serde_json::Value {
+    json!({
+        "stmt": { "sql": sql, "args": args.iter().map(value_json).collect::<Vec<_>>(), "want_rows": want_rows },
+    })
+}
+
+/// A statement and its arguments.
+pub(super) type Plain = (String, Vec<Value>);
+
+/// Collects the statements of a write instead of running them, so [`Client::write_once`] can send
+/// them in one request. Only statements without results fit: a read is refused.
+#[derive(Default)]
+pub(super) struct Plan {
+    pub(super) statements: Vec<Plain>,
+}
+
+impl Sql for Plan {
+    fn query(&mut self, _sql: &str, _args: &[Value]) -> Result<Vec<Row>, StoreError> {
+        Err(backend("a write sent in one request cannot read".to_owned()))
+    }
+
+    fn execute(&mut self, sql: &str, args: &[Value]) -> Result<Executed, StoreError> {
+        self.statements.push((sql.to_owned(), args.to_vec()));
+
+        Ok(Executed {
+            changes: 0,
+            last_insert_rowid: 0,
+        })
+    }
+
+    fn batch(&mut self, _sql: &str) -> Result<(), StoreError> {
+        Err(backend("a write sent in one request cannot run a script".to_owned()))
+    }
+}
+
 #[derive(Deserialize)]
 struct Reply {
     baton: Option<String>,
@@ -371,8 +495,30 @@ pub(super) enum Response {
     Execute {
         result: StatementResult,
     },
+    Batch {
+        result: BatchResult,
+    },
     #[serde(other)]
     Other,
+}
+
+/// What a `batch` did: per step, its result or its error (neither for a step that was skipped).
+#[derive(Deserialize)]
+pub(super) struct BatchResult {
+    step_results: Vec<Option<StatementResult>>,
+    step_errors: Vec<Option<Failure>>,
+}
+
+impl BatchResult {
+    /// The schema version the second step read, when it ran.
+    fn version(&self) -> Option<i64> {
+        let rows = &self.step_results.get(1)?.as_ref()?.rows;
+
+        match rows.first()?.first()? {
+            Cell::Integer { value } => value.parse().ok(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Deserialize)]

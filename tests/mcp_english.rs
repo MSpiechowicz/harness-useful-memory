@@ -218,6 +218,7 @@ fn the_instructions_and_tool_descriptions_follow_the_setting() {
     assert!(on_instructions.contains("English keywords"), "{on_instructions}");
     assert!(on_tools.contains("English keywords"), "{on_tools}");
     assert!(on_instructions.chars().count() <= 2000);
+    assert!(on_instructions.contains("note_feedback"), "{on_instructions}");
 
     SqliteStore::open(&dir.path().join("memory.sqlite3"))
         .expect("store")
@@ -226,6 +227,7 @@ fn the_instructions_and_tool_descriptions_follow_the_setting() {
 
     let (off_instructions, off_tools) = handshake(&dir);
     assert!(!off_instructions.contains("English"), "{off_instructions}");
+    assert!(off_instructions.contains("note_feedback"), "{off_instructions}");
     assert!(!off_tools.contains("English"), "{off_tools}");
 
     // Synonym tags are asked for either way.

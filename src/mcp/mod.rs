@@ -40,6 +40,7 @@ pub use input::stop_on_sigterm;
 pub(crate) use script_blocks::{Approval, Shown, author_json, place_label, repo_label};
 pub use vectors::Vectors;
 
+use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
@@ -81,6 +82,31 @@ pub struct Server {
     vector_notice: bool,
     /// Stops the script running now ([`input`]).
     stop: Stop,
+    /// The counter writes of the reply being answered, run once it is written ([`Self::after_reply`]).
+    after: Vec<Counted>,
+    /// The notes counted as shown / as useful in this session already: each counts once.
+    shown_counted: HashSet<i64>,
+    useful_counted: HashSet<i64>,
+}
+
+/// A usefulness counter to write after the reply that caused it went out, so counting never
+/// delays an answer.
+enum Counted {
+    Shown(Vec<i64>),
+    Useful(Vec<i64>, i64),
+}
+
+/// The ids among `ids` not in `counted`, each once.
+fn uncounted(ids: &[i64], counted: &HashSet<i64>) -> Vec<i64> {
+    let mut new: Vec<i64> = Vec::new();
+
+    for id in ids {
+        if !counted.contains(id) && !new.contains(id) {
+            new.push(*id);
+        }
+    }
+
+    new
 }
 
 impl std::fmt::Debug for Server {
@@ -115,6 +141,53 @@ impl Server {
             vectors: None,
             vector_notice: false,
             stop: Stop::default(),
+            after: Vec::new(),
+            shown_counted: HashSet::new(),
+            useful_counted: HashSet::new(),
+        }
+    }
+
+    /// Writes the usefulness counters the last answer asked for. [`serve`] calls it once the
+    /// answer is written and flushed: a counter never delays a reply, and it is a single attempt
+    /// that drops its count when the database is busy. Nothing is reported, whatever happens.
+    /// A note counts as counted in this session when its write is attempted here, so the notes of
+    /// a cancelled request (which never get here) are counted by the next one that shows them.
+    pub fn after_reply(&mut self) {
+        for counted in std::mem::take(&mut self.after) {
+            match counted {
+                Counted::Shown(ids) => {
+                    let new: Vec<i64> = ids.into_iter().filter(|id| self.shown_counted.insert(*id)).collect();
+
+                    if !new.is_empty() {
+                        let _ = self.store.record_shown(&new);
+                    }
+                }
+                Counted::Useful(ids, at) => {
+                    let new: Vec<i64> = ids.into_iter().filter(|id| self.useful_counted.insert(*id)).collect();
+
+                    if !new.is_empty() {
+                        let _ = self.store.record_useful(&new, at);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Queues the notes `ids` that were not counted as shown in this session yet.
+    fn queue_shown(&mut self, ids: &[i64]) {
+        let new = uncounted(ids, &self.shown_counted);
+
+        if !new.is_empty() {
+            self.after.push(Counted::Shown(new));
+        }
+    }
+
+    /// Queues the notes `ids` that were not counted as useful in this session yet, at `at`.
+    fn queue_useful(&mut self, ids: &[i64], at: i64) {
+        let new = uncounted(ids, &self.useful_counted);
+
+        if !new.is_empty() {
+            self.after.push(Counted::Useful(new, at));
         }
     }
 
@@ -315,6 +388,9 @@ pub fn serve<R: BufRead + Send + 'static, W: Write>(reader: R, mut writer: W, se
         if let Some(reply) = reply {
             protocol::write_message(&mut writer, &reply)?;
         }
+
+        // Counted after the answer is out (and dropped with an answer nobody gets).
+        server.after_reply();
     }
 }
 
@@ -325,6 +401,10 @@ fn answer(server: &mut Server, watch: &Watch, message: Value) -> Option<Value> {
     watch.begin(request.as_ref());
     let reply = server.handle(message);
     let cancelled = watch.finish();
+
+    if cancelled {
+        server.after.clear();
+    }
 
     reply.filter(|_| !cancelled)
 }

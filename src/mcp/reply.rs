@@ -24,13 +24,16 @@ impl Capped {
     }
 
     /// Adds `block` whole, or counts it as omitted once anything was omitted or it does not fit.
-    pub fn push(&mut self, block: &str) {
+    /// Says whether the block was added.
+    pub fn push(&mut self, block: &str) -> bool {
         if self.omitted > 0 || !self.fits(block.len()) {
             self.omitted += 1;
-            return;
+            return false;
         }
 
         self.append(block);
+
+        true
     }
 
     /// Adds `block` whole when it fits, else as much of it as fits (cut at a character boundary,
@@ -137,5 +140,13 @@ mod tests {
         reply.push(&"x".repeat(80));
         reply.push("small");
         assert_eq!(reply.finish(), "first block\n… (2 more)");
+    }
+
+    #[test]
+    fn capped_push_says_whether_the_block_was_added() {
+        let mut reply = Capped::new(60);
+        assert!(reply.push("first block"));
+        assert!(!reply.push(&"x".repeat(80)));
+        assert!(!reply.push("small"));
     }
 }

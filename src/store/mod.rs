@@ -43,7 +43,7 @@ pub use hidden::{HiddenEntry, HiddenNote, HiddenNotes, HiddenScripts};
 pub use hooks::{HookDelete, HookDraft, HookPage, HookPut, HookStore, TeamHook, checked_hook, hook_sha256};
 pub use lazy::Lazy;
 pub use libsql::LibsqlStore;
-pub use listing::{LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort};
+pub use listing::{LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort, UsefulFilter};
 pub use mongo::MongoStore;
 pub use postgres::PostgresStore;
 pub use reach::Reach;
@@ -268,6 +268,30 @@ pub struct Note {
     /// The language a store looked at: `None` when it did not (an older server wrote the note, or
     /// the database has no `lang`) or was not certain.
     pub lang: Option<Lang>,
+    /// How often the note was shown to an agent and found useful; `None` when the database has no
+    /// such counters (a read-only role on a database an older server made).
+    pub usage: Option<NoteUsage>,
+}
+
+/// The usefulness counters of a note: how often an agent was shown it in search results, how often
+/// it said the note helped, and when it last did. Counted by [`MemoryStore::record_shown`] and
+/// [`MemoryStore::record_useful`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoteUsage {
+    pub shown: i64,
+    pub useful: i64,
+    /// Unix seconds; `None` until an agent said the note helped.
+    pub last_useful_at: Option<i64>,
+}
+
+/// Which of the notes asked for may be counted found useful ([`MemoryStore::countable`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Countable {
+    /// The notes visible to the caller.
+    pub visible: Vec<i64>,
+    /// The notes that could not be checked (their database or the hidden list could not be read),
+    /// so they are neither counted nor known to be missing.
+    pub unchecked: Vec<i64>,
 }
 
 /// The result of a write to a note.
@@ -541,6 +565,43 @@ pub trait MemoryStore: Send {
     fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
         let _ = (query, ids);
         Ok(Vec::new())
+    }
+
+    /// Which of `ids` (as this store shows them) are visible in `view` for counting them
+    /// ([`Self::record_useful`]), reading no hit. A read that fails never fails the call: the notes
+    /// it covered are [`Countable::unchecked`]. The default reads with [`Self::peek`], all or
+    /// nothing.
+    fn countable(&mut self, view: &View, ids: &[i64]) -> Countable {
+        let mut found = Countable::default();
+
+        for chunk in ids.chunks(crate::limits::GET_IDS_MAX) {
+            match self.peek(view, chunk) {
+                Ok(notes) => found
+                    .visible
+                    .extend(chunk.iter().filter(|id| notes.iter().any(|note| note.id == **id))),
+                Err(_) => found.unchecked.extend_from_slice(chunk),
+            }
+        }
+
+        found
+    }
+
+    /// Counts one more time shown on each of the notes `ids` (as this store shows them, each
+    /// counted once) in one write. It touches no other field of a note, so a revision, a hit
+    /// count, the update time and the search indexes stay as they are, and it also counts the notes
+    /// of a read-only scope. Ids of notes that do not exist are ignored. A single attempt: a
+    /// database whose write lock is taken fails the call at once instead of waiting for it (a caller
+    /// drops the count). The default counts nothing.
+    fn record_shown(&mut self, ids: &[i64]) -> Result<(), StoreError> {
+        let _ = ids;
+        Ok(())
+    }
+
+    /// Counts one more time found useful on each of the notes `ids` (as [`Self::record_shown`])
+    /// and sets their last useful time to `at` (Unix seconds). The default counts nothing.
+    fn record_useful(&mut self, ids: &[i64], at: i64) -> Result<(), StoreError> {
+        let _ = (ids, at);
+        Ok(())
     }
 
     /// Up to `limit` notes in `view` resembling note `id` (which is left out).

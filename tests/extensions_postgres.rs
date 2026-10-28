@@ -1,14 +1,16 @@
 //! The additive schema extensions of the PostgreSQL store (see `postgres_support`): the English
 //! search column, `lang` and its reset trigger are added on every open without a new schema
 //! version, and an older server keeps reading and writing the upgraded database with its writes
-//! still searchable.
+//! still searchable. The usefulness counters of a note are added the same way, and a role that
+//! cannot change the schema keeps what it has without them.
 
 mod common;
 mod postgres_support;
 
+use common::listing::listing;
 use common::{both, draft, query, repo};
 use harness_memory::store::postgres::schema::SCHEMA_VERSION;
-use harness_memory::store::{MemoryStore, NoteKind, NotePatch};
+use harness_memory::store::{MemoryStore, NoteKind, NotePatch, NoteUsage, UsefulFilter};
 use postgres::Client;
 use postgres_support::{Database, database};
 use pretty_assertions::assert_eq;
@@ -22,6 +24,13 @@ const POLISH: &str = "Zadanie synchronizacji czyta każdą zmienioną notatkę z
                       wersję w lokalnej pamięci podręcznej, żeby następne wyszukiwanie znalazło ją od razu.";
 
 /// Counts the rows `sql` returns in its first column.
+/// The extension installs of every test take one database-wide migration lock (with a lock timeout), so tests that
+/// run in parallel on one server would time each other out: they run one at a time.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn count(client: &mut Client, sql: &str) -> i64 {
     client.query_one(sql, &[]).expect("query").get(0)
 }
@@ -37,6 +46,21 @@ fn objects(client: &mut Client) -> i64 {
               + (SELECT count(*) FROM pg_trigger WHERE tgrelid = to_regclass('notes')
                      AND tgname = 'notes_lang_reset')",
     )
+}
+
+/// The usage counter columns the schema has, out of the three there are.
+fn counter_columns(client: &mut Client) -> i64 {
+    count(
+        client,
+        "SELECT count(*) FROM pg_attribute WHERE attrelid = to_regclass('notes')
+             AND attname IN ('shown', 'useful', 'last_useful_at') AND NOT attisdropped",
+    )
+}
+
+fn drop_counters(client: &mut Client) {
+    client
+        .batch_execute("ALTER TABLE notes DROP COLUMN shown, DROP COLUMN useful, DROP COLUMN last_useful_at;")
+        .expect("drop the counters");
 }
 
 fn schema_version(client: &mut Client) -> i64 {
@@ -76,6 +100,7 @@ fn open(db: &Database) -> harness_memory::store::PostgresStore {
 
 #[test]
 fn an_empty_database_gets_the_extensions() {
+    let _serial = serial();
     let Some(db) = database() else { return };
     drop(open(&db));
 
@@ -86,6 +111,7 @@ fn an_empty_database_gets_the_extensions() {
 
 #[test]
 fn a_current_database_without_them_is_upgraded_in_place() {
+    let _serial = serial();
     let Some(db) = database() else { return };
     let mut store = open(&db);
     store
@@ -124,6 +150,7 @@ fn a_current_database_without_them_is_upgraded_in_place() {
 
 #[test]
 fn opening_again_changes_nothing() {
+    let _serial = serial();
     let Some(db) = database() else { return };
     drop(open(&db));
     let mut store = open(&db);
@@ -143,6 +170,7 @@ fn opening_again_changes_nothing() {
 
 #[test]
 fn an_older_servers_writes_stay_searchable_and_get_a_language() {
+    let _serial = serial();
     let Some(db) = database() else { return };
     let mut store = open(&db);
     let mut admin = db.admin();
@@ -174,6 +202,7 @@ fn an_older_servers_writes_stay_searchable_and_get_a_language() {
 
 #[test]
 fn an_older_servers_edit_clears_the_language_and_a_new_servers_edit_keeps_it() {
+    let _serial = serial();
     let Some(db) = database() else { return };
     let mut store = open(&db);
     let mut admin = db.admin();
@@ -254,6 +283,7 @@ fn an_older_servers_edit_clears_the_language_and_a_new_servers_edit_keeps_it() {
 
 #[test]
 fn the_english_notes_setting_defaults_on_and_is_shared() {
+    let _serial = serial();
     let Some(db) = database() else { return };
     let mut store = open(&db);
     assert!(store.english_notes().expect("default"), "on when nothing is stored");
@@ -294,6 +324,7 @@ impl Drop for LimitedRole {
 
 #[test]
 fn a_role_that_cannot_change_the_schema_runs_without_the_extensions() {
+    let _serial = serial();
     let Some(db) = database() else { return };
     drop(open(&db));
 
@@ -338,6 +369,7 @@ fn a_role_that_cannot_change_the_schema_runs_without_the_extensions() {
 /// extensions, and adds them at the next open once the lock is gone.
 #[test]
 fn a_table_lock_held_elsewhere_makes_the_open_run_without_the_extensions_for_now() {
+    let _serial = serial();
     let Some(db) = database() else { return };
     drop(open(&db));
 
@@ -374,4 +406,177 @@ fn a_table_lock_held_elsewhere_makes_the_open_run_without_the_extensions_for_now
 
 fn count_text(client: &mut Client, sql: &str) -> String {
     client.query_one(sql, &[]).expect("query").get(0)
+}
+
+const UNCOUNTED: NoteUsage = NoteUsage {
+    shown: 0,
+    useful: 0,
+    last_useful_at: None,
+};
+
+#[test]
+fn a_database_without_counters_gets_them_and_keeps_its_notes() {
+    let _serial = serial();
+    let Some(db) = database() else { return };
+    let mut store = open(&db);
+    store
+        .remember(&repo(REPO), &draft("Lint", ENGLISH, NoteKind::Note))
+        .expect("remember");
+    drop(store);
+
+    let mut admin = db.admin();
+    drop_counters(&mut admin);
+    assert_eq!(counter_columns(&mut admin), 0);
+
+    let mut store = open(&db);
+    assert_eq!(counter_columns(&mut admin), 3);
+    assert_eq!(schema_version(&mut admin), SCHEMA_VERSION, "no schema version change");
+
+    let page = store.list_notes(&listing(both(REPO))).expect("list");
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0].usage, Some(UNCOUNTED));
+}
+
+#[test]
+fn counting_a_note_changes_nothing_else_of_it() {
+    let _serial = serial();
+    let Some(db) = database() else { return };
+    let mut store = open(&db);
+    let id = store
+        .remember(&repo(REPO), &draft("Sync job", ENGLISH, NoteKind::Note))
+        .expect("remember")
+        .id;
+
+    let mut admin = db.admin();
+    let state = |admin: &mut Client| {
+        ["updated_at", "revision", "hits"]
+            .map(|column| count(admin, &format!("SELECT {column} FROM notes WHERE id = {id}")))
+    };
+    let before = state(&mut admin);
+
+    store.record_shown(&[id, id]).expect("shown");
+    store.record_useful(&[id], 4_000).expect("useful");
+
+    assert_eq!(state(&mut admin), before, "only the counters changed");
+    assert_eq!(count(&mut admin, "SELECT count(*) FROM notes WHERE lang = 'en'"), 1);
+    assert_eq!(store.search(&query("sync", both(REPO))).expect("search").len(), 1);
+
+    let note = store.peek(&both(REPO), &[id]).expect("peek").remove(0);
+    assert_eq!(
+        note.usage,
+        Some(NoteUsage {
+            shown: 1,
+            useful: 1,
+            last_useful_at: Some(4_000)
+        })
+    );
+}
+
+#[test]
+fn a_counter_never_waits_long_for_a_row_another_client_holds() {
+    let _serial = serial();
+    let Some(db) = database() else { return };
+    let mut store = open(&db);
+    let id = store
+        .remember(&repo(REPO), &draft("Sync job", ENGLISH, NoteKind::Note))
+        .expect("remember")
+        .id;
+
+    // Another client keeps the note's row locked.
+    let mut admin = db.admin();
+    admin
+        .batch_execute(&format!("BEGIN; UPDATE notes SET hits = hits WHERE id = {id}"))
+        .expect("lock the row");
+
+    let started = std::time::Instant::now();
+    assert!(store.record_shown(&[id]).is_err(), "the count is dropped");
+    assert!(store.record_useful(&[id], 4_000).is_err(), "so is this one");
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_millis(1_500),
+        "two counters took {took:?}"
+    );
+
+    admin.batch_execute("ROLLBACK").expect("unlock");
+    assert_eq!(
+        count(&mut admin, &format!("SELECT shown + useful FROM notes WHERE id = {id}")),
+        0
+    );
+
+    // A migration another test runs on the shared server can drop a count too: try again.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while store.record_shown(&[id]).is_err() {
+        assert!(std::time::Instant::now() < deadline, "counting never works again");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(
+        count(&mut admin, &format!("SELECT shown FROM notes WHERE id = {id}")),
+        1
+    );
+}
+
+#[test]
+fn a_role_that_cannot_change_the_schema_keeps_the_language_without_the_counters() {
+    let _serial = serial();
+    let Some(db) = database() else { return };
+    let mut owner = open(&db);
+    owner
+        .remember(&repo(REPO), &draft("Sync job", ENGLISH, NoteKind::Note))
+        .expect("remember");
+    drop(owner);
+
+    let mut admin = db.admin();
+    drop_counters(&mut admin);
+
+    let name = format!("hm_readonly_{}", std::process::id());
+    let schema = count_text(&mut admin, "SELECT current_schema()");
+    admin
+        .batch_execute(&format!(
+            "CREATE ROLE {name} LOGIN PASSWORD 'limited';
+             GRANT USAGE ON SCHEMA \"{schema}\" TO {name};
+             GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA \"{schema}\" TO {name};
+             GRANT USAGE ON ALL SEQUENCES IN SCHEMA \"{schema}\" TO {name};"
+        ))
+        .expect("create the limited role");
+    let _role = LimitedRole {
+        admin: db.admin(),
+        name: name.clone(),
+    };
+
+    let url = db.url();
+    let (scheme, rest) = url.split_once("://").expect("a URL");
+    let (_, host) = rest.split_once('@').expect("a URL with a user");
+    let mut store =
+        harness_memory::store::PostgresStore::connect(&format!("{scheme}://{name}:limited@{host}")).expect("connect");
+
+    assert!(store.has_extensions(), "the language and the English index are there");
+    assert_eq!(counter_columns(&mut admin), 0, "the role could not add the counters");
+
+    // The language is shown, the counters are not, and nothing fails for the missing columns.
+    let page = store.list_notes(&listing(both(REPO))).expect("list");
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0].usage, None);
+    assert_eq!(page.rows[0].lang, Some(harness_memory::support::lang::Lang::En));
+
+    let note = store.peek(&both(REPO), &[page.rows[0].id]).expect("peek").remove(0);
+    assert_eq!(note.usage, None);
+
+    for useful in [UsefulFilter::Ever, UsefulFilter::Never] {
+        for sort in [
+            harness_memory::store::NoteSort::Useful,
+            harness_memory::store::NoteSort::LastUseful,
+        ] {
+            let filtered = store
+                .list_notes(&harness_memory::store::NoteListQuery {
+                    useful: Some(useful),
+                    sort,
+                    ..listing(both(REPO))
+                })
+                .expect("list");
+            assert_eq!((filtered.total, filtered.rows.len()), (0, 0), "{useful:?}");
+        }
+    }
+
+    store.record_shown(&[page.rows[0].id]).expect("counts nothing");
+    store.record_useful(&[page.rows[0].id], 5).expect("counts nothing");
 }

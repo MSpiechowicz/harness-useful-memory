@@ -31,7 +31,7 @@ use super::sqlite::sql::Sql;
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, Saved, SearchQuery};
 use super::{Forgotten, NoteListQuery, NotePage, NoteText, StoreError, Target, VectorTarget, View};
 use crate::backend::Place;
-use hrana::{Client, Outcome, Stream, execute};
+use hrana::{Client, Outcome, Plan, Stream, execute};
 
 /// How long a write keeps asking for a lock the server reports busy.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -45,6 +45,8 @@ pub struct LibsqlStore {
     newer: bool,
     /// The additive schema extensions are in place (see [`engine::install`]).
     extensions: bool,
+    /// The usefulness counters of a note are in place (kept apart: see [`Engine::usage`]).
+    usage: bool,
 }
 
 impl std::fmt::Debug for LibsqlStore {
@@ -52,6 +54,7 @@ impl std::fmt::Debug for LibsqlStore {
         f.debug_struct("LibsqlStore")
             .field("newer", &self.newer)
             .field("extensions", &self.extensions)
+            .field("usage", &self.usage)
             .finish_non_exhaustive()
     }
 }
@@ -66,12 +69,15 @@ impl LibsqlStore {
             client,
             newer: false,
             extensions: false,
+            usage: false,
         };
 
         store.newer = store.migrate()? == SchemaState::Newer;
 
         if !store.newer {
-            store.extensions = engine::install(&mut store);
+            let installed = engine::install(&mut store);
+            store.extensions = installed.extensions;
+            store.usage = installed.usage;
             engine::backfill(&mut store);
         }
 
@@ -161,6 +167,26 @@ impl Engine for LibsqlStore {
         written
     }
 
+    /// For a counter: `op`'s statements go in one request that does the version check, the
+    /// writes and the commit, and closes the stream by itself ([`Client::write_once`]), within
+    /// [`hrana::COUNT_BUDGET`]. A busy database fails it at once or it waits out its budget;
+    /// either way nothing it began stays open once this call gives up.
+    fn write_once<T>(&mut self, op: impl FnOnce(&mut dyn Sql) -> Result<T, StoreError>) -> Result<T, StoreError> {
+        self.check_version()?;
+
+        let mut plan = Plan::default();
+        let done = op(&mut plan)?;
+        let written = self
+            .client
+            .write_once(&plan.statements, SCHEMA_VERSION, hrana::COUNT_BUDGET);
+
+        if matches!(written, Err(StoreError::NewerSchema)) {
+            self.newer = true;
+        }
+
+        written.map(|()| done)
+    }
+
     fn read<T>(&mut self, op: impl FnOnce(&mut dyn Sql) -> Result<T, StoreError>) -> Result<T, StoreError> {
         self.check_version()?;
         op(&mut self.client.single())
@@ -168,6 +194,10 @@ impl Engine for LibsqlStore {
 
     fn extensions(&self) -> bool {
         self.extensions
+    }
+
+    fn usage(&self) -> bool {
+        self.usage
     }
 }
 
@@ -202,6 +232,14 @@ impl MemoryStore for LibsqlStore {
 
     fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
         embed::hits_for(self, query, ids)
+    }
+
+    fn record_shown(&mut self, ids: &[i64]) -> Result<(), StoreError> {
+        engine::record_shown(self, ids)
+    }
+
+    fn record_useful(&mut self, ids: &[i64], at: i64) -> Result<(), StoreError> {
+        engine::record_useful(self, ids, at)
     }
 
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {

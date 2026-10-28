@@ -67,8 +67,9 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--o
 /// guards with their held items and user-only saves (`notes save`, `notes update`, `scripts save`,
 /// `held list|save|skip`), the `settings` command, the notes language (`notes list --lang`, the
 /// `lang` of a note, the English notes setting), the shared embedder (`embedder`), and the offline
-/// fallback (`offline_fallback`).
-const FEATURES: [&str; 12] = [
+/// fallback (`offline_fallback`), and the usefulness counters of a note (`notes list --sort
+/// useful|lastUseful`, `--useful ever|never`, the `shown`, `useful` and `lastUsefulAt` of a note).
+const FEATURES: [&str; 13] = [
     "notes-remote-local",
     "notes-hide",
     "push-json",
@@ -81,6 +82,7 @@ const FEATURES: [&str; 12] = [
     "notes-lang",
     "embedder",
     "offline-fallback",
+    "notes-useful",
 ];
 
 /// mimalloc hands freed memory back to the operating system, which the embedder's idle unload of

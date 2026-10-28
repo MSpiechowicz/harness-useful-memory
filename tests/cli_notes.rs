@@ -276,7 +276,10 @@ fn lists_gets_and_deletes(folders: &Folders, repo_place: &str, global_place: &st
             "updatedAt",
             "revision",
             "hits",
-            "lang"
+            "lang",
+            "shown",
+            "useful",
+            "lastUsefulAt"
         ]
     );
     assert_eq!(flaky_row["id"], flaky);
@@ -296,6 +299,15 @@ fn lists_gets_and_deletes(folders: &Folders, repo_place: &str, global_place: &st
     assert_eq!(
         (flaky_row["revision"].clone(), flaky_row["hits"].clone()),
         (json!(1), json!(0))
+    );
+    assert_eq!(
+        (
+            flaky_row["shown"].clone(),
+            flaky_row["useful"].clone(),
+            flaky_row["lastUsefulAt"].clone()
+        ),
+        (json!(0), json!(0), Value::Null),
+        "no agent was shown the note yet"
     );
     assert_eq!(notes[0]["id"], tabs);
     assert_eq!(notes[0]["scope"], "global");
@@ -865,6 +877,12 @@ fn bad_usage_exits_2() {
         &["notes", "list", "--json", "--lang", "EN"],
         &["notes", "list", "--json", "--lang"],
         &["notes", "list", "--json", "--lang", "en", "--lang", "en"],
+        &["notes", "list", "--json", "--sort", "lastuseful"],
+        &["notes", "list", "--json", "--sort", "Useful"],
+        &["notes", "list", "--json", "--useful", "sometimes"],
+        &["notes", "list", "--json", "--useful", "Ever"],
+        &["notes", "list", "--json", "--useful"],
+        &["notes", "list", "--json", "--useful", "ever", "--useful", "never"],
         &["settings"],
         &["settings", "get"],
         &["settings", "set", "english_notes=true"],
@@ -1474,5 +1492,112 @@ fn the_language_filter_pages_over_many_notes() {
     assert_eq!(
         folders.json(&["notes", "list", "--json", "--lang", "unknown"])["total"],
         0
+    );
+}
+
+/// Seeds the global notes `Cold` (shown 4 times, never useful), `Warm` (shown 3 times, useful
+/// once), `Hot` (shown 5 times, useful 3 times, the last at 1_700_000_500) and `Rare` (shown twice,
+/// never useful) in the local file; the id of `Hot`.
+fn seed_usefulness(folders: &Folders) -> i64 {
+    let mut store = SqliteStore::open(&folders.data.join("memory.sqlite3")).expect("store");
+
+    let [cold, warm, hot, rare] = ["Cold", "Warm", "Hot", "Rare"].map(|title| {
+        let draft = NoteDraft {
+            title: title.to_owned(),
+            body: format!("{title} body"),
+            kind: NoteKind::Note,
+            tags: Vec::new(),
+            entities: Vec::new(),
+            provenance: Provenance::default(),
+        };
+        store.remember(&Target::Global, &draft).expect("remember").id
+    });
+
+    for (ids, times) in [
+        (vec![cold, warm, hot], 3),
+        (vec![hot], 2),
+        (vec![cold], 1),
+        (vec![rare], 2),
+    ] {
+        for _ in 0..times {
+            store.record_shown(&ids).expect("shown");
+        }
+    }
+
+    store.record_useful(&[warm], 1_700_000_000).expect("warm");
+    store.record_useful(&[hot], 1_700_000_100).expect("hot");
+    store.record_useful(&[hot], 1_700_000_300).expect("hot");
+    store.record_useful(&[hot], 1_700_000_500).expect("hot");
+
+    hot
+}
+
+#[test]
+fn the_usefulness_counters_are_listed_sorted_and_filtered() {
+    let folders = folders();
+    let hot = seed_usefulness(&folders);
+    let list = |extra: &[&str]| -> Value {
+        let args: Vec<&str> = ["notes", "list", "--json"].iter().chain(extra).copied().collect();
+        folders.json(&args)
+    };
+
+    let all = list(&[]);
+    let hot_row = row(&all, "Hot");
+    assert_eq!(
+        (
+            hot_row["shown"].clone(),
+            hot_row["useful"].clone(),
+            hot_row["lastUsefulAt"].clone()
+        ),
+        (json!(5), json!(3), json!("2023-11-14T22:21:40Z"))
+    );
+    assert_eq!(row(&all, "Cold")["lastUsefulAt"], Value::Null);
+    assert_eq!(row(&all, "Rare")["shown"], 2);
+
+    // Most useful first; a note never found useful comes last, in id order the sort turns round.
+    assert_eq!(
+        titles(&list(&["--sort", "useful"])),
+        ["Hot", "Warm", "Rare", "Cold"],
+        "rare and cold tie at 0, newer id first"
+    );
+    assert_eq!(
+        titles(&list(&["--sort", "useful", "--order", "asc"])),
+        ["Cold", "Rare", "Warm", "Hot"]
+    );
+    assert_eq!(
+        titles(&list(&["--sort", "lastUseful"])),
+        ["Hot", "Warm", "Rare", "Cold"]
+    );
+
+    // `any` keeps everything, `ever` the notes found useful, `never` those shown 3 times or more
+    // without a use (Rare was shown twice only).
+    assert_eq!(list(&["--useful", "any"])["total"], 4);
+
+    let ever = list(&["--useful", "ever", "--sort", "useful"]);
+    assert_eq!(titles(&ever), ["Hot", "Warm"]);
+    assert_eq!(ever["total"], 2);
+
+    let never = list(&["--useful", "never"]);
+    assert_eq!(titles(&never), ["Cold"]);
+    assert_eq!(never["total"], 1);
+    assert_eq!(
+        never["kinds"]
+            .as_array()
+            .expect("kinds")
+            .iter()
+            .map(|kind| kind["count"].as_u64().expect("count"))
+            .sum::<u64>(),
+        1,
+        "the counts follow the filter"
+    );
+
+    let shown = folders.json(&["notes", "get", &hot.to_string(), "--json"]);
+    assert_eq!(
+        (
+            shown["note"]["shown"].clone(),
+            shown["note"]["useful"].clone(),
+            shown["note"]["lastUsefulAt"].clone()
+        ),
+        (json!(5), json!(3), json!("2023-11-14T22:21:40Z"))
     );
 }

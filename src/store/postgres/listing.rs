@@ -8,9 +8,10 @@ use postgres::GenericClient;
 use super::notes::{VISIBLE, kind_from_sql, note_from_row, row_columns};
 use super::{KIND_MAX, backend, column, cut, view_params};
 use crate::limits::ENTITY_MAX;
+use crate::store::extensions::Columns;
 use crate::store::listing::{
-    LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort, checked_exclude, direction, page_limit, query_entity,
-    query_text, scoped,
+    LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort, UsefulFilter, checked_exclude, direction, page_limit,
+    query_entity, query_text, scoped,
 };
 use crate::store::{NoteKind, Scope, StoreError};
 
@@ -23,16 +24,17 @@ const KEPT: &str = "($1::text IS NULL OR strpos(lower(n.title), lower($1::text))
 pub(super) fn list(
     client: &mut impl GenericClient,
     query: &NoteListQuery,
-    extensions: bool,
+    columns: Columns,
 ) -> Result<NotePage, StoreError> {
     let text = query_text(query)?;
     let entity = query_entity(query);
     let exclude = checked_exclude(&query.exclude)?.to_vec();
     let (repo, global) = view_params(client, &query.view)?;
-    let lang = LangFilter::condition(query.lang, "n.lang", extensions);
+    let lang = LangFilter::condition(query.lang, "n.lang", columns.lang);
+    let useful = UsefulFilter::condition(query.useful, "n.shown", "n.useful", columns.usage);
 
     let counts_sql = format!(
-        "SELECT {}, n.project_id IS NULL, count(*) FROM notes n WHERE {VISIBLE} AND {KEPT} AND {lang}
+        "SELECT {}, n.project_id IS NULL, count(*) FROM notes n WHERE {VISIBLE} AND {KEPT} AND {lang} AND {useful}
            AND n.id <> ALL($5::bigint[])
          GROUP BY n.kind, n.project_id IS NULL",
         cut("n.kind", KIND_MAX)
@@ -57,12 +59,16 @@ pub(super) fn list(
         NoteSort::Kind => format!("n.kind COLLATE \"C\" {dir}, n.id {dir}"),
         NoteSort::Scope => format!("(n.project_id IS NOT NULL) {dir}, n.id {dir}"),
         NoteSort::Place => format!("n.id {dir}"),
+        // Without the counters every note counts as 0, so only the id orders them.
+        NoteSort::Useful | NoteSort::LastUseful if !columns.usage => format!("n.id {dir}"),
+        NoteSort::Useful => format!("coalesce(n.useful, 0) {dir}, n.id {dir}"),
+        NoteSort::LastUseful => format!("coalesce(n.last_useful_at, 0) {dir}, n.id {dir}"),
     };
     let sql = format!(
         "SELECT {} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
-         WHERE {VISIBLE} AND {KEPT} AND {lang} AND ($5::text IS NULL OR n.kind = $5::text) AND n.id <> ALL($8::bigint[])
+         WHERE {VISIBLE} AND {KEPT} AND {lang} AND {useful} AND ($5::text IS NULL OR n.kind = $5::text) AND n.id <> ALL($8::bigint[])
          ORDER BY {order} LIMIT $6 OFFSET $7",
-        row_columns(extensions)
+        row_columns(columns)
     );
 
     let limit = i64::try_from(page_limit(query)).unwrap_or(1);

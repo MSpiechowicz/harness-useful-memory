@@ -148,7 +148,68 @@ impl Database {
     }
 }
 
+/// The write lock of a database, held by another client until this drops.
+pub struct Hold<'a> {
+    server: Option<(&'a Server, String)>,
+    _connection: Option<rusqlite::Connection>,
+}
+
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        if let Some((server, baton)) = self.server.take() {
+            server.send(json!({ "baton": baton, "requests": [{ "type": "execute", "stmt": { "sql": "ROLLBACK" } }, { "type": "close" }] }));
+        }
+    }
+}
+
+impl Database {
+    /// Another client takes the write lock of this database and keeps it while the result lives.
+    pub fn hold_write_lock(&self) -> Hold<'_> {
+        match self {
+            Self::Sqlite(dir) => {
+                let conn = rusqlite::Connection::open(dir.path().join("memory.sqlite3")).expect("raw");
+                conn.execute_batch("BEGIN IMMEDIATE").expect("lock");
+                Hold {
+                    server: None,
+                    _connection: Some(conn),
+                }
+            }
+            Self::Libsql(server) => {
+                let reply = server.send(
+                    json!({ "baton": null, "requests": [{ "type": "execute", "stmt": { "sql": "BEGIN IMMEDIATE" } }] }),
+                );
+                let baton = reply["baton"].as_str().expect("the stream stays open").to_owned();
+                Hold {
+                    server: Some((server, baton)),
+                    _connection: None,
+                }
+            }
+        }
+    }
+}
+
 impl Server {
+    /// Posts `body` to the pipeline and returns the whole reply.
+    fn send(&self, body: Value) -> Value {
+        let mut call = self
+            .agent
+            .post(format!("{}/v2/pipeline", self.url.trim_end_matches('/')));
+
+        if let Some(token) = &self.token {
+            call = call.header("authorization", format!("Bearer {token}"));
+        }
+
+        let text = call
+            .header("content-type", "application/json")
+            .send(body.to_string())
+            .expect("libSQL server")
+            .body_mut()
+            .read_to_string()
+            .expect("reply");
+
+        serde_json::from_str(&text).expect("JSON reply")
+    }
+
     fn batch(&self, sql: &str) {
         self.pipeline(json!({ "type": "sequence", "sql": sql }));
     }

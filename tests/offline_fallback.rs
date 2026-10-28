@@ -148,6 +148,31 @@ fn a_remote_scope_is_served_from_this_computer_and_copied_when_the_team_database
 }
 
 #[test]
+fn a_counter_neither_opens_the_team_database_nor_copies_the_notes_saved_offline() {
+    let fixture = Fixture::new();
+    let mut store = fixture.store(NotesPlace::Remote, true);
+
+    let id = save(&mut store, "written offline").expect("saved on this computer");
+    assert!(store.offline());
+
+    // The team database is back, but only a call that settles may notice it.
+    fixture.up.store(true, Ordering::SeqCst);
+    wait_out_the_cooldown();
+
+    store.record_shown(&[id]).expect("shown");
+    store.record_useful(&[id], 100).expect("useful");
+
+    assert!(store.offline(), "a counter did not settle");
+    assert!(fixture.pending().is_file(), "the note still waits to be copied");
+    assert!(!fixture.team_file().exists(), "the team database was not opened");
+
+    // The next call that settles copies it.
+    titles(&mut store, "offline");
+    assert!(!store.offline());
+    assert_eq!(fixture.team_titles("offline"), ["written offline"]);
+}
+
+#[test]
 fn notes_saved_offline_are_copied_when_a_later_server_starts() {
     let fixture = Fixture::new();
     save(&mut fixture.store(NotesPlace::Remote, true), "left behind").expect("saved");

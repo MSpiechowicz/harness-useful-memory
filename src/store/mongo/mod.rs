@@ -116,6 +116,8 @@ mod search;
 mod settings;
 mod team_docs;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -146,6 +148,19 @@ const META: &str = "meta";
 /// How long the driver looks for a usable server when the URL does not say.
 const SERVER_SELECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The longest a usefulness counter write is waited for: the driver has no deadline for one
+/// operation, so the write runs on its own thread and is left behind when it is late.
+const COUNT_BUDGET: Duration = Duration::from_millis(750);
+
+/// Lets the next counter write start once dropped: the counter thread owns it, so a panic frees it too.
+struct CountGate(Arc<AtomicBool>);
+
+impl Drop for CountGate {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Attempts of one write before it gives up on concurrent changes.
 const WRITE_ATTEMPTS: u32 = 20;
 
@@ -175,6 +190,8 @@ pub struct MongoStore {
     documentdb: bool,
     /// The additive schema extensions are in place (see [`schema::ensure_extensions`]).
     extensions: bool,
+    /// A counter write left behind by [`COUNT_BUDGET`] is still running: no other one starts.
+    counting: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for MongoStore {
@@ -238,6 +255,7 @@ impl MongoStore {
             text_index: !documentdb,
             documentdb,
             extensions: false,
+            counting: Arc::new(AtomicBool::new(false)),
         };
 
         if !store.newer {
@@ -307,6 +325,59 @@ impl MongoStore {
         }
 
         Ok(())
+    }
+
+    /// Runs the counter write `count` once, for at most [`COUNT_BUDGET`]: it checks the schema
+    /// version and writes on a thread of its own, which a late write is left running on (a new
+    /// counter is dropped meanwhile), so a stalled database never holds up the caller.
+    fn count(
+        &mut self,
+        count: impl FnOnce(&Database, bool) -> Result<(), Fail> + Send + 'static,
+    ) -> Result<(), StoreError> {
+        if self.newer {
+            return Err(StoreError::NewerSchema);
+        }
+
+        if self.counting.swap(true, Ordering::AcqRel) {
+            return Err(StoreError::Backend("a counter write is still running".to_owned()));
+        }
+
+        let (db, documentdb, running) = (self.db.clone(), self.documentdb, Arc::clone(&self.counting));
+        let (sender, receiver) = mpsc::channel();
+
+        let spawned = thread::Builder::new().name("mongo-counter".to_owned()).spawn(move || {
+            // Clears the gate when the thread ends, also when the write panics.
+            let gate = CountGate(running);
+
+            let written = (|| {
+                let version = schema::version(&db, documentdb).map_err(|error| driver_error(&error, documentdb))?;
+
+                if version > schema::SCHEMA_VERSION {
+                    return Err(StoreError::NewerSchema);
+                }
+
+                count(&db, documentdb).map_err(|fail| fail.into_store(documentdb))
+            })();
+
+            drop(gate);
+            let _ = sender.send(written);
+        });
+
+        if let Err(error) = spawned {
+            // The closure, and the gate it owned, is gone: open the gate again.
+            self.counting.store(false, Ordering::Release);
+            return Err(StoreError::Backend(format!("a counter write could not start: {error}")));
+        }
+
+        let written = receiver
+            .recv_timeout(COUNT_BUDGET)
+            .unwrap_or_else(|_| Err(StoreError::Backend("the counter write timed out".to_owned())));
+
+        if matches!(written, Err(StoreError::NewerSchema)) {
+            self.newer = true;
+        }
+
+        written
     }
 
     /// Runs `op` as one write: in a transaction when the deployment has them, retried from the
@@ -410,6 +481,19 @@ impl MemoryStore for MongoStore {
 
     fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
         search::by_ids(&mut self.reader()?, query, ids).map_err(|fail| self.failed(fail))
+    }
+
+    fn record_shown(&mut self, ids: &[i64]) -> Result<(), StoreError> {
+        let ids = ids.to_vec();
+
+        // One atomic increment per note, so this needs no transaction (like the hit of a read).
+        self.count(move |db, documentdb| notes::record_shown(&mut Ctx::new(db, None, documentdb), &ids))
+    }
+
+    fn record_useful(&mut self, ids: &[i64], at: i64) -> Result<(), StoreError> {
+        let ids = ids.to_vec();
+
+        self.count(move |db, documentdb| notes::record_useful(&mut Ctx::new(db, None, documentdb), &ids, at))
     }
 
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {
@@ -1116,6 +1200,9 @@ fn note_fields() -> Document {
         "revision": number("$revision"),
         "hits": number("$hits"),
         "lang": fresh_lang(),
+        "shown": number("$shown"),
+        "useful": number("$useful"),
+        "last_useful_at": optional_number("$last_useful_at"),
     }
 }
 
@@ -1167,6 +1254,11 @@ fn number(path: &str) -> Bson {
     Bson::Document(doc! { "$cond": [is_number(path), path, 0_i64] })
 }
 
+/// The number at `path`; `null` when it is not a number.
+fn optional_number(path: &str) -> Bson {
+    Bson::Document(doc! { "$cond": [is_number(path), path, Bson::Null] })
+}
+
 /// True when the value at `path` is a number. `$type` instead of `$isNumber`, which Amazon
 /// DocumentDB only has from engine 8.0.1.
 fn is_number(path: &str) -> Bson {
@@ -1206,6 +1298,27 @@ mod tests {
         Some(Scratch(
             client.database(&format!("hmu_sorted_{}_{nanos}", std::process::id())),
         ))
+    }
+
+    #[test]
+    fn a_counter_write_that_panics_does_not_stop_the_next_one() {
+        let Ok(url) = std::env::var("HARNESS_MEMORY_TEST_MONGO_URL") else {
+            eprintln!("skipped: set HARNESS_MEMORY_TEST_MONGO_URL to a MongoDB URL to run the counter gate test");
+            return;
+        };
+
+        let (base, query) = url
+            .split_once('?')
+            .map_or((url.as_str(), ""), |(base, query)| (base, query));
+        let database = format!("hmu_gate_{}", std::process::id());
+        let url = format!("{}/{database}?{query}", base.trim_end_matches('/'));
+        let mut store = MongoStore::connect(&url).expect("connect");
+
+        let panicked = store.count(|_, _| panic!("a counter write that dies"));
+        assert!(panicked.is_err(), "{panicked:?}");
+
+        store.count(|_, _| Ok(())).expect("the next counter is not refused");
+        let _ = store.db.drop().run();
     }
 
     #[test]

@@ -59,7 +59,12 @@ pub fn run_raw(server: &mut Server, input: &[u8]) -> Vec<Value> {
 pub fn run(server: &mut Server, messages: &[Value]) -> Vec<Value> {
     messages
         .iter()
-        .filter_map(|message| server.handle(message.clone()))
+        .filter_map(|message| {
+            let reply = server.handle(message.clone());
+            // As `serve` does once an answer is written: the counters of the call.
+            server.after_reply();
+            reply
+        })
         .collect()
 }
 

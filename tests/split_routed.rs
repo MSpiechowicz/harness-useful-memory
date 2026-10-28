@@ -10,13 +10,16 @@ mod mongo_support;
 mod postgres_support;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::{both, draft, global_only, query, repo, repo_only};
 use harness_memory::backend::{NotesPlace, Place};
 use harness_memory::store::split::LOCAL_ID_OFFSET;
 use harness_memory::store::{
-    Forget, HiddenNotes, Link, MemoryStore, NoteKind, NoteListQuery, NoteOrigin, NotePage, NotePatch, NoteSort, Scope,
-    SplitStore, SqliteStore, StoreError, Target, View,
+    Edge, Forget, Forgotten, HiddenNotes, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NoteKind,
+    NoteListQuery, NoteOrigin, NotePage, NotePatch, NoteSort, NoteUsage, Saved, Scope, SearchQuery, SplitStore,
+    SqliteStore, StoreError, Target, View,
 };
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -96,7 +99,7 @@ impl Fixture {
 
 type Case = fn(&Fixture);
 
-const CASES: [Case; 11] = [
+const CASES: [Case; 12] = [
     remote_local_reads_both_and_saves_here,
     pages_merge_both_stores_in_order,
     a_place_lists_its_store_and_counts_both,
@@ -108,6 +111,7 @@ const CASES: [Case; 11] = [
     another_process_skips_a_recent_prune,
     saving_under_a_hidden_title_is_refused,
     deleting_every_note_leaves_the_hidden_team_notes,
+    counters_reach_the_store_of_each_note_also_when_it_is_read_only,
 ];
 
 fn run(fresh: Fresh) {
@@ -152,6 +156,7 @@ fn listing(view: View) -> NoteListQuery {
         place: None,
         entity: None,
         lang: None,
+        useful: None,
         sort: NoteSort::Updated,
         descending: true,
         offset: 0,
@@ -975,4 +980,221 @@ fn hiding_at_once_never_passes_the_limit() {
         .query_row("SELECT count(*) FROM hidden_team_notes", [], |row| row.get(0))
         .expect("count");
     assert_eq!((hid, rows), (2, 500), "only two more fit");
+}
+
+/// A usefulness counter is not a change to a note: it counts on a read-only team note and on one
+/// kept on this computer, each in the store that holds the note, and changes nothing else of them.
+fn counters_reach_the_store_of_each_note_also_when_it_is_read_only(fixture: &Fixture) {
+    let mut team = fixture.team.open();
+    let shared = team
+        .remember(
+            &repo(REPO),
+            &draft("Team deploy", "deploy with make", NoteKind::Decision),
+        )
+        .expect("team repository note");
+
+    let mut split = fixture.routed(NotesPlace::RemoteLocal, NotesPlace::Remote);
+    let mine = split
+        .remember(&repo(REPO), &draft("My deploy", "deploy by hand", NoteKind::Fix))
+        .expect("saved here")
+        .id;
+    assert!(mine >= LOCAL_ID_OFFSET);
+    assert!(split.origin(shared.id, Scope::Repo) == NoteOrigin::Team { read_only: true });
+
+    let before = split.list_notes(&listing(both(REPO))).expect("list");
+
+    split.record_shown(&[shared.id, mine, mine]).expect("shown");
+    split.record_shown(&[shared.id]).expect("shown");
+    split.record_useful(&[shared.id], 100).expect("useful");
+    split.record_useful(&[mine], 200).expect("useful");
+
+    let counters = |shown, useful, last_useful_at| {
+        Some(NoteUsage {
+            shown,
+            useful,
+            last_useful_at,
+        })
+    };
+
+    // Each store has counted its own note.
+    let at_team = team.peek(&repo_only(REPO), &[shared.id]).expect("peek").remove(0);
+    assert_eq!(at_team.usage, counters(2, 1, Some(100)));
+    assert_eq!((at_team.revision, at_team.hits), (1, 0), "the team note is unchanged");
+
+    let after = split.list_notes(&listing(both(REPO))).expect("list");
+    let usage = |page: &NotePage, id: i64| page.rows.iter().find(|row| row.id == id).expect("listed").usage;
+    assert_eq!(usage(&after, shared.id), counters(2, 1, Some(100)));
+    assert_eq!(usage(&after, mine), counters(1, 1, Some(200)));
+
+    for (was, now) in before.rows.iter().zip(&after.rows) {
+        assert_eq!(
+            (was.id, was.updated_at, was.revision, was.hits),
+            (now.id, now.updated_at, now.revision, now.hits)
+        );
+    }
+
+    // The merged list orders by them, the note found useful most recently first.
+    let latest = NoteListQuery {
+        sort: NoteSort::LastUseful,
+        ..listing(both(REPO))
+    };
+    assert_eq!(
+        split
+            .list_notes(&latest)
+            .expect("list")
+            .rows
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        vec![mine, shared.id]
+    );
+
+    // And it is still read-only.
+    let patch = NotePatch {
+        append: Some("more".to_owned()),
+        ..NotePatch::default()
+    };
+    assert!(split.update(&both(REPO), shared.id, &patch).is_err());
+}
+
+/// A team store that counts the notes it is asked to read.
+struct Reads {
+    inner: SqliteStore,
+    reads: Arc<AtomicUsize>,
+}
+
+impl Reads {
+    fn read(&self) {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl MemoryStore for Reads {
+    fn remember(&mut self, target: &Target, draft: &NoteDraft) -> Result<Saved, StoreError> {
+        self.inner.remember(target, draft)
+    }
+
+    fn update(&mut self, view: &View, id: i64, patch: &NotePatch) -> Result<Saved, StoreError> {
+        self.inner.update(view, id, patch)
+    }
+
+    fn get(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
+        self.read();
+        self.inner.get(view, ids)
+    }
+
+    fn peek(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
+        self.read();
+        self.inner.peek(view, ids)
+    }
+
+    fn list_notes(&mut self, query: &NoteListQuery) -> Result<NotePage, StoreError> {
+        self.read();
+        self.inner.list_notes(query)
+    }
+
+    fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
+        self.read();
+        self.inner.search(query)
+    }
+
+    fn record_shown(&mut self, ids: &[i64]) -> Result<(), StoreError> {
+        self.inner.record_shown(ids)
+    }
+
+    fn record_useful(&mut self, ids: &[i64], at: i64) -> Result<(), StoreError> {
+        self.inner.record_useful(ids, at)
+    }
+
+    fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {
+        self.read();
+        self.inner.similar(view, id, limit)
+    }
+
+    fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {
+        self.inner.link(target, link)
+    }
+
+    fn neighbors(&mut self, view: &View, entity: &str, depth: u8, limit: usize) -> Result<Neighborhood, StoreError> {
+        self.read();
+        self.inner.neighbors(view, entity, depth, limit)
+    }
+
+    fn forget(&mut self, view: &View, target: &Target, what: &Forget) -> Result<usize, StoreError> {
+        self.inner.forget(view, target, what)
+    }
+
+    fn forget_notes(&mut self, view: &View, exclude: &[i64]) -> Result<Forgotten, StoreError> {
+        self.inner.forget_notes(view, exclude)
+    }
+
+    fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
+        self.read();
+        self.inner.find_by_title(target, title)
+    }
+}
+
+/// A counter never waits for the team database: with the hidden list due for a prune (which reads
+/// the team database with the long timeouts of a call), it reads the list as it is and counts only
+/// what is not hidden. A call that replies still prunes.
+#[test]
+fn a_counter_does_not_prune_the_hidden_list() {
+    let dir = TempDir::new().expect("temp dir");
+    let local = dir.path().join("memory.sqlite3");
+    let team_file = dir.path().join("team.sqlite3");
+
+    let mut team = SqliteStore::open(&team_file).expect("team file");
+    let kept = team
+        .remember(&repo(REPO), &draft("Kept", "counted as shown", NoteKind::Note))
+        .expect("team note");
+    let hidden = team
+        .remember(&repo(REPO), &draft("Hidden", "never counted", NoteKind::Note))
+        .expect("team note");
+    let note = team.peek(&both(REPO), &[hidden.id]).expect("peek").remove(0);
+    assert!(HiddenNotes::new(local.clone(), TEAM_KEY).hide(&note).expect("hide"));
+
+    // Pruned long ago (the epoch): the next call that replies is due to prune.
+    let raw = rusqlite::Connection::open(&local).expect("raw local");
+    raw.execute(
+        "INSERT INTO hidden_team_notes_meta (team, pruned_at) VALUES (?1, 1)
+         ON CONFLICT (team) DO UPDATE SET pruned_at = 1",
+        [TEAM_KEY],
+    )
+    .expect("window passed");
+
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counting = Reads {
+        inner: SqliteStore::open(&team_file).expect("team file"),
+        reads: Arc::clone(&reads),
+    };
+    let mut split = SplitStore::routed(
+        Box::new(counting),
+        Box::new(SqliteStore::open(&local).expect("local file")),
+        NotesPlace::Remote,
+        NotesPlace::Remote,
+        Some(HiddenNotes::new(local, TEAM_KEY)),
+    );
+
+    split.record_shown(&[kept.id, hidden.id]).expect("shown");
+    split.record_useful(&[kept.id, hidden.id], 100).expect("useful");
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "the counters did not read the team database"
+    );
+
+    let mut counted = |id: i64| {
+        let usage = team.peek(&both(REPO), &[id]).expect("peek").remove(0).usage;
+        usage.map(|usage| (usage.shown, usage.useful))
+    };
+    assert_eq!(counted(hidden.id), Some((0, 0)), "a hidden note is not counted");
+    assert_eq!(counted(kept.id), Some((1, 1)), "a note that is not hidden is");
+
+    // A call that replies prunes the list (the hidden note still exists, so it stays hidden).
+    listed_titles(&mut split, &listing(both(REPO)));
+    assert!(reads.load(Ordering::SeqCst) > 0, "a read reached the team database");
+    let pruned_at: i64 = raw
+        .query_row("SELECT pruned_at FROM hidden_team_notes_meta", [], |row| row.get(0))
+        .expect("pruned_at");
+    assert!(pruned_at > 1, "the prune was recorded");
 }

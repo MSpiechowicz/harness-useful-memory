@@ -51,6 +51,7 @@ fn initialize_negotiates_the_version_and_sends_instructions() {
     assert!(instructions.chars().count() <= 2000);
     for tool in [
         "note_search",
+        "note_feedback",
         "note_save",
         "note_update",
         "note_delete",

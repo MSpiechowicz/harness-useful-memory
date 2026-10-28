@@ -49,6 +49,8 @@ pub struct SqliteStore {
     newer: bool,
     /// The additive schema extensions are in place (see [`engine::install`]).
     extensions: bool,
+    /// The usefulness counters of a note are in place (kept apart: see [`Engine::usage`]).
+    usage: bool,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -56,6 +58,7 @@ impl std::fmt::Debug for SqliteStore {
         f.debug_struct("SqliteStore")
             .field("newer", &self.newer)
             .field("extensions", &self.extensions)
+            .field("usage", &self.usage)
             .finish_non_exhaustive()
     }
 }
@@ -86,10 +89,13 @@ impl SqliteStore {
             conn,
             newer: state == SchemaState::Newer,
             extensions: false,
+            usage: false,
         };
 
         if !store.newer {
-            store.extensions = engine::install(&mut store);
+            let installed = engine::install(&mut store);
+            store.extensions = installed.extensions;
+            store.usage = installed.usage;
             engine::backfill(&mut store);
         }
 
@@ -161,12 +167,35 @@ impl Engine for SqliteStore {
         Ok(done)
     }
 
+    fn write_once<T>(&mut self, op: impl FnOnce(&mut dyn Sql) -> Result<T, StoreError>) -> Result<T, StoreError> {
+        let conn = self.conn()?;
+
+        // No busy handler: a lock another process holds fails the statement at once.
+        conn.busy_timeout(Duration::ZERO)?;
+
+        let written = (|| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let done = op(&mut Local(&tx))?;
+            tx.commit()?;
+            Ok(done)
+        })();
+
+        // The waiting of every other statement is back, whatever this one did.
+        let _ = conn.busy_timeout(BUSY_TIMEOUT);
+
+        written
+    }
+
     fn read<T>(&mut self, op: impl FnOnce(&mut dyn Sql) -> Result<T, StoreError>) -> Result<T, StoreError> {
         op(&mut Local(self.conn()?))
     }
 
     fn extensions(&self) -> bool {
         self.extensions
+    }
+
+    fn usage(&self) -> bool {
+        self.usage
     }
 }
 
@@ -201,6 +230,14 @@ impl MemoryStore for SqliteStore {
 
     fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
         embed::hits_for(self, query, ids)
+    }
+
+    fn record_shown(&mut self, ids: &[i64]) -> Result<(), StoreError> {
+        engine::record_shown(self, ids)
+    }
+
+    fn record_useful(&mut self, ids: &[i64], at: i64) -> Result<(), StoreError> {
+        engine::record_useful(self, ids, at)
     }
 
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {

@@ -1,8 +1,8 @@
 //! What the additive schema extensions of every backend share.
 //!
-//! The extensions (English search objects, the `lang` of a note, the settings) are added to a
-//! database without a new schema version, so an older server keeps using it. Each backend adds
-//! what is missing on every open (`ensure_extensions`), then fills `lang` (and on MongoDB the
+//! The extensions (English search objects, the `lang` of a note, the settings, the usefulness
+//! counters of a note) are added to a database without a new schema version, so an older server
+//! keeps using it. Each backend adds what is missing on every open (`ensure_extensions`), then fills `lang` (and on MongoDB the
 //! English terms) of the notes an older server wrote, a page at a time for a bounded time per
 //! open ([`BACKFILL_BUDGET`]). A database that does not let this server add them (no DDL right) is
 //! used without them, with one line on stderr.
@@ -22,6 +22,27 @@ pub(crate) const BACKFILL_BUDGET: Duration = Duration::from_millis(1500);
 /// The settings key of the English notes setting (the key of its row in every backend).
 pub(crate) const ENGLISH_NOTES: &str = "english_notes";
 
+/// Which of the optional columns of a note a database has, so a statement names only those.
+///
+/// The usage counters are tracked apart from the other extensions: a read-only role on a database
+/// that an older server upgraded has `lang` but cannot add the counters, and must keep showing the
+/// language.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Columns {
+    /// The `lang` column.
+    pub lang: bool,
+    /// The usefulness counters (`shown`, `useful`, `last_useful_at`).
+    pub usage: bool,
+}
+
+impl Columns {
+    /// No optional column: for a read that only needs the note's content.
+    pub(crate) const NONE: Self = Self {
+        lang: false,
+        usage: false,
+    };
+}
+
 /// Says once per process, on stderr (stdout is the MCP stream), that the extensions are not
 /// available and why.
 pub(crate) fn warn_unavailable(error: &StoreError) {
@@ -29,8 +50,9 @@ pub(crate) fn warn_unavailable(error: &StoreError) {
 
     WARNED.call_once(|| {
         eprintln!(
-            "harness-memory: cannot add the search extensions to the memory database ({}), continuing without \
-             them: English stemming and the notes language setting are off for this database",
+            "harness-memory: cannot add the schema extensions to the memory database ({}), continuing without \
+             them: English stemming, the notes language setting and the usefulness counters are off where the \
+             database lacks them",
             redact_text(&error.to_string())
         );
     });

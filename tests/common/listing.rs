@@ -6,8 +6,8 @@
 //! updated-time sorts against the rows' own times and ids, and exact orders for title sorts.
 
 use harness_memory::store::{
-    Forgotten, LangFilter, Link, MemoryStore, NoteDraft, NoteKind, NoteListQuery, NotePage, NoteRow, NoteSort, Scope,
-    SearchQuery, StoreError, Target, View,
+    Forgotten, LangFilter, Link, MemoryStore, NoteDraft, NoteKind, NoteListQuery, NotePage, NoteRow, NoteSort,
+    NoteUsage, Scope, SearchQuery, StoreError, Target, UsefulFilter, View,
 };
 use harness_memory::support::lang::Lang;
 use pretty_assertions::assert_eq;
@@ -21,7 +21,7 @@ pub const OTHER: &str = "github.com/acme/gadget";
 pub type Case = fn(&mut dyn MemoryStore);
 
 /// Every case, by name.
-pub const CASES: [(&str, Case); 13] = [
+pub const CASES: [(&str, Case); 14] = [
     ("lists_visible_notes_newest_first", lists_visible_notes_newest_first),
     (
         "excluded_ids_leave_lists_and_searches",
@@ -50,6 +50,10 @@ pub const CASES: [(&str, Case); 13] = [
         scope_text_and_kind_filter_together_and_count,
     ),
     ("lang_shows_filters_and_pages", lang_shows_filters_and_pages),
+    (
+        "usefulness_is_counted_listed_sorted_and_filtered",
+        usefulness_is_counted_listed_sorted_and_filtered,
+    ),
 ];
 
 /// The first page (of up to 200) of `view`, newest first.
@@ -62,6 +66,7 @@ pub fn listing(view: View) -> NoteListQuery {
         place: None,
         entity: None,
         lang: None,
+        useful: None,
         sort: NoteSort::Updated,
         descending: true,
         offset: 0,
@@ -1002,4 +1007,161 @@ pub fn lang_shows_filters_and_pages(store: &mut dyn MemoryStore) {
 
     let note = store.peek(&both(REPO), &[whole.rows[0].id]).expect("peek");
     assert_eq!(note[0].lang, Some(Lang::Other));
+}
+
+/// The usage of the row of note `id` on a page.
+fn usage_of(page: &NotePage, id: i64) -> NoteUsage {
+    page.rows
+        .iter()
+        .find(|row| row.id == id)
+        .unwrap_or_else(|| panic!("note {id} is listed"))
+        .usage
+        .expect("the store has the counters")
+}
+
+fn ids(rows: &[NoteRow]) -> Vec<i64> {
+    rows.iter().map(|row| row.id).collect()
+}
+
+/// Counters start at 0, count each listed note once per call and nothing else of it, and sort and
+/// filter the list: `ever` keeps the notes found useful, `never` those shown at least 3 times
+/// without a use, whatever the sort, and the counts follow the filter.
+pub fn usefulness_is_counted_listed_sorted_and_filtered(store: &mut dyn MemoryStore) {
+    // Global and repository notes, so a split store has notes in both its stores.
+    let saved: Vec<i64> = ["Alpha", "Bravo", "Charlie", "Delta", "Echo"]
+        .iter()
+        .enumerate()
+        .map(|(index, title)| {
+            let target = if index % 2 == 0 { Target::Global } else { repo(REPO) };
+            save(store, &target, &draft(title, "How the build is cached", NoteKind::Fix))
+        })
+        .collect();
+    let [a, b, c, d, e] = saved[..] else {
+        panic!("five notes");
+    };
+
+    let fresh = list(store, &listing(both(REPO)));
+    let untouched = NoteUsage {
+        shown: 0,
+        useful: 0,
+        last_useful_at: None,
+    };
+
+    for id in [a, b, c, d, e] {
+        assert_eq!(usage_of(&fresh, id), untouched, "note {id} starts uncounted");
+    }
+
+    // Three rounds of results show a to d (a listed twice in the first counts once), e once.
+    store.record_shown(&[a, b, c, d, e, a]).expect("first round");
+    store.record_shown(&[a, b, c, d]).expect("second round");
+    store.record_shown(&[d, c, b, a]).expect("third round");
+    store.record_shown(&[]).expect("no notes counts nothing");
+    store.record_shown(&[a + 7_000_000]).expect("a missing note is ignored");
+
+    store.record_useful(&[a], 1_000).expect("a is useful");
+    store.record_useful(&[b], 2_000).expect("b is useful");
+    store.record_useful(&[b, b], 3_000).expect("b is useful again, once");
+
+    let counted = list(store, &listing(both(REPO)));
+    let counters = |shown, useful, last_useful_at| NoteUsage {
+        shown,
+        useful,
+        last_useful_at,
+    };
+
+    assert_eq!(usage_of(&counted, a), counters(3, 1, Some(1_000)));
+    assert_eq!(usage_of(&counted, b), counters(3, 2, Some(3_000)));
+    assert_eq!(usage_of(&counted, c), counters(3, 0, None));
+    assert_eq!(usage_of(&counted, d), counters(3, 0, None));
+    assert_eq!(usage_of(&counted, e), counters(1, 0, None));
+
+    // Only the counters changed: not the update time, the revision nor the hits.
+    for (before, after) in fresh.rows.iter().zip(&counted.rows) {
+        assert_eq!(
+            (before.id, before.updated_at, before.revision, before.hits),
+            (after.id, after.updated_at, after.revision, after.hits)
+        );
+    }
+
+    let read = store.peek(&both(REPO), &[b]).expect("peek");
+    assert_eq!(read[0].usage, Some(counters(3, 2, Some(3_000))));
+    assert_eq!((read[0].revision, read[0].hits), (1, 0));
+
+    // Most useful first, ties by id the same way; a note never found useful sorts as 0.
+    let by_useful = NoteListQuery {
+        sort: NoteSort::Useful,
+        ..listing(both(REPO))
+    };
+    let mut rest = [c, d, e];
+    rest.sort_unstable();
+    rest.reverse();
+    let mut expected = vec![b, a];
+    expected.extend(rest);
+    assert_eq!(ids(&list(store, &by_useful).rows), expected);
+
+    let ascending = NoteListQuery {
+        descending: false,
+        ..by_useful
+    };
+    expected.reverse();
+    assert_eq!(ids(&list(store, &ascending).rows), expected);
+
+    let by_last_useful = NoteListQuery {
+        sort: NoteSort::LastUseful,
+        ..listing(both(REPO))
+    };
+    let mut expected = vec![b, a];
+    expected.extend(rest);
+    assert_eq!(ids(&list(store, &by_last_useful).rows), expected);
+
+    // The filters narrow the page and every count.
+    let ever = list(
+        store,
+        &NoteListQuery {
+            useful: Some(UsefulFilter::Ever),
+            sort: NoteSort::LastUseful,
+            ..listing(both(REPO))
+        },
+    );
+    assert_eq!(ids(&ever.rows), vec![b, a]);
+    assert_eq!(ever.total, 2);
+    assert_eq!(ever.kinds.iter().map(|(_, count)| count).sum::<usize>(), 2);
+    assert_eq!(ever.scopes.iter().map(|(_, count)| count).sum::<usize>(), 2);
+
+    let never = NoteListQuery {
+        useful: Some(UsefulFilter::Never),
+        descending: false,
+        sort: NoteSort::Title,
+        ..listing(both(REPO))
+    };
+    let never_page = list(store, &never);
+    assert_eq!(
+        titles(&never_page.rows),
+        vec!["Charlie", "Delta"],
+        "echo was shown once only"
+    );
+    assert_eq!(never_page.total, 2);
+    assert_eq!(never_page.kinds.iter().map(|(_, count)| count).sum::<usize>(), 2);
+
+    let second = list(
+        store,
+        &NoteListQuery {
+            offset: 1,
+            limit: 1,
+            ..never
+        },
+    );
+    assert_eq!((titles(&second.rows), second.total), (vec!["Delta"], 2));
+
+    // A fourth round shows echo twice more: now it qualifies too.
+    store.record_shown(&[e]).expect("echo");
+    store.record_shown(&[e]).expect("echo");
+    let again = list(
+        store,
+        &NoteListQuery {
+            useful: Some(UsefulFilter::Never),
+            ..listing(both(REPO))
+        },
+    );
+    assert_eq!(again.total, 3);
 }

@@ -218,9 +218,63 @@ fn a_commit_whose_reply_is_lost_may_have_applied_and_is_not_repeated() {
     assert_eq!(db.integer("SELECT count(*) FROM notes"), 2);
 }
 
+#[test]
+fn a_counter_whose_reply_is_lost_leaves_nothing_open_on_the_server() {
+    let Some(db) = Database::libsql() else {
+        return;
+    };
+    let Database::Libsql(server) = &db else {
+        unreachable!("a libSQL database");
+    };
+    let Some(upstream) = server.url.strip_prefix("http://") else {
+        eprintln!("skipped: the lost-reply case needs a plain http:// server");
+        return;
+    };
+
+    let (url, armed) = lose_replies(upstream.trim_end_matches('/').to_owned());
+    let mut store = LibsqlStore::connect(&url, server.token.as_deref()).expect("connect");
+    let id = store
+        .remember(&repo(REPO), &draft("Counted", "Body", NoteKind::Note))
+        .expect("remember")
+        .id;
+
+    // The server runs the counter; the client never hears of it.
+    armed.store(true, Ordering::SeqCst);
+    store.record_shown(&[id]).expect_err("the reply is lost");
+    armed.store(false, Ordering::SeqCst);
+
+    // It began no transaction that is left open: another client writes at once, instead of
+    // waiting for the server to take the lock from an idle one.
+    let started = Instant::now();
+    LibsqlStore::connect(&server.url, server.token.as_deref())
+        .expect("connect")
+        .remember(&repo(REPO), &draft("Next", "Body", NoteKind::Note))
+        .expect("remember");
+
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(500), "a write waited {took:?}");
+    assert_eq!(db.integer(&format!("SELECT shown FROM notes WHERE id = {id}")), 1);
+}
+
 /// A relay to `upstream` (`host:port`) that, once armed, forwards the next request with a
 /// `COMMIT` but drops the connection instead of returning the server's reply.
 fn lose_one_commit_reply(upstream: String) -> (String, Arc<AtomicBool>) {
+    relay_to(upstream, Loss::NextCommit)
+}
+
+/// A relay to `upstream` that, while armed, forwards every request but drops the connection
+/// instead of returning the server's reply.
+fn lose_replies(upstream: String) -> (String, Arc<AtomicBool>) {
+    relay_to(upstream, Loss::Every)
+}
+
+#[derive(Clone, Copy)]
+enum Loss {
+    NextCommit,
+    Every,
+}
+
+fn relay_to(upstream: String, loss: Loss) -> (String, Arc<AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("relay listener");
     let url = format!("http://127.0.0.1:{}", listener.local_addr().expect("address").port());
     let armed = Arc::new(AtomicBool::new(false));
@@ -232,14 +286,14 @@ fn lose_one_commit_reply(upstream: String) -> (String, Arc<AtomicBool>) {
                 break;
             };
             let server = TcpStream::connect(&upstream).expect("libSQL server");
-            relay(client, server, Arc::clone(&shared));
+            relay(client, server, Arc::clone(&shared), loss);
         }
     });
 
     (url, armed)
 }
 
-fn relay(client: TcpStream, server: TcpStream, armed: Arc<AtomicBool>) {
+fn relay(client: TcpStream, server: TcpStream, armed: Arc<AtomicBool>, loss: Loss) {
     let lost = Arc::new(AtomicBool::new(false));
 
     let mut requests = client.try_clone().expect("clone");
@@ -252,7 +306,14 @@ fn relay(client: TcpStream, server: TcpStream, armed: Arc<AtomicBool>) {
             let chunk = &buffer[..read];
 
             // Set before the request goes on, so its reply is the one dropped.
-            if chunk.windows(6).any(|window| window == b"COMMIT") && armed.swap(false, Ordering::SeqCst) {
+            let lose = match loss {
+                Loss::NextCommit => {
+                    chunk.windows(6).any(|window| window == b"COMMIT") && armed.swap(false, Ordering::SeqCst)
+                }
+                Loss::Every => armed.load(Ordering::SeqCst),
+            };
+
+            if lose {
                 losing.store(true, Ordering::SeqCst);
             }
 

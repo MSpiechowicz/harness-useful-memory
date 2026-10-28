@@ -141,7 +141,7 @@ expression: "replies[0][\"result\"]"
     },
     {
       "name": "note_search",
-      "description": "Call FIRST at the start of every task: returns known fixes, decisions and file locations for this repository. Search with a few specific keywords from the task (they match by word and by meaning), not an empty query: an empty query only lists the most recent notes. This repository's notes rank above equally relevant global ones. A message that starts with a `<harness-memory-recall>` block already carries the notes found for that message: search further only if needed. Saved scripts whose name or description match the keywords are listed after the notes: prefer script_run to retyping them.",
+      "description": "Call FIRST at the start of every task: returns known fixes, decisions and file locations for this repository. Search with a few specific keywords from the task (they match by word and by meaning), not an empty query: an empty query only lists the most recent notes. This repository's notes rank above equally relevant global ones. A message that starts with a `<harness-memory-recall>` block already carries the notes found for that message: search further only if needed. Saved scripts whose name or description match the keywords are listed after the notes: prefer script_run to retyping them. If it found notes, afterwards call note_feedback with the ids that helped, or an empty list. Do not call note_feedback when it found none.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -603,6 +603,47 @@ expression: "replies[0][\"result\"]"
         "readOnlyHint": false,
         "destructiveHint": true,
         "openWorldHint": false
+      }
+    },
+    {
+      "name": "note_feedback",
+      "description": "After a note_search that returned notes, report which helped with the next step: their ids, or an empty list when none did, and optionally a few words why. Only ids is required. Not a save: it works when saving is off.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "ids": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "minItems": 0,
+            "maxItems": 20,
+            "description": "Ids of the notes that helped; empty when none did"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "Optional: a few words on how they helped, or why none did"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "repo",
+              "global",
+              "both"
+            ],
+            "default": "both",
+            "description": "repo: this repository; global: shared by all repositories"
+          },
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository you are working in (your working directory's git root). Always pass it: the server's own working directory may be another project. Unused for scope global"
+          }
+        },
+        "required": [
+          "ids"
+        ],
+        "additionalProperties": false
       }
     }
   ]

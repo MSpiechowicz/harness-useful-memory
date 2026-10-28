@@ -86,6 +86,7 @@ fn notes_persist_across_processes_in_the_memory_folder() {
             "script_get",
             "script_run",
             "script_delete",
+            "note_feedback",
         ]
     );
 

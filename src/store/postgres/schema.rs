@@ -243,9 +243,9 @@ pub(super) fn stored_version(client: &mut impl GenericClient) -> Result<Option<i
     row.map(|row| column(&row, 0)).transpose()
 }
 
-/// What [`ensure_extensions`] adds, as one existence check of every object (in the schema the
-/// tables are in): the English search column and its index, `lang`, the reset trigger with its
-/// function.
+/// What [`ensure_extensions`] adds but the usage counters, as one existence check of every object
+/// (in the schema the tables are in): the English search column and its index, `lang`, the reset
+/// trigger with its function.
 const EXTENSIONS_PRESENT: &str = "
 SELECT
     EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('notes') AND attname = 'search_en'
@@ -284,20 +284,43 @@ CREATE TRIGGER notes_lang_reset BEFORE UPDATE OF title, body ON notes FOR EACH R
     EXECUTE FUNCTION harness_memory_lang_reset();
 ";
 
-/// True when every object of [`ensure_extensions`] exists (existence only, not the version).
+/// The usefulness counters of a note: how often it was shown to an agent, how often it was found
+/// useful, and when it last was. They default to 0 (and NULL), so an older server's inserts stay
+/// valid, and adding them rewrites no row.
+const USAGE: &str = "
+ALTER TABLE notes ADD COLUMN IF NOT EXISTS shown BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE notes ADD COLUMN IF NOT EXISTS useful BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE notes ADD COLUMN IF NOT EXISTS last_useful_at BIGINT;
+";
+
+/// One existence check of the three columns of [`USAGE`].
+const USAGE_PRESENT: &str = "
+SELECT count(*) = 3 FROM pg_attribute
+WHERE attrelid = to_regclass('notes') AND attname IN ('shown', 'useful', 'last_useful_at') AND NOT attisdropped
+";
+
+/// True when every object of [`ensure_extensions`] but the usage counters exists (existence only,
+/// not the version). A read-only role may have these without [`usage_present`].
 pub(super) fn extensions_present(client: &mut impl GenericClient) -> Result<bool, StoreError> {
     let row = client.query_one(EXTENSIONS_PRESENT, &[]).map_err(backend)?;
 
     column(&row, 0)
 }
 
+/// True when the usefulness counters of the notes exist.
+pub(super) fn usage_present(client: &mut impl GenericClient) -> Result<bool, StoreError> {
+    let row = client.query_one(USAGE_PRESENT, &[]).map_err(backend)?;
+
+    column(&row, 0)
+}
+
 /// Adds the objects the database lacks of the English search column with its index, `lang` with
-/// its reset trigger. The schema version is neither read nor written. Everything runs in one
+/// its reset trigger, and the usage counters. The schema version is neither read nor written. Everything runs in one
 /// transaction under the migration lock, after a first look without it, so a database that has
 /// the extensions is only read, and servers starting together add them once. A lock that cannot be
 /// had within five seconds is an error, like a refused right.
 pub(super) fn ensure_extensions(client: &mut Client) -> Result<(), StoreError> {
-    if extensions_present(client)? {
+    if extensions_present(client)? && usage_present(client)? {
         return Ok(());
     }
 
@@ -316,6 +339,10 @@ pub(super) fn ensure_extensions(client: &mut Client) -> Result<(), StoreError> {
 
     if !extensions_present(&mut tx)? {
         tx.batch_execute(EXTENSIONS).map_err(backend)?;
+    }
+
+    if !usage_present(&mut tx)? {
+        tx.batch_execute(USAGE).map_err(backend)?;
     }
 
     tx.commit().map_err(backend)

@@ -49,6 +49,9 @@ pub const SNIPPET_MAX: usize = 240;
 /// Similar notes listed after `note_save`.
 pub const SIMILAR_MAX: usize = 3;
 
+/// Length of the reason of a `note_feedback`, in characters.
+pub const FEEDBACK_REASON_MAX: usize = 200;
+
 /// Ids per `note_get`.
 pub const GET_IDS_MAX: usize = 5;
 

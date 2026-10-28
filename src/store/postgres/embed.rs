@@ -5,6 +5,7 @@ use postgres::GenericClient;
 
 use super::notes::note_columns;
 use super::{backend, column};
+use crate::store::extensions::Columns;
 use crate::store::{NoteText, StoreError};
 
 pub(super) fn notes_since(
@@ -16,7 +17,7 @@ pub(super) fn notes_since(
     let sql = format!(
         "SELECT {} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
          WHERE n.updated_at >= $1 ORDER BY n.updated_at, n.id LIMIT $2",
-        note_columns(false)
+        note_columns(Columns::NONE)
     );
 
     client

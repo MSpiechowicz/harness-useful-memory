@@ -7,12 +7,13 @@ use mongodb::bson::{Bson, Document, doc};
 use super::notes::{Stored, stored};
 use super::scripts::literal_pattern;
 use super::{
-    Ctx, ENTITIES, ENTITY_NORM_MAX, Fail, NOTES, cut, int, lang_is_fresh, note_fields, scope_value, text, visible,
+    Ctx, ENTITIES, ENTITY_NORM_MAX, Fail, NOTES, cut, int, lang_is_fresh, note_fields, number, scope_value, text,
+    visible,
 };
 use crate::limits::{ENTITY_MAX, TITLE_MAX};
 use crate::store::listing::{
-    LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort, checked_exclude, page_limit, query_entity, query_text,
-    scoped,
+    LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort, UsefulFilter, checked_exclude, page_limit, query_entity,
+    query_text, scoped,
 };
 use crate::store::{NoteKind, Scope, View};
 
@@ -46,6 +47,8 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage,
     if !exclude.is_empty() {
         kept.insert("_id", doc! { "$nin": exclude });
     }
+
+    kept.extend(useful_match(query.useful));
 
     let mut counts_filter = visible(&query.view);
     counts_filter.extend(kept.clone());
@@ -92,6 +95,7 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage,
         NoteSort::Kind => doc! { "kind": way, "_id": way },
         NoteSort::Scope => doc! { "project": way, "_id": way },
         NoteSort::Place => doc! { "_id": way },
+        NoteSort::Useful | NoteSort::LastUseful => doc! { USEFUL_ORDER: way, "_id": way },
     };
 
     // The page is sorted again at the end: Amazon DocumentDB keeps the order of a `$sort` only
@@ -102,6 +106,14 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage,
 
     let mut paging = vec![doc! { "$match": page_filter }];
     paging.extend(lang_stages(query.lang));
+
+    // A note nobody rated has no counters: it sorts as 0, in a field of its own so the counters
+    // read back stay as they are stored.
+    if let Some(order) = useful_order(query.sort) {
+        paging.push(doc! { "$addFields": { USEFUL_ORDER: order } });
+        fields.insert(USEFUL_ORDER, 1);
+    }
+
     paging.extend([
         doc! { "$sort": sort.clone() },
         doc! { "$skip": i64::try_from(query.offset).unwrap_or(i64::MAX) },
@@ -115,6 +127,31 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage,
     let stored: Vec<Stored> = found.iter().map(stored).collect();
     let rows = with_entities(ctx, stored)?;
     Ok(NotePage::new(counted, query, rows))
+}
+
+/// The field the page is sorted on for the sorts by usefulness.
+const USEFUL_ORDER: &str = "useful_order";
+
+/// The value a sort by usefulness orders by (`None` for the other sorts).
+fn useful_order(sort: NoteSort) -> Option<Bson> {
+    match sort {
+        NoteSort::Useful => Some(number("$useful")),
+        NoteSort::LastUseful => Some(number("$last_useful_at")),
+        _ => None,
+    }
+}
+
+/// The match that keeps the notes of `filter` (nothing for no filter). A note nobody rated has no
+/// `useful` field, which counts as 0: `$not` of `$gte` also matches a missing field.
+fn useful_match(filter: Option<UsefulFilter>) -> Document {
+    match filter {
+        None => Document::new(),
+        Some(UsefulFilter::Ever) => doc! { "useful": { "$gte": 1_i64 } },
+        Some(UsefulFilter::Never) => doc! {
+            "shown": { "$gte": UsefulFilter::SHOWN_MIN },
+            "useful": { "$not": { "$gte": 1_i64 } },
+        },
+    }
 }
 
 /// The stages that keep the notes of the language `filter` (none for no filter). A note whose

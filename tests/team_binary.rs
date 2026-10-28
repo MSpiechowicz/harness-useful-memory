@@ -284,7 +284,7 @@ fn features_lists_what_this_build_can_do() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(
         stdout(&output),
-        "notes-remote-local\nnotes-hide\npush-json\nscripts-remote-local\nscripts-hide\nscripts-push-json\nall-repos\nsave-guards\nsettings\nnotes-lang\nembedder\noffline-fallback\n"
+        "notes-remote-local\nnotes-hide\npush-json\nscripts-remote-local\nscripts-hide\nscripts-push-json\nall-repos\nsave-guards\nsettings\nnotes-lang\nembedder\noffline-fallback\nnotes-useful\n"
     );
 }
 

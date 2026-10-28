@@ -296,9 +296,35 @@ BEGIN
 END;
 ";
 
-/// True when every object of [`ensure_extensions`] exists (existence only, not the version).
+/// The usefulness counters of a note: how often it was shown to an agent, how often it was found
+/// useful, and when it last was. Nullable `last_useful_at` and counters that default to 0 keep an
+/// older server's inserts valid.
+const USAGE_COLUMNS: [(&str, &str); 3] = [
+    ("shown", "INTEGER NOT NULL DEFAULT 0"),
+    ("useful", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_useful_at", "INTEGER"),
+];
+
+/// True when every object of [`ensure_extensions`] but the usage counters exists (existence only,
+/// not the version). A read-only role may have these without [`usage_present`].
 pub(crate) fn extensions_present(db: &mut dyn Sql) -> Result<bool, StoreError> {
     Ok(inspect(db)?.is_complete())
+}
+
+/// True when the usefulness counters of the notes exist.
+pub(crate) fn usage_present(db: &mut dyn Sql) -> Result<bool, StoreError> {
+    Ok(usage_columns(db)?.len() == USAGE_COLUMNS.len())
+}
+
+/// The names of the usage counters the `notes` table has.
+fn usage_columns(db: &mut dyn Sql) -> Result<Vec<String>, StoreError> {
+    db.column(
+        &format!(
+            "SELECT name FROM pragma_table_info('notes') WHERE name IN ({})",
+            USAGE_COLUMNS.map(|(name, _)| format!("'{name}'")).join(", ")
+        ),
+        args![],
+    )
 }
 
 /// What of the extensions a database has.
@@ -335,17 +361,21 @@ fn inspect(db: &mut dyn Sql) -> Result<Found, StoreError> {
 }
 
 /// Adds what the database lacks of the English index with its triggers, the `lang` column with
-/// its reset trigger and the `settings` table, inside the caller's write transaction. Existing
-/// objects are left as they are, so it can run on every open, also at once from several servers
-/// (the second finds everything in place). The index is rebuilt when it or its triggers were
-/// missing. The schema version is neither read nor written.
+/// its reset trigger, the `settings` table and the usage counters, inside the caller's write
+/// transaction. Existing objects are left as they are, so it can run on every open, also at once
+/// from several servers (the second finds everything in place). The index is rebuilt when it or
+/// its triggers were missing. The schema version is neither read nor written.
 pub(crate) fn ensure_extensions(db: &mut dyn Sql) -> Result<(), StoreError> {
     let found = inspect(db)?;
 
-    if found.is_complete() {
-        return Ok(());
+    if !found.is_complete() {
+        add_search_extensions(db, &found)?;
     }
 
+    add_usage_columns(db)
+}
+
+fn add_search_extensions(db: &mut dyn Sql, found: &Found) -> Result<(), StoreError> {
     let index_complete = [
         "notes_fts_en",
         "notes_fts_en_insert",
@@ -371,4 +401,16 @@ pub(crate) fn ensure_extensions(db: &mut dyn Sql) -> Result<(), StoreError> {
 
     db.batch("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")?;
     db.batch(LANG_RESET)
+}
+
+fn add_usage_columns(db: &mut dyn Sql) -> Result<(), StoreError> {
+    let present = usage_columns(db)?;
+
+    for (name, definition) in USAGE_COLUMNS {
+        if !present.iter().any(|found| found == name) {
+            db.batch(&format!("ALTER TABLE notes ADD COLUMN {name} {definition}"))?;
+        }
+    }
+
+    Ok(())
 }

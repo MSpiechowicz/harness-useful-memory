@@ -9,32 +9,38 @@ use super::{KIND_MAX, LANG_MAX, PATH_MAX, SOURCE_MAX, backend, column, cut, grap
 use super::{target_project_existing, view_params};
 use crate::limits::{BODY_MAX, ENTITY_MAX, GET_IDS_MAX, TAG_MAX, TAGS_MAX, TITLE_MAX};
 use crate::store::clean::{self, CleanDraft, CleanPatch};
-use crate::store::{Forgotten, Note, NoteKind, Provenance, Saved, Scope, StoreError, Target, View};
+use crate::store::extensions::Columns;
+use crate::store::{Forgotten, Note, NoteKind, NoteUsage, Provenance, Saved, Scope, StoreError, Target, View};
 use crate::support::lang;
 
 /// The columns [`note_from_row`] reads, from `notes n LEFT JOIN projects p`, with the text cut to
-/// the limits (see [`cut`]). The last is the language, which a database without the schema
-/// extensions has no column for.
-pub(super) fn note_columns(extensions: bool) -> String {
-    columns(&cut("n.body", BODY_MAX), extensions)
+/// the limits (see [`cut`]). The last four are the language and the usefulness counters, which a
+/// database without them has no columns for.
+pub(super) fn note_columns(columns: Columns) -> String {
+    note_select(&cut("n.body", BODY_MAX), columns)
 }
 
 /// [`note_columns`] with an empty body, for lists.
-pub(super) fn row_columns(extensions: bool) -> String {
-    columns("''", extensions)
+pub(super) fn row_columns(columns: Columns) -> String {
+    note_select("''", columns)
 }
 
 /// The columns of a note with `body` as its body.
-fn columns(body: &str, extensions: bool) -> String {
-    let lang = if extensions {
+fn note_select(body: &str, columns: Columns) -> String {
+    let lang = if columns.lang {
         cut("n.lang", LANG_MAX)
     } else {
         "NULL::text".to_owned()
     };
+    let usage = if columns.usage {
+        "n.shown, n.useful, n.last_useful_at"
+    } else {
+        "NULL::bigint, NULL::bigint, NULL::bigint"
+    };
 
     format!(
         "n.id, n.project_id, {key}, {kind}, {title}, {body}, {tags}, {source}, \
-         n.created_at, n.updated_at, n.revision, n.hits, {root}, n.via_override, {lang}",
+         n.created_at, n.updated_at, n.revision, n.hits, {root}, n.via_override, {lang}, {usage}",
         key = cut("p.key", PATH_MAX),
         kind = cut("n.kind", KIND_MAX),
         title = cut("n.title", TITLE_MAX),
@@ -157,7 +163,7 @@ pub(super) fn update(
     patch: &CleanPatch,
     extensions: bool,
 ) -> Result<Saved, StoreError> {
-    let Some(note) = load(tx, view, id, false)? else {
+    let Some(note) = load(tx, view, id, Columns::NONE)? else {
         return Err(not_found(id));
     };
 
@@ -254,7 +260,7 @@ pub(super) fn get(
     view: &View,
     ids: &[i64],
     count: bool,
-    extensions: bool,
+    columns: Columns,
 ) -> Result<Vec<Note>, StoreError> {
     if ids.is_empty() || ids.len() > GET_IDS_MAX {
         return Err(StoreError::Invalid(format!("ids must list 1-{GET_IDS_MAX} note ids")));
@@ -267,7 +273,7 @@ pub(super) fn get(
             continue;
         }
 
-        let Some(note) = load(client, view, id, extensions)? else {
+        let Some(note) = load(client, view, id, columns)? else {
             continue;
         };
 
@@ -284,7 +290,7 @@ pub(super) fn get(
 }
 
 pub(super) fn forget(tx: &mut Transaction<'_>, view: &View, id: i64) -> Result<usize, StoreError> {
-    if load(tx, view, id, false)?.is_none() {
+    if load(tx, view, id, Columns::NONE)?.is_none() {
         return Err(not_found(id));
     }
 
@@ -343,7 +349,7 @@ pub(super) fn find_by_title(
     client: &mut impl GenericClient,
     target: &Target,
     title: &str,
-    extensions: bool,
+    columns: Columns,
 ) -> Result<Option<Note>, StoreError> {
     let Some(project) = target_project_existing(client, target)? else {
         return Ok(None);
@@ -352,7 +358,7 @@ pub(super) fn find_by_title(
     let sql = format!(
         "SELECT {} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
          WHERE coalesce(n.project_id, 0) = $1 AND n.title_norm = $2",
-        note_columns(extensions)
+        note_columns(columns)
     );
 
     let row = client
@@ -368,18 +374,18 @@ pub(super) fn find_by_title(
     Ok(Some(note))
 }
 
-/// The note `id` when it is visible in `view`; its language is read only when `extensions`.
+/// The note `id` when it is visible in `view`; the optional `columns` are read only when present.
 pub(super) fn load(
     client: &mut impl GenericClient,
     view: &View,
     id: i64,
-    extensions: bool,
+    columns: Columns,
 ) -> Result<Option<Note>, StoreError> {
     let (repo, global) = view_params(client, view)?;
     let sql = format!(
         "SELECT {} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
          WHERE n.id = $1 AND {VISIBLE}",
-        note_columns(extensions)
+        note_columns(columns)
     );
 
     let row = client.query_opt(&sql, &[&id, &repo, &global]).map_err(backend)?;
@@ -445,7 +451,54 @@ pub(super) fn note_from_row(row: &Row) -> Result<Note, StoreError> {
         lang: column::<Option<String>>(row, 14)?
             .as_deref()
             .and_then(lang::Lang::parse),
+        usage: usage_from_row(row)?,
     })
+}
+
+/// The counters of a row of [`note_columns`]; `None` when the database has none (the columns are
+/// NULL then, and `NOT NULL` where they exist).
+fn usage_from_row(row: &Row) -> Result<Option<NoteUsage>, StoreError> {
+    let Some(shown) = column::<Option<i64>>(row, 15)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(NoteUsage {
+        shown,
+        useful: column::<Option<i64>>(row, 16)?.unwrap_or(0),
+        last_useful_at: column(row, 17)?,
+    }))
+}
+
+/// `ids` sorted, each once; `None` for no id.
+pub(super) fn unique_ids(ids: &[i64]) -> Option<Vec<i64>> {
+    let mut unique: Vec<i64> = ids.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+
+    (!unique.is_empty()).then_some(unique)
+}
+
+/// Counts a time shown on the notes `ids`, and nothing else of them: not the update time, the
+/// revision, the hits, nor the search columns.
+pub(super) fn record_shown(tx: &mut Transaction<'_>, ids: &[i64]) -> Result<(), StoreError> {
+    tx.execute(
+        "UPDATE notes SET shown = shown + 1 WHERE id = ANY($1::bigint[])",
+        &[&ids],
+    )
+    .map_err(backend)?;
+
+    Ok(())
+}
+
+/// Counts a time found useful, at `at`, on the notes `ids` (see [`record_shown`]).
+pub(super) fn record_useful(tx: &mut Transaction<'_>, ids: &[i64], at: i64) -> Result<(), StoreError> {
+    tx.execute(
+        "UPDATE notes SET useful = useful + 1, last_useful_at = $2 WHERE id = ANY($1::bigint[])",
+        &[&ids, &at],
+    )
+    .map_err(backend)?;
+
+    Ok(())
 }
 
 /// Fails when another note in the same scope already has `title_norm`.

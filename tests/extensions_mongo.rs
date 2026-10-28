@@ -9,7 +9,9 @@ mod mongo_support;
 use common::listing::listing;
 use common::{both, draft, query, repo};
 use harness_memory::store::mongo::schema::SCHEMA_VERSION;
-use harness_memory::store::{LangFilter, MemoryStore, NoteKind, NoteListQuery, NotePatch};
+use harness_memory::store::{
+    LangFilter, MemoryStore, NoteKind, NoteListQuery, NotePatch, NoteSort, NoteUsage, UsefulFilter,
+};
 use mongo_support::{TestDb, store};
 use mongodb::bson::{Bson, Document, doc};
 use pretty_assertions::assert_eq;
@@ -279,4 +281,138 @@ fn the_english_notes_setting_defaults_on_and_is_shared() {
     other.set_english_notes(true).expect("set on");
     assert!(store.english_notes().expect("on"));
     assert_eq!(db.count("meta", doc! { "_id": "settings", "english_notes": true }), 1);
+}
+
+/// A note an older server wrote has none of the counter fields: it lists as never shown, sorts as
+/// 0 beside the notes that were counted, and the fields appear only when it is counted. Nothing
+/// else of the document changes.
+/// A counter that stalls behind another client's open transaction on the note is left behind
+/// after a moment: the call comes back, and counting works again once the transaction ends.
+#[test]
+fn a_counter_never_waits_long_for_a_note_another_client_holds() {
+    let Some(db) = TestDb::new() else { return };
+    let mut store = db.connect();
+
+    if !store.uses_transactions() {
+        eprintln!("skipped: the test server has no transactions to hold a note with");
+        return;
+    }
+
+    let id = store
+        .remember(&repo(REPO), &draft("Sync job", ENGLISH, NoteKind::Note))
+        .expect("remember")
+        .id;
+
+    let mut session = db.client().start_session().run().expect("session");
+    session.start_transaction().run().expect("transaction");
+    notes(&db)
+        .update_one(doc! { "_id": id }, doc! { "$set": { "held_by_test": 1_i64 } })
+        .session(&mut session)
+        .run()
+        .expect("hold the note");
+
+    let started = std::time::Instant::now();
+    assert!(store.record_shown(&[id]).is_err(), "the count is dropped");
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_millis(1_500),
+        "the counter took {took:?}"
+    );
+
+    // The late write is still running: a later counter is dropped at once.
+    let started = std::time::Instant::now();
+    assert!(store.record_useful(&[id], 4_000).is_err());
+    assert!(started.elapsed() < std::time::Duration::from_millis(1_500));
+
+    session.abort_transaction().run().expect("release");
+
+    // The late write ends once the note is free, then counting works again.
+    std::thread::sleep(std::time::Duration::from_millis(1_000));
+    store.record_useful(&[id], 4_000).expect("counts again");
+    assert_eq!(note(&db, id).get_i64("useful").unwrap_or(0), 1);
+}
+
+#[test]
+fn notes_without_counter_fields_count_as_zero() {
+    let Some((db, mut store)) = store() else { return };
+    old_insert(&db, 900, "Release steps", "Tag the commit then publish the changelog");
+    old_insert(&db, 901, "Lint rules", "Run clippy with warnings as errors");
+    old_insert(&db, 902, "Editor tabs", "Four wide, indented with spaces");
+
+    let counters = |shown, useful, last_useful_at| NoteUsage {
+        shown,
+        useful,
+        last_useful_at,
+    };
+    let ordered = |store: &mut dyn MemoryStore, query: NoteListQuery| -> Vec<i64> {
+        store
+            .list_notes(&query)
+            .expect("list")
+            .rows
+            .iter()
+            .map(|row| row.id)
+            .collect()
+    };
+
+    let page = store.list_notes(&listing(both(REPO))).expect("list");
+    assert_eq!(page.total, 3);
+    assert!(page.rows.iter().all(|row| row.usage == Some(counters(0, 0, None))));
+
+    for _ in 0..3 {
+        store.record_shown(&[900, 901]).expect("shown");
+    }
+
+    store.record_useful(&[900], 1_500).expect("useful");
+
+    // 900 was found useful, 901 was shown three times without a use, 902 was not counted at all.
+    let by_useful = NoteListQuery {
+        sort: NoteSort::Useful,
+        ..listing(both(REPO))
+    };
+    assert_eq!(ordered(&mut store, by_useful.clone()), vec![900, 902, 901]);
+    assert_eq!(
+        ordered(
+            &mut store,
+            NoteListQuery {
+                sort: NoteSort::LastUseful,
+                descending: false,
+                ..listing(both(REPO))
+            }
+        ),
+        vec![901, 902, 900]
+    );
+    assert_eq!(
+        ordered(
+            &mut store,
+            NoteListQuery {
+                useful: Some(UsefulFilter::Ever),
+                ..by_useful.clone()
+            }
+        ),
+        vec![900]
+    );
+
+    let never = NoteListQuery {
+        useful: Some(UsefulFilter::Never),
+        ..by_useful
+    };
+    let kept = store.list_notes(&never).expect("list");
+    assert_eq!(
+        (kept.total, kept.rows.iter().map(|row| row.id).collect::<Vec<_>>()),
+        (1, vec![901])
+    );
+    assert_eq!(kept.rows[0].usage, Some(counters(3, 0, None)));
+
+    let untouched = note(&db, 902);
+    assert!(!untouched.contains_key("shown") && !untouched.contains_key("useful"));
+
+    let counted = note(&db, 900);
+    assert_eq!(
+        (
+            counted.get_i64("updated_at"),
+            counted.get_i64("revision"),
+            counted.get_i64("hits")
+        ),
+        (Ok(2), Ok(1), Ok(0))
+    );
 }

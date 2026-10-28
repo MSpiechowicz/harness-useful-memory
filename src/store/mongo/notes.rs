@@ -12,7 +12,7 @@ use super::{Ctx, ENTITIES, Fail, NOTES, RELATIONS, graph, int, now, project_of, 
 use super::{PATH_MAX, cut, flag, id_only, note_fields, number, text, visible};
 use crate::limits::{BODY_MAX, ENTITY_MAX, GET_IDS_MAX};
 use crate::store::{
-    Forgotten, Note, NoteDraft, NoteKind, NotePatch, Provenance, Saved, StoreError, Target, View, clean,
+    Forgotten, Note, NoteDraft, NoteKind, NotePatch, NoteUsage, Provenance, Saved, StoreError, Target, View, clean,
 };
 use crate::support::lang;
 use crate::support::redact::redact_text;
@@ -345,6 +345,34 @@ pub(super) fn get(ctx: &mut Ctx<'_>, view: &View, ids: &[i64], count: bool) -> R
     Ok(found)
 }
 
+/// Counts a time shown on the notes `ids` (each once), and nothing else of them: not the update
+/// time, the revision, the hits, nor the search fields.
+pub(super) fn record_shown(ctx: &mut Ctx<'_>, ids: &[i64]) -> Result<(), Fail> {
+    record(ctx, ids, doc! { "$inc": { "shown": 1_i64 } })
+}
+
+/// Counts a time found useful, at `at`, on the notes `ids` (see [`record_shown`]).
+pub(super) fn record_useful(ctx: &mut Ctx<'_>, ids: &[i64], at: i64) -> Result<(), Fail> {
+    record(
+        ctx,
+        ids,
+        doc! { "$inc": { "useful": 1_i64 }, "$set": { "last_useful_at": at } },
+    )
+}
+
+fn record(ctx: &mut Ctx<'_>, ids: &[i64], update: Document) -> Result<(), Fail> {
+    let unique: HashSet<i64> = ids.iter().copied().collect();
+
+    if unique.is_empty() {
+        return Ok(());
+    }
+
+    let wanted: Vec<i64> = unique.into_iter().collect();
+    ctx.update_many(NOTES, doc! { "_id": { "$in": wanted } }, update)?;
+
+    Ok(())
+}
+
 pub(super) fn forget(ctx: &mut Ctx<'_>, view: &View, id: i64) -> Result<usize, Fail> {
     let Some(Stored { note, norms }) = load(ctx, view, id)? else {
         return Err(Fail::Store(not_found(id)));
@@ -463,6 +491,20 @@ pub(super) fn provenance_of(document: &Document) -> Provenance {
     }
 }
 
+/// The counters of a stored note; a note nobody rated has none of the fields yet.
+fn usage_of(document: &Document) -> NoteUsage {
+    let last_useful_at = match document.get("last_useful_at") {
+        Some(Bson::Int64(_) | Bson::Int32(_) | Bson::Double(_)) => Some(int(document, "last_useful_at")),
+        _ => None,
+    };
+
+    NoteUsage {
+        shown: int(document, "shown"),
+        useful: int(document, "useful"),
+        last_useful_at,
+    }
+}
+
 pub(super) fn stored(document: &Document) -> Stored {
     let project = text(document, "project");
 
@@ -481,6 +523,7 @@ pub(super) fn stored(document: &Document) -> Stored {
         revision: int(document, "revision"),
         hits: int(document, "hits"),
         lang: text(document, "lang").as_deref().and_then(lang::Lang::parse),
+        usage: Some(usage_of(document)),
     };
 
     Stored {

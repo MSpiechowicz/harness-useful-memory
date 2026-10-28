@@ -6,9 +6,10 @@
 mod common;
 mod libsql_support;
 
+use common::listing::listing;
 use common::{both, draft, query, repo};
 use harness_memory::store::sqlite::schema::{SCHEMA_VERSION, V1, V2, V3, V4, V5};
-use harness_memory::store::{NoteKind, NotePatch};
+use harness_memory::store::{NoteKind, NotePatch, NoteUsage, StoreError};
 use libsql_support::Database;
 use pretty_assertions::assert_eq;
 
@@ -27,6 +28,12 @@ store_cases!(
     an_older_servers_writes_stay_indexed_and_get_a_language,
     an_older_servers_edit_clears_the_language_and_a_new_servers_edit_keeps_it,
     the_english_notes_setting_defaults_on_and_is_shared,
+    a_database_without_counters_gets_them_and_keeps_its_notes,
+    counting_a_note_changes_nothing_else_of_it,
+    a_counter_never_waits_long_for_the_write_lock,
+    counters_that_gave_up_leave_the_write_lock_free,
+    a_counter_does_not_write_to_a_newer_schema,
+    an_older_server_keeps_working_on_a_database_with_counters,
 );
 
 /// The extension objects the database has, out of the six there are.
@@ -35,6 +42,11 @@ fn objects(db: &Database) -> i64 {
         "SELECT count(*) FROM sqlite_master WHERE name IN ('notes_fts_en', 'notes_fts_en_insert', \
          'notes_fts_en_delete', 'notes_fts_en_update', 'settings', 'notes_lang_reset')",
     )
+}
+
+/// The usage counter columns the database has, out of the three there are.
+fn counter_columns(db: &Database) -> i64 {
+    db.integer("SELECT count(*) FROM pragma_table_info('notes') WHERE name IN ('shown', 'useful', 'last_useful_at')")
 }
 
 fn has_lang_column(db: &Database) -> i64 {
@@ -253,5 +265,240 @@ fn the_english_notes_setting_defaults_on_and_is_shared(db: &Database) {
     assert_eq!(
         db.integer("SELECT count(*) FROM settings WHERE key = 'english_notes'"),
         1
+    );
+}
+
+/// A database the previous server left, with its extensions (the language, the English index, the
+/// settings) but without the usage counters.
+fn without_counters(db: &Database) {
+    without_extensions(db);
+    drop(db.open());
+    db.batch(
+        "ALTER TABLE notes DROP COLUMN shown;
+         ALTER TABLE notes DROP COLUMN useful;
+         ALTER TABLE notes DROP COLUMN last_useful_at;",
+    );
+    assert_eq!(counter_columns(db), 0);
+    assert_eq!(objects(db), 6);
+}
+
+fn a_database_without_counters_gets_them_and_keeps_its_notes(db: &Database) {
+    without_counters(db);
+
+    let mut store = db.open();
+
+    assert_eq!(counter_columns(db), 3);
+    assert_eq!(
+        db.integer("PRAGMA user_version"),
+        SCHEMA_VERSION,
+        "no schema version change"
+    );
+
+    // Every note that was there starts uncounted.
+    let page = store.list_notes(&listing(both(REPO))).expect("list");
+    assert_eq!(page.total, 2);
+
+    for row in &page.rows {
+        assert_eq!(
+            row.usage,
+            Some(NoteUsage {
+                shown: 0,
+                useful: 0,
+                last_useful_at: None
+            }),
+            "{}",
+            row.title
+        );
+    }
+
+    // Opening again adds nothing and changes nothing.
+    store.record_shown(&[page.rows[0].id]).expect("shown");
+    drop(store);
+
+    let mut again = db.open();
+    assert_eq!(counter_columns(db), 3);
+    let counted = again.list_notes(&listing(both(REPO))).expect("list");
+    assert_eq!(
+        counted
+            .rows
+            .iter()
+            .map(|row| row.usage.map_or(0, |usage| usage.shown))
+            .sum::<i64>(),
+        1
+    );
+}
+
+fn counting_a_note_changes_nothing_else_of_it(db: &Database) {
+    let mut store = db.open();
+    let saved = store
+        .remember(&repo(REPO), &draft("Sync job", ENGLISH, NoteKind::Note))
+        .expect("remember");
+    let id = saved.id;
+
+    // The update time, the revision, the hits and whether the language is known.
+    let state = |db: &Database| {
+        ["updated_at", "revision", "hits", "lang = 'en'"]
+            .map(|column| db.integer(&format!("SELECT {column} FROM notes WHERE id = {id}")))
+    };
+    let before = state(db);
+    let indexed = "SELECT count(*) FROM notes_fts_en WHERE notes_fts_en MATCH 'sync'";
+    assert_eq!(db.integer(indexed), 1);
+
+    store.record_shown(&[id, id]).expect("shown");
+    store.record_useful(&[id], 4_000).expect("useful");
+
+    assert_eq!(state(db), before, "only the counters changed");
+    assert_eq!(db.integer(indexed), 1, "the search index is as it was");
+    assert_eq!(
+        db.integer(&format!(
+            "SELECT shown * 100 + useful * 10 + (last_useful_at = 4000) FROM notes WHERE id = {id}"
+        )),
+        111
+    );
+
+    // The note is still found, and an edit of its text keeps what was counted.
+    assert_eq!(store.search(&query("sync", both(REPO))).expect("search").len(), 1);
+
+    let patch = NotePatch {
+        append: Some("It also retries.".to_owned()),
+        ..NotePatch::default()
+    };
+    store.update(&both(REPO), id, &patch).expect("update");
+
+    let note = store.peek(&both(REPO), &[id]).expect("peek").remove(0);
+    assert_eq!(
+        note.usage,
+        Some(NoteUsage {
+            shown: 1,
+            useful: 1,
+            last_useful_at: Some(4_000)
+        })
+    );
+    assert_eq!(note.revision, 2);
+}
+
+/// A counter is dropped, not waited for, when another client holds the write lock: the call comes
+/// back in about a second at most, whatever the server does with a writer that queues.
+fn a_counter_never_waits_long_for_the_write_lock(db: &Database) {
+    let mut store = db.open();
+    let id = store
+        .remember(&repo(REPO), &draft("Sync job", ENGLISH, NoteKind::Note))
+        .expect("remember")
+        .id;
+
+    let lock = db.hold_write_lock();
+
+    // Each counter alone is what one request waits for.
+    let started = std::time::Instant::now();
+    let _ = store.record_shown(&[id]);
+    let shown_took = started.elapsed();
+
+    let started = std::time::Instant::now();
+    let _ = store.record_useful(&[id], 4_000);
+    let useful_took = started.elapsed();
+    drop(lock);
+
+    let limit = std::time::Duration::from_millis(1_000);
+    assert!(shown_took < limit, "a counter took {shown_took:?}");
+    assert!(useful_took < limit, "a counter took {useful_took:?}");
+
+    // Once the lock is free, counting works again. A libSQL server finishes the counters that gave
+    // up when it can, so the count is at least this one.
+    store.record_shown(&[id]).expect("shown");
+    assert!(db.integer(&format!("SELECT shown FROM notes WHERE id = {id}")) >= 1);
+}
+
+/// A counter that gave up leaves nothing open on the server: once the other client lets go of the
+/// write lock, a write is not held up by the counters that stopped waiting for it.
+fn counters_that_gave_up_leave_the_write_lock_free(db: &Database) {
+    let mut store = db.open();
+    let id = store
+        .remember(&repo(REPO), &draft("Sync job", ENGLISH, NoteKind::Note))
+        .expect("remember")
+        .id;
+    let mut other = db.open();
+
+    let lock = db.hold_write_lock();
+
+    for round in 0..5 {
+        let started = std::time::Instant::now();
+        let _ = if round % 2 == 0 {
+            store.record_shown(&[id])
+        } else {
+            store.record_useful(&[id], 4_000)
+        };
+
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(1_000),
+            "counter {round} took {took:?}"
+        );
+    }
+
+    drop(lock);
+
+    let started = std::time::Instant::now();
+    other
+        .remember(&repo(REPO), &draft("Release steps", "Tag the commit", NoteKind::Note))
+        .expect("remember");
+
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_millis(200),
+        "a write waited {took:?} for the counters that gave up"
+    );
+}
+
+/// A server that migrated the database since this one connected is not written to by a counter
+/// (a shared server only: a local file is opened by one version at a time).
+fn a_counter_does_not_write_to_a_newer_schema(db: &Database) {
+    if !db.is_libsql() {
+        return;
+    }
+
+    let mut store = db.open();
+    let id = store
+        .remember(&repo(REPO), &draft("Sync job", ENGLISH, NoteKind::Note))
+        .expect("remember")
+        .id;
+
+    db.batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1));
+
+    assert!(matches!(store.record_shown(&[id]), Err(StoreError::NewerSchema)));
+    assert!(matches!(
+        store.record_useful(&[id], 4_000),
+        Err(StoreError::NewerSchema)
+    ));
+    assert_eq!(
+        db.integer(&format!("SELECT shown + useful FROM notes WHERE id = {id}")),
+        0
+    );
+}
+
+fn an_older_server_keeps_working_on_a_database_with_counters(db: &Database) {
+    drop(db.open());
+    assert_eq!(counter_columns(db), 3);
+
+    // What the previous server runs: it knows no counter column and names none.
+    old_insert(db, "Release steps", "Tag the commit then publish the changelog");
+    db.batch("UPDATE notes SET revision = revision + 1, updated_at = 5 WHERE title = 'Release steps';");
+
+    assert_eq!(
+        db.integer("SELECT shown + useful FROM notes WHERE title = 'Release steps'"),
+        0,
+        "a note it wrote starts uncounted"
+    );
+    assert_eq!(db.integer("SELECT count(*) FROM notes WHERE last_useful_at IS NULL"), 1);
+
+    let mut store = db.open();
+    let page = store.list_notes(&listing(both(REPO))).expect("list");
+    assert_eq!(page.total, 1);
+    assert_eq!(
+        page.rows[0].usage,
+        Some(NoteUsage {
+            shown: 0,
+            useful: 0,
+            last_useful_at: None
+        })
     );
 }

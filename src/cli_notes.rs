@@ -6,8 +6,8 @@
 //! hidden on this computer are left out as they are for the agent.
 //!
 //! - `harness-memory notes list --json [--project PATH | --repo KEY | --all-repos] [--kind KIND] [--scope repo|global]
-//!   [--place local|team] [--lang en|other|unknown] [--query TEXT] [--sort updated|title|kind|scope|place] [--order asc|desc]
-//!   [--offset N] [--limit N]` prints `{"total": N, "kinds": [{"kind", "count"}], "scopes":
+//!   [--place local|team] [--lang en|other|unknown] [--useful any|ever|never] [--query TEXT]
+//!   [--sort updated|title|kind|scope|place|useful|lastUseful] [--order asc|desc] [--offset N] [--limit N]` prints `{"total": N, "kinds": [{"kind", "count"}], "scopes":
 //!   {"repo": N, "global": N}, "places": {"local": N, "team": N}, "notes": [...]}`: one page of the
 //!   notes (see [`crate::store::listing`] for the matching and the order). `--query` keeps the
 //!   notes whose title, body or tags contain it, ignoring case, `--kind` the notes of one kind,
@@ -17,16 +17,22 @@
 //!   counts per scope every filter but `--scope`, the counts per place every filter but
 //!   `--place`, the total all four. Newest first unless `--sort title` (A to Z), `kind` (by kind
 //!   name), `scope` (global notes first) or `place` (notes on this computer first), all ascending;
-//!   `--order` turns any round, ties go by id. `--limit` is 1 to 200, 50 when not given. A note
+//!   `useful` (the most often found useful first) or `lastUseful` (the most recently found useful
+//!   first, a note never found useful last); `--order` turns any round, ties go by id. `--limit` is 1 to 200, 50 when not given. A note
 //!   object has `id`, `kind`, `title`, `scope` (`repo` or `global`), `repo`
 //!   (`github.com/o/r`, a `path:` key whole, `null` for a global note), `place` (`team` or
 //!   `local`: where this note is kept), `readOnly` (a team note of a scope routed
 //!   `remote+local`, which cannot be changed from here), `hidden` (hidden on this computer),
 //!   `tags`, `entities`, `author` (`source` and `root`, shown like a script's writer),
-//!   `createdAt` and `updatedAt` (RFC 3339), `revision`, `hits` and `lang` (`en`, `other`, or
-//!   `null` when the note was not looked at yet or its language is not certain). `--lang` keeps
+//!   `createdAt` and `updatedAt` (RFC 3339), `revision`, `hits`, `lang` (`en`, `other`, or
+//!   `null` when the note was not looked at yet or its language is not certain), and the
+//!   usefulness counters `shown` (how often agents were shown the note in search results),
+//!   `useful` (how often they said it helped) and `lastUsefulAt` (RFC 3339, `null` until then);
+//!   all three are `null` when the database has no counters. `--lang` keeps
 //!   the notes of one language (`unknown`: those with a `null` lang), narrowing the page and
-//!   every count like `--query` does. With a team database the
+//!   every count like `--query` does, and so does `--useful`: `ever` keeps the notes found useful
+//!   at least once, `never` those shown at least 3 times and never found useful (`any` keeps
+//!   every note). With a team database the
 //!   object also has `hiddenCount` (the team notes of the view hidden on this computer) and
 //!   `localCounts` (`{"repo": N, "global": N}`: the notes in the local file per scope, every
 //!   repository's, 0 without the file). `--hidden` lists only the hidden team notes of the view
@@ -81,6 +87,7 @@ use crate::mcp::{author_json, place_label, repo_label};
 use crate::open::{lone_notes_place, notes_place, open_hidden, open_notes};
 use crate::store::{
     Forget, HiddenNotes, LangFilter, MemoryStore, Note, NoteKind, NoteListQuery, NoteOrigin, NoteRow, NoteSort,
+    UsefulFilter,
 };
 use crate::store::{ProjectKey, Scope, SqliteStore, StoreError, Target, View, clean};
 use crate::support::Env;
@@ -89,7 +96,7 @@ use crate::support::time::rfc3339;
 
 /// The usage of these commands, for the executable's usage line.
 pub const USAGE: &str = "notes list --json [--project PATH | --repo KEY | --all-repos] [--kind KIND] [--scope repo|global] \
-                         [--place local|team] [--lang en|other|unknown] [--query TEXT] [--sort updated|title|kind|scope|place] [--order asc|desc] [--offset N] [--limit N] \
+                         [--place local|team] [--lang en|other|unknown] [--useful any|ever|never] [--query TEXT] [--sort updated|title|kind|scope|place|useful|lastUseful] [--order asc|desc] [--offset N] [--limit N] \
                          [--hidden] | notes repos --json | notes repos --json | notes get <id> --json [--project PATH | --repo KEY | --all-repos] [--hidden] | notes hide <id> \
                          [--project PATH | --repo KEY | --all-repos] [--json] | notes unhide <id> [--project PATH | --repo KEY | --all-repos] [--json] | notes delete \
                          <id> [--project PATH | --repo KEY | --all-repos] | notes delete --all --yes [--project PATH | --repo KEY] [--json] | notes \
@@ -215,6 +222,7 @@ fn repos(args: &[Option<&str>]) -> ExitCode {
             place: None,
             entity: None,
             lang: None,
+            useful: None,
             sort: NoteSort::Updated,
             descending: true,
             offset,
@@ -378,7 +386,7 @@ fn parse_list(args: &[Option<&str>]) -> Option<(Repos, NoteListQuery, bool)> {
     let valued = [
         &PAGE_OPTIONS[..],
         &PICK_VALUED[..],
-        &["--kind", "--scope", "--place", "--sort", "--lang"],
+        &["--kind", "--scope", "--place", "--sort", "--lang", "--useful"],
     ]
     .concat();
     let parsed = Args::parse(args, &["--json", "--hidden", "--all-repos"], &valued)?;
@@ -399,12 +407,19 @@ fn parse_list(args: &[Option<&str>]) -> Option<(Repos, NoteListQuery, bool)> {
         None => None,
     };
 
+    let useful = match parsed.value("--useful") {
+        None | Some("any") => None,
+        Some(raw) => Some(UsefulFilter::parse(raw)?),
+    };
+
     let sort = match parsed.value("--sort") {
         None | Some("updated") => NoteSort::Updated,
         Some("title") => NoteSort::Title,
         Some("kind") => NoteSort::Kind,
         Some("scope") => NoteSort::Scope,
         Some("place") => NoteSort::Place,
+        Some("useful") => NoteSort::Useful,
+        Some("lastUseful") => NoteSort::LastUseful,
         Some(_) => return None,
     };
 
@@ -426,8 +441,13 @@ fn parse_list(args: &[Option<&str>]) -> Option<(Repos, NoteListQuery, bool)> {
         place: parsed.place().ok()?,
         entity: None,
         lang,
+        useful,
         sort,
-        descending: descending.unwrap_or(sort == NoteSort::Updated),
+        // The newest and the most useful notes come first.
+        descending: descending.unwrap_or(matches!(
+            sort,
+            NoteSort::Updated | NoteSort::Useful | NoteSort::LastUseful
+        )),
         offset,
         limit,
         exclude: Vec::new(),
@@ -522,6 +542,7 @@ impl Opened {
             place: None,
             entity: None,
             lang: None,
+            useful: None,
             sort: NoteSort::Updated,
             descending: true,
             offset: 0,
@@ -563,6 +584,9 @@ impl Opened {
             "revision": row.revision,
             "hits": row.hits,
             "lang": row.lang.map(Lang::as_str),
+            "shown": row.usage.map(|usage| usage.shown),
+            "useful": row.usage.map(|usage| usage.useful),
+            "lastUsefulAt": row.usage.and_then(|usage| usage.last_useful_at).map(rfc3339),
         })
     }
 
@@ -642,6 +666,7 @@ impl Opened {
             place: None,
             entity: Some(name.to_owned()),
             lang: None,
+            useful: None,
             sort: NoteSort::Updated,
             descending: true,
             offset: 0,

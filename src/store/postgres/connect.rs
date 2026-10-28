@@ -10,6 +10,12 @@
 //! `sslmode` and `sslrootcert` are taken out of the URL here because the client library knows
 //! only `disable`, `prefer` and `require` and has no `sslrootcert`; every other parameter is the
 //! library's (`options`, `connect_timeout`, `application_name`, `channel_binding`, ...).
+//!
+//! A connection to a network that goes silent (a dropped route, a firewall that forgets the
+//! connection) ends in seconds instead of hanging for the system's two hours: `tcp_user_timeout`
+//! gives up on data the other side does not acknowledge, and TCP keepalives probe an idle one.
+//! Neither cuts a healthy connection, also not one waiting for a long statement (the server
+//! acknowledges the probes). A URL that sets any of these parameters keeps its own value.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -25,6 +31,19 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 /// How long connecting may take when the URL sets no `connect_timeout`.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long sent data may stay unacknowledged before the connection is closed (Linux only): a
+/// healthy server acknowledges within a round trip, whatever its statement takes.
+const TCP_USER_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a connection is idle before the first keepalive probe.
+const KEEPALIVES_IDLE: Duration = Duration::from_secs(15);
+
+/// The pause between keepalive probes.
+const KEEPALIVES_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How many keepalive probes go unanswered before the connection is closed.
+const KEEPALIVES_RETRIES: u32 = 3;
 
 /// The `application_name` the server shows for these sessions, unless the URL names one.
 const APPLICATION_NAME: &str = "harness-memory";
@@ -100,6 +119,24 @@ pub fn parse(url: &str) -> Result<Settings, UrlError> {
 
     if config.get_application_name().is_none() {
         config.application_name(APPLICATION_NAME);
+    }
+
+    let named = |name: &str| kept.iter().any(|pair| pair.split('=').next() == Some(name));
+
+    if !named("tcp_user_timeout") {
+        config.tcp_user_timeout(TCP_USER_TIMEOUT);
+    }
+
+    if !named("keepalives_idle") {
+        config.keepalives_idle(KEEPALIVES_IDLE);
+    }
+
+    if !named("keepalives_interval") {
+        config.keepalives_interval(KEEPALIVES_INTERVAL);
+    }
+
+    if !named("keepalives_retries") {
+        config.keepalives_retries(KEEPALIVES_RETRIES);
     }
 
     Ok(Settings {
@@ -262,6 +299,26 @@ mod tests {
         assert_eq!(settings.config.get_connect_timeout(), Some(&CONNECT_TIMEOUT));
         assert_eq!(settings.config.get_application_name(), Some(APPLICATION_NAME));
         assert!(!settings.local);
+    }
+
+    #[test]
+    fn a_silent_network_ends_the_connection_unless_the_url_says_otherwise() {
+        let config = parse("postgres://u@db.example.com/m").expect("parses").config;
+
+        assert_eq!(config.get_tcp_user_timeout(), Some(&TCP_USER_TIMEOUT));
+        assert!(config.get_keepalives());
+        assert_eq!(config.get_keepalives_idle(), KEEPALIVES_IDLE);
+        assert_eq!(config.get_keepalives_interval(), Some(KEEPALIVES_INTERVAL));
+        assert_eq!(config.get_keepalives_retries(), Some(KEEPALIVES_RETRIES));
+
+        let own = parse("postgres://u@db.example.com/m?tcp_user_timeout=60&keepalives_idle=90&keepalives_retries=9")
+            .expect("parses")
+            .config;
+
+        assert_eq!(own.get_tcp_user_timeout(), Some(&Duration::from_secs(60)));
+        assert_eq!(own.get_keepalives_idle(), Duration::from_secs(90));
+        assert_eq!(own.get_keepalives_interval(), Some(KEEPALIVES_INTERVAL));
+        assert_eq!(own.get_keepalives_retries(), Some(9));
     }
 
     #[test]

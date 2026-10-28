@@ -57,9 +57,9 @@ use crate::store::listing::{compare, directed, page_limit, per_place};
 use crate::store::pending::{Entry, Kind, Pending};
 use crate::store::rank::Terms;
 use crate::store::{
-    Edge, Forget, Forgotten, HiddenNotes, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NoteListQuery,
-    NoteOrigin, NotePage, NotePatch, NoteRow, NoteSort, Saved, Scope, SearchQuery, StoreError, Target, VectorTarget,
-    View, clean,
+    Countable, Edge, Forget, Forgotten, HiddenNotes, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft,
+    NoteListQuery, NoteOrigin, NotePage, NotePatch, NoteRow, NoteSort, Saved, Scope, SearchQuery, StoreError, Target,
+    VectorTarget, View, clean,
 };
 
 /// How long a copy of the notes saved offline that failed is not tried again.
@@ -444,6 +444,38 @@ impl SplitStore {
         directed(query, team(a).cmp(&team(b)).then(a.id.cmp(&b.id)))
     }
 
+    /// The shown ids `ids` that a counter may reach, as [`ids_by_side`] splits them. A counter
+    /// never settles ([`Self::settle`] may open the team database or copy the notes saved
+    /// offline, which no counter may wait for): the call that queued it did. The team notes are
+    /// left out while the team database is down, hidden on this computer, or while the hidden list
+    /// cannot be read (a hidden note must not be counted as shown). The list is read as it is, never
+    /// pruned ([`Self::hidden_ids_unpruned`]).
+    fn countable_by_side(&mut self, ids: &[i64]) -> Vec<(Side, Vec<i64>)> {
+        let mut sides = ids_by_side(ids);
+
+        if self.down {
+            sides.retain(|(side, _)| *side != Side::Team);
+        }
+
+        if !sides.iter().any(|(side, _)| *side == Side::Team) {
+            return sides;
+        }
+
+        match self.hidden_ids_unpruned() {
+            Ok(hidden) => {
+                for (side, raw) in &mut sides {
+                    if *side == Side::Team {
+                        raw.retain(|id| !hidden.contains(id));
+                    }
+                }
+            }
+            Err(_) => sides.retain(|(side, _)| *side != Side::Team),
+        }
+
+        sides.retain(|(_, raw)| !raw.is_empty());
+        sides
+    }
+
     fn store(&mut self, side: Side) -> &mut dyn MemoryStore {
         match side {
             Side::Team => self.team.as_mut(),
@@ -484,6 +516,16 @@ impl SplitStore {
 
         let _ = hidden.prune_if_due(self.team.as_mut());
         hidden.try_ids()
+    }
+
+    /// The ids [`Self::hidden_ids_strict`] reads, without pruning the list: a prune reads the team
+    /// database with the long timeouts of a call, which no counter may wait for. The call that
+    /// queued the counter pruned already, and the next reply does again.
+    fn hidden_ids_unpruned(&mut self) -> Result<Vec<i64>, StoreError> {
+        match self.hidden.as_mut() {
+            Some(hidden) => hidden.try_ids(),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Refuses to save `title` in the team scope `target` when a team note with that title is
@@ -696,6 +738,24 @@ fn with_asked(mut ids: Vec<i64>, side: Side, asked: &[i64]) -> Vec<i64> {
     }
 
     ids
+}
+
+/// The shown note ids `ids` as each store's own, the team database's first; a store none of them
+/// belongs to is left out.
+fn ids_by_side(ids: &[i64]) -> Vec<(Side, Vec<i64>)> {
+    [Side::Team, Side::Local]
+        .into_iter()
+        .map(|side| {
+            let own: Vec<i64> = ids
+                .iter()
+                .map(|id| decode(*id))
+                .filter(|(of, _)| *of == side)
+                .map(|(_, raw)| raw)
+                .collect();
+            (side, own)
+        })
+        .filter(|(_, own)| !own.is_empty())
+        .collect()
 }
 
 /// The scopes of `view` that `keep` keeps; `None` when it keeps none.
@@ -1145,6 +1205,76 @@ impl MemoryStore for SplitStore {
         }
 
         Ok(hits)
+    }
+
+    fn countable(&mut self, view: &View, ids: &[i64]) -> Countable {
+        self.settle();
+
+        let mut found = Countable::default();
+        // The strict list: a hidden list that cannot be read hides nothing, so no team note is
+        // counted on its word (a hidden note must never be counted).
+        let hidden = self.hidden_ids_strict();
+
+        for side in [Side::Team, Side::Local] {
+            let own: Vec<(i64, i64)> = ids
+                .iter()
+                .map(|id| (*id, decode(*id)))
+                .filter(|(_, (of, _))| *of == side)
+                .map(|(shown, (_, raw))| (shown, raw))
+                .collect();
+
+            if own.is_empty() {
+                continue;
+            }
+
+            // A scope this side is not read for is not visible: checked, and not found.
+            let Some(narrowed) = self.narrow(view, side) else {
+                continue;
+            };
+
+            let wanted: Vec<(i64, i64)> = match (side, &hidden) {
+                (Side::Team, Err(_)) => {
+                    found.unchecked.extend(own.iter().map(|(shown, _)| *shown));
+                    continue;
+                }
+                (Side::Team, Ok(hidden)) => own.into_iter().filter(|(_, raw)| !hidden.contains(raw)).collect(),
+                (Side::Local, _) => own,
+            };
+
+            for chunk in wanted.chunks(GET_IDS_MAX) {
+                let raws: Vec<i64> = chunk.iter().map(|(_, raw)| *raw).collect();
+
+                match self.store(side).peek(&narrowed, &raws) {
+                    Ok(notes) => found.visible.extend(
+                        chunk
+                            .iter()
+                            .filter(|(_, raw)| notes.iter().any(|note| note.id == *raw))
+                            .map(|(shown, _)| *shown),
+                    ),
+                    Err(_) => found.unchecked.extend(chunk.iter().map(|(shown, _)| *shown)),
+                }
+            }
+        }
+
+        found
+    }
+
+    fn record_shown(&mut self, ids: &[i64]) -> Result<(), StoreError> {
+        // A counter is not a change to the note: it also counts a read-only team note. Each side is
+        // counted on its own, so a team database that is down does not stop the local counts.
+        for (side, raw) in self.countable_by_side(ids) {
+            let _ = self.store(side).record_shown(&raw);
+        }
+
+        Ok(())
+    }
+
+    fn record_useful(&mut self, ids: &[i64], at: i64) -> Result<(), StoreError> {
+        for (side, raw) in self.countable_by_side(ids) {
+            let _ = self.store(side).record_useful(&raw, at);
+        }
+
+        Ok(())
     }
 
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {
