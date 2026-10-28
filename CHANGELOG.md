@@ -1,3 +1,10 @@
+# [2.10.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.9.2...v2.10.0) (2026-10-28)
+
+
+### Features
+
+* **usefulness:** note_feedback tool and per-note usefulness counters ([4f79edb](https://github.com/MSpiechowicz/harness-useful-memory/commit/4f79edbc7f9decdd75d0e510d501c572f0d511a3))
+
 ## [2.9.2](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.9.1...v2.9.2) (2026-10-26)
 
 
