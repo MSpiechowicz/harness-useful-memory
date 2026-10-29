@@ -1,0 +1,45 @@
+---
+source: tests/code_golden.rs
+expression: "fixture_output(\"svelte\")"
+---
+== map
+src/lib/store.ts
+  function countTodos(): number
+  function addTodo(text: string): Todo
+src/lib/TodoItem.svelte
+  <TodoItem>
+src/App.svelte
+
+== symbol TodoItem
+component TodoItem  src/lib/TodoItem.svelte:1-8
+  <TodoItem>
+  uses:
+    countTodos src/lib/store.ts:13  at src/lib/TodoItem.svelte:5 | const position = countTodos();
+  used by 1 site(s):
+    src/App.svelte:12 App | <TodoItem label="…" />
+
+== symbol addTodo
+fn addTodo  src/lib/store.ts:7-11
+  function addTodo(text: string): Todo
+  uses:
+    Todo src/lib/store.ts:1  at src/lib/store.ts:7 | export function addTodo(text: string): Todo {
+  used by 1 site(s):
+    src/App.svelte:6 onAdd | addTodo("…");
+
+== symbol countTodos
+fn countTodos  src/lib/store.ts:13-15
+  function countTodos(): number
+  used by 1 site(s):
+    src/lib/TodoItem.svelte:5 TodoItem | const position = countTodos();
+
+== impact countTodos d2
+`countTodos`: 2 production file(s), 0 test file(s) within 2 caller hop(s). Entries read `caller → what it calls`
+  d0 src/lib/store.ts  [defined here: countTodos]
+  d1 src/lib/TodoItem.svelte  [TodoItem → countTodos]
+  d2 src/App.svelte  [App → TodoItem]
+
+== impact countTodos d3
+`countTodos`: 2 production file(s), 0 test file(s) within 3 caller hop(s). Entries read `caller → what it calls`
+  d0 src/lib/store.ts  [defined here: countTodos]
+  d1 src/lib/TodoItem.svelte  [TodoItem → countTodos]
+  d2 src/App.svelte  [App → TodoItem]

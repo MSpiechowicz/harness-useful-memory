@@ -1,0 +1,97 @@
+# vuejs/vitepress at 415a6a39507af37e282c02eb57ca50594f1bc237 (TypeScript and Vue). Every fact was read from
+# the sources with `git grep -n` in target/bench-repos/vitepress.
+
+[[symbol]]
+query = "resolveConfig"
+note = "git grep -n 'resolveConfig(' src: cli.ts:41 (module level) and :50 (restartServer), serve.ts:21, server.ts:12, build/build.ts:61"
+defined = "src/node/config.ts:118"
+sure_used_by = [
+  "src/node/cli.ts:41 <module>",
+  "src/node/cli.ts:50 restartServer",
+  "src/node/serve/serve.ts:21 serve",
+  "src/node/server.ts:12 createServer",
+]
+uses = ["resolveSiteData"]
+
+[[symbol]]
+query = "resolveConfig"
+note = "src/node/build/build.ts:61 inside `export async function build`"
+used_by = ["src/node/build/build.ts:61 build"]
+
+[[symbol]]
+query = "build"
+note = "export async function build in src/node/build/build.ts:49"
+defined = "src/node/build/build.ts:49"
+
+[[symbol]]
+query = "resolveSiteData"
+sure_used_by = ["src/node/config.ts:138 resolveConfig"]
+
+[[symbol]]
+query = "resolveSiteDataByRoute"
+note = "git grep -n 'resolveSiteDataByRoute(' src: client/app/data.ts:33 (initData), node/plugin.ts:331 (configureServer), node/build/render.ts:92"
+defined = "src/shared/shared.ts:166"
+sure_used_by = ["src/client/app/data.ts:33 initData", "src/node/plugin.ts:331 configureServer"]
+
+[[symbol]]
+query = "resolveSiteDataByRoute"
+used_by = ["src/node/build/render.ts:92"]
+
+[[impact]]
+query = "resolveConfig"
+depth = 1
+files = ["src/node/cli.ts", "src/node/serve/serve.ts", "src/node/server.ts"]
+contains = ["createServer → resolveConfig", "serve → resolveConfig", "restartServer → resolveConfig"]
+
+[[impact]]
+query = "resolveConfig"
+depth = 1
+files = ["src/node/build/build.ts"]
+
+[[symbol]]
+query = "composables/data::useData"
+note = "git grep -n useData src/client/theme-default: Layout.vue:28, composables/layout.ts:24 (useLayout) and many components import it from ./composables/data"
+sure_used_by = [
+  "src/client/theme-default/Layout.vue:28 Layout",
+  "src/client/theme-default/NotFound.vue:7 NotFound",
+  "src/client/theme-default/components/VPContent.vue:11 VPContent",
+  "src/client/theme-default/composables/layout.ts:24 useLayout",
+]
+
+[[symbol]]
+query = "composables/data::useData"
+note = "src/client/app/components/Content.ts:1 and :14"
+not_used_by = ["src/client/app/components/Content.ts"]
+
+[[symbol]]
+query = "app/data::useData"
+note = "src/client/app/index.ts:17 imports it from ./data, :45 calls it"
+sure_used_by = ["src/client/app/index.ts:45 setup"]
+
+[[symbol]]
+query = "app/data::useData"
+sure_used_by = ["src/client/app/components/Content.ts:14 setup"]
+
+[[symbol]]
+query = "VPContent"
+note = "Layout.vue:5 imports it and :63 renders <VPContent>"
+sure_used_by = ["src/client/theme-default/Layout.vue:63 Layout"]
+uses = ["useData"]
+
+[[map]]
+budget = 1500
+top = 10
+note = "src/shared/shared.ts is imported by 53 files and composables/data.ts by 30 (git grep -l)"
+files = ["src/shared/shared.ts", "src/client/theme-default/composables/data.ts"]
+
+[[map]]
+budget = 1500
+top = 5
+not_files = ["src/node/utils/moduleGraph.ts"]
+
+[[path]]
+from = "createServer"
+to = "resolveSiteData"
+note = "server.ts:12 createServer calls resolveConfig, config.ts:138 resolveConfig calls resolveSiteData"
+hops = 2
+through = ["createServer", "resolveConfig", "resolveSiteData"]

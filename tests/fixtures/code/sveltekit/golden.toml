@@ -1,0 +1,24 @@
+# A SvelteKit app: `$lib` is not in any config the index reads (the generated .svelte-kit/tsconfig.json is
+# a hidden tool folder), svelte.config.js is what tells it. The .storybook folder is tracked source.
+
+[[symbol]]
+query = "applyTheme"
+note = "Card.svelte:5 and .storybook/preview.ts:3 call it through '$lib/theme'"
+defined = "src/lib/theme.ts:1"
+used_by = ["src/lib/components/Card.svelte:5", ".storybook/preview.ts:3"]
+
+[[symbol]]
+query = "formatDate"
+note = "+page.svelte:5 calls it through '$lib/format'"
+defined = "src/lib/format.ts:1"
+used_by = ["src/routes/+page.svelte:5"]
+
+[[symbol]]
+query = "Card"
+note = "+page.svelte:8 renders <Card /> imported from '$lib/components/Card.svelte'"
+used_by = ["src/routes/+page.svelte:8"]
+
+[[map]]
+note = ".storybook is walked, the generated .svelte-kit folder is not"
+files = [".storybook/preview.ts", "src/lib/theme.ts"]
+not_files = [".svelte-kit/generated/client-app.js"]

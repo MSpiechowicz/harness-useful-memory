@@ -1,0 +1,68 @@
+---
+source: tests/code_golden.rs
+expression: "fixture_output(\"react-tsx\")"
+---
+== map
+src/api.ts
+  interface Subject
+  Api: async listSubjects(): Promise<Subject[]>
+src/hooks.ts
+  function useSubjects(): Subject[]
+src/components/Header.tsx
+  function Header({ title }: { title: string })
+src/components/SubjectList.tsx
+  function SubjectList()
+src/App.tsx
+
+== symbol Api.listSubjects
+method Api::listSubjects  src/api.ts:6-8
+  async listSubjects(): Promise<Subject[]>
+  uses:
+    Subject src/api.ts:1  at src/api.ts:6 | async listSubjects(): Promise<Subject[]> {
+  used by 1 site(s):
+    src/hooks.ts:8 useSubjects | api.listSubjects().then(setSubjects);
+
+== symbol Header
+fn Header  src/components/Header.tsx:1-3
+  function Header({ title }: { title: string })
+  used by 1 site(s):
+    src/App.tsx:7 App | <Header title="…" />
+
+== symbol MockApi.listSubjects
+method MockApi::listSubjects  src/mock.ts:5-7
+  async listSubjects(): Promise<Subject[]>
+  uses:
+    Subject src/api.ts:1  at src/mock.ts:5 | async listSubjects(): Promise<Subject[]> {
+  used by 0 site(s):
+
+== symbol SubjectList
+fn SubjectList  src/components/SubjectList.tsx:3-13
+  function SubjectList()
+  uses:
+    useSubjects src/hooks.ts:4  at src/components/SubjectList.tsx:4 | const subjects = useSubjects();
+  used by 1 site(s):
+    src/App.tsx:8 App | <SubjectList />
+
+== symbol useSubjects
+fn useSubjects  src/hooks.ts:4-12
+  function useSubjects(): Subject[]
+  uses:
+    Subject src/api.ts:1  at src/hooks.ts:4 | export function useSubjects(): Subject[] {
+    Api::listSubjects src/api.ts:6  at src/hooks.ts:8 | api.listSubjects().then(setSubjects);
+  used by 1 site(s):
+    src/components/SubjectList.tsx:4 SubjectList | const subjects = useSubjects();
+
+== impact Api.listSubjects d3
+`Api.listSubjects`: 3 production file(s), 0 test file(s) within 3 caller hop(s). Entries read `caller → what it calls`
+  d0 src/api.ts  [defined here: Api::listSubjects]
+  d1 src/hooks.ts  [useSubjects → Api::listSubjects]
+  d2 src/components/SubjectList.tsx  [SubjectList → useSubjects]
+  d3 src/App.tsx  [App → SubjectList]
+
+== path SubjectList -> Api.listSubjects
+`SubjectList` → `Api.listSubjects`: 2 hops
+    SubjectList  src/components/SubjectList.tsx:3
+  → useSubjects  src/hooks.ts:4
+        at src/components/SubjectList.tsx:4 | const subjects = useSubjects();
+  → Api::listSubjects  src/api.ts:6
+        at src/hooks.ts:8 | api.listSubjects().then(setSubjects);

@@ -1,0 +1,14 @@
+[[symbol]]
+query = "getPosts"
+note = "index.astro:5 calls getPosts in the frontmatter"
+used_by = ["src/pages/index.astro:5"]
+
+[[symbol]]
+query = "Layout"
+note = "index.astro:8 renders <Layout>"
+used_by = ["src/pages/index.astro:8"]
+
+[[impact]]
+query = "getPosts"
+depth = 1
+files = ["src/pages/index.astro"]

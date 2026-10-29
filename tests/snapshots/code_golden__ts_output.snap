@@ -1,0 +1,56 @@
+---
+source: tests/code_golden.rs
+expression: "fixture_output(\"ts\")"
+---
+== map
+src/api.ts
+  interface User
+  async function fetchUser(id: number): Promise<User>
+src/user.ts
+  async function loadUserName(id: number): Promise<string>
+src/format.ts
+  function formatName(user: User): string
+src/main.ts
+src/util/index.ts
+
+== symbol api::fetchUser
+fn fetchUser  src/api.ts:6-9
+  async function fetchUser(id: number): Promise<User>
+  uses:
+    User src/api.ts:1  at src/api.ts:6 | export async function fetchUser(id: number): Promise<User> {
+  used by 1 site(s):
+    src/user.ts:5 loadUserName | const user = await fetchUser(id);
+
+== symbol formatName
+fn formatName  src/format.ts:3-5
+  function formatName(user: User): string
+  uses:
+    User src/api.ts:1  at src/format.ts:3 | export function formatName(user: User): string {
+  used by 1 site(s):
+    src/user.ts:6 loadUserName | return formatName(user);
+
+== symbol loadUserName
+fn loadUserName  src/user.ts:4-7
+  async function loadUserName(id: number): Promise<string>
+  uses:
+    fetchUser src/api.ts:6  at src/user.ts:5 | const user = await fetchUser(id);
+    formatName src/format.ts:3  at src/user.ts:6 | return formatName(user);
+  used by 1 site(s):
+    src/main.ts:4 main | console.log(await loadUserName(1));
+
+== symbol util/index::fetchUser
+fn fetchUser  src/util/index.ts:2-4
+  function fetchUser(): string
+  used by 0 site(s):
+
+== impact api::fetchUser d2
+`api::fetchUser`: 2 production file(s), 0 test file(s) within 2 caller hop(s). Entries read `caller → what it calls`
+  d0 src/api.ts  [defined here: fetchUser]
+  d1 src/user.ts  [loadUserName → fetchUser]
+  d2 src/main.ts  [main → loadUserName]
+
+== impact formatName d2
+`formatName`: 2 production file(s), 0 test file(s) within 2 caller hop(s). Entries read `caller → what it calls`
+  d0 src/format.ts  [defined here: formatName]
+  d1 src/user.ts  [loadUserName → formatName]
+  d2 src/main.ts  [main → loadUserName]

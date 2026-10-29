@@ -1,0 +1,18 @@
+# Public repositories used by the code index benchmarks, pinned by commit.
+# `bench/fetch.sh` checks them out into target/bench-repos/<name>; tests/code_golden.rs reads the
+# expectations in bench/golden/<name>.toml and skips a repository that was not fetched.
+
+[fzf]
+url = "https://github.com/junegunn/fzf"
+commit = "26ff936df038b6a62ec42cf18db27b2ea2bb8ec3"
+language = "go"
+
+[vitepress]
+url = "https://github.com/vuejs/vitepress"
+commit = "415a6a39507af37e282c02eb57ca50594f1bc237"
+language = "vue-ts"
+
+[httpx]
+url = "https://github.com/encode/httpx"
+commit = "b5addb64f0161ff6bfe94c124ef76f6a1fba5254"
+language = "python"

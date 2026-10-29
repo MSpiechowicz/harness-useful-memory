@@ -1,0 +1,40 @@
+[[symbol]]
+query = "Header"
+note = "App.tsx:7 renders <Header />"
+sure_used_by = ["src/App.tsx:7 App"]
+
+[[symbol]]
+query = "SubjectList"
+sure_used_by = ["src/App.tsx:8 App"]
+
+[[symbol]]
+query = "useSubjects"
+sure_used_by = ["src/components/SubjectList.tsx:4 SubjectList"]
+
+[[symbol]]
+query = "Api.listSubjects"
+note = "hooks.ts:8 calls api.listSubjects() on the Api instance; MockApi is a different class"
+sure_used_by = ["src/hooks.ts:8 useSubjects"]
+
+[[symbol]]
+query = "MockApi.listSubjects"
+note = "nothing calls the mock"
+not_used_by = ["src/hooks.ts"]
+
+[[impact]]
+query = "Api.listSubjects"
+depth = 3
+files = ["src/hooks.ts", "src/components/SubjectList.tsx", "src/App.tsx"]
+not_files = ["src/mock.ts"]
+
+[[map]]
+top = 3
+files = ["src/api.ts"]
+
+[[path]]
+from = "SubjectList"
+to = "Api.listSubjects"
+note = "SubjectList.tsx:4 useSubjects(), hooks.ts:8 api.listSubjects()"
+hops = 2
+through = ["SubjectList", "useSubjects", "Api::listSubjects"]
+not_through = ["MockApi::listSubjects"]

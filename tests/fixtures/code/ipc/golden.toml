@@ -1,0 +1,59 @@
+[[symbol]]
+query = "validate_paths"
+note = "api.ts:4 invoke('validate_paths', ..) names the Rust function in a string"
+sure_used_by = ["src/lib/api.ts:4 validatePaths (by name)"]
+
+[[symbol]]
+query = "validatePaths"
+sure_used_by = ["src/ui/form.ts:4 submitForm"]
+
+[[symbol]]
+query = "open_project"
+note = "no string names open_project"
+not_used_by = ["src/lib/api.ts"]
+
+[[impact]]
+query = "validate_paths"
+depth = 3
+files = ["src/lib/api.ts", "src/ui/form.ts"]
+contains = ["validatePaths → by name validate_paths", "submitForm → validatePaths"]
+
+[[impact]]
+query = "open_project"
+depth = 3
+not_files = ["src/lib/api.ts", "src/ui/form.ts"]
+
+[[path]]
+from = "submitForm"
+to = "validate_paths"
+note = "form.ts:4 calls validatePaths, api.ts:4 names validate_paths in a string"
+hops = 2
+through = ["submitForm", "validatePaths", "validate_paths (by name)"]
+
+[[path]]
+from = "src/ui/form.ts"
+to = "validate_paths"
+note = "a file as the start: form.ts defines submitForm only, which calls validatePaths (form.ts:4)"
+hops = 2
+through = ["submitForm", "validatePaths", "validate_paths (by name)"]
+
+[[path]]
+from = "submitForm"
+to = "src-tauri/src/commands.rs"
+note = "a file as the end: any definition of commands.rs, here validate_paths"
+hops = 2
+through = ["submitForm", "validatePaths", "validate_paths (by name)"]
+
+[[path]]
+from = "form_opened"
+to = "validate_paths"
+note = "a string as the start: no function is named form_opened, events.ts:6 listens to it and events.rs:4 emits it; the listener calls submitForm (events.ts:6)"
+hops = 3
+through = ["watchForm", "submitForm", "validatePaths", "validate_paths (by name)"]
+
+[[path]]
+from = "src/ui/events.ts"
+to = "form_opened"
+note = "a file to a string: watchForm itself writes form_opened, so it is its own chain"
+hops = 0
+through = ["watchForm"]

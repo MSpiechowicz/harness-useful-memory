@@ -1,0 +1,69 @@
+# Facts about the Rust fixture, read from the sources.
+
+[[symbol]]
+query = "pricing::total"
+note = "orders.rs:13 calls pricing::total(&self.items); report.rs has its own total that nothing in orders.rs calls"
+defined = "src/pricing.rs:7"
+sure_used_by = ["src/orders.rs:13 Order::cost"]
+not_used_by = ["src/report.rs"]
+uses = ["add_tax", "subtotal"]
+
+[[symbol]]
+query = "report::total"
+note = "report.rs:7 summary() calls its own total"
+not_used_by = ["src/orders.rs", "src/pricing.rs"]
+
+[[symbol]]
+query = "report::total"
+note = "report.rs:7 summary() calls its own total inside format!"
+sure_used_by = ["src/report.rs:7 summary"]
+
+[[symbol]]
+query = "tax::add_tax"
+sure_used_by = ["src/pricing.rs:8 total"]
+
+[[symbol]]
+query = "Order::cost"
+note = "checkout(order: &Order) calls order.cost(); Quote::cost is another type with the same method name"
+sure_used_by = ["src/orders.rs:18 checkout"]
+
+[[symbol]]
+query = "Quote::cost"
+note = "nothing in the crate calls Quote::cost"
+not_used_by = ["src/orders.rs"]
+
+[[impact]]
+query = "pricing::total"
+depth = 3
+files = ["src/orders.rs"]
+not_files = ["src/report.rs"]
+contains = ["Order::cost → total", "checkout → Order::cost"]
+
+[[impact]]
+query = "tax::add_tax"
+depth = 3
+files = ["src/pricing.rs", "src/orders.rs"]
+not_files = ["src/report.rs"]
+
+[[map]]
+note = "tax and pricing are what the rest of the crate leans on"
+top = 3
+files = ["src/pricing.rs", "src/tax.rs"]
+
+[[symbol]]
+query = "pricing::total"
+note = "pricing.rs:21 calls total inside assert_eq!"
+tests = ["src/pricing.rs"]
+
+[[symbol]]
+query = "RATE_PERCENT"
+note = "tax.rs:4 mentions RATE_PERCENT inside add_tax"
+sure_used_by = ["src/tax.rs:4 add_tax"]
+
+[[path]]
+from = "checkout"
+to = "tax::add_tax"
+note = "orders.rs:18 order.cost(), orders.rs:13 pricing::total(..), pricing.rs:8 tax::add_tax(..)"
+hops = 3
+through = ["checkout", "Order::cost", "total", "add_tax"]
+not_through = ["Quote::cost"]

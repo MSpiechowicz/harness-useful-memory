@@ -1,0 +1,35 @@
+# A Vite + shadcn layout: the root tsconfig.json only references tsconfig.app.json, which holds the `@/*` paths.
+
+[[symbol]]
+query = "cn"
+note = "button.tsx:4 and card.tsx:5 call cn imported from '@/lib/utils' (utils.ts:3)"
+defined = "src/lib/utils.ts:3"
+sure_used_by = ["src/components/ui/button.tsx:4 Button", "src/components/ui/card.tsx:5 Card"]
+
+[[symbol]]
+query = "formatPrice"
+note = "card.tsx:5 calls it through '@/lib/format'"
+defined = "src/lib/format.ts:1"
+sure_used_by = ["src/components/ui/card.tsx:5 Card"]
+
+[[symbol]]
+query = "useToast"
+note = "App.tsx:8 calls it through '@/hooks/use-toast'"
+defined = "src/hooks/use-toast.ts:1"
+sure_used_by = ["src/App.tsx:8 App"]
+
+[[symbol]]
+query = "Button"
+note = "App.tsx:13 renders <Button>"
+used_by = ["src/App.tsx:13 App"]
+
+[[symbol]]
+query = "Card"
+note = "App.tsx:12 renders <Card>"
+used_by = ["src/App.tsx:12 App"]
+
+[[impact]]
+query = "cn"
+depth = 2
+note = "App renders Card and Button (App.tsx:12-13), which call cn"
+files = ["src/components/ui/button.tsx", "src/components/ui/card.tsx", "src/App.tsx"]

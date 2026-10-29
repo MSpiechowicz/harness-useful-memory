@@ -1,0 +1,46 @@
+# Agent A/B tasks over the public benchmark repositories (bench/repos.toml). Private repositories have theirs in
+# bench/local/ab-tasks.toml (gitignored).
+#
+# repo          a name of bench/repos.toml (target/bench-repos/<name>) or of bench/local.toml
+# question      the prompt given to `claude -p`
+# expect_files  repo-relative files the answer must mention. A file counts as mentioned when the answer holds its
+#               last two path components (`util/chars.go`) or the whole path; a root file needs its name.
+
+[[task]]
+id = "fzf-impact-tochars"
+repo = "fzf"
+question = "If I change the signature of util.ToChars (src/util/chars.go), what production code is affected? List the callers with file:line and how they reach it. Be concise."
+# git grep -n 'ToChars(' src: production calls in core.go, pattern.go, terminal.go, tokenizer.go
+expect_files = ["src/core.go", "src/pattern.go", "src/terminal.go", "src/tokenizer.go"]
+
+[[task]]
+id = "fzf-flow-keystroke"
+repo = "fzf"
+question = "How does a keystroke typed by the user end up re-filtering the list? Trace from reading terminal input to the matcher running the fuzzy algorithm, one hop per line with file:line. Be concise."
+# terminal.go Loop sets EvtSearchNew, core.go Run resets the matcher, matcher.go scan calls pattern.go Match,
+# which runs algo.FuzzyMatchV2
+expect_files = ["src/terminal.go", "src/core.go", "src/matcher.go", "src/pattern.go", "src/algo/algo.go"]
+
+[[task]]
+id = "fzf-central-modules"
+repo = "fzf"
+question = "Give an overview of the 8 most central modules of this Go codebase and what each is for, one line each."
+# the engine files any overview of fzf names
+expect_files = ["src/terminal.go", "src/core.go", "src/matcher.go", "src/pattern.go"]
+min_expect = 2
+
+[[task]]
+id = "httpx-impact-sync-auth-flow"
+repo = "httpx"
+question = "If I change the signature of Auth.sync_auth_flow (httpx/_auth.py), which production code is affected, all the way up to the public API? List the call chain(s) with file:line. Be concise."
+# only Client._send_handling_auth calls it (_client.py:937); Client.send, request and stream sit above it, and
+# _api.py (request/stream functions) and _main.py (client.stream) call those
+expect_files = ["httpx/_client.py", "httpx/_api.py", "httpx/_main.py"]
+
+[[task]]
+id = "httpx-flow-get-to-transport"
+repo = "httpx"
+question = "When a user calls httpx.get(url), how does the request get from that function to the transport's handle_request? List each hop with file:line. Be concise."
+# _api.py get -> request -> Client.request -> send -> _send_handling_auth -> _send_handling_redirects ->
+# _send_single_request -> transport.handle_request (_transports/default.py)
+expect_files = ["httpx/_api.py", "httpx/_client.py", "httpx/_transports/default.py"]

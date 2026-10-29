@@ -1,0 +1,44 @@
+[[symbol]]
+query = "pricing::add_tax"
+note = "pricing.py:9 make_receipt calls add_tax"
+sure_used_by = ["shop/pricing.py:9 make_receipt"]
+
+[[symbol]]
+query = "make_receipt"
+note = "cli.py imports it from shop.pricing"
+sure_used_by = ["shop/cli.py:5 run"]
+
+[[symbol]]
+query = "Receipt"
+note = "pricing.py:8 names Receipt as the return type and imports it from .models (relative import)"
+used_by = ["shop/pricing.py:8 make_receipt"]
+
+[[impact]]
+query = "pricing::add_tax"
+depth = 2
+files = ["shop/pricing.py", "shop/cli.py"]
+
+[[symbol]]
+query = "Receipt.describe"
+note = "cli.py:6 receipt.describe()"
+sure_used_by = ["shop/cli.py:6 run"]
+
+[[symbol]]
+query = "Invoice.describe"
+note = "nothing calls Invoice.describe"
+not_used_by = ["shop/cli.py"]
+
+[[path]]
+from = "run"
+to = "add_tax"
+note = "cli.py:5 make_receipt(net), pricing.py:9 add_tax(net)"
+hops = 2
+through = ["run", "make_receipt", "add_tax"]
+
+[[path]]
+from = "add_tax"
+to = "run"
+note = "nothing calls from add_tax towards run, so the answer is the chain the other way round"
+reverse = true
+hops = 2
+through = ["run", "make_receipt", "add_tax"]

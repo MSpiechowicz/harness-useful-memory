@@ -1,0 +1,35 @@
+---
+source: tests/code_golden.rs
+expression: "fixture_output(\"sveltekit\")"
+---
+== map
+src/lib/theme.ts
+  function applyTheme(name: string)
+src/lib/components/Card.svelte
+  <Card>
+src/lib/format.ts
+  function formatDate(iso: string)
+.storybook/preview.ts
+src/routes/+page.svelte
+svelte.config.js
+
+== symbol Card
+component Card  src/lib/components/Card.svelte:1-8
+  <Card>
+  uses:
+    applyTheme src/lib/theme.ts:1  at src/lib/components/Card.svelte:5 | const theme = applyTheme("…");
+  used by 1 site(s):
+    src/routes/+page.svelte:8 +page | <Card title={today} />
+
+== symbol applyTheme
+fn applyTheme  src/lib/theme.ts:1-3
+  function applyTheme(name: string)
+  used by 2 site(s):
+    .storybook/preview.ts:3 parameters | export const parameters = { theme: applyTheme("…") };
+    src/lib/components/Card.svelte:5 Card | const theme = applyTheme("…");
+
+== symbol formatDate
+fn formatDate  src/lib/format.ts:1-3
+  function formatDate(iso: string)
+  used by 1 site(s):
+    src/routes/+page.svelte:5 +page | const today = formatDate("…");

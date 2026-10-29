@@ -1,0 +1,80 @@
+---
+source: tests/code_golden.rs
+expression: "fixture_output(\"rust\")"
+---
+== map
+src/tax.rs
+  pub fn add_tax(net: u64) -> u64
+src/pricing.rs
+  pub struct Item
+  pub fn total(items: &[Item]) -> u64
+src/lib.rs
+src/orders.rs
+src/report.rs
+
+== symbol Order::cost
+fn Order::cost  src/orders.rs:12-14
+  pub fn cost(&self) -> u64
+  uses:
+    total src/pricing.rs:7  at src/orders.rs:13 | pricing::total(&self.items)
+  used by 1 site(s):
+    src/orders.rs:18 checkout | order.cost()
+
+== symbol Quote::cost
+fn Quote::cost  src/report.rs:16-18
+  pub fn cost(&self) -> u64
+  used by 0 site(s):
+
+== symbol RATE_PERCENT
+const RATE_PERCENT  src/tax.rs:1-1
+  pub const RATE_PERCENT: u64 = 23;
+  used by 1 site(s):
+    src/tax.rs:4 add_tax | net + net * RATE_PERCENT / 100
+
+== symbol pricing::total
+fn total  src/pricing.rs:7-9
+  pub fn total(items: &[Item]) -> u64
+  uses:
+    Item src/pricing.rs:3  at src/pricing.rs:7 | pub fn total(items: &[Item]) -> u64 {
+    add_tax src/tax.rs:3  at src/pricing.rs:8 | tax::add_tax(subtotal(items))
+    subtotal src/pricing.rs:11  at src/pricing.rs:8 | tax::add_tax(subtotal(items))
+  used by 1 site(s) + 1 test(s):
+    src/orders.rs:13 Order::cost | pricing::total(&self.items)
+    tests: src/pricing.rs (1)
+
+== symbol report::total
+fn total  src/report.rs:2-4
+  pub fn total(values: &[u64]) -> u64
+  used by 1 site(s):
+    src/report.rs:7 summary | format!("…", values.len(), total(values))
+
+== symbol tax::add_tax
+fn add_tax  src/tax.rs:3-5
+  pub fn add_tax(net: u64) -> u64
+  uses:
+    RATE_PERCENT src/tax.rs:1  at src/tax.rs:4 | net + net * RATE_PERCENT / 100
+  used by 1 site(s):
+    src/pricing.rs:8 total | tax::add_tax(subtotal(items))
+
+== impact pricing::total d3
+`pricing::total`: 1 production file(s), 1 test file(s) within 3 caller hop(s). Entries read `caller → what it calls`
+  d0 src/pricing.rs  [defined here: total]
+  d1 src/orders.rs  [Order::cost → total, checkout → Order::cost]
+  tests: src/pricing.rs (1)
+
+== impact tax::add_tax d3
+`tax::add_tax`: 2 production file(s), 1 test file(s) within 3 caller hop(s). Entries read `caller → what it calls`
+  d0 src/tax.rs  [defined here: add_tax]
+  d1 src/pricing.rs  [total → add_tax]
+  d2 src/orders.rs  [Order::cost → total, checkout → Order::cost]
+  tests: src/pricing.rs (1)
+
+== path checkout -> tax::add_tax
+`checkout` → `tax::add_tax`: 3 hops
+    checkout  src/orders.rs:17
+  → Order::cost  src/orders.rs:12
+        at src/orders.rs:18 | order.cost()
+  → total  src/pricing.rs:7
+        at src/orders.rs:13 | pricing::total(&self.items)
+  → add_tax  src/tax.rs:3
+        at src/pricing.rs:8 | tax::add_tax(subtotal(items))

@@ -1,0 +1,14 @@
+[[symbol]]
+query = "useCounter"
+note = "Counter.vue:4 calls useCounter in <script setup>"
+used_by = ["src/Counter.vue:4"]
+
+[[symbol]]
+query = "Counter"
+note = "App.vue:6 renders <Counter />"
+used_by = ["src/App.vue:6"]
+
+[[impact]]
+query = "useCounter"
+depth = 2
+files = ["src/Counter.vue", "src/App.vue"]

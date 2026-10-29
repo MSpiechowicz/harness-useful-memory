@@ -1,0 +1,86 @@
+---
+source: tests/code_golden.rs
+expression: "fixture_output(\"ipc\")"
+---
+== map
+src-tauri/src/commands.rs
+  pub fn validate_paths(paths: Vec<String>) -> Vec<String>
+src/lib/api.ts
+  function validatePaths(paths: string[]): Promise<string[]>
+src/ui/form.ts
+  async function submitForm(paths: string[]): Promise<boolean>
+src-tauri/src/events.rs
+src/ui/events.ts
+
+== symbol open_project
+fn open_project  src-tauri/src/commands.rs:7-9
+  pub fn open_project(path: String) -> String
+  used by 0 site(s):
+
+== symbol validatePaths
+fn validatePaths  src/lib/api.ts:3-5
+  function validatePaths(paths: string[]): Promise<string[]>
+  uses:
+    validate_paths src-tauri/src/commands.rs:2  at src/lib/api.ts:4 | return invoke("…", { paths });
+  used by 1 site(s):
+    src/ui/form.ts:4 submitForm | const valid = await validatePaths(paths);
+
+== symbol validate_paths
+fn validate_paths  src-tauri/src/commands.rs:2-4
+  pub fn validate_paths(paths: Vec<String>) -> Vec<String>
+  used by 1 site(s):
+    src/lib/api.ts:4 validatePaths (by name) | return invoke("…", { paths });
+
+== impact open_project d3
+`open_project`: 0 production file(s), 0 test file(s) within 3 caller hop(s). Entries read `caller → what it calls`
+  d0 src-tauri/src/commands.rs  [defined here: open_project]
+
+== impact validate_paths d3
+`validate_paths`: 3 production file(s), 0 test file(s) within 3 caller hop(s). Entries read `caller → what it calls`
+  d0 src-tauri/src/commands.rs  [defined here: validate_paths]
+  d1 src/lib/api.ts  [validatePaths → by name validate_paths]
+  d2 src/ui/form.ts  [submitForm → validatePaths]
+  d3 src/ui/events.ts  [watchForm → submitForm]
+
+== path submitForm -> validate_paths
+`submitForm` → `validate_paths`: 2 hops
+    submitForm  src/ui/form.ts:3
+  → validatePaths  src/lib/api.ts:3
+        at src/ui/form.ts:4 | const valid = await validatePaths(paths);
+  → validate_paths (by name)  src-tauri/src/commands.rs:2
+        at src/lib/api.ts:4 | return invoke("…", { paths });
+
+== path src/ui/form.ts -> validate_paths
+`src/ui/form.ts` → `validate_paths`: 2 hops
+from: file src/ui/form.ts: 1 definition
+    submitForm  src/ui/form.ts:3
+  → validatePaths  src/lib/api.ts:3
+        at src/ui/form.ts:4 | const valid = await validatePaths(paths);
+  → validate_paths (by name)  src-tauri/src/commands.rs:2
+        at src/lib/api.ts:4 | return invoke("…", { paths });
+
+== path submitForm -> src-tauri/src/commands.rs
+`submitForm` → `src-tauri/src/commands.rs`: 2 hops
+to: file src-tauri/src/commands.rs: 2 definitions
+    submitForm  src/ui/form.ts:3
+  → validatePaths  src/lib/api.ts:3
+        at src/ui/form.ts:4 | const valid = await validatePaths(paths);
+  → validate_paths (by name)  src-tauri/src/commands.rs:2
+        at src/lib/api.ts:4 | return invoke("…", { paths });
+
+== path form_opened -> validate_paths
+`form_opened` → `validate_paths`: 3 hops
+from: `form_opened` is a string, not a symbol: written in 2 places (src/ui/events.ts:6, src-tauri/src/events.rs:4), 2 definitions used
+    watchForm  src/ui/events.ts:5
+  → submitForm  src/ui/form.ts:3
+        at src/ui/events.ts:6 | listen("…", () => submitForm([]));
+  → validatePaths  src/lib/api.ts:3
+        at src/ui/form.ts:4 | const valid = await validatePaths(paths);
+  → validate_paths (by name)  src-tauri/src/commands.rs:2
+        at src/lib/api.ts:4 | return invoke("…", { paths });
+
+== path src/ui/events.ts -> form_opened
+`src/ui/events.ts` → `form_opened`: 0 hops
+from: file src/ui/events.ts: 1 definition
+to: `form_opened` is a string, not a symbol: written in 2 places (src/ui/events.ts:6, src-tauri/src/events.rs:4), 2 definitions used
+    watchForm  src/ui/events.ts:5

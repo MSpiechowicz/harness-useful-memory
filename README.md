@@ -150,13 +150,21 @@ as the command instead.
 | `script_get` | Reads a script with its body, by id or name |
 | `script_run` | Runs a script by id or name with arguments and standard input, and returns its exit code, stdout and stderr. A script from a teammate runs only after you approve it |
 | `script_delete` | Deletes a script by id or name |
+| `code_map` | A ranked map of a project's key files with their signatures, within a token budget (`budget` 200 to 4000, default 700), optionally centred on a path prefix (`focus`, relative to the project, with or without `./` or the project root; one that matches no indexed file is answered `no indexed files under <focus>`). Tests are left out. Where no definition is used by another file, each file lists its top definitions instead. For an unfamiliar area, before grep. Listed only while the [code index](#code-index) is on |
+| `code_symbol` | Where a function, type or constant is defined (`name`, `Type::name`, `module::name` or `path/fragment::name`; a repository-relative file path lists the file's most used definitions), what it uses and who uses it, with `path:line` and, for the first sites of each list, the line of source that makes the link (see Call-site lines under [Code index](#code-index)). `limit` 1 to 50 (default 20). A link found only by a shared name is marked `(by name)`, an uncertain one `?` |
+| `code_impact` | Everything that depends on a symbol or a file (all its definitions), by caller depth (`depth` 1 to 4, default 2), one `caller → callee` line each, tests summarised per file. For before a signature changes |
+| `code_path` | How A reaches B (`from`, `to`, `max_depth` 1 to 10, default 6): the shortest chain of calls, renders, shared constants and name links, one hop per line with `path:line` and, under it, the call site (`at path:line` and the line of source). An end is a symbol, a repository-relative file path (the start is all its definitions and the code at its top, the end any definition in it) a string that names no symbol, such as an event name (the definitions that write it), or plain words (`/useful-skills doctor`, `the diff view loads the lines`: read by their content words against names and short word literals, and the answer lists what they were taken for). The answer says what an end was taken for when it stands for more than one definition. A text that matches nothing is answered with the advice to grep once for it and call `code_path` from the function that handles it. Tries the other direction when nothing leads forward. Answers how does A get to B, in one call and without opening the files |
 
-Every tool takes an optional `scope` (`repo` or `global`, and `both` for reads) and a `project_path`, the absolute path
+The note and script tools take an optional `scope` (`repo` or `global`, and `both` for reads) and a `project_path`, the absolute path
 of the repository, for when the server cannot tell it from its working directory. The server also sends instructions that
 tell agents when to search, when to save, and to update a note rather than add a duplicate.
 
 Per-call limits keep the notes short: a title is at most 120 characters, a body 4000, a note has at most 8 tags and 10
 entities, and search and read replies are capped at a few KiB. The number of notes is not capped.
+
+The code tools are different: `project_path` is required on each (a missing, relative, nonexistent, home, root, hidden-in-home or
+non-git path is a tool error), there is no `scope`, they never touch the note stores (a team database included), and the reply is the
+rendered text alone.
 
 The script tools also return `structuredContent`: `script_save` `{"script", "created"}`, `script_list` `{"scripts"}`,
 `script_get` `{"script"}` (with `body`), `script_delete` `{"deleted", "id"}` and `script_run` `{"id", "sha256",
@@ -510,6 +518,117 @@ harness-memory embedder remove-model    # delete the model files and the vectors
   deletes the old files and vectors (`cleanup-done`). If a step fails, the old model keeps serving, and the update is
   tried again at the next start and every hour.
 
+### Code index
+
+The code tools answer from a local index of the project, built from its files with tree-sitter (Rust, TypeScript and
+JavaScript, `.svelte`, `.vue` and `.astro` files, Go, Python). It is on by default. Nothing is sent anywhere and nothing is
+written to a team database: the index is `code.sqlite3` next to `memory.sqlite3` (mode 0600, one file for every
+repository on this computer).
+
+- **Always fresh.** Each `code_*` call compares the size and modification time of the files with the index, reads only
+  the ones that changed and answers from the updated graph. There is no watcher, no commit hook and nothing to rebuild.
+- **Bounded.** The walk follows no symbolic links, stays on one file system, respects `.gitignore` and skips
+  `node_modules`, `target`, `.venv`, `venv`, `__pycache__` and `vendor` anywhere, and `dist` and `build` at the top of
+  the repository or next to a project manifest (`package.json`, `Cargo.toml`, ...), since `src/node/build/` is source.
+  Hidden folders that are not ignored are indexed (`.github`, `.storybook`, `.vitepress`), except the ones that hold
+  tool state or caches (`.git`, `.svelte-kit`, `.next`, `.nuxt`, `.cache`, `.turbo`, `.idea`, `.vscode`, ...). Hidden
+  files are skipped. Files over 1 MB and files that are not UTF-8 are skipped. A repository with more than 200,000 entries or 20,000 indexable files, or a single folder with more than 50,000 entries, is refused
+  (`repository too large to index`): folders are read one entry at a time and counted as they are read, so a folder of
+  millions of files is refused before it is held. Folders more than 128 levels deep and paths over 1,024 bytes (below the root) are left
+  out and counted as skipped, and the paths of the kept files may add up to 16 MiB (`repository too large to index` past it). Ignore files (`.gitignore`, `.ignore`, `.git/info/exclude`) are read with their
+  own small caps: 256 KiB per walk, lines of at most 1 KiB and 64 wildcards (a longer or wilder line is left out and
+  counted as skipped), at most 64 folders on one path from the root that bring ignore files (the files of deeper ones
+  are left unread and counted as skipped), and compiled rules are kept between calls while the file stays the same, up to an estimate of 8 MiB of memory (a file
+  of wildcard lines compiles to about a hundred times its text, and is compiled again on every call instead).
+- **Only git repositories.** The tools read and print lines of the files they index, so `project_path` must resolve to a
+  git work tree (a `.git` folder that holds a `HEAD`, or a `.git` file whose first line is `gitdir: <path>` to a folder that
+  holds one: worktrees, submodules and separate git folders; git itself is not run): any other folder, a settings folder for one, is refused with `The code
+  index only works inside a git repository.` A hidden folder directly under the home folder (`~/.config`, `~/.ssh`) is
+  refused even when it holds a repository, as are the home folder, the folders above it, `/` and system folders (also
+  spelled in another case on macOS and Windows). `project_path` resolves like the note tools do, so a subfolder indexes
+  its repository.
+- **No values.** Every string literal in the first line of a definition (`API_KEY = "..."`, `export const token =
+  "..."`, `const K: &str = "..."`, a default argument, a one-line function body, an f-string or template, a Go struct
+  tag, a `macro_rules!` body; raw, byte, triple-quoted ones too) is replaced by `"…"` in every signature, except a
+  short literal in a type position of TypeScript, JavaScript and Python (`type Mode = "fast" | "slow"`, `m: "x"`,
+  `Foo<"x">`, `Literal["a"]`, `x: "Foo"`), which stays: type literals are visible, values are hidden. A
+  credential format (`sk_live_...`, `ghp_...`) or URL password that a name or signature still carries is masked in
+  the reply. A string that looks like a key is not stored as a by-name reference either, and strings that name no
+  definition are not loaded into the graph. Paths, names and signatures are shown with line
+  breaks, escapes and bidirectional controls written out (`\n`, `\u{1b}`), so a file name cannot forge a line of an
+  answer.
+- **Call-site lines.** A hop of `code_path`, and the first sites of `used by` (10) and `uses` (6) in `code_symbol`,
+  show the line of source that makes the link, so an agent does not open the file to see the call. The line is read
+  when the reply is written, never stored: only while the file still has the size and modification time the index
+  holds for it (else the place `path:line` is given alone), through the same checks as any read (no link, one name,
+  at most 1 MB, inside the repository), and only the line asked for (at most 2 KiB long). Its string literals are
+  replaced like those of a signature, it is cut to 120 characters, and written out like any text of the repository.
+  A line that could sit in the middle of a string (it holds a backtick, or in Python a triple quote or a brace before
+  the name) is shown by place only. Files and strings as the ends of a question: a file path, a path ending with a
+  file name only one file has, or a string that names no symbol (the places where strings that name nothing are
+  written are kept in memory, at most 50,000 in all). Plain words: a text that is no symbol, file or string is cut into
+  its words (3 letters or more, no filler such as `the`, `file` or `request`) and each is matched, in any case,
+  against the names of definitions (the whole name, then a part of it: `doctor` is a part of `runDoctorSetup`) and
+  against the word literals the code writes. A word literal is a string that is one lowercase word or a short
+  command of at most two parts (`"doctor"`, `"harness-memory"`, `"/useful-skills doctor"`: lowercase letters and `-`,
+  32 bytes at most, no digit or capital letter, so never a key) inside a definition, and the parts of a string that
+  names a function (`"git_file_lines"`). They are stored as `word` references, never shown in a signature, at most 2,000
+  per file, and kept in memory for at most 100,000 places. The eight best definitions are the end: production before
+  tests, functions before constants, the ones that match the most words (rarer words count more) first.
+- **Limited.** A repository is untrusted input, so it is indexed in a separate process (`harness-memory code-worker`,
+  started by the server and not meant to be run by hand) that has a memory limit and a time limit and is killed past
+  them. The server loads a graph into its own process only after such a worker loaded and ranked that very version of
+  the index. A repository that breaks its worker (out of memory, out of time, a crash) is answered `This repository
+  could not be indexed within the code index limits.` while the server keeps running, and answers the same at once
+  until one of its files changes (or the memory limit, the version or a day changes: a repository is only marked when
+  the worker crashed, aborted or ran out of time, not when the system or you killed it, and a worker that finished
+  its work before it was killed is served). The worker dumps no core, and stops when the server does (it watches its
+  standard input, on every system). The memory limit is 2 GiB (`HARNESS_MEMORY_CODE_WORKER_MEMORY_MB`, 256 to 65536) on
+  Linux, where the kernel enforces it. macOS does not enforce it reliably and Windows has no such limit, so there
+  only the time limit and the crash isolation apply.
+- **Weak links.** A link between files in different languages comes only from a string that names a function or
+  component defined elsewhere. Replies mark it `(by name)`, and an uncertain edge `?`.
+- **Functions passed through objects.** In TypeScript and JavaScript a function put in a property of an object literal
+  (`createRunner({ run: runIt })`, `{ run }`, `run: a ?? runIt`, `run: runIt.bind(x)`, `run: ns.runIt`) is remembered,
+  and a later call `host.run(..)`, `host?.run(..)` or `this.host.run(..)` that nothing else explains links to it, so a
+  flow that goes through a configuration or services object still has a chain. The link is marked `?` and `code_path`
+  follows it. It is made only when at most four different functions are put in a property of that name, prefers the
+  literals passed to a function that contains the call, never takes a receiver that is a module or class of the
+  repository (unless a literal passed to code around the call fills it), and test code counts only for test code.
+  Python keyword arguments and dictionaries, Go struct fields and methods (`this.method`) are not linked yet. A
+  function in an array (`[["Facts", factsStep]]`) counts as passed as a value.
+
+```sh
+harness-memory code status --json    # {"enabled": true, "source": "default"}
+harness-memory code disable --json   # {"enabled": false, "source": "file"}, writes code.toml
+harness-memory code enable --json    # {"enabled": true, "source": "file"}
+```
+
+`source` says what decided: `file` (`code.toml` in the data folder, `enabled = true|false`), `default` (no file, so on)
+or `env` (the `HARNESS_MEMORY_CODE_INDEX` variable, `0` or `1`, which wins over the file). Without `--json` the answer
+is one line of text. `code hint --project PATH --query NAME [--json]` is the one-line nudge a hook gives when an agent
+searches the text of a project for a name: it prints `{"hint": "..."}` (or `{"hint": null}`), or the line (or nothing)
+without `--json`, and exits 0 whatever the answer (2 for wrong arguments). It never builds, refreshes or creates the
+index and starts no worker: it reads `code.sqlite3` read-only and answers only when the switch is on, `PATH` is a git
+repository the tools may read, its current index generation was validated by a worker, and `NAME` (`name`,
+`Type::name` or `Type.name`, 3 to 80 characters) is defined in the index. Off hides the four tools from `tools/list` (a server reads the switch when the client
+initializes), makes a call answer `The code index is off. Turn it on in Harness Desktop → Settings → Memory.`, and keeps
+the index file. A `code.toml` that is another user's, writable by others or not valid means off.
+
+**Build status.** A first index of a repository, or a refresh that touches 200 files or more at once (a branch switch),
+is a build. It writes `code-builds/<first 16 hex digits of the SHA-256 of the root path>.json` in the data folder (mode
+0600, replaced atomically), so Harness Desktop can show its progress:
+
+```json
+{"version": 1, "buildId": 42, "root": "/work/app", "repoName": "app", "kind": "full", "phase": "building",
+ "filesTotal": 812, "filesDone": 120, "startedAt": 1761700000, "finishedAt": null, "error": null}
+```
+
+`kind` is `full` or `bulk`, `phase` is `building`, `ready` or `error` (`error` then holds the reason; a cancelled call
+ends its build as `error` with `cancelled`), and times are Unix seconds. Progress is written at most every 500 ms. A
+refresh below the threshold writes nothing. The next build deletes status files that finished more than ten minutes
+before. Refresh diagnostics (timings, files read) go to the server's standard error, never into a reply.
+
 ### English notes
 
 A store can ask agents to write notes in English, which the search and the stemming work best with. The setting is kept
@@ -600,6 +719,9 @@ run from `run` inside it, and the script approvals pass through `requests` there
 `<data dir>/com.mspiechowicz.harness-useful-desktop/memory/memory.sqlite3`. On first run, when there is no database in
 the new place yet, the server copies that file over. The old one is left untouched. Harness Desktop versions that still
 bundle their own server keep writing the old file, so notes saved through them after the copy stay there.
+
+The code index adds `code.sqlite3` (the index, for this computer only), `code.toml` (`enabled = true|false`, a missing
+file means on) and `code-builds/` (the build status files).
 
 The embedder adds these files to the same folder: `embedder.toml` (`enabled = true|false`), `embedder.lock` (held while
 it runs), `embedder.sock` (its socket, or in the temporary folder when the path is long), `vectors.sqlite3` (the note
@@ -1123,10 +1245,10 @@ object has `scripts` totals instead of `notes`, no `relations` or `entitiesCut`,
 ```
 
 `harness-memory features` lists what this build supports, one per line (`push-json`, `scripts-remote-local`,
-`scripts-hide`, `scripts-push-json`, `settings`, `notes-lang`, `notes-useful` and `embedder` among them), so a tool can
+`scripts-hide`, `scripts-push-json`, `settings`, `notes-lang`, `notes-useful`, `embedder`, `code-index` and `code-hint` among them), so a tool can
 check before it asks for them. `settings` is the `settings` command, `notes-lang` the `lang` of a note and the `--lang`
-filter, `notes-useful` the usefulness counters of a note with `--useful` and `--sort useful|lastUseful`, and `embedder`
-the `embedder` command.
+filter, `notes-useful` the usefulness counters of a note with `--useful` and `--sort useful|lastUseful`, `embedder`
+the `embedder` command, `code-index` the `code` command and the `code_*` tools, and `code-hint` the `code hint` command.
 
 ### Security and backups
 
@@ -1147,8 +1269,8 @@ the `embedder` command.
   downloads its search model once when vector search is on (and again when a release names a new model), from a
   harness-useful-memory GitHub release, checked against a SHA-256 compiled into the build. It talks MCP to the process that
   started it, and the only other programs it runs are `git`, to find the repository (see above), and the scripts agents
-  save and run with `script_run` (see [Scripts](#scripts)). It reads no other file of
-  your project. When you configure a [team database](#team-memory), it connects to that one server and every note, global
+  save and run with `script_run` (see [Scripts](#scripts)). It reads no file of your project except the source files
+  the [code index](#code-index) reads, while that is on, and keeps what it learned from them on this computer only. When you configure a [team database](#team-memory), it connects to that one server and every note, global
   ones included, is stored there, readable by everyone who has its credentials.
 - **Notes are untrusted data.** Agents write them, they may be wrong or outdated, and a planted note can try to steer a
   later session. Results say where each note came from, and the server tells agents to check notes against the code and

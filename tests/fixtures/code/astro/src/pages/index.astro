@@ -1,0 +1,10 @@
+---
+import Layout from '../layouts/Layout.astro';
+import { getPosts } from '../lib/posts';
+
+const posts = getPosts();
+---
+
+<Layout title="Home">
+  <ul>{posts.map((post) => <li>{post.slug}</li>)}</ul>
+</Layout>

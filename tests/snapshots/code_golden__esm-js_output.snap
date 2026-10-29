@@ -1,0 +1,93 @@
+---
+source: tests/code_golden.rs
+expression: "fixture_output(\"esm-js\")"
+---
+== map
+doctor-setup.js
+  async function runDoctorSetup({ cwd, check, services } = {})
+command-core.js
+  function createCommandRunner(host)
+claude/command.js
+
+== symbol probeCodeGraph
+fn probeCodeGraph  doctor-setup.js:6-12
+  function probeCodeGraph(execute = execFile, { cwd, signal } = {})
+  uses:
+    PROBE_TERM_MS doctor-setup.js:3  at doctor-setup.js:8 | execute("…", ["…"], { cwd, signal, timeout: PROBE_TERM_MS }, (error, stdout) => {
+  used by 1 site(s):
+    doctor-setup.js:22 codeGraphStep ? | return services.probeCodeGraph({ cwd, signal });
+
+== symbol runDoctorSetup
+fn runDoctorSetup  doctor-setup.js:26-29
+  async function runDoctorSetup({ cwd, check, services } = {})
+  uses:
+    codeGraphStep doctor-setup.js:21  at doctor-setup.js:27 | const code = await codeGraphStep({ services: doctorServices(services), cwd });
+    doctorServices doctor-setup.js:15  at doctor-setup.js:27 | const code = await codeGraphStep({ services: doctorServices(services), cwd });
+  used by 1 site(s):
+    command-core.js:4 doctor ? | const outcome = await host.runDoctor({ cwd, check, services: doctorServices });
+
+== path claude/command.js -> probeCodeGraph
+`claude/command.js` → `probeCodeGraph`: 5 hops
+from: file claude/command.js: 3 definitions
+    runCommand  claude/command.js:9
+  → createCommandRunner  command-core.js:2
+        at claude/command.js:9 | export const runCommand = createCommandRunner({
+  → doctor  command-core.js:3
+        at command-core.js:13 | return argv[0] === "…" ? doctor(argv, context) : status();
+  → runDoctorSetup  doctor-setup.js:26
+        at command-core.js:4 | const outcome = await host.runDoctor({ cwd, check, services: doctorServices });
+  → codeGraphStep  doctor-setup.js:21
+        at doctor-setup.js:27 | const code = await codeGraphStep({ services: doctorServices(services), cwd });
+  → probeCodeGraph  doctor-setup.js:6
+        at doctor-setup.js:22 | return services.probeCodeGraph({ cwd, signal });
+
+== path command.js -> doctor-setup.js
+`command.js` → `doctor-setup.js`: 3 hops
+from: file claude/command.js: 3 definitions
+to: file doctor-setup.js: 5 definitions
+    runCommand  claude/command.js:9
+  → createCommandRunner  command-core.js:2
+        at claude/command.js:9 | export const runCommand = createCommandRunner({
+  → doctor  command-core.js:3
+        at command-core.js:13 | return argv[0] === "…" ? doctor(argv, context) : status();
+  → runDoctorSetup  doctor-setup.js:26
+        at command-core.js:4 | const outcome = await host.runDoctor({ cwd, check, services: doctorServices });
+
+== path ./claude/command.js -> codeGraphStep
+`./claude/command.js` → `codeGraphStep`: 4 hops
+from: file claude/command.js: 3 definitions
+    runCommand  claude/command.js:9
+  → createCommandRunner  command-core.js:2
+        at claude/command.js:9 | export const runCommand = createCommandRunner({
+  → doctor  command-core.js:3
+        at command-core.js:13 | return argv[0] === "…" ? doctor(argv, context) : status();
+  → runDoctorSetup  doctor-setup.js:26
+        at command-core.js:4 | const outcome = await host.runDoctor({ cwd, check, services: doctorServices });
+  → codeGraphStep  doctor-setup.js:21
+        at doctor-setup.js:27 | const code = await codeGraphStep({ services: doctorServices(services), cwd });
+
+== path probeCodeGraph -> runCommand
+no chain from `probeCodeGraph` to `runCommand`, reverse: `runCommand` → `probeCodeGraph`: 5 hops
+    runCommand  claude/command.js:9
+  → createCommandRunner  command-core.js:2
+        at claude/command.js:9 | export const runCommand = createCommandRunner({
+  → doctor  command-core.js:3
+        at command-core.js:13 | return argv[0] === "…" ? doctor(argv, context) : status();
+  → runDoctorSetup  doctor-setup.js:26
+        at command-core.js:4 | const outcome = await host.runDoctor({ cwd, check, services: doctorServices });
+  → codeGraphStep  doctor-setup.js:21
+        at doctor-setup.js:27 | const code = await codeGraphStep({ services: doctorServices(services), cwd });
+  → probeCodeGraph  doctor-setup.js:6
+        at doctor-setup.js:22 | return services.probeCodeGraph({ cwd, signal });
+
+== path /useful-skills doctor -> harness-memory features
+`/useful-skills doctor` → `harness-memory features`: 3 hops
+from: words `doctor` → doctor command-core.js:3, createCommandRunner command-core.js:2, doctorServices doctor-setup.js:15, runDoctorSetup doctor-setup.js:26 (no match: `useful-skills`)
+to: words `harness-memory`, `features` → probeCodeGraph doctor-setup.js:6
+    doctor  command-core.js:3
+  → runDoctorSetup  doctor-setup.js:26
+        at command-core.js:4 | const outcome = await host.runDoctor({ cwd, check, services: doctorServices });
+  → codeGraphStep  doctor-setup.js:21
+        at doctor-setup.js:27 | const code = await codeGraphStep({ services: doctorServices(services), cwd });
+  → probeCodeGraph  doctor-setup.js:6
+        at doctor-setup.js:22 | return services.probeCodeGraph({ cwd, signal });

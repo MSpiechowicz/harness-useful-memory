@@ -3,7 +3,7 @@
 //! [`redact_text`] masks, in order:
 //!
 //! 1. **Credential formats** anywhere in the text (`sk-`, `sk-ant-`, `ghp_`/`gho_`/`ghs_`/`ghu_`,
-//!    `github_pat_`, `xox?-`, `AKIA…`, `AIza…`, `glpat-`, `hf_`, `npm_`, JWTs, `Bearer `/`Basic `
+//!    `github_pat_`, `xox?-`, `AKIA…`, `AIza…`, `glpat-`, `hf_`, `npm_`, `sk_live_`/`sk_test_`/`rk_live_`, JWTs, `Bearer `/`Basic `
 //!    credentials, PEM blocks).
 //! 2. **Assignments** `NAME=value` / `NAME: value` whose name looks secret (`api_key`, `token`,
 //!    `secret`, `password`, `passwd`, `credential`): the value only.
@@ -17,7 +17,7 @@
 
 mod rules;
 
-use rules::{MASK, has_token, has_url_credentials, is_high_entropy, mask_tokens};
+use rules::{MASK, has_token, has_url_credentials, is_high_entropy, mask_formats, mask_tokens};
 
 /// Masks secrets in free text (note titles, bodies, tags): credential formats, `NAME=value`
 /// assignments with secret-looking names, URL userinfo and secret query values, and
@@ -53,6 +53,12 @@ pub fn redact_output(text: &str) -> String {
     mask_tokens(text)
 }
 
+/// Masks credential formats and URL secrets only, for text that is code: a name like `token: String` or
+/// `API_KEY = x` is how code is written, and masking the value after it would hide the type, not a secret.
+pub fn redact_formats(text: &str) -> String {
+    mask_formats(text)
+}
+
 /// True when `text` holds a credential format (as [`redact_text`] masks them; a PEM block only
 /// when it is a private key) or a URL with a literal password or secret query value. Variable
 /// references (`$GH_TOKEN`, `https://u:${PASS}@host`), `NAME=value` assignments and random-looking
@@ -66,6 +72,24 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn code_keeps_its_assignments_while_credential_formats_and_url_secrets_are_masked() {
+        let token = format!("gh{}_{}", "p", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4");
+
+        assert_eq!(
+            redact_formats("pub token: String, password: &str"),
+            "pub token: String, password: &str"
+        );
+        assert_eq!(redact_formats(&format!("fn {token}()")), "fn ••••()");
+        assert_eq!(
+            redact_formats("let u = https://user:pa55@host/p?sig=abc"),
+            "let u = https://••••@host/p?sig=••••"
+        );
+        // the assignment rule of the free-text scrubber is what this one leaves out
+        assert_eq!(redact_output("API_KEY = hunter2"), "API_KEY = ••••");
+        assert_eq!(redact_formats("API_KEY = hunter2"), "API_KEY = hunter2");
+    }
 
     #[test]
     fn credential_formats_are_masked_anywhere() {
@@ -93,6 +117,22 @@ mod tests {
         for sample in samples {
             assert!(redact_text(sample).contains(MASK), "{sample}");
         }
+    }
+
+    #[test]
+    fn stripe_style_keys_are_masked_in_text_and_in_code() {
+        let tail = "4eC39HqLyjWDarjtT1zdp7dc";
+
+        for prefix in ["sk_live_", "sk_test_", "rk_live_"] {
+            let key = [prefix, tail].concat();
+
+            assert!(has_credentials(&key), "{prefix}");
+            assert_eq!(redact_formats(&format!("let k = {key};")), "let k = ••••;", "{prefix}");
+        }
+
+        // too short to be a key, and a name that only starts like one
+        assert!(!has_credentials(&["sk_live_", "short"].concat()));
+        assert!(!has_credentials("risk_live_values_of_the_market"));
     }
 
     #[test]

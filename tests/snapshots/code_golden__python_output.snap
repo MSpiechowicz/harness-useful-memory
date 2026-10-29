@@ -1,0 +1,66 @@
+---
+source: tests/code_golden.rs
+expression: "fixture_output(\"python\")"
+---
+== map
+shop/models.py
+  class Receipt:
+  Receipt: def describe(self) -> str:
+shop/pricing.py
+  def make_receipt(net: int) -> Receipt:
+shop/__init__.py
+shop/cli.py
+
+== symbol Invoice.describe
+method Invoice::describe  shop/models.py:12-13
+  def describe(self) -> str:
+  used by 0 site(s):
+
+== symbol Receipt
+class Receipt  shop/models.py:1-6
+  class Receipt:
+  used by 1 site(s):
+    shop/pricing.py:8 make_receipt | def make_receipt(net: int) -> Receipt:
+
+== symbol Receipt.describe
+method Receipt::describe  shop/models.py:5-6
+  def describe(self) -> str:
+  used by 1 site(s):
+    shop/cli.py:6 run | return receipt.describe()
+
+== symbol make_receipt
+fn make_receipt  shop/pricing.py:8-9
+  def make_receipt(net: int) -> Receipt:
+  uses:
+    Receipt shop/models.py:1  at shop/pricing.py:8 | def make_receipt(net: int) -> Receipt:
+    add_tax shop/pricing.py:4  at shop/pricing.py:9 | return Receipt(add_tax(net))
+  used by 1 site(s):
+    shop/cli.py:5 run | receipt = make_receipt(net)
+
+== symbol pricing::add_tax
+fn add_tax  shop/pricing.py:4-5
+  def add_tax(net: int) -> int:
+  used by 1 site(s):
+    shop/pricing.py:9 make_receipt | return Receipt(add_tax(net))
+
+== impact pricing::add_tax d2
+`pricing::add_tax`: 2 production file(s), 0 test file(s) within 2 caller hop(s). Entries read `caller → what it calls`
+  d0 shop/pricing.py  [defined here: add_tax]
+  d1 shop/pricing.py  [make_receipt → add_tax]
+  d2 shop/cli.py  [run → make_receipt]
+
+== path run -> add_tax
+`run` → `add_tax`: 2 hops
+    run  shop/cli.py:4
+  → make_receipt  shop/pricing.py:8
+        at shop/cli.py:5 | receipt = make_receipt(net)
+  → add_tax  shop/pricing.py:4
+        at shop/pricing.py:9 | return Receipt(add_tax(net))
+
+== path add_tax -> run
+no chain from `add_tax` to `run`, reverse: `run` → `add_tax`: 2 hops
+    run  shop/cli.py:4
+  → make_receipt  shop/pricing.py:8
+        at shop/cli.py:5 | receipt = make_receipt(net)
+  → add_tax  shop/pricing.py:4
+        at shop/pricing.py:9 | return Receipt(add_tax(net))

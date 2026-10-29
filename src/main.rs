@@ -29,7 +29,7 @@ use harness_memory::store::Scope;
 use harness_memory::support::Env;
 use harness_memory::support::runner::Stop;
 use harness_memory::support::time::rfc3339;
-use harness_memory::{cli_embedder, cli_held, cli_notes, cli_settings, cli_team_docs, cli_trust};
+use harness_memory::{cli_code, cli_embedder, cli_held, cli_notes, cli_settings, cli_team_docs, cli_trust};
 use harness_memory::{database_path, serve};
 use serde_json::{Value, json};
 
@@ -58,7 +58,7 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--o
                      [--project PATH] [--client NAME] < patch.json | scripts save --json [--project PATH] [--client NAME] \
                      < script.json | held list --json \
                      [--chat KEY] | held save <heldId> --json [< draft.json] | held skip <heldId> --json | settings get --json | \
-                     settings set english_notes=true|false --json | --version]";
+                     settings set english_notes=true|false --json | code status|enable|disable [--json] | code hint --project PATH --query TEXT [--json] | --version]";
 
 /// What this build can do that older ones could not, as `harness-memory features` lists it: the
 /// `remote+local` note routing, hiding team notes on this computer, `push --json`, and the same for
@@ -68,8 +68,9 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--o
 /// `held list|save|skip`), the `settings` command, the notes language (`notes list --lang`, the
 /// `lang` of a note, the English notes setting), the shared embedder (`embedder`), and the offline
 /// fallback (`offline_fallback`), and the usefulness counters of a note (`notes list --sort
-/// useful|lastUseful`, `--useful ever|never`, the `shown`, `useful` and `lastUsefulAt` of a note).
-const FEATURES: [&str; 13] = [
+/// useful|lastUseful`, `--useful ever|never`, the `shown`, `useful` and `lastUsefulAt` of a note), and the
+/// code index (`code status|enable|disable`, the `code_*` tools) and its one-line hint (`code hint`).
+const FEATURES: [&str; 15] = [
     "notes-remote-local",
     "notes-hide",
     "push-json",
@@ -83,6 +84,8 @@ const FEATURES: [&str; 13] = [
     "embedder",
     "offline-fallback",
     "notes-useful",
+    "code-index",
+    "code-hint",
 ];
 
 /// mimalloc hands freed memory back to the operating system, which the embedder's idle unload of
@@ -126,6 +129,9 @@ fn main() -> ExitCode {
         [Some("held"), rest @ ..] => cli_held::held(rest),
         [Some("settings"), rest @ ..] => cli_settings::settings(rest),
         [Some("embedder"), rest @ ..] => cli_embedder::embedder(rest),
+        [Some("code"), rest @ ..] => cli_code::code(rest),
+        // started by the server only, never typed (see `harness_memory::code::worker`)
+        [Some(harness_memory::code::worker::COMMAND)] => harness_memory::code::worker::main(),
         [Some("hooks"), rest @ ..] => cli_team_docs::hooks(rest),
         [Some("routines"), rest @ ..] => cli_team_docs::routines(rest),
         [Some("--version")] => {

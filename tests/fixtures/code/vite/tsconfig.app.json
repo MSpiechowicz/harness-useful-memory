@@ -1,0 +1,12 @@
+{
+  // paths live here, not in the root config that only references this one
+  "compilerOptions": {
+    "target": "ES2020",
+    "jsx": "react-jsx",
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"],
+    },
+  },
+  "include": ["src"],
+}

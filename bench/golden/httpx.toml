@@ -1,0 +1,98 @@
+# encode/httpx at b5addb64f0161ff6bfe94c124ef76f6a1fba5254 (Python). Every fact was read from the sources with
+# `git grep -n` in target/bench-repos/httpx.
+
+[[symbol]]
+query = "Client.send"
+note = "git grep -n '\\.send(' httpx: _client.py:825 (request) and :868 (stream) call Client.send, the other hits are generator .send(response) in _auth.py:83/108 and _client.py:949, or AsyncClient"
+defined = "httpx/_client.py:879"
+sure_used_by = ["httpx/_client.py:825 Client::request", "httpx/_client.py:868 Client::stream"]
+uses = ["Client::_send_handling_auth"]
+tests = ["tests/client/test_client.py"]
+
+[[symbol]]
+query = "Client.send"
+not_used_by = ["httpx/_auth.py:83", "httpx/_auth.py:108", "httpx/_client.py:949"]
+
+[[symbol]]
+query = "Client._send_handling_auth"
+sure_used_by = ["httpx/_client.py:914 Client::send"]
+uses = ["Client::_send_handling_redirects", "Auth::sync_auth_flow"]
+
+[[symbol]]
+query = "Client._send_handling_redirects"
+sure_used_by = ["httpx/_client.py:942 Client::_send_handling_auth"]
+uses = ["Client::_send_single_request"]
+
+[[symbol]]
+query = "Client._send_single_request"
+note = "the only caller of the sync one is _client.py:979, the async one has its own at :1694"
+sure_used_by = ["httpx/_client.py:979 Client::_send_handling_redirects"]
+
+[[impact]]
+query = "Client._send_single_request"
+depth = 4
+note = "request/stream -> send -> _send_handling_auth -> _send_handling_redirects -> _send_single_request (impact stops at 4 hops)"
+files = ["httpx/_client.py"]
+contains = [
+  "Client::_send_handling_redirects → Client::_send_single_request",
+  "Client::_send_handling_auth → Client::_send_handling_redirects",
+  "Client::send → Client::_send_handling_auth",
+  "Client::request → Client::send",
+]
+
+[[impact]]
+query = "Client._send_single_request"
+depth = 4
+not_files = ["httpx/_auth.py"]
+
+[[symbol]]
+query = "Client.request"
+note = "Client.get/post/put/patch/delete/head/options all `return self.request(..)`"
+sure_used_by = [
+  "httpx/_client.py:1053 Client::get",
+  "httpx/_client.py:1144 Client::post",
+  "httpx/_client.py:1181 Client::put",
+  "httpx/_client.py:1218 Client::patch",
+  "httpx/_client.py:1251 Client::delete",
+]
+
+[[symbol]]
+query = "Auth.sync_auth_flow"
+sure_used_by = ["httpx/_client.py:937 Client::_send_handling_auth"]
+tests = ["tests/test_auth.py"]
+
+[[symbol]]
+query = "Cookies.set"
+note = "_models.py:1089 and :1211 call self.set(..) inside Cookies; asgi.py:167/175 call Event.set(), _urls.py:343 calls QueryParams.set"
+sure_used_by = ["httpx/_models.py:1089 Cookies::__init__", "httpx/_models.py:1211 Cookies::__setitem__"]
+
+[[symbol]]
+query = "Cookies.set"
+not_used_by = ["httpx/_transports/asgi.py:167", "httpx/_transports/asgi.py:175", "httpx/_urls.py:343"]
+
+[[symbol]]
+query = "QueryParams.set"
+sure_used_by = ["httpx/_urls.py:343 URL::copy_set_param"]
+
+[[symbol]]
+query = "Response.read"
+note = "_models.py:554 `self.read()` inside Response.__init__"
+sure_used_by = ["httpx/_models.py:554 Response::__init__"]
+
+[[symbol]]
+query = "Response.read"
+note = "httpx/_models.py:876 read() is `self._content = b\"\".join(self.iter_bytes())`"
+not_uses = ["URL::join"]
+
+[[map]]
+budget = 1500
+top = 10
+note = "_models.py is imported by 13 modules, _types.py by 12, _exceptions.py by 9, _urls.py by 8 (git grep -l)"
+files = ["httpx/_models.py", "httpx/_exceptions.py", "httpx/_types.py", "httpx/_urls.py"]
+
+[[path]]
+from = "Client.request"
+to = "Client._send_single_request"
+note = "request -> send -> _send_handling_auth -> _send_handling_redirects -> _send_single_request (see the impact above)"
+hops = 4
+through = ["Client::request", "Client::send", "Client::_send_handling_auth", "Client::_send_handling_redirects", "Client::_send_single_request"]

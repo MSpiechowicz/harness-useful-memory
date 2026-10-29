@@ -1,0 +1,30 @@
+---
+source: tests/code_golden.rs
+expression: "fixture_output(\"vue\")"
+---
+== map
+src/composables/useCounter.ts
+  function useCounter(start = 0)
+src/Counter.vue
+  <Counter>
+src/App.vue
+
+== symbol Counter
+component Counter  src/Counter.vue:1-9
+  <Counter>
+  uses:
+    useCounter src/composables/useCounter.ts:3  at src/Counter.vue:4 | const { count, increment } = useCounter(1);
+  used by 1 site(s):
+    src/App.vue:6 App | <Counter />
+
+== symbol useCounter
+fn useCounter  src/composables/useCounter.ts:3-11
+  function useCounter(start = 0)
+  used by 1 site(s):
+    src/Counter.vue:4 Counter | const { count, increment } = useCounter(1);
+
+== impact useCounter d2
+`useCounter`: 2 production file(s), 0 test file(s) within 2 caller hop(s). Entries read `caller → what it calls`
+  d0 src/composables/useCounter.ts  [defined here: useCounter]
+  d1 src/Counter.vue  [Counter → useCounter]
+  d2 src/App.vue  [App → Counter]

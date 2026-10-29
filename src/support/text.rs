@@ -1,5 +1,8 @@
 //! Text checks shared by the store and the project resolver.
 
+use std::borrow::Cow;
+use std::fmt::Write;
+
 /// True when `value` has no control characters, no invisible format characters (Unicode
 /// categories Cf, Zl and Zp: bidirectional overrides, isolates and marks, zero-width characters,
 /// the soft hyphen, the byte-order mark, line/paragraph separators, tag characters) and no other
@@ -9,6 +12,32 @@ pub fn display_safe(value: &str) -> bool {
     !value
         .chars()
         .any(|character| character.is_control() || is_format_character(character))
+}
+
+/// `value` with every control character and invisible format character (see [`display_safe`]) written out as
+/// an escape (`\n`, `\u{1b}`, `\u{202e}`), so text taken from an untrusted source cannot start a line, move
+/// the cursor or reorder what follows when it is shown. Text that is already safe is returned as it is.
+pub fn display_escaped(value: &str) -> Cow<'_, str> {
+    if display_safe(value) {
+        return Cow::Borrowed(value);
+    }
+
+    let mut out = String::with_capacity(value.len() + 8);
+
+    for character in value.chars() {
+        match character {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            // a tab starts no line and moves nothing
+            '\t' => out.push('\t'),
+            other if other.is_control() || is_format_character(other) => {
+                let _ = write!(out, "\\u{{{:x}}}", u32::from(other));
+            }
+            other => out.push(other),
+        }
+    }
+
+    Cow::Owned(out)
 }
 
 /// Unicode format characters (category Cf), the line and paragraph separators (Zl, Zp), and the
@@ -83,6 +112,16 @@ pub fn is_query_stopword(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsafe_characters_are_written_out_and_safe_text_is_untouched() {
+        assert_eq!(display_escaped("a\tb"), "a\tb");
+        assert!(matches!(display_escaped("plain name"), Cow::Borrowed(_)));
+        assert_eq!(display_escaped("a\nb\r"), "a\\nb\\r");
+        assert_eq!(display_escaped("x\u{1b}[2Jy"), "x\\u{1b}[2Jy");
+        assert_eq!(display_escaped("a\u{202e}b"), "a\\u{202e}b");
+        assert!(display_safe(&display_escaped("\n\u{1b}\u{202e}\u{7}\u{2028}")));
+    }
 
     #[test]
     fn control_and_invisible_characters_are_not_display_safe() {

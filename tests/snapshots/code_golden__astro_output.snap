@@ -1,0 +1,29 @@
+---
+source: tests/code_golden.rs
+expression: "fixture_output(\"astro\")"
+---
+== map
+src/layouts/Layout.astro
+  <Layout>
+src/lib/posts.ts
+  function getPosts(): Post[]
+src/pages/index.astro
+
+== symbol Layout
+component Layout  src/layouts/Layout.astro:1-12
+  <Layout>
+  used by 1 site(s):
+    src/pages/index.astro:8 index | <Layout title="…">
+
+== symbol getPosts
+fn getPosts  src/lib/posts.ts:5-7
+  function getPosts(): Post[]
+  uses:
+    Post src/lib/posts.ts:1  at src/lib/posts.ts:5 | export function getPosts(): Post[] {
+  used by 1 site(s):
+    src/pages/index.astro:5 index | const posts = getPosts();
+
+== impact getPosts d1
+`getPosts`: 1 production file(s), 0 test file(s) within 1 caller hop(s). Entries read `caller → what it calls`
+  d0 src/lib/posts.ts  [defined here: getPosts]
+  d1 src/pages/index.astro  [index → getPosts]

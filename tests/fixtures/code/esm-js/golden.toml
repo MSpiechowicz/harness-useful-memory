@@ -1,0 +1,47 @@
+[[symbol]]
+query = "probeCodeGraph"
+note = "doctor-setup.js:22 calls it from codeGraphStep as services.probeCodeGraph(..), and doctor-setup.js:17 puts it in the property probeCodeGraph of the object doctorServices returns: a call through a property is never sure"
+defined = "doctor-setup.js:6"
+used_by = ["doctor-setup.js:22 codeGraphStep ?"]
+
+[[symbol]]
+query = "runDoctorSetup"
+note = "command.js:12 puts it in the property runDoctor of the object passed to createCommandRunner, and command-core.js:4 calls host.runDoctor(..) inside it"
+defined = "doctor-setup.js:26"
+used_by = ["command-core.js:4 doctor ?"]
+
+[[path]]
+from = "claude/command.js"
+to = "probeCodeGraph"
+note = "command.js:9 runCommand calls createCommandRunner({ runDoctor: runDoctorSetup }), command-core.js:13 calls doctor, :4 doctor calls host.runDoctor (the property), doctor-setup.js:27 runDoctorSetup calls codeGraphStep, :22 services.probeCodeGraph (the property of doctorServices)"
+hops = 5
+through = ["runCommand", "createCommandRunner", "doctor", "runDoctorSetup", "codeGraphStep", "probeCodeGraph"]
+
+[[path]]
+from = "command.js"
+to = "doctor-setup.js"
+note = "a bare file name: only one file ends with command.js; the end is any definition of doctor-setup.js, the first reached is runDoctorSetup"
+hops = 3
+through = ["runCommand", "createCommandRunner", "doctor", "runDoctorSetup"]
+
+[[path]]
+from = "./claude/command.js"
+to = "codeGraphStep"
+note = "the same file written with a leading ./"
+hops = 4
+through = ["runCommand", "createCommandRunner", "doctor", "runDoctorSetup", "codeGraphStep"]
+
+[[path]]
+from = "probeCodeGraph"
+to = "runCommand"
+note = "nothing leads from the probe to the command, the other way round does"
+reverse = true
+hops = 5
+through = ["runCommand", "createCommandRunner", "doctor", "runDoctorSetup", "codeGraphStep", "probeCodeGraph"]
+
+[[path]]
+from = "/useful-skills doctor"
+to = "harness-memory features"
+note = "words, no symbol: `doctor` is a function of command-core.js (also the literal written in runCommand), and `harness-memory` and `features` are the literals probeCodeGraph passes to execute at doctor-setup.js:8; command-core.js:4 calls host.runDoctor (runDoctorSetup), :27 codeGraphStep, :22 services.probeCodeGraph"
+hops = 3
+through = ["doctor", "runDoctorSetup", "codeGraphStep", "probeCodeGraph"]

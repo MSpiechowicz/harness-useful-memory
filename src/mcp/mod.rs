@@ -9,12 +9,14 @@
 //! - Nothing a client sends is written to stderr.
 //! - The save guards refuse or hold an agent's writes before they run ([`guards`]), and the reads
 //!   say when they would ([`saving`]).
+//! - The code index tools never touch the note stores ([`calls_code`]).
 //! - A running script stops when the client cancels its request, closes the input, or the server
 //!   gets SIGTERM ([`input`]).
 
 mod approval;
 mod blocks;
 mod calls;
+mod calls_code;
 mod calls_scripts;
 mod english;
 mod guard_repos;
@@ -28,6 +30,7 @@ mod scope;
 mod script_blocks;
 mod search_scripts;
 pub mod tools;
+mod tools_code;
 mod tools_scripts;
 mod trusting;
 pub(crate) mod user;
@@ -48,6 +51,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::backend::{NotesPlace, Place};
+use crate::code::CodeIndex;
 use crate::limits::LINE_MAX;
 use crate::project::ProjectResolver;
 use crate::store::{MemoryStore, ScriptStore, TrustStore};
@@ -75,6 +79,11 @@ pub struct Server {
     /// Whether the English notes setting was on when the client initialized (`false` when it was
     /// off or could not be read); the instructions and tool descriptions follow it.
     english: bool,
+    /// Whether the code index was on when the client initialized; the instructions and `tools/list`
+    /// follow it (each `code_*` call reads the switch again).
+    code_on: bool,
+    /// The code index of this computer, opened by the first `code_*` call ([`calls_code`]).
+    code: Option<CodeIndex>,
     /// The embedder of this computer, for the hybrid note search ([`vectors`]); none to search by
     /// keywords alone.
     vectors: Option<Vectors>,
@@ -138,6 +147,8 @@ impl Server {
             projects,
             client: None,
             english: false,
+            code_on: false,
+            code: None,
             vectors: None,
             vector_notice: false,
             stop: Stop::default(),
@@ -307,15 +318,16 @@ impl Server {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 self.english = self.store.english_notes().unwrap_or(false);
+                self.code_on = calls_code::switched_on(self);
 
                 if let Some(vectors) = &self.vectors {
                     vectors.warm();
                 }
 
-                protocol::result(id, protocol::initialize_result(&params, self.english))
+                protocol::result(id, protocol::initialize_result(&params, self.english, self.code_on))
             }
             "ping" => protocol::result(id, json!({})),
-            "tools/list" => protocol::result(id, tools::definitions(self.english)),
+            "tools/list" => protocol::result(id, tools::definitions(self.english, self.code_on)),
             "tools/call" => self.tools_call(id, &params),
             _ => protocol::error(id, METHOD_NOT_FOUND, "Method not found"),
         };

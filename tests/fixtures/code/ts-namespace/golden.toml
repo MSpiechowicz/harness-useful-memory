@@ -1,0 +1,26 @@
+# `import * as ns from` and a call `ns.name()` on it, in TypeScript and in the three single-file formats.
+
+[[symbol]]
+query = "src/lib/math.ts::double"
+note = "report.ts:6, Panel.svelte:4 and Hero.astro:4 call math.double; other.ts has a double nobody calls"
+defined = "src/lib/math.ts:1"
+sure_used_by = ["src/ui/report.ts:6 report"]
+used_by = ["src/ui/Panel.svelte:4", "src/ui/Hero.astro:4"]
+not_used_by = ["src/lib/other.ts"]
+
+[[symbol]]
+query = "src/lib/other.ts::double"
+note = "no namespace import names other.ts"
+not_used_by = ["src/ui/"]
+
+[[symbol]]
+query = "triple"
+note = "an arrow function: report.ts:6 and Badge.vue:4 through math, report.ts:10 through the barrel src/lib/index.ts"
+defined = "src/lib/math.ts:5"
+sure_used_by = ["src/ui/report.ts:6 report", "src/ui/report.ts:10 viaBarrel"]
+used_by = ["src/ui/Badge.vue:4"]
+
+[[symbol]]
+query = "Counter"
+note = "report.ts:5 is new math.Counter()"
+sure_used_by = ["src/ui/report.ts:5 report"]

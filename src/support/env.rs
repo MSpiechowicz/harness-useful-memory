@@ -59,6 +59,15 @@ pub const CAPTURED_VARS: &[&str] = &[
     // The chat Harness Desktop started this server's harness for, whose save guards apply (see
     // `crate::backend::SESSION_VAR`).
     "HARNESS_MEMORY_SESSION",
+    // Overrides the code index switch, `0` or `1` (see `crate::code::switch`).
+    "HARNESS_MEMORY_CODE_INDEX",
+    // The code index worker process (see `crate::code::worker`): its memory limit, the in-process mode
+    // of the unit tests, and the test hook and executable that only debug builds honour.
+    "HARNESS_MEMORY_CODE_WORKER_MEMORY_MB",
+    "HARNESS_MEMORY_CODE_INPROCESS",
+    "HARNESS_MEMORY_CODE_WORKER_TEST",
+    "HARNESS_MEMORY_CODE_WORKER_BIN",
+    "HARNESS_MEMORY_CODE_BUDGET_MS",
     // The Windows config folder (roaming), which holds the config file.
     "APPDATA",
 ];

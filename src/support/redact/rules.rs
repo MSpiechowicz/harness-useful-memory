@@ -60,6 +60,7 @@ static TOKEN: LazyLock<Regex> = LazyLock::new(|| {
         r"|\bAIza[0-9A-Za-z_-]{35}",
         r"|\bglpat-[A-Za-z0-9_-]{20,}",
         r"|\bhf_[A-Za-z0-9]{20,}",
+        r"|\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}",
         r"|\bnpm_[A-Za-z0-9]{20,}",
         r"|\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*",
         r"|\bBearer\s+[A-Za-z0-9._~+/=-]{8,}",
@@ -164,6 +165,11 @@ pub(super) fn mask_tokens(text: &str) -> String {
     let text = TOKEN.replace_all(text, MASK);
     let text = ASSIGNMENT.replace_all(&text, format!("${{1}}{MASK}"));
     mask_urls(&text)
+}
+
+/// Masks credential formats and URL secrets, but not `NAME: value` assignments (see [`super::redact_formats`]).
+pub(super) fn mask_formats(text: &str) -> String {
+    mask_urls(&TOKEN.replace_all(text, MASK))
 }
 
 /// Minimum length for the entropy heuristic.

@@ -69,7 +69,7 @@ const GIT_ENV: [(&str, &str); 3] = [
 ];
 
 /// The server's team database settings (see `crate::backend`), never passed on to git.
-pub(super) const TEAM_VARS: [&str; 6] = [
+pub(crate) const TEAM_VARS: [&str; 6] = [
     "HARNESS_MEMORY_DATABASE_URL",
     "HARNESS_MEMORY_DATABASE_TOKEN",
     "HARNESS_MEMORY_DATABASE_KIND",

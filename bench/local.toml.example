@@ -1,0 +1,7 @@
+# Private repositories for the code index benchmarks (copy to bench/local.toml, which is gitignored).
+# name = "/absolute/path/to/the/repository"
+# Each one needs bench/local/golden/<name>.toml (same format as bench/golden/*.toml, see tests/code_golden.rs)
+# and may have tasks in bench/local/ab-tasks.toml.
+track-things-frontend = "/home/me/projects/track-things-frontend"
+track-things-backend = "/home/me/projects/track-things-backend"
+harness-useful-desktop = "/home/me/projects/harness-useful-desktop"

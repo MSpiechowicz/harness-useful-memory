@@ -1,0 +1,129 @@
+# junegunn/fzf at 26ff936df038b6a62ec42cf18db27b2ea2bb8ec3 (Go). Every fact was read from the sources with
+# `git grep -n` in target/bench-repos/fzf.
+
+[[symbol]]
+query = "util.ToChars"
+note = "git grep -n 'ToChars(' src: production calls in core.go:90, pattern.go:480, terminal.go:1680/3788/3865, tokenizer.go:142/275 (RunesToChars at terminal.go:1636 is another function)"
+defined = "src/util/chars.go:130"
+sure_used_by = [
+  "src/core.go:90 Run",
+  "src/pattern.go:480 Pattern::transformInput",
+  "src/terminal.go:1680 Terminal::parsePrompt",
+  "src/terminal.go:3788 Terminal::printFooter",
+  "src/terminal.go:3865 Terminal::printHeaderImpl",
+  "src/tokenizer.go:142 withPrefixLengths",
+  "src/tokenizer.go:275 Transform",
+]
+not_used_by = ["src/terminal.go:1636", "src/algo/algo.go"]
+tests = ["src/algo/algo_test.go", "src/chunklist_test.go"]
+
+[[impact]]
+query = "util.ToChars"
+depth = 2
+note = "Run is called by main.go:113 (fzf.Run); Transform by options.go:866 inside nthTransformer"
+files = ["src/core.go", "src/pattern.go", "src/terminal.go", "src/tokenizer.go", "main.go", "src/options.go"]
+not_files = ["src/algo/algo.go", "src/matcher.go"]
+contains = ["Run → ToChars", "Pattern::transformInput → ToChars", "main → Run"]
+
+[[impact]]
+query = "util.ToChars"
+depth = 2
+not_files = ["src/tmux.go", "src/zellij.go"]
+
+[[symbol]]
+query = "Run"
+note = "git grep -n 'Run(': only main.go:113 calls fzf.Run; tmux.go:80 and zellij.go:15 call exec.Cmd.Run"
+defined = "src/core.go:55"
+sure_used_by = ["main.go:113 main"]
+
+[[symbol]]
+query = "Run"
+not_used_by = ["src/tmux.go:80", "src/zellij.go:15"]
+
+[[symbol]]
+query = "NewMatcher"
+sure_used_by = ["src/core.go:258 Run"]
+
+[[symbol]]
+query = "BuildPattern"
+sure_used_by = ["src/core.go:254 Run"]
+tests = ["src/pattern_test.go"]
+
+[[symbol]]
+query = "Matcher.scan"
+note = "git grep -n 'scan(' src: core.go:308 and matcher.go:138"
+sure_used_by = ["src/matcher.go:138 Matcher::Loop"]
+used_by = ["src/core.go:308 Run"]
+uses = ["Pattern::Match"]
+
+[[symbol]]
+query = "Matcher.scan"
+not_uses = ["History::append"]
+
+[[symbol]]
+query = "Pattern.Match"
+note = "matcher.go:194 request.pattern.Match(..); tmux.go:51 calls Match on a regexp"
+sure_used_by = ["src/matcher.go:194 Matcher::scan"]
+
+[[symbol]]
+query = "Pattern.Match"
+not_used_by = ["src/tmux.go:51"]
+
+[[symbol]]
+query = "Pattern.matchChunk"
+sure_used_by = ["src/pattern.go:314 Pattern::Match"]
+uses = ["Pattern::MatchItem"]
+
+[[symbol]]
+query = "Pattern.matchChunk"
+not_uses = ["History::append"]
+
+[[symbol]]
+query = "Pattern.MatchItem"
+note = "git grep -n 'MatchItem(': core.go:282, pattern.go:363/378, terminal.go:4267/8869"
+used_by = ["src/core.go:282 Run", "src/pattern.go:363 Pattern::matchChunk"]
+
+[[symbol]]
+query = "Matcher.Loop"
+note = "core.go:360 `go matcher.Loop()`; Terminal also has a Loop method"
+used_by = ["src/core.go:360 Run"]
+uses = ["Matcher::scan"]
+
+[[symbol]]
+query = "Matcher.Loop"
+sure_used_by = ["src/core.go:360 Run"]
+
+[[symbol]]
+query = "Terminal.Loop"
+sure_used_by = ["src/core.go:371 Run"]
+
+[[impact]]
+query = "Pattern.Match"
+depth = 3
+note = "keystroke -> matcher: Run starts Matcher.Loop, which scans, which matches chunks"
+files = ["src/matcher.go", "src/core.go"]
+contains = ["Matcher::scan → Pattern::Match"]
+
+[[symbol]]
+query = "EvtSearchNew"
+note = "git grep -n EvtSearchNew src"
+defined = "src/constants.go:64"
+used_by = ["src/terminal.go:8703 Terminal::Loop", "src/core.go:482 Run"]
+
+[[symbol]]
+query = "EvtSearchFin"
+note = "git grep -n EvtSearchFin src"
+used_by = ["src/matcher.go:147 Matcher::Loop", "src/core.go:597 Run"]
+
+[[map]]
+budget = 1500
+top = 10
+note = "src/util is imported by 19 production files, src/tui by 7, and chars.go defines Chars used in 6 of them (git grep -l)"
+files = ["src/util/chars.go", "src/util/util.go", "src/tui/tui.go"]
+
+[[path]]
+from = "Terminal.Loop"
+to = "Matcher.scan"
+note = "terminal.go:8703 sends EvtSearchNew, core.go:482 handles it and core.go:308 calls matcher.scan(..)"
+hops = 3
+through = ["Terminal::Loop", "EvtSearchNew", "Run", "Matcher::scan"]

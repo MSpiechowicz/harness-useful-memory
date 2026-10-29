@@ -1,0 +1,87 @@
+---
+source: tests/code_golden.rs
+expression: "fixture_output(\"go\")"
+---
+== map
+internal/server/server.go
+  func Start() *Server
+  Server: func (s *Server) Handle(message string)
+internal/events/events.go
+  Kind int
+  EvtNew Kind = iota
+  EvtDone
+internal/store/store.go
+  Store struct
+  func New() *Store
+  Store: func (s *Store) Save(message string)
+  Store: func (s *Store) Len() int
+main.go
+
+== symbol EvtNew
+const EvtNew  internal/events/events.go:8-8
+  EvtNew Kind = iota
+  used by 2 site(s):
+    internal/server/server.go:22 Server::Handle | s.events <- events.EvtNew
+    internal/server/server.go:29 Server::Run | case events.EvtNew:
+
+== symbol Kind
+type Kind  internal/events/events.go:4-4
+  Kind int
+  used by 3 site(s):
+    internal/events/events.go:8 <module> | EvtNew Kind = iota
+    internal/server/server.go:11 Server | events chan events.Kind
+    internal/server/server.go:16 Start | return &Server{store: store.New(), events: make(chan events.Kind, 8)}
+
+== symbol Start
+fn Start  internal/server/server.go:15-17
+  func Start() *Server
+  uses:
+    Server internal/server/server.go:9  at internal/server/server.go:15 | func Start() *Server {
+    New internal/store/store.go:9  at internal/server/server.go:16 | return &Server{store: store.New(), events: make(chan events.Kind, 8)}
+    Kind internal/events/events.go:4  at internal/server/server.go:16 | return &Server{store: store.New(), events: make(chan events.Kind, 8)}
+  used by 1 site(s):
+    main.go:6 main | srv := server.Start()
+
+== symbol Store.Save
+method Store::Save  internal/store/store.go:14-16
+  func (s *Store) Save(message string)
+  uses:
+    Store internal/store/store.go:4  at internal/store/store.go:14 | func (s *Store) Save(message string) {
+  used by 1 site(s):
+    internal/server/server.go:21 Server::Handle | s.store.Save(message)
+
+== symbol store.New
+fn New  internal/store/store.go:9-11
+  func New() *Store
+  uses:
+    Store internal/store/store.go:4  at internal/store/store.go:9 | func New() *Store {
+  used by 1 site(s):
+    internal/server/server.go:16 Start | return &Server{store: store.New(), events: make(chan events.Kind, 8)}
+
+== impact Store.Save d3
+`Store.Save`: 2 production file(s), 0 test file(s) within 3 caller hop(s). Entries read `caller → what it calls`
+  d0 internal/store/store.go  [defined here: Store::Save]
+  d1 internal/server/server.go  [Server::Handle → Store::Save]
+  d2 main.go  [main → Server::Handle]
+
+== impact store.New d3
+`store.New`: 2 production file(s), 0 test file(s) within 3 caller hop(s). Entries read `caller → what it calls`
+  d0 internal/store/store.go  [defined here: New]
+  d1 internal/server/server.go  [Start → New]
+  d2 main.go  [main → Start]
+
+== path main -> Store.Save
+`main` → `Store.Save`: 2 hops
+    main  main.go:5
+  → Server::Handle  internal/server/server.go:20
+        at main.go:7 | srv.Handle("…")
+  → Store::Save  internal/store/store.go:14
+        at internal/server/server.go:21 | s.store.Save(message)
+
+== path Server.Handle -> Server.Run
+`Server.Handle` → `Server.Run`: 2 hops
+    Server::Handle  internal/server/server.go:20
+  → EvtNew  internal/events/events.go:8
+        at internal/server/server.go:22 | s.events <- events.EvtNew
+  → Server::Run  internal/server/server.go:26
+        at internal/server/server.go:29 | case events.EvtNew:

@@ -1,0 +1,31 @@
+[[symbol]]
+query = "api::fetchUser"
+note = "user.ts imports fetchUser from ./api; util/index.ts has an unrelated fetchUser nobody imports"
+defined = "src/api.ts:6"
+sure_used_by = ["src/user.ts:5 loadUserName"]
+
+[[symbol]]
+query = "util/index::fetchUser"
+note = "no file imports ./util"
+not_used_by = ["src/user.ts"]
+
+[[symbol]]
+query = "formatName"
+sure_used_by = ["src/user.ts:6 loadUserName"]
+
+[[symbol]]
+query = "loadUserName"
+note = "main.ts imports it through the tsconfig alias @/user"
+sure_used_by = ["src/main.ts:4 main"]
+
+[[impact]]
+query = "api::fetchUser"
+depth = 2
+files = ["src/user.ts", "src/main.ts"]
+contains = ["loadUserName → fetchUser", "main → loadUserName"]
+
+[[impact]]
+query = "formatName"
+depth = 2
+files = ["src/user.ts", "src/main.ts"]
+not_files = ["src/util/index.ts"]

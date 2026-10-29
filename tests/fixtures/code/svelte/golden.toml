@@ -1,0 +1,25 @@
+[[symbol]]
+query = "addTodo"
+note = "App.svelte:6 calls addTodo inside onAdd"
+sure_used_by = ["src/App.svelte:6 onAdd"]
+
+[[symbol]]
+query = "countTodos"
+note = "TodoItem.svelte:5 calls countTodos in its script"
+used_by = ["src/lib/TodoItem.svelte:5"]
+
+[[symbol]]
+query = "TodoItem"
+note = "App.svelte:12 renders <TodoItem />"
+used_by = ["src/App.svelte:12"]
+
+[[impact]]
+query = "countTodos"
+depth = 2
+files = ["src/lib/TodoItem.svelte"]
+
+[[impact]]
+query = "countTodos"
+depth = 3
+note = "TodoItem.svelte:5 runs when <TodoItem /> in App.svelte:12 is created"
+files = ["src/App.svelte"]

@@ -87,6 +87,10 @@ fn notes_persist_across_processes_in_the_memory_folder() {
             "script_run",
             "script_delete",
             "note_feedback",
+            "code_map",
+            "code_symbol",
+            "code_impact",
+            "code_path",
         ]
     );
 

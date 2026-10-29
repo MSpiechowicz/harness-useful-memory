@@ -1,0 +1,63 @@
+---
+source: tests/code_golden.rs
+expression: "fixture_output(\"vite\")"
+---
+== map
+src/lib/utils.ts
+  function cn(...inputs: string[])
+src/App.tsx
+  function App()
+src/hooks/use-toast.ts
+  function useToast()
+  toast: (message: string) => message
+src/lib/format.ts
+  function formatPrice(cents: number)
+src/components/ui/button.tsx
+  function Button(props: { className?: string; children?: string })
+src/components/ui/card.tsx
+  function Card(props: { price: number })
+src/main.tsx
+vite.config.ts
+
+== symbol Button
+fn Button  src/components/ui/button.tsx:3-5
+  function Button(props: { className?: string; children?: string })
+  uses:
+    cn src/lib/utils.ts:3  at src/components/ui/button.tsx:4 | return <button className={cn("…", props.className ?? "…")}>{props.children}</button>;
+  used by 1 site(s):
+    src/App.tsx:13 App | <Button>{toast("…")}</Button>
+
+== symbol Card
+fn Card  src/components/ui/card.tsx:4-6
+  function Card(props: { price: number })
+  uses:
+    cn src/lib/utils.ts:3  at src/components/ui/card.tsx:5 | return <div className={cn("…")}>{formatPrice(props.price)}</div>;
+    formatPrice src/lib/format.ts:1  at src/components/ui/card.tsx:5 | return <div className={cn("…")}>{formatPrice(props.price)}</div>;
+  used by 1 site(s):
+    src/App.tsx:12 App | <Card price={count} />
+
+== symbol cn
+fn cn  src/lib/utils.ts:3-5
+  function cn(...inputs: string[])
+  used by 2 site(s):
+    src/components/ui/button.tsx:4 Button | return <button className={cn("…", props.className ?? "…")}>{props.children}</button>;
+    src/components/ui/card.tsx:5 Card | return <div className={cn("…")}>{formatPrice(props.price)}</div>;
+
+== symbol formatPrice
+fn formatPrice  src/lib/format.ts:1-3
+  function formatPrice(cents: number)
+  used by 1 site(s):
+    src/components/ui/card.tsx:5 Card | return <div className={cn("…")}>{formatPrice(props.price)}</div>;
+
+== symbol useToast
+fn useToast  src/hooks/use-toast.ts:1-3
+  function useToast()
+  used by 1 site(s):
+    src/App.tsx:8 App | const { toast } = useToast();
+
+== impact cn d2
+`cn`: 3 production file(s), 0 test file(s) within 2 caller hop(s). Entries read `caller → what it calls`
+  d0 src/lib/utils.ts  [defined here: cn]
+  d1 src/components/ui/button.tsx  [Button → cn]
+  d1 src/components/ui/card.tsx  [Card → cn]
+  d2 src/App.tsx  [App → Button]

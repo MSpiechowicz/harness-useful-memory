@@ -1,0 +1,42 @@
+---
+source: tests/code_golden.rs
+expression: "fixture_output(\"ts-namespace\")"
+---
+== map
+src/lib/math.ts
+  function double(n: number)
+  triple = (n: number) => n * 3
+  class Counter
+src/lib/index.ts
+src/lib/other.ts
+src/ui/Badge.vue
+src/ui/Hero.astro
+src/ui/Panel.svelte
+src/ui/report.ts
+
+== symbol Counter
+class Counter  src/lib/math.ts:7-11
+  class Counter
+  used by 1 site(s):
+    src/ui/report.ts:5 report | const made = new math.Counter();
+
+== symbol src/lib/math.ts::double
+fn double  src/lib/math.ts:1-3
+  function double(n: number)
+  used by 3 site(s):
+    src/ui/Hero.astro:4 Hero | const value = math.double(4);
+    src/ui/Panel.svelte:4 Panel | const value = math.double(2);
+    src/ui/report.ts:6 report | return [math.double(n), math.triple(n), made];
+
+== symbol src/lib/other.ts::double
+fn double  src/lib/other.ts:1-3
+  function double(n: number)
+  used by 0 site(s):
+
+== symbol triple
+fn triple  src/lib/math.ts:5-5
+  triple = (n: number) => n * 3
+  used by 3 site(s):
+    src/ui/Badge.vue:4 Badge | const value = math.triple(3);
+    src/ui/report.ts:10 viaBarrel | return lib.triple(n);
+    src/ui/report.ts:6 report | return [math.double(n), math.triple(n), made];

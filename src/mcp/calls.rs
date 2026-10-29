@@ -25,6 +25,12 @@ pub(super) struct Reply {
 
 /// Runs tool `name`; `None` when there is no such tool.
 pub(super) fn call(server: &mut Server, name: &str, arguments: Value) -> Option<Reply> {
+    // The code index tools come first: they never touch the note stores, so no English gate, save
+    // guard, saving notice, store connection or offline notice applies to them.
+    if name.starts_with("code_") {
+        return super::calls_code::call(server, name, arguments);
+    }
+
     // A note that is not in English is refused before the guards, so it is never held for review.
     if let Some(reply) = super::english::gate(server, name, &arguments) {
         return Some(reply);

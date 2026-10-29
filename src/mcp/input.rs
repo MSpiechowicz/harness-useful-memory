@@ -5,8 +5,8 @@
 //!   is killed and the request gets no answer, as the MCP spec asks;
 //! - the input ends (the client closed it, the MCP way to shut a server down): the script running
 //!   then is killed, and so is any script a request still waiting asks for;
-//! - (on Unix) the server gets SIGTERM ([`stop_on_sigterm`]): the script is killed and the server
-//!   stops serving.
+//! - (on Unix) the server gets SIGTERM or SIGINT ([`stop_on_sigterm`]): the script is killed and the
+//!   server stops serving, or ends the process after two seconds if it is busy with something else.
 //!
 //! Lines reach the serving loop in the order they were read; a cancel that arrives before its
 //! request started still stops it (the last [`MAX_EARLY_CANCELS`] are kept).
@@ -140,17 +140,25 @@ pub(super) fn spawn_reader<R: BufRead + Send + 'static>(
     });
 }
 
-/// Makes SIGTERM stop `stop` ([`Stop::terminate`]) instead of ending the process at once, so a
-/// running script is killed and its file removed first. Blocks SIGTERM in the calling thread and
-/// every thread it starts afterwards (scripts and git do not inherit that: the standard library
-/// clears the signal mask of a child), and waits for it on a thread of its own. Call it first
-/// thing, before anything starts a thread.
+/// How long the server may take to end after its first SIGTERM or SIGINT before the process exits anyway.
+#[cfg(unix)]
+const EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Makes SIGTERM and SIGINT stop `stop` ([`Stop::terminate`]) instead of ending the process at once, so a
+/// running script is killed and its file removed first. A computation that does not look at `stop` (a big
+/// index build, a stuck neighbour) would ignore that, so the process exits [`EXIT_GRACE`] after the first
+/// signal if it has not ended by then (a transaction still open is rolled back with the process), and at
+/// once on a second one. Blocks both signals in the calling thread and every thread it starts afterwards,
+/// and waits for them on a thread of its own. A child process inherits the blocked signals (the standard
+/// library does not clear the signal mask): the code index worker unblocks them itself, and git and scripts
+/// are ended with SIGKILL, which cannot be blocked. Call it first thing, before anything starts a thread.
 #[cfg(unix)]
 pub fn stop_on_sigterm(stop: &Stop) {
     use nix::sys::signal::{SigSet, Signal};
 
     let mut set = SigSet::empty();
     set.add(Signal::SIGTERM);
+    set.add(Signal::SIGINT);
 
     if set.thread_block().is_err() {
         return;
@@ -159,15 +167,29 @@ pub fn stop_on_sigterm(stop: &Stop) {
     let stop = stop.clone();
 
     thread::spawn(move || {
-        loop {
-            match set.wait() {
-                Ok(Signal::SIGTERM) => break,
-                Ok(_) => {}
-                Err(_) => return,
-            }
-        }
+        let mut signalled = false;
 
-        stop.terminate();
+        loop {
+            let signal = match set.wait() {
+                Ok(signal @ (Signal::SIGTERM | Signal::SIGINT)) => signal,
+                Ok(_) => continue,
+                Err(_) => return,
+            };
+            // the status a shell shows for a process ended by that signal
+            let status = 128 + signal as i32;
+
+            if signalled {
+                std::process::exit(status);
+            }
+
+            signalled = true;
+            stop.terminate();
+
+            thread::spawn(move || {
+                thread::sleep(EXIT_GRACE);
+                std::process::exit(status);
+            });
+        }
     });
 }
 

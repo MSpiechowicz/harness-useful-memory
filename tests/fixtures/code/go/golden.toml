@@ -1,0 +1,47 @@
+[[symbol]]
+query = "Start"
+note = "main.go:6 calls server.Start()"
+sure_used_by = ["main.go:6 main"]
+
+[[symbol]]
+query = "store.New"
+sure_used_by = ["internal/server/server.go:16 Start"]
+
+[[impact]]
+query = "store.New"
+depth = 3
+files = ["internal/server/server.go", "main.go"]
+
+[[symbol]]
+query = "Store.Save"
+note = "server.go:21 calls s.store.Save(message)"
+used_by = ["internal/server/server.go:21 Server::Handle"]
+
+[[impact]]
+query = "Store.Save"
+depth = 3
+files = ["internal/server/server.go", "main.go"]
+
+[[symbol]]
+query = "Kind"
+note = "the events channel and the Run switch are typed with events.Kind"
+used_by = ["internal/server/server.go:11"]
+
+[[symbol]]
+query = "EvtNew"
+note = "server.go:22 sends events.EvtNew, server.go:29 has case events.EvtNew"
+used_by = ["internal/server/server.go:22 Server::Handle", "internal/server/server.go:29 Server::Run"]
+
+[[path]]
+from = "main"
+to = "Store.Save"
+note = "main.go:7 srv.Handle(..) with srv := server.Start() (a *Server), server.go:21 s.store.Save(..)"
+hops = 2
+through = ["main", "Server::Handle", "Store::Save"]
+
+[[path]]
+from = "Server.Handle"
+to = "Server.Run"
+note = "Handle sends events.EvtNew (server.go:22), Run switches on it (server.go:29): the constant links them"
+hops = 2
+through = ["Server::Handle", "EvtNew", "Server::Run"]
