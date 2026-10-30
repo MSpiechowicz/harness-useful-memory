@@ -577,6 +577,8 @@ fn the_value_of_a_constant_never_reaches_a_reply_and_credential_shaped_names_are
     assert!(replies[2].contains("••••"), "{}", replies[2]);
 }
 
+// Windows forbids line breaks in file names
+#[cfg(unix)]
 #[test]
 fn a_file_name_with_a_line_break_cannot_forge_a_line_of_a_reply() {
     let machine = Machine::new();

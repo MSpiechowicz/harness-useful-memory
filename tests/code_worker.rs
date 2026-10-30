@@ -901,6 +901,22 @@ impl Direct {
         self.child.id()
     }
 
+    /// True when the worker ended within `limit`. It is this test's child, so it is waited for: a worker
+    /// that ended but was not reaped stays a zombie, which `kill -0` (all macOS has) counts as running.
+    fn ended_within(&mut self, limit: Duration) -> bool {
+        let until = Instant::now() + limit;
+
+        while Instant::now() < until {
+            if self.child.try_wait().expect("wait").is_some() {
+                return true;
+            }
+
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        self.child.try_wait().expect("wait").is_some()
+    }
+
     /// What the worker printed, once it ended.
     fn report(mut self) -> Value {
         let mut printed = String::new();
@@ -1063,7 +1079,7 @@ fn a_worker_whose_server_closed_its_input_stops() {
     // the end of the pipe is how a worker knows its server is gone (the only way on Windows)
     drop(worker.stdin.take());
 
-    assert!(gone_within(worker.pid(), Duration::from_secs(15)), "the worker went on");
+    assert!(worker.ended_within(Duration::from_secs(15)), "the worker went on");
 }
 
 /// A stand-in for the worker executable: a shell script that runs `body`, where `$REAL` is the real one and
