@@ -2,7 +2,8 @@
 //! use more: a call that would exhaust the memory ends the process, and the test fails. Also the server
 //! that must end on SIGTERM while a call is busy with something that does not look at the signal.
 
-#![cfg(unix)]
+// `ulimit -v` sets an address-space limit only on Linux (macOS refuses it)
+#![cfg(target_os = "linux")]
 
 mod common;
 

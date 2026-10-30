@@ -865,6 +865,7 @@ fn code_command(machine: &Machine, args: &[&str], variable: Option<&str>) -> (i3
         .arg("code")
         .args(args)
         .env("HARNESS_MEMORY_DIR", machine.data())
+        .env(HOME_VAR, home_of(&machine.data()))
         .env_remove("HARNESS_MEMORY_CODE_INDEX");
 
     if let Some(value) = variable {
@@ -916,6 +917,15 @@ fn the_code_command_reads_and_changes_the_switch() {
     }
 }
 
+/// The variable the CLI reads its home folder from.
+const HOME_VAR: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+
+/// The test's own home folder, beside its data folder: on Windows the temp folder is under the runner's
+/// `AppData`, a tool folder of the real home that the code index refuses to read.
+fn home_of(data: &Path) -> PathBuf {
+    data.parent().expect("a data folder in the test folder").join("home")
+}
+
 // ---- `code hint` -------------------------------------------------------------------------------------------
 
 /// `harness-memory code hint --project PROJECT --query QUERY [--json]` on the machine's data folder:
@@ -927,6 +937,7 @@ fn hint_command(data: &Path, project: &Path, query: &str, json: bool, variable: 
         .arg(project)
         .args(["--query", query])
         .env("HARNESS_MEMORY_DIR", data)
+        .env(HOME_VAR, home_of(data))
         .env_remove("HARNESS_MEMORY_CODE_INDEX");
 
     if json {
@@ -1142,6 +1153,7 @@ fn a_hint_is_quick_and_exits_zero_whatever_the_answer_and_two_for_wrong_argument
             .arg("code")
             .args(args)
             .env("HARNESS_MEMORY_DIR", machine.data())
+            .env(HOME_VAR, home_of(&machine.data()))
             .output()
             .expect("runs");
 
@@ -1184,6 +1196,7 @@ fn prepare_command(data: &Path, verb: &str, project: &Path) -> (i32, Value) {
         .arg(project)
         .arg("--json")
         .env("HARNESS_MEMORY_DIR", data)
+        .env(HOME_VAR, home_of(data))
         .env_remove("HARNESS_MEMORY_CODE_INDEX")
         .output()
         .expect("runs");
@@ -1245,6 +1258,7 @@ fn the_repo_state_reads_what_a_build_made_and_creates_nothing() {
         .args(["code", "repo", "--project"])
         .arg(&machine.repo)
         .env("HARNESS_MEMORY_DIR", machine.data())
+        .env(HOME_VAR, home_of(&machine.data()))
         .env_remove("HARNESS_MEMORY_CODE_INDEX")
         .output()
         .expect("runs");
@@ -1393,6 +1407,7 @@ fn a_build_that_ran_out_of_time_and_went_on_is_one_build_that_never_shows_an_err
         .arg(&machine.repo)
         .arg("--json")
         .env("HARNESS_MEMORY_DIR", machine.data())
+        .env(HOME_VAR, home_of(&machine.data()))
         .env("HARNESS_MEMORY_CODE_BUDGET_MS", "1000")
         .env("HARNESS_MEMORY_CODE_WORKER_TEST", "stall")
         .env_remove("HARNESS_MEMORY_CODE_INDEX")
@@ -1529,6 +1544,7 @@ fn the_repo_and_build_commands_exit_two_for_wrong_arguments() {
                 .arg("code")
                 .args(args)
                 .env("HARNESS_MEMORY_DIR", machine.data())
+                .env(HOME_VAR, home_of(&machine.data()))
                 .output()
                 .expect("runs");
 
