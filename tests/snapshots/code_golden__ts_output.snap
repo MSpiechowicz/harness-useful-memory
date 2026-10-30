@@ -13,6 +13,8 @@ src/format.ts
 src/main.ts
 src/util/index.ts
 
+Next: code_symbol for where a name above is defined and who uses it, code_impact before changing it. To trace how a request or data flows, call code_path once (from `src/user.ts` to `src/api.ts`, or between any two names or files) instead of reading the files in between.
+
 == symbol api::fetchUser
 fn fetchUser  src/api.ts:6-9
   async function fetchUser(id: number): Promise<User>

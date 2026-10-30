@@ -3,11 +3,13 @@ source: tests/code_golden.rs
 expression: "fixture_output(\"esm-js\")"
 ---
 == map
-doctor-setup.js
-  async function runDoctorSetup({ cwd, check, services } = {})
 command-core.js
   function createCommandRunner(host)
+doctor-setup.js
+  async function runDoctorSetup({ cwd, check, services } = {})
 claude/command.js
+
+Next: code_symbol for where a name above is defined and who uses it, code_impact before changing it. To trace how a request or data flows, call code_path once (from `claude/command.js` to `doctor-setup.js`, or between any two names or files) instead of reading the files in between.
 
 == symbol probeCodeGraph
 fn probeCodeGraph  doctor-setup.js:6-12

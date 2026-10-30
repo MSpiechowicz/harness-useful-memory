@@ -3,14 +3,16 @@ source: tests/code_golden.rs
 expression: "fixture_output(\"ipc\")"
 ---
 == map
-src-tauri/src/commands.rs
-  pub fn validate_paths(paths: Vec<String>) -> Vec<String>
 src/lib/api.ts
   function validatePaths(paths: string[]): Promise<string[]>
+src-tauri/src/commands.rs
+  pub fn validate_paths(paths: Vec<String>) -> Vec<String>
 src/ui/form.ts
   async function submitForm(paths: string[]): Promise<boolean>
-src-tauri/src/events.rs
 src/ui/events.ts
+src-tauri/src/events.rs
+
+Next: code_symbol for where a name above is defined and who uses it, code_impact before changing it. To trace how a request or data flows, call code_path once (from `src/ui/events.ts` to `src-tauri/src/commands.rs`, or between any two names or files) instead of reading the files in between.
 
 == symbol open_project
 fn open_project  src-tauri/src/commands.rs:7-9

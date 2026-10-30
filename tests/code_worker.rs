@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 use common::mcp::{call, canonical, env, is_error, repo_with_remote, run, text};
 use common::stdio::{BINARY, Client};
 use harness_memory::Server;
+use harness_memory::code::prepare::{Built, build};
+use harness_memory::code::status::StatusFile;
+use harness_memory::code::{BuildKind, BuildObserver};
 use harness_memory::project::ProjectResolver;
 use harness_memory::store::SqliteStore;
 use harness_memory::support::runner::Stop;
@@ -1061,4 +1064,111 @@ fn a_worker_whose_server_closed_its_input_stops() {
     drop(worker.stdin.take());
 
     assert!(gone_within(worker.pid(), Duration::from_secs(15)), "the worker went on");
+}
+
+/// A stand-in for the worker executable: a shell script that runs `body`, where `$REAL` is the real one and
+/// `$MARK` a file that exists once the stand-in has run before.
+fn stand_in(machine: &Machine, body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = machine.dir.path().join("worker.sh");
+    let mark = machine.dir.path().join("ran-before");
+
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\nREAL='{BINARY}'\nMARK='{}'\n{body}\n", mark.display()),
+    )
+    .expect("script");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn a_worker_that_used_the_whole_budget_still_gets_its_validated_graph_loaded() {
+    let machine = Machine::new();
+    // the worker validates the generation at once and then lingers past the budget of the call, as one that
+    // used most of it on a large first build would: the load that follows has a budget of its own
+    let slow = stand_in(&machine, "\"$REAL\" \"$@\"\nstatus=$?\nsleep 1.3\nexit $status");
+    let mut server = machine.server(&[
+        ("HARNESS_MEMORY_CODE_WORKER_BIN", &slow),
+        ("HARNESS_MEMORY_CODE_BUDGET_MS", "1000"),
+    ]);
+    let reply = machine.symbol(&mut server);
+
+    assert!(!is_error(&reply), "{reply}");
+    assert!(text(&reply).contains("src/lib.rs"), "{}", text(&reply));
+    assert_eq!(machine.generations().0, machine.generations().1);
+}
+
+/// What `code build` does in `machine` with `stand_in` as the worker.
+fn built_with(machine: &Machine, stand_in: &str) -> Built {
+    let env = env(&machine.home())
+        .with_var("HARNESS_MEMORY_DIR", machine.data().to_string_lossy())
+        .with_var("HARNESS_MEMORY_CODE_WORKER_BIN", stand_in);
+
+    build(&env, &machine.repo.to_string_lossy())
+}
+
+/// Another session's build of this repository that is `building` (id 999) when the attempts of `code build` run
+/// out of time before they wrote a status file of their own.
+fn foreign_build(machine: &Machine) -> StatusFile {
+    let mut foreign = StatusFile::new(&machine.data(), &machine.repo);
+
+    foreign.on_start(999, BuildKind::Full, 50);
+
+    foreign
+}
+
+const RAN_OUT_OF_TIME: &str = "echo '{\"ok\":false,\"error\":\"indexing took too long\"}'";
+
+#[test]
+fn a_build_does_not_end_another_sessions_live_build_as_an_error() {
+    let machine = Machine::new();
+    let foreign = foreign_build(&machine);
+    // the first attempt ran out of time without a build of its own, the second fails for another reason
+    let worker = stand_in(
+        &machine,
+        &format!(
+            "if [ -e \"$MARK\" ]; then echo '{{\"ok\":false,\"error\":\"boom\"}}'; \
+             else touch \"$MARK\"; {RAN_OUT_OF_TIME}; fi\nexit 1"
+        ),
+    );
+
+    assert_eq!(built_with(&machine, &worker), Built::Error("boom".to_owned()));
+
+    let status: Value = serde_json::from_slice(&std::fs::read(foreign.path()).expect("file")).expect("JSON");
+
+    assert_eq!(
+        (
+            status["buildId"].clone(),
+            status["phase"].clone(),
+            status["error"].clone()
+        ),
+        (json!(999), json!("building"), Value::Null)
+    );
+}
+
+#[test]
+fn a_build_does_not_take_over_and_finish_another_sessions_live_build() {
+    let machine = Machine::new();
+    let foreign = foreign_build(&machine);
+    // the first attempt ran out of time without a build of its own, the second is the real worker
+    let worker = stand_in(
+        &machine,
+        &format!("if [ -e \"$MARK\" ]; then exec \"$REAL\" \"$@\"; fi\ntouch \"$MARK\"\n{RAN_OUT_OF_TIME}\nexit 1"),
+    );
+
+    assert_eq!(built_with(&machine, &worker), Built::Done(1));
+
+    let status: Value = serde_json::from_slice(&std::fs::read(foreign.path()).expect("file")).expect("JSON");
+    let ours: i64 = machine
+        .database()
+        .query_row("SELECT id FROM builds", [], |row| row.get(0))
+        .expect("one build of its own");
+
+    assert_eq!(
+        (status["buildId"].clone(), status["phase"].clone()),
+        (json!(ours), json!("ready"))
+    );
 }

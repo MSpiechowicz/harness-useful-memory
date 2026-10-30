@@ -3,14 +3,16 @@ source: tests/code_golden.rs
 expression: "fixture_output(\"rust\")"
 ---
 == map
-src/tax.rs
-  pub fn add_tax(net: u64) -> u64
 src/pricing.rs
   pub struct Item
   pub fn total(items: &[Item]) -> u64
-src/lib.rs
+src/tax.rs
+  pub fn add_tax(net: u64) -> u64
 src/orders.rs
+src/lib.rs
 src/report.rs
+
+Next: code_symbol for where a name above is defined and who uses it, code_impact before changing it. To trace how a request or data flows, call code_path once (from `src/orders.rs` to `src/tax.rs`, or between any two names or files) instead of reading the files in between.
 
 == symbol Order::cost
 fn Order::cost  src/orders.rs:12-14

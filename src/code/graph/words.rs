@@ -5,16 +5,25 @@
 //!
 //! 1. the text is cut into words (letters, digits, `_` and `-`); short words and filler words are dropped;
 //! 2. each word is matched, without regard to case, against the names of the definitions (the whole name, then
-//!    a part of it: `doctor` is a part of `runDoctorSetup` and `doctor_services`) and against the word literals
+//!    a part of it: `doctor` is a part of `runDoctorSetup` and `doctor_services`, `authenticated` of
+//!    `createAuthenticationMiddleware` by its stem, `note_search` of `noteSearchTool`) and against the word literals
 //!    the code writes (`"doctor"`, `"harness-memory"`, `"git status"`: see `extract::word_like`, and the parts of
 //!    a string that names a function, `"git_file_lines"` giving `git`, `file` and `lines`);
-//! 3. a word that matches neither also counts when it is a part of the path of the file that holds a definition
-//!    the other words found (`reading` for `src/reading/Input.go`);
-//! 4. production comes before tests and functions and components before constants, then the definitions that
-//!    match the most words, then those that carry the word in their name (not only in a string or a folder), the
-//!    main definition of a file named like it, those whose name is the word, those that write it and those that
-//!    only hold it as a part (a word that few definitions hold counts more), then the one that is used in more
-//!    places, shorter names first.
+//! 3. a word that matches neither also counts when it is a part of the name of the type a member belongs to
+//!    (`git` for `GitCli::run`), a part of the path of the file that holds a definition the other words found
+//!    (`reading` for `src/reading/Input.go`), or a part of a string that names nothing defined (`'http_polling'`):
+//!    such a string is a tag or a key, so it helps a definition hold every word but does not rank it higher (nor
+//!    does a word of the type, unless the member's own name holds another word: `GitCli::run` for `git cli run`);
+//! 4. production comes before tests and tooling (a top-level `scripts/`, `bench/` or `examples/`), functions and
+//!    components before constants, then the definitions that match the most words, then those that carry the word
+//!    in their name (not only in a string or a folder), the main definition of a file named like it, those whose
+//!    name is the word, those whose folders and file hold the words too, those that write it and those that only
+//!    hold it as a part (a word that few definitions hold counts more), then the one that is used in more places,
+//!    shorter names first, shorter paths first (the source before its copies).
+//!
+//! A candidate listing shows the copies of one definition (the same name, signature and lines in a file whose path
+//! ends with the other's, as generated `plugins/…` folders make them) once, by the shortest path. A definition
+//! that holds the words only by its type or by tags and keys it writes is never the end on its own.
 //!
 //! The best few are the end, and the answer says which words were read as what, so the caller can see the
 //! reading and correct it.
@@ -71,18 +80,30 @@ const COMMON_SHARE: usize = 20;
 /// it.
 const RARE: u32 = 20;
 
-/// What a word is to a definition, best first: its name, a literal it writes, a part of its name.
-const NAME: u8 = 6;
-const LITERAL: u8 = 4;
-const PART: u8 = 2;
-const PATH: u8 = 1;
+/// What a word is to a definition, best first: its name, a literal it writes, a part of its name, a part of the
+/// name of the type it belongs to, a part of the path of its file, a part of a string it writes that names nothing
+/// the repository defines (`'http_polling'`, `"authenticatedPrincipal"`: a tag or a key, which says little about
+/// what the definition does).
+const NAME: u8 = 12;
+const LITERAL: u8 = 8;
+const PART: u8 = 4;
+const OWNER: u8 = 3;
+const PATH: u8 = 2;
+const LOOSE: u8 = 1;
+
+/// True for a match only the type of a definition or a tag or key it writes makes (`OWNER`, `LOOSE`): it helps the
+/// definition hold every word and adds to its strength, but never makes a definition the end on its own.
+fn weak(tier: u8) -> bool {
+    tier == OWNER || tier == LOOSE
+}
 
 /// Set on a match whose definition carries the word in its own name (the whole name or a part of it), besides
 /// whatever else matched: a name says more than a string the definition writes.
 const NAMED: u8 = 0x80;
 
-/// Definitions a candidate listing names.
+/// Definitions a candidate listing names, and the ranked ones it picks them from.
 const LISTED: usize = 5;
+const LISTABLE: usize = 64;
 
 /// Keeps the definition `sym` as a writer of the word literal `literal` (and of each of its words, when it is
 /// a command of two parts), within the caps.
@@ -195,11 +216,70 @@ fn singular(word: &str) -> &str {
     }
 }
 
-/// True when `joined` (`-run-doctor-setup-`) holds `word` as one of its parts, in the singular or the plural.
+/// The word without the ending of its form, so that `authenticated`, `authenticate` and `authentication` meet, and
+/// `entries` with `entry`. The stem keeps at least four letters (five for `-y` and `-ion`, so `ready` stays apart
+/// from `read` and `station` from `state`), and a final `s` stays after `s`, `u` and `i` (`process`, `status`,
+/// `analysis`).
+fn stem(word: &str) -> String {
+    const ENDINGS: &[(&str, &str, usize)] = &[
+        ("ions", "", 5),
+        ("ion", "", 5),
+        ("ings", "", 4),
+        ("ing", "", 4),
+        ("ies", "y", 3),
+        ("ied", "y", 3),
+        ("ed", "", 4),
+        ("es", "", 4),
+        ("s", "", 4),
+        ("e", "", 4),
+        ("y", "", 5),
+    ];
+
+    for (ending, then, least) in ENDINGS {
+        let Some(stem) = word.strip_suffix(ending) else {
+            continue;
+        };
+
+        if stem.chars().count() < *least || (*ending == "s" && stem.ends_with(['s', 'u', 'i'])) {
+            continue;
+        }
+
+        return format!("{stem}{then}");
+    }
+
+    word.to_owned()
+}
+
+/// A word of several parts (`note_search`, `git-file-lines`, `__init__`) as its parts joined by dashes, the way
+/// [`segments`] joins the parts of a name: `note-search`, `init`.
+fn dashed(word: &str) -> String {
+    word.split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// True when `joined` (`-run-doctor-setup-`) holds `word` as one of its parts, in the singular or the plural or
+/// another form of it (`authenticated` for the part `authentication`). A word of several parts (`note_search`,
+/// `git-file-lines`) is looked for as those parts in a row.
 fn has_part(joined: &str, word: &str) -> bool {
-    [word, singular(word)]
-        .into_iter()
-        .any(|form| joined.contains(&format!("-{form}-")) || joined.contains(&format!("-{form}s-")))
+    let word = if word.contains(['-', '_']) {
+        dashed(word)
+    } else {
+        word.to_owned()
+    };
+
+    if word.contains('-') {
+        return [word.as_str(), singular(&word)]
+            .into_iter()
+            .any(|form| joined.contains(&format!("-{form}-")) || joined.contains(&format!("-{form}s-")));
+    }
+
+    let wanted = stem(&word);
+
+    joined.split('-').any(|part| {
+        part == word || part == singular(&word) || singular(part) == word || (!part.is_empty() && stem(part) == wanted)
+    })
 }
 
 /// How each word matches one definition (0 = not at all).
@@ -227,20 +307,29 @@ impl Graph {
         let mut holders = [0_usize; MAX_QUERY_WORDS];
 
         for tiers in matches.values() {
+            // a weak match does not make a word held, nor common (`git` of four hundred `GitHub*` members)
             for (holder, tier) in holders.iter_mut().zip(tiers) {
-                *holder += usize::from(*tier > 0);
+                *holder += usize::from(*tier > 0 && !weak(*tier));
             }
         }
 
         let weights = holders.map(|count| RARE.saturating_sub(2 * count.max(1).ilog2()).max(1));
         let required = self.required(&words, &holders);
+        let agree = self.path_agreement(&words, &matches);
         let rank = |sym: usize, tiers: &Tiers| {
-            let found = tiers.iter().filter(|tier| **tier > 0).count();
+            // a word only a tag or key holds (`LOOSE`) helps the definition hold every word and adds to its
+            // strength, but does not rank it above one that is named for a word (`'http_polling'` does not make a
+            // panel the HTTP request). A word of its type (`OWNER`) counts like that too, unless the member's own
+            // name holds another word: `GitCli::run` for `git cli run` is named for all three, but
+            // `HttpPollingConfigStrategy::buildQuery` is not named for `http request`
+            let own_name = tiers.iter().any(|tier| tier & NAMED != 0);
+            let counts = |tier: u8| tier > 0 && tier != LOOSE && (tier != OWNER || own_name);
+            let found = tiers.iter().filter(|tier| counts(**tier)).count();
             // a word the name carries counts twice: it says more than a string or a folder does
             let carried: usize = tiers
                 .iter()
                 .map(|tier| match *tier {
-                    0 => 0,
+                    tier if !counts(tier) => 0,
                     tier if tier & NAMED != 0 => 2,
                     _ => 1,
                 })
@@ -250,28 +339,41 @@ impl Graph {
                 .zip(weights)
                 .map(|(tier, weight)| u64::from(*tier & !NAMED).saturating_mul(u64::from(weight)))
                 .fold(0, u64::saturating_add);
+            // a definition named the word (`doctor`) before one that holds it as a part (`runDoctorSetup`), and
+            // then the one whose folders and file hold the words too
+            let exact = tiers.iter().filter(|tier| **tier & !NAMED == NAME).count();
             let def = self.syms.get(sym);
 
             (
                 def.is_some_and(|d| d.test),
+                self.is_tooling(sym),
                 def.and_then(|d| kind_rank(&d.kind)),
                 std::cmp::Reverse(found),
                 std::cmp::Reverse(carried),
                 std::cmp::Reverse(self.names_its_file(sym)),
+                std::cmp::Reverse(exact),
+                std::cmp::Reverse(agree.get(&sym).copied().unwrap_or(0)),
                 std::cmp::Reverse(strength),
             )
         };
         let mut ranked: Vec<(usize, Tiers)> = matches.into_iter().collect();
 
-        // of definitions that match alike, the one more places use leads, then the shorter name
+        // of definitions that match alike, the one more places use leads, then the shorter name, then the shorter
+        // path (the source before its copies in `plugins/…`)
         ranked.sort_by_cached_key(|(sym, tiers)| {
+            let def = self.syms.get(*sym);
+
             (
                 rank(*sym, tiers),
                 std::cmp::Reverse(self.incoming.get(*sym).map_or(0, Vec::len)),
-                self.syms.get(*sym).map_or(0, |d| d.name.len()),
+                def.map_or(0, |d| d.name.len()),
+                def.and_then(|d| self.files.get(d.file)).map_or(0, |f| f.path.len()),
                 *sym,
             )
         });
+        // the candidates to list come from further down, as copies of one definition are listed once
+        let listable: Vec<(usize, Tiers)> = ranked.iter().take(LISTABLE).copied().collect();
+
         ranked.truncate(MAX_WORD_ENDS);
 
         let Some((first, first_tiers)) = ranked.first() else {
@@ -279,28 +381,34 @@ impl Graph {
         };
 
         // the definition that holds every word that counts and clearly beats the next one with another name.
-        // Definitions of the lead's name are one end, as a name is (`git_file_lines` in two files)
+        // Definitions of the lead's name that hold the same words are one end, as a name is (`git_file_lines` in
+        // two files), but not one that lacks a word the lead holds (`run` for `GitCli::run` and `git`)
         let lead = self.syms.get(*first);
-        let same = |sym: usize| {
+        let held = |tiers: &Tiers| tiers.map(|tier| tier > 0);
+        let lead_held = held(first_tiers);
+        let same = |sym: usize, tiers: &Tiers| {
             let def = self.syms.get(sym);
 
             def.map(|d| (&d.name, d.test, kind_rank(&d.kind))) == lead.map(|d| (&d.name, d.test, kind_rank(&d.kind)))
+                && held(tiers) == lead_held
         };
         let top = rank(*first, first_tiers);
-        let size = ranked.iter().filter(|(sym, _)| same(*sym)).count();
+        let size = ranked.iter().filter(|(sym, tiers)| same(*sym, tiers)).count();
         let beats = ranked
             .iter()
-            .find(|(sym, _)| !same(*sym))
+            .find(|(sym, tiers)| !same(*sym, tiers))
             .is_none_or(|(sym, tiers)| top < rank(*sym, tiers));
 
         let holds = |tiers: &Tiers| required.iter().all(|&i| tiers.get(i).is_some_and(|tier| *tier > 0));
         let holds_all = holds(first_tiers);
-        let clear = holds_all && beats;
-        let unsure = (!clear).then(|| self.unsure(&words, &required, &ranked, holds_all));
+        // the end holds at least one word by more than its type or a tag: `'http_polling'` alone names nothing
+        let named = first_tiers.iter().any(|tier| *tier > 0 && !weak(*tier));
+        let clear = holds_all && beats && named;
+        let unsure = (!clear).then(|| self.unsure(&words, &required, &listable, holds_all));
 
         // the lead's name first
         if clear {
-            ranked.sort_by_key(|(sym, _)| !same(*sym));
+            ranked.sort_by_key(|(sym, tiers)| !same(*sym, tiers));
         }
 
         let sure_note = clear.then(|| self.words_note(&words, ranked.get(..size).unwrap_or(&[])));
@@ -358,6 +466,41 @@ impl Graph {
         plain(&def.name) == plain(stem)
     }
 
+    /// True for a definition in a top-level folder of tooling ([`super::is_tooling_path`]): `request` in
+    /// `scripts/check-seo-http.mjs` is not the HTTP request of the app.
+    fn is_tooling(&self, sym: usize) -> bool {
+        self.syms
+            .get(sym)
+            .and_then(|def| self.files.get(def.file))
+            .is_some_and(|file| super::is_tooling_path(&file.path))
+    }
+
+    /// Per matched definition, how many of the words are also parts of the path of its file
+    /// (`createAuthenticationMiddleware` in `src/auth/middleware.ts` for `auth middleware`): the folder agrees.
+    fn path_agreement(&self, words: &[String], matches: &Matches) -> HashMap<usize, u8> {
+        let mut per_file: HashMap<usize, u8> = HashMap::new();
+
+        matches
+            .keys()
+            .filter_map(|&sym| {
+                let file = self.syms.get(sym)?.file;
+                let count = *per_file.entry(file).or_insert_with(|| {
+                    let path = self.files.get(file).map_or("", |f| f.path.as_str());
+                    let stem = path.rsplit_once('.').map_or(path, |(stem, _)| stem);
+                    let joined = format!("-{}-", segments(stem).join("-"));
+                    let held = words
+                        .iter()
+                        .filter(|word| has_part(&joined, &word.replace('-', "")))
+                        .count();
+
+                    u8::try_from(held).unwrap_or(u8::MAX)
+                });
+
+                Some((sym, count))
+            })
+            .collect()
+    }
+
     /// The candidates of an end that words do not settle: the best few with the words each holds.
     fn unsure(&self, words: &[String], required: &[usize], ranked: &[(usize, Tiers)], holds_all: bool) -> Unsure {
         let quote = |list: &[&String]| -> String {
@@ -376,13 +519,42 @@ impl Graph {
         } else {
             "no definition holds all of"
         };
-        let lines: Vec<String> = ranked
+        // the copies of a definition take one place, shown by the copy with the shortest path: a copy has the same
+        // name, signature and lines in a file whose path ends with the other's (`doctor.js:148` and
+        // `plugins/claude/doctor.js:148`, as a generated folder makes them)
+        let copies = |a: usize, b: usize| {
+            let (a_loc, b_loc) = (self.loc(a), self.loc(b));
+            let (short, long) = if a_loc.len() <= b_loc.len() {
+                (a_loc, b_loc)
+            } else {
+                (b_loc, a_loc)
+            };
+
+            let body = |sym: usize| self.syms.get(sym).map(|def| (&def.sig, def.end_line));
+
+            self.label(a) == self.label(b)
+                && body(a) == body(b)
+                && (short == long || long.ends_with(&format!("/{short}")))
+        };
+        // per listed place: the copy shown and the ranked definitions it stands for
+        let mut groups: Vec<(usize, &Tiers)> = Vec::new();
+
+        for (sym, tiers) in ranked {
+            if let Some(group) = groups.iter_mut().find(|(shown, _)| copies(*shown, *sym)) {
+                if self.loc(*sym).len() < self.loc(group.0).len() {
+                    *group = (*sym, tiers);
+                }
+            } else if groups.len() < LISTED {
+                groups.push((*sym, tiers));
+            }
+        }
+
+        let lines: Vec<String> = groups
             .iter()
-            .take(LISTED)
             .map(|(sym, tiers)| {
                 let held: Vec<&String> = words
                     .iter()
-                    .zip(tiers)
+                    .zip(tiers.iter())
                     .filter(|(_, tier)| **tier > 0)
                     .map(|(word, _)| word)
                     .collect();
@@ -390,6 +562,14 @@ impl Graph {
                 format!("{}  ({})", self.place(*sym), quote(&held))
             })
             .collect();
+
+        // no word is held by more than a type, a tag or a key: say so rather than list no words
+        if all.is_empty() {
+            return Unsure {
+                why: format!("only types, tags or keys hold {}", quote(&skipped)),
+                lines,
+            };
+        }
 
         let ignored = if skipped.is_empty() {
             String::new()
@@ -405,37 +585,103 @@ impl Graph {
 
     /// Matches the words against the names of the definitions.
     fn match_names(&self, words: &[String], matches: &mut Matches) {
-        // the word without its dashes finds the names that hold it, whatever separates their parts
+        // the word without its dashes and underscores finds the names that hold it, whatever separates their parts,
+        // and its stem the names that hold another form of it
         let flat: Vec<String> = words
             .iter()
-            .map(|word| singular(&word.replace('-', "")).to_owned())
+            .map(|word| singular(&word.replace(['-', '_'], "")).to_owned())
             .collect();
-
-        for (name, syms) in &self.by_name {
-            let lower: String = name
-                .chars()
+        let stems: Vec<String> = words
+            .iter()
+            .zip(&flat)
+            .map(|(word, flat)| {
+                if word.contains(['-', '_']) {
+                    flat.clone()
+                } else {
+                    stem(word)
+                }
+            })
+            .collect();
+        // a name in lowercase without its underscores, as the words are compared with it
+        let lowered = |name: &str| -> String {
+            name.chars()
                 .filter(|c| *c != '_')
                 .flat_map(char::to_lowercase)
-                .collect();
+                .collect()
+        };
+        // how the word `i` matches `name`: the whole name, a part of it, or not at all
+        let tier_of = |name: &str, lower: &str, i: usize, parts: &mut Option<String>| -> u8 {
+            let wanted = flat.get(i).map_or("", String::as_str);
+            let gate = stems.get(i).map_or(wanted, String::as_str);
+
+            if !lower.contains(gate) {
+                return 0;
+            }
+
+            if lower == wanted || lower.strip_suffix('s') == Some(wanted) {
+                return NAME;
+            }
+
+            let joined = parts.get_or_insert_with(|| format!("-{}-", segments(name).join("-")));
+
+            if words.get(i).is_some_and(|word| has_part(joined, word)) {
+                PART
+            } else {
+                0
+            }
+        };
+
+        for (name, syms) in &self.by_name {
+            let lower = lowered(name);
             let mut parts: Option<String> = None;
 
-            for (i, word) in words.iter().enumerate() {
-                let wanted = flat.get(i).map_or("", String::as_str);
-
-                if !lower.contains(wanted) {
-                    continue;
-                }
-
-                let tier = if lower == wanted || lower.strip_suffix('s') == Some(wanted) {
-                    NAME
-                } else {
-                    let joined = parts.get_or_insert_with(|| format!("-{}-", segments(name).join("-")));
-
-                    if has_part(joined, word) { PART } else { 0 }
-                };
+            for i in 0..words.len() {
+                let tier = tier_of(name, &lower, i, &mut parts);
 
                 if tier > 0 {
                     self.credit(syms.iter().take(MAX_PER_NAME), i, tier | NAMED, matches);
+                }
+            }
+        }
+
+        // a member holds the words of the type it belongs to, weaker than its own name (`GitCli::run` holds
+        // `git`): the name a caller writes it with (`git.run(…)`) says what it is part of
+        let mut owners: HashMap<&str, (Tiers, usize)> = HashMap::new();
+
+        for (sym, def) in self.syms.iter().enumerate() {
+            let Some(owner) = def.parent.as_deref() else {
+                continue;
+            };
+            // only a member a word may end at uses up the cap of its type (fields do not)
+            if kind_rank(&def.kind).is_none() {
+                continue;
+            }
+
+            let (tiers, credited) = owners.entry(owner).or_insert_with(|| {
+                let lower = lowered(owner);
+                let mut parts: Option<String> = None;
+                let mut tiers: Tiers = [0; MAX_QUERY_WORDS];
+
+                for (i, tier) in tiers.iter_mut().enumerate().take(words.len()) {
+                    *tier = if tier_of(owner, &lower, i, &mut parts) > 0 {
+                        OWNER
+                    } else {
+                        0
+                    };
+                }
+
+                (tiers, 0)
+            });
+
+            if tiers.iter().all(|tier| *tier == 0) || *credited >= MAX_PER_NAME {
+                continue;
+            }
+
+            *credited += 1;
+
+            for (i, tier) in tiers.iter().enumerate() {
+                if *tier > 0 {
+                    self.credit(std::iter::once(&sym), i, *tier, matches);
                 }
             }
         }
@@ -446,6 +692,10 @@ impl Graph {
         for (i, word) in words.iter().enumerate() {
             if let Some(syms) = self.words.get(word) {
                 self.credit(syms.iter(), i, LITERAL, matches);
+            }
+
+            if let Some(syms) = self.loose_words.get(word) {
+                self.credit(syms.iter(), i, LOOSE, matches);
             }
         }
 
@@ -460,7 +710,9 @@ impl Graph {
     }
 
     /// Matches the words that matched a definition by no name or literal against the parts of the path of its
-    /// file: a definition one word found is more likely the one when the file is named for another word.
+    /// file: a definition one word found is more likely the one when the file is named for another word. A word of
+    /// several parts (`useful-skills`) counts only as one part there: as parts in a row it would match the folders
+    /// of generated copies (`plugins/…/harness-useful-skills/`).
     fn match_paths(&self, words: &[String], matches: &mut Matches) {
         let mut parts: HashMap<usize, String> = HashMap::new();
 
@@ -503,12 +755,14 @@ impl Graph {
 
     /// `words `a`, `b` → name path:line, …`, and the words that matched nothing.
     fn words_note(&self, words: &[String], ranked: &[(usize, Tiers)]) -> String {
-        let used = |i: usize| {
+        let used = |i: usize, strong: bool| {
             ranked
                 .iter()
-                .any(|(_, tiers)| tiers.get(i).is_some_and(|tier| *tier > 0))
+                .any(|(_, tiers)| tiers.get(i).is_some_and(|tier| *tier > 0 && !(strong && weak(*tier))))
         };
-        let (read, lost): (Vec<usize>, Vec<usize>) = (0..words.len()).partition(|i| used(*i));
+        let (read, lost): (Vec<usize>, Vec<usize>) = (0..words.len()).partition(|i| used(*i, false));
+        // a word the listed definitions hold only by their type or a tag or key they write
+        let weakly: Vec<usize> = read.iter().copied().filter(|i| !used(*i, true)).collect();
         let quote = |list: &[usize]| -> String {
             list.iter()
                 .filter_map(|i| words.get(*i))
@@ -528,6 +782,10 @@ impl Graph {
             note.push_str(&format!(", … {more} more"));
         }
 
+        if !weakly.is_empty() {
+            note.push_str(&format!(" (only by a type, tag or key: {})", quote(&weakly)));
+        }
+
         if !lost.is_empty() {
             note.push_str(&format!(" (no match: {})", quote(&lost)));
         }
@@ -540,7 +798,30 @@ impl Graph {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{MAX_SYMS_PER_WORD, MAX_WORD_PLACES, keep, keep_parts, query_words, segments};
+    use super::{MAX_SYMS_PER_WORD, MAX_WORD_PLACES, has_part, keep, keep_parts, query_words, segments, stem};
+
+    #[test]
+    fn the_forms_of_a_word_meet_and_short_or_unlike_words_do_not() {
+        assert_eq!(stem("authenticated"), stem("authentication"));
+        assert_eq!(stem("authenticate"), stem("authentication"));
+        assert_eq!(stem("entries"), stem("entry"));
+        assert_eq!(stem("listing"), "list");
+        assert_eq!(stem("processes"), stem("process"));
+        assert_eq!(stem("status"), "status");
+        // a stem keeps four letters: `app` is not `apply`
+        assert_eq!(stem("used"), "used");
+        // `-y` and `-ion` need a stem of five: `ready` is not `read`, `station` not `state`, `story` not `store`
+        assert_ne!(stem("ready"), stem("read"));
+        assert_ne!(stem("station"), stem("state"));
+        assert_ne!(stem("story"), stem("store"));
+        assert_eq!(stem("queries"), stem("query"));
+        assert!(has_part("-init-", "__init__"));
+        assert!(!has_part("-apply-patch-", "app"));
+        assert!(has_part("-create-authentication-middleware-", "authenticated"));
+        assert!(has_part("-register-entry-routes-", "entries"));
+        assert!(has_part("-note-search-tool-", "note_search"));
+        assert!(!has_part("-note-tool-search-", "note_search"));
+    }
 
     #[test]
     fn names_split_at_separators_and_case_changes() {

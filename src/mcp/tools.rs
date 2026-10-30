@@ -93,6 +93,9 @@ pub fn definitions(english: bool, code_on: bool) -> Value {
         extend(&mut tools[2], ENGLISH_SEARCH);
     }
 
+    // the search an agent is asked to make first is in front of it from the start
+    always_loaded(&mut tools[2]);
+
     if code_on {
         tools.extend(tools_code::definitions());
     }
@@ -292,6 +295,16 @@ fn entity_delete() -> Value {
         }),
         &[],
     )
+}
+
+/// Marks `tool` to be loaded up front. Claude Code defers MCP tools (the model sees only their names and loads a
+/// schema with ToolSearch before a call), and an agent that is told to use a deferred tool first often goes on
+/// with the tools it already has. A client that knows the mark loads the tool with the others; any other client
+/// ignores `_meta`.
+pub(super) fn always_loaded(tool: &mut Value) {
+    if let Some(object) = tool.as_object_mut() {
+        object.insert("_meta".to_owned(), json!({ "anthropic/alwaysLoad": true }));
+    }
 }
 
 pub(super) fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {

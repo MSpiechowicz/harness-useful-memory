@@ -8,8 +8,10 @@ shop/models.py
   Receipt: def describe(self) -> str:
 shop/pricing.py
   def make_receipt(net: int) -> Receipt:
-shop/__init__.py
 shop/cli.py
+shop/__init__.py
+
+Next: code_symbol for where a name above is defined and who uses it, code_impact before changing it. To trace how a request or data flows, call code_path once (from `shop/cli.py` to `shop/models.py`, or between any two names or files) instead of reading the files in between.
 
 == symbol Invoice.describe
 method Invoice::describe  shop/models.py:12-13

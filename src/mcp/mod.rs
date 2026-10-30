@@ -16,7 +16,7 @@
 mod approval;
 mod blocks;
 mod calls;
-mod calls_code;
+pub(crate) mod calls_code;
 mod calls_scripts;
 mod english;
 mod guard_repos;

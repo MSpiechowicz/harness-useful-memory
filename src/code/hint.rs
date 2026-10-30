@@ -88,7 +88,7 @@ fn work_tree(dir: &Path) -> Option<PathBuf> {
 }
 
 /// The index file, read-only: `None` when it does not exist, is not a file or is not of the current schema.
-fn open(path: &Path) -> Option<Connection> {
+pub(crate) fn open(path: &Path) -> Option<Connection> {
     if !std::fs::symlink_metadata(path).ok()?.is_file() {
         return None;
     }

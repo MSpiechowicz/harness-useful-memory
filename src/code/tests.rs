@@ -1404,3 +1404,30 @@ fn a_path_goes_through_production_code_through_a_shared_constant_and_stops_at_th
             .starts_with("no chain from `sink` to `producer`, reverse:")
     );
 }
+
+#[test]
+fn the_builds_a_worker_started_are_those_of_its_pid_since_it_was_spawned() {
+    let fixture = Fixture::new();
+    let key = "/repo";
+    let txn = fixture.index.store.write().expect("write");
+    let repo = txn.repo(key).expect("repo");
+    let since = store::now();
+
+    let mut ids = Vec::new();
+
+    // a row of a process that had this pid weeks ago, one of another pid, and the worker's own
+    for (pid, started_at) in [(42, since - 86_400 * 20), (43, since), (42, since - 1), (42, since)] {
+        txn.conn()
+            .execute(
+                "INSERT INTO builds(repo_id, kind, status, started_at, pid) VALUES (?1, 'full', 'running', ?2, ?3)",
+                rusqlite::params![repo, started_at, pid],
+            )
+            .expect("row");
+        ids.push(txn.conn().last_insert_rowid());
+    }
+
+    txn.finish().expect("commit");
+
+    assert_eq!(fixture.index.started_by(key, 42, since - 1), vec![ids[2], ids[3]]);
+    assert_eq!(fixture.index.started_by(key, 42, since), vec![ids[3]]);
+}

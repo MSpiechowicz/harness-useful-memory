@@ -324,6 +324,95 @@ fn a_map_of_files_that_use_nothing_of_each_other_still_shows_their_definitions()
     );
 }
 
+#[test]
+fn a_map_ranks_what_the_code_depends_on_and_leaves_out_copies_and_tooling_last() {
+    let mut repo = Repo::new();
+
+    // `helper` is used by three tests only, `core` by the app: the tests do not make helper central
+    repo.write("src/helper.ts", "export function helper() {\n  return 1;\n}\n");
+    repo.write("src/core.ts", "export function core() {\n  return 2;\n}\n");
+    repo.write(
+        "src/app.ts",
+        "import { core } from './core';\n\nexport function app() {\n  return core();\n}\n",
+    );
+
+    for name in ["one", "two", "three"] {
+        repo.write(
+            &format!("test/{name}.test.ts"),
+            "import { helper } from '../src/helper';\n\nexport function check() {\n  return helper();\n}\n",
+        );
+    }
+
+    // a generated copy of core and a build script that uses core
+    repo.write("plugins/web/src/core.ts", "export function core() {\n  return 2;\n}\n");
+    repo.write(
+        "scripts/build.ts",
+        "import { core } from '../src/core';\n\nexport function build() {\n  return core();\n}\n",
+    );
+
+    let map = repo.graph().map(4000, None);
+    let core = map.find("src/core.ts\n").expect("core");
+    let helper = map.find("src/helper.ts\n").expect("helper");
+    let script = map.find("scripts/build.ts\n").expect("build");
+
+    assert!(core < helper, "{map}");
+    assert!(helper < script, "the code before its tooling: {map}");
+    assert!(!map.contains("plugins/web/src/core.ts\n"), "{map}");
+    assert!(
+        map.contains("(1 copy of other files left out, such as plugins/web/src/core.ts)\n"),
+        "{map}"
+    );
+}
+
+#[test]
+fn a_map_focused_on_tooling_follows_what_it_uses_and_empty_files_are_no_copies() {
+    let mut repo = Repo::new();
+
+    repo.write("src/core.ts", "export function core() {\n  return 2;\n}\n");
+    // alpha comes first by path: only the script's use can put core before it
+    repo.write("src/alpha.ts", "export function alpha() {\n  return 3;\n}\n");
+    repo.write(
+        "scripts/build.ts",
+        "import { core } from '../src/core';\n\nexport function build() {\n  return core();\n}\n",
+    );
+    repo.write("app/utils/__init__.py", "");
+    repo.write("utils/__init__.py", "");
+
+    // the script's use of core counts under its own focus: core leads the code
+    let map = repo.graph().map(4000, Some("scripts"));
+    let core = map.find("src/core.ts\n").expect("core");
+    let alpha = map.find("src/alpha.ts\n").expect("alpha");
+
+    assert!(core < alpha, "{map}");
+    assert!(!map.contains("left out"), "two empty files are no copies: {map}");
+}
+
+#[test]
+fn a_bundle_built_from_the_sources_is_not_indexed() {
+    let mut repo = Repo::new();
+
+    repo.write("src/core.ts", "export function core() {\n  return 2;\n}\n");
+    repo.write(
+        "src/app.ts",
+        "import { core } from './core';\n\nexport function app() {\n  return core();\n}\n",
+    );
+    // what esbuild or bun writes when the sources are bundled into one committed file
+    repo.write(
+        "extension.js",
+        "var __create = Object.create;\nvar __defProp = Object.defineProperty;\nvar __commonJS = (cb, mod) => cb;\n\nfunction core() {\n  return 2;\n}\nfunction app() {\n  return core();\n}\n",
+    );
+
+    let graph = repo.graph();
+    let symbol = graph.symbol("core", 5);
+
+    assert!(symbol.contains("src/core.ts"), "{symbol}");
+    assert!(!symbol.contains("extension.js"), "{symbol}");
+    assert!(
+        !graph.map(4000, None).contains("extension.js"),
+        "the map leaves the bundle out"
+    );
+}
+
 // ---- the size of the graph -----------------------------------------------------------------------------
 
 #[test]
@@ -350,6 +439,190 @@ fn an_aliased_import_of_a_constant_keeps_its_reference() {
     );
 
     assert!(repo.symbol("MAX_ROWS").contains("src/use.ts:2 f"));
+}
+
+#[test]
+fn a_lowercase_constant_an_astro_page_imports_is_used_by_the_page() {
+    let mut repo = Repo::new();
+
+    repo.write(
+        "src/data/site.ts",
+        "export const siteContent: Record<string, string> = { en: 'a' };\n",
+    );
+    repo.write(
+        "src/pages/index.astro",
+        "---\nimport { siteContent } from \"../data/site\";\n\nconst content = siteContent.en;\n---\n<h1>{content}</h1>\n",
+    );
+
+    let answer = repo.symbol("siteContent");
+
+    assert_eq!(sites(&answer), vec!["src/pages/index.astro:4 index"], "{answer}");
+}
+
+#[test]
+fn a_function_an_astro_template_calls_is_used_by_the_component_at_the_template_line() {
+    let mut repo = Repo::new();
+
+    repo.write(
+        "src/i18n.ts",
+        "export function alternatePath(locale: string) {\n  return `/${locale}/`;\n}\n",
+    );
+    repo.write(
+        "src/components/SiteHeader.astro",
+        "---\nimport { alternatePath } from \"../i18n\";\nconst { locale } = Astro.props;\n---\n<header>\n  <a href={alternatePath(locale)}>other language</a>\n  <p>alternatePath is not shown {locale}</p>\n</header>\n",
+    );
+
+    let answer = repo.symbol("alternatePath");
+
+    assert_eq!(
+        sites(&answer),
+        vec!["src/components/SiteHeader.astro:6 SiteHeader"],
+        "{answer}"
+    );
+}
+
+#[test]
+fn a_function_a_svelte_template_calls_is_used_by_the_component() {
+    let mut repo = Repo::new();
+
+    repo.write(
+        "src/format.ts",
+        "export function format(x: number) {\n  return `${x}`;\n}\n",
+    );
+    repo.write(
+        "src/Row.svelte",
+        "<script lang=\"ts\">\n  import { format } from './format';\n  export let x = 1;\n</script>\n\n<p>{format(x)}</p>\n",
+    );
+
+    let answer = repo.symbol("format");
+
+    assert_eq!(sites(&answer), vec!["src/Row.svelte:6 Row"], "{answer}");
+}
+
+#[test]
+fn functions_a_vue_template_calls_in_text_and_directives_are_used_by_the_component() {
+    let mut repo = Repo::new();
+
+    repo.write(
+        "src/format.ts",
+        "export function format(x: number) {\n  return `${x}`;\n}\nexport function label(x: number) {\n  return `${x}`;\n}\n",
+    );
+    repo.write(
+        "src/Row.vue",
+        "<script setup lang=\"ts\">\nimport { format, label } from './format';\n</script>\n\n<template>\n  <p :title=\"label(x)\">\n    {{ format(x) }}\n  </p>\n</template>\n",
+    );
+
+    let format = repo.symbol("format");
+    let label = repo.symbol("label");
+
+    assert_eq!(sites(&format), vec!["src/Row.vue:7 Row"], "{format}");
+    assert_eq!(sites(&label), vec!["src/Row.vue:6 Row"], "{label}");
+}
+
+#[test]
+fn a_name_a_component_does_not_import_is_not_used_by_its_template() {
+    let mut repo = Repo::new();
+
+    repo.write(
+        "src/format.ts",
+        "export function format(x: number) {\n  return `${x}`;\n}\n",
+    );
+    repo.write("src/other.ts", "export function other() {\n  return 1;\n}\n");
+    repo.write(
+        "src/Row.svelte",
+        "<script>\n  import { other } from './other';\n</script>\n\n<p>{format(1)} {other()}</p>\n<p>format(2)</p>\n<p>{'format(3)'}</p>\n",
+    );
+    repo.write(
+        "src/Row.vue",
+        "<script setup>\nimport { other } from './other';\n</script>\n\n<template>\n  <p :title=\"format(1)\">format(2) {{ other() }} {{ 'format(3)' }}</p>\n</template>\n",
+    );
+
+    let format = repo.symbol("format");
+    let other = repo.symbol("other");
+
+    assert!(sites(&format).is_empty(), "{format}");
+    assert_eq!(
+        sites(&other),
+        vec!["src/Row.svelte:5 Row", "src/Row.vue:6 Row"],
+        "{other}"
+    );
+}
+
+#[test]
+fn a_lowercase_constant_is_used_where_it_is_imported_as_a_value_an_alias_or_a_namespace() {
+    let mut repo = Repo::new();
+
+    repo.write(
+        "src/data/site.ts",
+        "export const siteContent = { en: 'a' };\nexport const fallback = { en: 'b' };\n",
+    );
+    repo.write(
+        "src/plain.ts",
+        "import { siteContent } from './data/site';\nexport function read() { return siteContent.en; }\n",
+    );
+    repo.write(
+        "src/aliased.ts",
+        "import { siteContent as content } from './data/site';\nexport function pick() { return content.en; }\n",
+    );
+    repo.write(
+        "src/spread.ts",
+        "import { siteContent } from './data/site';\nexport function all() { return { ...siteContent, siteContent }; }\n",
+    );
+    repo.write(
+        "src/namespaced.ts",
+        "import * as data from './data/site';\nexport function other() { return data.fallback; }\n",
+    );
+
+    let site = repo.symbol("siteContent");
+
+    assert!(site.contains("src/plain.ts:2 read"), "{site}");
+    assert!(site.contains("src/aliased.ts:2 pick"), "{site}");
+    assert!(site.contains("src/spread.ts:2 all"), "{site}");
+    assert!(!site.contains("src/namespaced.ts"), "{site}");
+    assert!(
+        repo.symbol("fallback").contains("src/namespaced.ts:2 other"),
+        "a member of a namespace import is a use of that export"
+    );
+}
+
+#[test]
+fn a_lowercase_name_that_is_not_imported_is_no_reference() {
+    let mut repo = Repo::new();
+
+    repo.write("src/data/site.ts", "export const siteContent = { en: 'a' };\n");
+    repo.write(
+        "src/local.ts",
+        "export function read(siteContent2) { const siteContent = { en: 'b' }; return siteContent.en + siteContent2; }\n",
+    );
+
+    let answer = repo.symbol("siteContent");
+
+    assert!(sites(&answer).is_empty(), "{answer}");
+}
+
+#[test]
+fn an_imported_lowercase_constant_resolves_to_the_module_it_is_imported_from() {
+    let mut repo = Repo::new();
+
+    repo.write("src/data/site.ts", "export const siteContent = { en: 'a' };\n");
+    repo.write("src/other/site.ts", "export const siteContent = { en: 'b' };\n");
+    repo.write(
+        "src/page.ts",
+        "import { siteContent } from './data/site';\nexport function read() { return siteContent.en; }\n",
+    );
+
+    let answer = repo.symbol("siteContent");
+    let sections: Vec<&str> = answer.split("const siteContent ").skip(1).collect();
+    let used = |path: &str| {
+        sections
+            .iter()
+            .find(|section| section.trim_start().starts_with(path))
+            .is_some_and(|section| section.contains("src/page.ts:2 read"))
+    };
+
+    assert_eq!(sections.len(), 2, "{answer}");
+    assert!(used("src/data/site.ts"), "{answer}");
+    assert!(!used("src/other/site.ts"), "{answer}");
 }
 
 #[test]
@@ -891,6 +1164,174 @@ fn a_word_that_names_the_file_of_a_definition_counts_for_it() {
 
     assert!(exact.contains("fn runDoctorSetup  src/setup.ts:1"), "{exact}");
     assert!(repo.graph().impact("doctor", 2).contains("words `doctor` →"));
+}
+
+#[test]
+fn a_word_finds_another_form_of_it_and_a_word_with_an_underscore_its_parts() {
+    let mut repo = Repo::new();
+
+    repo.write(
+        "src/auth/middleware.ts",
+        "export function createAuthenticationMiddleware() {\n  return 1;\n}\n",
+    );
+    repo.write("src/tools.ts", "export function noteSearchTool() {\n  return 2;\n}\n");
+    repo.write(
+        "src/app.ts",
+        "import { createAuthenticationMiddleware } from './auth/middleware';\nimport { noteSearchTool } from './tools';\n\nexport function createApp() {\n  return createAuthenticationMiddleware() + noteSearchTool();\n}\n",
+    );
+
+    // `authenticated` meets the part `authentication`
+    let forms = repo.graph().path("createApp", "authenticated middleware", 4);
+
+    assert!(
+        forms.contains(
+            "to: words `authenticated`, `middleware` → createAuthenticationMiddleware src/auth/middleware.ts:1\n"
+        ),
+        "{forms}"
+    );
+    assert!(forms.contains(": 1 hop\n"), "{forms}");
+
+    // `note_search` is the parts `note` and `search` in a row
+    let parts = repo.graph().path("createApp", "note_search tool", 4);
+
+    assert!(
+        parts.contains("to: words `note_search`, `tool` → noteSearchTool src/tools.ts:1\n"),
+        "{parts}"
+    );
+}
+
+#[test]
+fn tooling_comes_after_the_code_and_copies_of_a_definition_are_listed_once() {
+    let mut repo = Repo::new();
+
+    repo.write(
+        "src/lib/api/request.ts",
+        "export function request(url: string) {\n  return url;\n}\n",
+    );
+    repo.write(
+        "scripts/check-http.mjs",
+        "export function sendRequest(url) {\n  return url;\n}\n",
+    );
+
+    // the script holds `http` in its file name, but the request of the code leads
+    let http = repo.graph().path("http request", "request", 4);
+    let code = http.find("request src/lib/api/request.ts:1").expect("request");
+    let script = http.find("sendRequest scripts/check-http.mjs:1").expect("sendRequest");
+
+    assert!(code < script, "{http}");
+
+    let mut skills = Repo::new();
+    let format = "export function formatDoctor(report) {\n  return report;\n}\n";
+
+    skills.write("plugins/claude/doctor.js", format);
+    skills.write("plugins/opencode/doctor.js", format);
+    skills.write("doctor.js", format);
+    skills.write(
+        "doctor-setup.js",
+        "export function doctorServices() {\n  return 1;\n}\n",
+    );
+
+    // three copies of formatDoctor take one place, shown by the source
+    let doctor = skills.graph().path("doctor", "doctorServices", 4);
+
+    assert!(doctor.contains("  formatDoctor doctor.js:1  (doctor)\n"), "{doctor}");
+    assert!(
+        doctor.contains("  doctorServices doctor-setup.js:1  (doctor)\n"),
+        "{doctor}"
+    );
+    assert!(!doctor.contains("plugins/"), "{doctor}");
+}
+
+#[test]
+fn a_member_holds_the_words_of_its_type_and_a_tag_string_ranks_no_definition_higher() {
+    let mut rust = Repo::new();
+
+    rust.write(
+        "src/cli.rs",
+        "pub struct GitCli;\n\nimpl GitCli {\n    pub fn run(&self) {}\n}\n",
+    );
+    rust.write("src/other.rs", "pub fn run() {}\n");
+    rust.write("src/main.rs", "pub fn start() {\n    other::run();\n}\n");
+
+    // `git` is a part of the type of GitCli::run, so it alone holds both words: the other `run` is not the end
+    let owner = rust.graph().path("start", "run git", 4);
+
+    assert!(
+        owner.contains("to: words `run`, `git` → GitCli::run src/cli.rs:4 (only by a type, tag or key: `git`)\n"),
+        "{owner}"
+    );
+    assert!(!owner.contains("run src/other.rs:1"), "{owner}");
+
+    // the type counts as a match once the member's own name holds a word: GitCli::run is named for all of
+    // `git cli run`, a free function named for two of them is not the end
+    rust.write("src/action.rs", "pub fn run_cli_action() {}\n");
+
+    let typed = rust.graph().path("start", "git cli run", 4);
+
+    assert!(typed.contains("→ GitCli::run src/cli.rs:4"), "{typed}");
+    assert!(!typed.contains("run_cli_action src/action.rs:1,"), "{typed}");
+
+    let mut ui = Repo::new();
+
+    ui.write(
+        "src/lib/api/request.ts",
+        "export function request(url: string) {\n  return url;\n}\n",
+    );
+    ui.write(
+        "src/panel.tsx",
+        "export function Panel(config: object) {\n  return config.type === 'http_polling' && 'request' in config;\n}\n",
+    );
+
+    // `http` of the tag `'http_polling'` neither lifts the panel above the request the name says nor counts as held
+    let tag = ui.graph().path("http request", "Panel", 4);
+
+    assert!(
+        tag.contains("from: words `request` → request src/lib/api/request.ts:1 (no match: `http`)\n"),
+        "{tag}"
+    );
+
+    // the panel holds `http` and `polling` only by its tag: that names no end, it is only a candidate
+    let only = ui.graph().path("http polling", "request", 4);
+
+    assert!(only.contains("the words do not name one definition"), "{only}");
+    assert!(
+        only.contains("only types, tags or keys hold http, polling. Closest:"),
+        "{only}"
+    );
+    assert!(only.contains("Panel src/panel.tsx:1"), "{only}");
+}
+
+#[test]
+fn only_copies_share_a_place_and_a_nested_scripts_folder_is_code() {
+    let mut repo = Repo::new();
+    let get = "export function GET() {\n  return 1;\n}\n";
+
+    repo.write("app/users/route.ts", get);
+    repo.write("app/orders/route.ts", get);
+    repo.write(
+        "src/lib/api/request.ts",
+        "export function request() {\n  return 2;\n}\n",
+    );
+    repo.write(
+        "src/scripts/check-http.ts",
+        "export function sendRequest() {\n  return 3;\n}\n",
+    );
+
+    repo.write("src/total.ts", "export function total() {\n  return 4;\n}\n");
+
+    // two route files of the same name in different folders are two definitions, not copies: both are listed
+    let routes = repo.graph().path("get total", "request", 4);
+
+    assert!(routes.contains("  GET app/users/route.ts:1"), "{routes}");
+    assert!(routes.contains("  GET app/orders/route.ts:1"), "{routes}");
+
+    // `src/scripts/` is a folder of the code: its sendRequest holds `http` by its file and is the end
+    let http = repo.graph().path("http request", "GET", 4);
+
+    assert!(
+        http.contains("from: words `http`, `request` → sendRequest src/scripts/check-http.ts:1"),
+        "{http}"
+    );
 }
 
 #[test]

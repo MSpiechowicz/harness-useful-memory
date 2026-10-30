@@ -167,6 +167,8 @@ pub struct Skipped {
     pub unsafe_or_large: usize,
     /// Files that went past the per-file caps on definitions and references: indexed, but cut.
     pub truncated: usize,
+    /// Source files a tool wrote (a bundle, generated or minified code): left out, not an error.
+    pub generated: usize,
 }
 
 impl Skipped {
@@ -998,6 +1000,8 @@ pub enum Skip {
     NotUtf8,
     /// Over the size cap, not a regular file, or not the file the walk saw.
     Unsafe,
+    /// A source file a tool wrote: a bundle of other sources, generated or minified code (see `generated`).
+    Generated,
 }
 
 /// The outcome of [`read_text`].
@@ -1039,13 +1043,20 @@ pub fn read_text(root: &Path, entry: &Entry) -> Read {
         return Read::Skipped(Skip::Unsafe);
     }
 
-    match String::from_utf8(bytes) {
-        Ok(text) => Read::Text(match text.strip_prefix('\u{feff}') {
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => match text.strip_prefix('\u{feff}') {
             Some(stripped) => stripped.to_string(),
             None => text,
-        }),
-        Err(_) => Read::Skipped(Skip::NotUtf8),
+        },
+        Err(_) => return Read::Skipped(Skip::NotUtf8),
+    };
+
+    // a bundle of the sources would show every symbol twice (manifests are read as they are)
+    if matches!(entry.class, Class::Source(_)) && generated::generated(&text) {
+        return Read::Skipped(Skip::Generated);
     }
+
+    Read::Text(text)
 }
 
 /// The longest line of a file, in bytes, that [`read_line`] gives back.
@@ -1141,9 +1152,12 @@ impl Skipped {
             Skip::Unreadable => self.unreadable += 1,
             Skip::NotUtf8 => self.not_utf8 += 1,
             Skip::Unsafe => self.unsafe_or_large += 1,
+            Skip::Generated => self.generated += 1,
         }
     }
 }
+
+mod generated;
 
 #[cfg(all(test, unix))]
 mod hostile;

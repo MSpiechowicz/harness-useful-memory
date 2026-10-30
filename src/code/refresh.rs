@@ -391,12 +391,17 @@ fn locked(
 
             started = Some(Instant::now());
 
-            if let Some(kind) = toast_kind(known.files.len(), plan.todo.len(), plan.gone.len()) {
+            // manifests are read but are no code: a repository that holds only those is no build to announce
+            let sources = plan.todo.iter().filter(|entry| is_source(entry)).count();
+            let indexed = known.files.values().filter(|stamp| stamp.lang != PACKAGE_LANG).count();
+            let removed = plan.gone.iter().filter(|(_, is_manifest)| !is_manifest).count();
+
+            if let Some(kind) = toast_kind(indexed, sources, removed) {
                 // another session's build is running: this call shares it instead of starting a second
                 if let Some(owner) = builds::running(txn.conn(), repo).map_err(db)? {
                     joined = Some(owner);
                 } else {
-                    let id = builds::start(txn.conn(), repo, kind, plan.todo.len()).map_err(db)?;
+                    let id = builds::start(txn.conn(), repo, kind, sources).map_err(db)?;
 
                     builds::prune(txn.conn()).map_err(db)?;
 
@@ -411,7 +416,7 @@ fn locked(
 
                     // the status file only says `building` once the row is committed: a process killed in
                     // between would leave a file that no row ever ends
-                    observer.on_start(id, kind, plan.todo.len());
+                    observer.on_start(id, kind, sources);
 
                     // others may have worked in between: plan again from the stamps as they are now
                     continue;
@@ -542,10 +547,14 @@ impl Work {
             pace.check()?;
 
             self.read_one(txn, entry, files.get(&entry.rel), pace)?;
-            self.done += 1;
 
-            if report {
-                observer.on_progress(self.done);
+            // the progress counts source files only, like the total it is shown against
+            if is_source(entry) {
+                self.done += 1;
+
+                if report {
+                    observer.on_progress(self.done);
+                }
             }
         }
 
@@ -604,6 +613,11 @@ impl Work {
 
         Ok(())
     }
+}
+
+/// True for a source file, false for a manifest.
+fn is_source(entry: &Entry) -> bool {
+    matches!(entry.class, Class::Source(_))
 }
 
 /// The `files.lang` of an entry.

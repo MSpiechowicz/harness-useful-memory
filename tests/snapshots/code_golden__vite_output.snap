@@ -3,21 +3,23 @@ source: tests/code_golden.rs
 expression: "fixture_output(\"vite\")"
 ---
 == map
-src/lib/utils.ts
-  function cn(...inputs: string[])
 src/App.tsx
   function App()
+src/lib/utils.ts
+  function cn(...inputs: string[])
+src/components/ui/card.tsx
+  function Card(props: { price: number })
+src/components/ui/button.tsx
+  function Button(props: { className?: string; children?: string })
 src/hooks/use-toast.ts
   function useToast()
   toast: (message: string) => message
 src/lib/format.ts
   function formatPrice(cents: number)
-src/components/ui/button.tsx
-  function Button(props: { className?: string; children?: string })
-src/components/ui/card.tsx
-  function Card(props: { price: number })
 src/main.tsx
 vite.config.ts
+
+Next: code_symbol for where a name above is defined and who uses it, code_impact before changing it. To trace how a request or data flows, call code_path once (from `src/App.tsx` to `src/lib/utils.ts`, or between any two names or files) instead of reading the files in between.
 
 == symbol Button
 fn Button  src/components/ui/button.tsx:3-5

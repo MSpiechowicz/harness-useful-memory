@@ -17,6 +17,8 @@ internal/store/store.go
   Store: func (s *Store) Len() int
 main.go
 
+Next: code_symbol for where a name above is defined and who uses it, code_impact before changing it. To trace how a request or data flows, call code_path once (from `internal/server/server.go` to `internal/events/events.go`, or between any two names or files) instead of reading the files in between.
+
 == symbol EvtNew
 const EvtNew  internal/events/events.go:8-8
   EvtNew Kind = iota

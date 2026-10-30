@@ -3,16 +3,19 @@ source: tests/code_golden.rs
 expression: "fixture_output(\"react-tsx\")"
 ---
 == map
+src/hooks.ts
+  function useSubjects(): Subject[]
 src/api.ts
   interface Subject
   Api: async listSubjects(): Promise<Subject[]>
-src/hooks.ts
-  function useSubjects(): Subject[]
-src/components/Header.tsx
-  function Header({ title }: { title: string })
+  api = new Api()
 src/components/SubjectList.tsx
   function SubjectList()
 src/App.tsx
+src/components/Header.tsx
+  function Header({ title }: { title: string })
+
+Next: code_symbol for where a name above is defined and who uses it, code_impact before changing it. To trace how a request or data flows, call code_path once (from `src/App.tsx` to `src/api.ts`, or between any two names or files) instead of reading the files in between.
 
 == symbol Api.listSubjects
 method Api::listSubjects  src/api.ts:6-8
@@ -49,6 +52,7 @@ fn useSubjects  src/hooks.ts:4-12
   uses:
     Subject src/api.ts:1  at src/hooks.ts:4 | export function useSubjects(): Subject[] {
     Api::listSubjects src/api.ts:6  at src/hooks.ts:8 | api.listSubjects().then(setSubjects);
+    api src/api.ts:11  at src/hooks.ts:8 | api.listSubjects().then(setSubjects);
   used by 1 site(s):
     src/components/SubjectList.tsx:4 SubjectList | const subjects = useSubjects();
 

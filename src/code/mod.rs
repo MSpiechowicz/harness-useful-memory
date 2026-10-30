@@ -11,6 +11,8 @@
 //! - `packages`: crate names, Go modules and TypeScript path aliases.
 //! - [`graph`]: resolution, ranking and the text the agent reads.
 //! - [`builds`]: which refreshes count as builds, and the hook that reports their progress.
+//! - [`hint`] and [`prepare`]: the read-only answers of `harness-memory code hint` and `code repo`, and the
+//!   one build `code build` starts when a project is opened.
 //! - [`worker`] and [`supervise`]: the process that indexes a repository within memory and time limits, and
 //!   the server's side of it. The server loads only a graph that a worker has loaded and ranked first.
 
@@ -24,6 +26,7 @@ pub mod graph;
 pub mod hint;
 pub mod pace;
 mod packages;
+pub mod prepare;
 mod refresh;
 pub mod status;
 pub mod store;
@@ -40,6 +43,7 @@ pub use walk::{CANCELLED, LIMITS, Skipped, TOO_LARGE};
 
 use pace::Pace;
 use refresh::Outcome;
+use status::Attempt;
 use store::{Caps, Store};
 use supervise::{Ended, Worker};
 
@@ -128,6 +132,11 @@ impl CodeIndex {
         self.budget = budget;
     }
 
+    /// The time one call may take, as set by [`CodeIndex::set_budget`].
+    pub fn budget(&self) -> Duration {
+        self.budget
+    }
+
     /// Sets how long a refresh waits for another session's write lock before it answers from what that
     /// session committed (two seconds by default).
     pub fn set_patience(&mut self, patience: Duration) {
@@ -151,12 +160,20 @@ impl CodeIndex {
     ) -> Result<(&Graph, Refresh), String> {
         let started = Instant::now();
         let key = root_key(root)?;
+        // one budget for the tries and the workers they start, so they end within it (and the grace of a
+        // worker) however often the repository moves. The load of the graph has a budget of its own (see
+        // `settle`): a worker that used most of this one has still validated the generation to load.
+        let pace = Pace::new(stop, self.budget);
         let mut tries = 0;
 
         let mut refresh = loop {
             tries += 1;
 
-            if let Some(refresh) = self.settle(root, &key, stop, observer)? {
+            if tries > 1 {
+                pace.check()?;
+            }
+
+            if let Some(refresh) = self.settle(root, &key, &pace, observer)? {
                 break refresh;
             }
 
@@ -172,20 +189,45 @@ impl CodeIndex {
         Ok((&hit.graph, refresh))
     }
 
+    /// Brings the index of `root` up to date and stops there: with a worker, the generation it validated is the
+    /// one stored, and no graph is loaded in this process (the next call that needs one loads it). One call of
+    /// the index, so it ends within the budget and the grace of a worker. `attempt` says where it stands in
+    /// the attempts of one `code build`. The ids of the `builds` rows the workers of this call started (whether
+    /// or not the call succeeds) are added to `begun`, so the caller can tell its own builds from another
+    /// session's. Fails with [`GRAPH_TOO_LARGE`] when the worker measured a graph the server would not serve.
+    pub fn prepare(
+        &self,
+        root: &Path,
+        stop: &dyn Fn() -> bool,
+        observer: &mut dyn BuildObserver,
+        attempt: Attempt,
+        begun: &mut Vec<i64>,
+    ) -> Result<Refresh, String> {
+        let started = Instant::now();
+        let key = root_key(root)?;
+        let pace = Pace::new(stop, self.budget);
+        let outcome = self.refreshed(root, &key, &pace, observer, attempt, begun)?;
+        let mut refresh = outcome.refresh;
+
+        if self.validated_bytes(outcome.repo) > GRAPH_BYTES {
+            return Err(GRAPH_TOO_LARGE.into());
+        }
+
+        refresh.ms = started.elapsed().as_millis();
+
+        Ok(refresh)
+    }
+
     /// Brings the index of `root` up to date and puts its graph first in the cache. `None` when another
     /// session wrote after the worker validated the generation, so the load did not happen.
     fn settle(
         &mut self,
         root: &Path,
         key: &str,
-        stop: &dyn Fn() -> bool,
+        pace: &Pace,
         observer: &mut dyn BuildObserver,
     ) -> Result<Option<Refresh>, String> {
-        let pace = Pace::new(stop, self.budget);
-        let outcome = match &self.worker {
-            Some(worker) => self.supervised(worker, root, key, &pace)?,
-            None => refresh::run(&self.store, root, key, &pace, self.caps, observer)?,
-        };
+        let outcome = self.refreshed(root, key, pace, observer, Attempt::default(), &mut Vec::new())?;
         let mut refresh = outcome.refresh;
 
         let cached = self.cache.iter().position(|cached| {
@@ -202,24 +244,14 @@ impl CodeIndex {
 
         // the size a worker measured says how much room the graph needs before it is loaded: the graphs that
         // would not fit beside it are dropped first, so memory never holds them both
-        let coming = self
-            .store
-            .conn()
-            .query_row(
-                "SELECT validated_bytes FROM repos WHERE id = ?1",
-                [outcome.repo],
-                |row| row.get::<_, i64>(0),
-            )
-            .ok()
-            .and_then(|bytes| usize::try_from(bytes).ok())
-            .unwrap_or(0);
+        let coming = self.validated_bytes(outcome.repo);
 
         self.cache.retain(|cached| cached.key != key);
         self.make_room(coming);
 
         // the worker's trial was of the generation it validated: only that one is loaded here
         let validated_only = self.worker.is_some();
-        let load_pace = Pace::new(stop, self.budget);
+        let budget = self.budget;
         let loaded = self.store.snapshot(|conn| {
             let (generation, validated, reported): (i64, i64, i64) = conn
                 .query_row(
@@ -240,11 +272,11 @@ impl CodeIndex {
                 return Err(GRAPH_TOO_LARGE.to_owned());
             }
 
-            Ok(Some((
-                generation,
-                reported,
-                Graph::load(conn, outcome.repo, &load_pace)?,
-            )))
+            // the load has a budget of its own, as it always had: the refresh (a worker's whole run, on a large
+            // first build) must not leave it none. Cancelling still ends it.
+            let loading = Pace::new(pace.stop(), budget);
+
+            Ok(Some((generation, reported, Graph::load(conn, outcome.repo, &loading)?)))
         })?;
         let Some((generation, reported, graph)) = loaded else {
             return Ok(None);
@@ -269,6 +301,53 @@ impl CodeIndex {
         Ok(Some(refresh))
     }
 
+    /// The refresh of `root`, by a worker when there is one (which then reports the build to the status file, and
+    /// `observer` is not called).
+    fn refreshed(
+        &self,
+        root: &Path,
+        key: &str,
+        pace: &Pace,
+        observer: &mut dyn BuildObserver,
+        attempt: Attempt,
+        begun: &mut Vec<i64>,
+    ) -> Result<Outcome, String> {
+        match &self.worker {
+            Some(worker) => self.supervised(worker, root, key, pace, attempt, begun),
+            None => refresh::run(&self.store, root, key, pace, self.caps, observer),
+        }
+    }
+
+    /// The ids of the `builds` rows the process `pid` started for the repository `key`, in any state, at or
+    /// after `since` (Unix seconds: rows are kept for weeks, and a pid is reused).
+    fn started_by(&self, key: &str, pid: u32, since: i64) -> Vec<i64> {
+        let ids = self.store.conn().prepare(
+            "SELECT id FROM builds WHERE pid = ?1 AND started_at >= ?3 \
+             AND repo_id = (SELECT id FROM repos WHERE root = ?2)",
+        );
+
+        ids.and_then(|mut statement| {
+            statement
+                .query_map(rusqlite::params![i64::from(pid), key, since], |row| {
+                    row.get::<_, i64>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_default()
+    }
+
+    /// The size a worker measured of the graph of the repository `repo` (0 when it measured none).
+    fn validated_bytes(&self, repo: i64) -> usize {
+        self.store
+            .conn()
+            .query_row("SELECT validated_bytes FROM repos WHERE id = ?1", [repo], |row| {
+                row.get::<_, i64>(0)
+            })
+            .ok()
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .unwrap_or(0)
+    }
+
     /// Drops the graphs that would not fit in memory beside one of `coming` bytes about to be loaded, least
     /// recently used first.
     fn make_room(&mut self, coming: usize) {
@@ -286,7 +365,15 @@ impl CodeIndex {
 
     /// Like [`refresh::run`], with a worker process doing what can use much memory or time. A repository
     /// the index holds exactly, at a generation a worker validated, needs none.
-    fn supervised(&self, worker: &Worker, root: &Path, key: &str, pace: &Pace) -> Result<Outcome, String> {
+    fn supervised(
+        &self,
+        worker: &Worker,
+        root: &Path,
+        key: &str,
+        pace: &Pace,
+        attempt: Attempt,
+        begun: &mut Vec<i64>,
+    ) -> Result<Outcome, String> {
         let started = refresh::start(&self.store, root, key, pace, Some(worker.memory_mb()))?;
 
         if let Some(current) = &started.current
@@ -298,7 +385,11 @@ impl CodeIndex {
         // the generation the repository had before the worker: one it validated is new only if it moved on
         let before = self.store.state(key)?.map(|(_, generation, _)| generation);
         let budget = pace.deadline().saturating_duration_since(Instant::now());
-        let run = worker.run(root, budget, pace.stop())?;
+        // `started_at` has whole seconds: a second of margin keeps a row the worker started in this one
+        let since = store::now().saturating_sub(1);
+        let run = worker.run(root, budget, attempt, pace.stop())?;
+
+        begun.extend(self.started_by(key, run.pid, since));
 
         match run.ended {
             Ended::Report(report) if report.ok => {

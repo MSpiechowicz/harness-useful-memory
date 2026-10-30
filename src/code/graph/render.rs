@@ -45,6 +45,10 @@ const MAX_IMPACT_TESTS: usize = 10;
 /// An edge weaker than this is not followed by `impact`.
 const MIN_FOLLOW_WEIGHT: f32 = 0.5;
 
+/// The folders of a path, and its length, that the copy check tries (`plugins/claude/` is two folders deep).
+const COPY_DEPTH: usize = 8;
+const COPY_PATH: usize = 512;
+
 /// Longest query used to look for similar names.
 const MAX_SUGGEST_QUERY: usize = 64;
 
@@ -68,21 +72,36 @@ impl Graph {
         };
         let ranks = self.rank(prefix.as_deref());
         let linked = ranks.syms.iter().any(|rank| *rank > 0.0);
-        let score = |f: usize| ranks.files.get(f).copied().unwrap_or(0.0);
+        // a file is central for the code that depends on it (its rank) and for the code it ties together: of two
+        // files used alike, the one that uses more other files is the hub (`command-core.js` over `names.js`)
+        let uses = self.files_used();
+        let score = |f: usize| {
+            let rank = ranks.files.get(f).copied().unwrap_or(0.0);
+            let used = uses.get(f).copied().unwrap_or(0) as f64;
+
+            rank * (1.0 + used).sqrt()
+        };
+        let copy = |f: usize| ranks.copies.get(f).copied().unwrap_or(false);
+        let tooling = |f: usize| self.files.get(f).is_some_and(|file| super::is_tooling_path(&file.path));
         let mut order: Vec<usize> = (0..self.files.len())
-            .filter(|f| self.files.get(*f).is_some_and(|file| !file.test))
+            .filter(|f| self.files.get(*f).is_some_and(|file| !file.test) && !copy(*f))
             .collect();
 
+        // the code before the tooling around it (`scripts/`), then the most central first
         order.sort_by(|a, b| {
-            score(*b).total_cmp(&score(*a)).then_with(|| {
-                self.files
-                    .get(*a)
-                    .map(|f| &f.path)
-                    .cmp(&self.files.get(*b).map(|f| &f.path))
-            })
+            tooling(*a)
+                .cmp(&tooling(*b))
+                .then_with(|| score(*b).total_cmp(&score(*a)))
+                .then_with(|| {
+                    self.files
+                        .get(*a)
+                        .map(|f| &f.path)
+                        .cmp(&self.files.get(*b).map(|f| &f.path))
+                })
         });
 
         let mut out = String::new();
+        let mut listed = Vec::new();
 
         for file in order {
             let Some(entry) = self.files.get(file) else {
@@ -126,9 +145,107 @@ impl Graph {
             }
 
             out += &block;
+            listed.push(file);
+        }
+
+        // the copies the map would have listed: of code, not of tests
+        let left_out: Vec<&str> = (0..self.files.len())
+            .filter(|f| copy(*f))
+            .filter_map(|f| self.files.get(f))
+            .filter(|file| !file.test)
+            .map(|file| file.path.as_str())
+            .collect();
+
+        if let Some(first) = left_out.first() {
+            let copies = if left_out.len() == 1 {
+                "1 copy".to_owned()
+            } else {
+                format!("{} copies", left_out.len())
+            };
+            let _ = writeln!(out, "({copies} of other files left out, such as {})", shown(first));
+        }
+
+        if linked && !listed.is_empty() {
+            out += &self.next_steps(&listed, &uses, |f| ranks.files.get(f).copied().unwrap_or(0.0));
         }
 
         out
+    }
+
+    /// The calls that go on from a map, with an example `code_path` between two of its files: agents asked how a
+    /// project flows read the files one by one after a map unless it names the call that traces the flow. The
+    /// example starts at the listed file that uses the most others (where work starts) and ends at the one the
+    /// rest depends on most.
+    fn next_steps(&self, listed: &[usize], uses: &[usize], rank: impl Fn(usize) -> f64) -> String {
+        let used = |f: usize| uses.get(f).copied().unwrap_or(0);
+        let from = listed.iter().copied().max_by_key(|f| used(*f));
+        let to = listed
+            .iter()
+            .copied()
+            .filter(|f| Some(*f) != from)
+            .max_by(|a, b| rank(*a).total_cmp(&rank(*b)));
+        let path = |f: usize| self.files.get(f).map(|file| shown(&file.path));
+        let mut next = String::from(
+            "\nNext: code_symbol for where a name above is defined and who uses it, code_impact before changing it.",
+        );
+
+        if let (Some(from), Some(to)) = (from.and_then(path), to.and_then(path)) {
+            let _ = write!(
+                next,
+                " To trace how a request or data flows, call code_path once (from `{from}` to `{to}`, or between \
+                 any two names or files) instead of reading the files in between."
+            );
+        }
+
+        next.push('\n');
+        next
+    }
+
+    /// Per file: how many other files its references resolve into.
+    fn files_used(&self) -> Vec<usize> {
+        let mut used: Vec<std::collections::HashSet<usize>> = vec![std::collections::HashSet::new(); self.files.len()];
+
+        for (ri, targets) in self.res.iter().enumerate() {
+            let Some(src) = self.refs.get(ri).map(|r| r.file) else {
+                continue;
+            };
+
+            for (sym, _) in targets {
+                if let Some(dst) = self.syms.get(*sym).map(|s| s.file)
+                    && dst != src
+                    && let Some(set) = used.get_mut(src)
+                {
+                    set.insert(dst);
+                }
+            }
+        }
+
+        used.iter().map(std::collections::HashSet::len).collect()
+    }
+
+    /// Per file: true when it is a copy of another indexed file, as a generated folder makes them: its path ends
+    /// with the other's (`plugins/claude/names.js` and `names.js`) and both have the same size.
+    ///
+    /// The same size is a guess, not proof: an empty file is never a copy (`__init__.py` in two packages), and
+    /// only the first [`COPY_DEPTH`] folders of a path no longer than [`COPY_PATH`] are tried, so a hostile tree
+    /// of deep paths costs little.
+    pub(super) fn copied_files(&self) -> Vec<bool> {
+        let by_path: std::collections::HashMap<&str, i64> =
+            self.files.iter().map(|file| (file.path.as_str(), file.size)).collect();
+
+        self.files
+            .iter()
+            .map(|file| {
+                file.size > 0
+                    && file.path.len() <= COPY_PATH
+                    && file
+                        .path
+                        .match_indices('/')
+                        .take(COPY_DEPTH)
+                        .map(|(at, _)| &file.path[at + 1..])
+                        .any(|tail| by_path.get(tail) == Some(&file.size))
+            })
+            .collect()
     }
 
     /// How a definition is placed among those of its file when nothing ranks them: top-level before members,

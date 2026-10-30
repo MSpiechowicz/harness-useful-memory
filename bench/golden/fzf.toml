@@ -118,8 +118,8 @@ used_by = ["src/matcher.go:147 Matcher::Loop", "src/core.go:597 Run"]
 [[map]]
 budget = 1500
 top = 10
-note = "src/util is imported by 19 production files, src/tui by 7, and chars.go defines Chars used in 6 of them (git grep -l)"
-files = ["src/util/chars.go", "src/util/util.go", "src/tui/tui.go"]
+note = "src/util is imported by 19 production files and src/tui by 7 (git grep -l). The map ranks by what the code (not its tests) depends on and by what a file ties together, so the hubs terminal.go (the main loop) and core.go (Run) lead, and a leaf like util/chars.go comes after"
+files = ["src/util/util.go", "src/tui/tui.go", "src/terminal.go", "src/core.go"]
 
 [[path]]
 from = "Terminal.Loop"

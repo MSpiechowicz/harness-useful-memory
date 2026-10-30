@@ -68,11 +68,14 @@ pub(super) fn extract_block(
         return;
     };
 
+    let imported = Imported::of(tree.root_node(), src.as_bytes());
+
     Walk {
         src: src.as_bytes(),
         line_off,
         jsx,
         sfc: owner.is_some(),
+        imported,
         class_sym: None,
         out,
     }
@@ -349,12 +352,44 @@ fn lazy_import(declarator: Node, src: &[u8]) -> Option<Import> {
     })
 }
 
+/// The local names the top level of a block imports, whatever their case.
+struct Imported {
+    /// Default and named imports (`import x`, `import { a, b as c }`): the values and functions of other files.
+    values: std::collections::HashSet<String>,
+    /// Namespace imports (`import * as ns`): `ns.member` names an export of the module.
+    namespaces: std::collections::HashSet<String>,
+}
+
+impl Imported {
+    fn of(root: Node, src: &[u8]) -> Self {
+        let mut imports = Vec::new();
+        let mut cursor = root.walk();
+
+        for statement in root
+            .named_children(&mut cursor)
+            .filter(|n| n.kind() == "import_statement")
+        {
+            collect_import(statement, src, &mut imports);
+        }
+
+        let (namespaces, values): (Vec<Import>, Vec<Import>) =
+            imports.into_iter().partition(|import| import.orig == "*");
+
+        Self {
+            values: values.into_iter().map(|import| import.local).collect(),
+            namespaces: namespaces.into_iter().map(|import| import.local).collect(),
+        }
+    }
+}
+
 struct Walk<'a> {
     src: &'a [u8],
     line_off: usize,
     jsx: bool,
     /// Inside a single-file component: a top-level `const x = f()` runs for the component, it is no definition.
     sfc: bool,
+    /// What this file (or script block) imports: such a name is a value of another file in any case.
+    imported: Imported,
     /// The class or interface whose body is being read.
     class_sym: Option<usize>,
     out: &'a mut Extract,
@@ -468,6 +503,18 @@ fn value_position(node: Node, parent: Node) -> bool {
         | "type_query" => false,
         _ => true,
     }
+}
+
+/// True when an imported name stands for its value there: where [`value_position`] says so, or as the
+/// object of a member access (`siteContent.en`).
+fn imported_position(node: Node, parent: Node) -> bool {
+    if parent.kind() == "member_expression" {
+        return parent
+            .child_by_field_name("object")
+            .is_some_and(|object| object.id() == node.id());
+    }
+
+    value_position(node, parent)
 }
 
 /// The type an object literal is declared to have: `const x: T = {..}`, `{..} as T`, or the return type of
@@ -975,9 +1022,16 @@ impl Walk<'_> {
                     push_ref(self.out, from, name, "fnref", None, line);
                 }
 
-                if constant_like(name) && value_position(node, parent) {
-                    push_use(self.out, from, name, None, node, src);
+                // a name this file imports is a value of another file whatever its case (`siteContent.en`)
+                let imported = self.imported.values.contains(name) && imported_position(node, parent);
+
+                if imported || (constant_like(name) && value_position(node, parent)) {
+                    push_use(self.out, from, name, None, node, src, line);
                 }
+            }
+            // `{ siteContent }`: the shorthand of an imported name passes its value on
+            "shorthand_property_identifier" if self.imported.values.contains(text(node, src)) => {
+                push_use(self.out, from, text(node, src), None, node, src, line);
             }
             "member_expression" => {
                 // `Color.Red`, `limits.MAX_ROWS`: a constant named through its owner
@@ -987,16 +1041,26 @@ impl Walk<'_> {
                     return;
                 };
                 let name = text(property, src);
+                // `ns.member` of `import * as ns` names an export of that module, whatever its case
+                let named = constant_like(name) || self.imported.namespaces.contains(text(object, src));
 
                 if object.kind() == "identifier"
                     && property.kind() == "property_identifier"
-                    && constant_like(name)
+                    && named
                     && !node.parent().is_some_and(|p| {
                         p.kind() == "call_expression"
                             && p.child_by_field_name("function").is_some_and(|f| f.id() == node.id())
                     })
                 {
-                    push_use(self.out, from, name, Some(text(object, src).to_string()), node, src);
+                    push_use(
+                        self.out,
+                        from,
+                        name,
+                        Some(text(object, src).to_string()),
+                        node,
+                        src,
+                        line,
+                    );
                 }
             }
             "string" => {
@@ -1057,6 +1121,25 @@ mod tests {
         assert!(refs.contains(&("Bar", "component", Some("Foo"))));
         assert!(refs.contains(&("git_file_lines", "str", None)));
         assert!(out.syms.iter().any(|s| s.name == "App" && s.kind == "fn"));
+    }
+
+    #[test]
+    fn an_imported_name_is_a_use_in_any_case_and_a_called_one_is_only_a_call() {
+        let out = run(
+            "a.ts",
+            "import { siteContent, run } from './x';\nimport * as ns from './y';\n\
+             function f(local) { run(); local.a; return [siteContent.en, ns.value, ns]; }\n",
+        );
+
+        let uses: Vec<(&str, Option<&str>)> = out
+            .refs
+            .iter()
+            .filter(|r| r.kind == "use")
+            .map(|r| (r.name.as_str(), r.qual.as_deref()))
+            .collect();
+
+        assert_eq!(uses, vec![("siteContent", None), ("value", Some("ns"))]);
+        assert!(out.refs.iter().any(|r| r.kind == "call" && r.name == "run"));
     }
 
     #[test]

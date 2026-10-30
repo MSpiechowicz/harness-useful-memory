@@ -2,7 +2,8 @@
 //!
 //! The file is a `component` symbol named after the file. Its `<script>` blocks (and an Astro-style `---`
 //! frontmatter) are parsed as TypeScript. The rest of the file (the template) is scanned for component tags
-//! (`<FooBar>`, `<Foo.Bar>`, `<foo-bar>`) and for quoted code names (`invoke('git_file_lines')`).
+//! (`<FooBar>`, `<Foo.Bar>`, `<foo-bar>`) and for quoted code names (`invoke('git_file_lines')`). The names the
+//! script imports are also looked for in the template's expressions (see `sfc_template`).
 //!
 //! The script, style and frontmatter regions are blanked in the template copy byte for byte (one ASCII space
 //! per byte, newlines kept), so offsets and line numbers of the template never shift, whatever the text holds.
@@ -15,7 +16,7 @@ use tree_sitter::Parser;
 use super::{Extract, Sym, ident_like, out_of_time, push_ref};
 
 /// The template scan looks at the clock this often, in bytes.
-const SCAN_CHECK: usize = 1 << 16;
+pub(super) const SCAN_CHECK: usize = 1 << 16;
 
 /// A quoted string longer than this is not a code name.
 const MAX_QUOTED: usize = 80;
@@ -77,6 +78,10 @@ pub(super) fn extract(parser: &mut Parser, path: &str, src: &str, out: &mut Extr
     }
 
     scan_template(&markup, owner, out);
+
+    let vue = Path::new(path).extension().is_some_and(|ext| ext == "vue");
+
+    super::sfc_template::extract(&markup, vue, owner, out);
     super::ts::keep_function_values(out);
 }
 
@@ -375,6 +380,131 @@ mod tests {
         );
         assert!(out.syms.iter().any(|s| s.name == "inner" && s.line == 2));
         assert!(out.refs.iter().any(|r| r.kind == "component" && r.name == "X"));
+    }
+
+    fn template_refs(out: &Extract) -> Vec<(&str, &'static str, Option<&str>, usize)> {
+        out.refs
+            .iter()
+            .filter(|r| matches!(r.kind, "use" | "call" | "mcall"))
+            .map(|r| (r.name.as_str(), r.kind, r.qual.as_deref(), r.line))
+            .collect()
+    }
+
+    #[test]
+    fn imported_names_are_read_in_nested_expressions_and_never_in_strings_or_properties() {
+        let out = run(
+            "page.astro",
+            "---\nimport Card from './Card.astro';\nimport { fmt, path as p } from './x';\nimport * as ns from './y';\n---\n<Card />\n{items.map((i) => <li class={`a ${fmt (i)}`}>{p}</li>)}\n<p title=\"fmt\">{ns.run(1)} {ns.NAME} {obj.fmt} {'fmt'} {/* fmt */}</p>\n{cond && <Card />}\n<!-- {fmt(1)} -->\n<p>fmt(2)</p>\n",
+        );
+
+        assert_eq!(
+            template_refs(&out),
+            vec![
+                ("fmt", "call", None, 7),
+                ("p", "use", None, 7),
+                ("run", "mcall", Some("ns"), 8),
+                ("NAME", "use", Some("ns"), 8),
+            ]
+        );
+        // the tag `<Card />` is a component reference, not a use of the import
+        assert!(out.refs.iter().all(|r| !(r.name == "Card" && r.kind == "use")));
+    }
+
+    #[test]
+    fn a_name_the_script_used_on_the_same_line_is_recorded_once() {
+        let out = run(
+            "ui/Row.svelte",
+            "<script>import { fmt } from './x'; fmt(1);</script>\n{fmt(2)}{fmt(3)}\n",
+        );
+
+        assert_eq!(
+            template_refs(&out),
+            vec![("fmt", "call", None, 1), ("fmt", "call", None, 2)]
+        );
+    }
+
+    #[test]
+    fn vue_reads_mustaches_and_dynamic_attributes_only() {
+        let src = "<script setup>\nimport { fmt, go } from './x';\n</script>\n<template>\n  <a :href=\"fmt('a>b')\" @click='go()' title=\"fmt\" v-if=\"ok\">text</a>\n  <p>{{ fmt }} { go() }</p>\n</template>\n";
+        let out = run("Row.vue", src);
+
+        assert_eq!(
+            template_refs(&out),
+            vec![
+                ("fmt", "call", None, 5),
+                ("go", "call", None, 5),
+                ("fmt", "use", None, 6)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_brace_that_never_closes_leaves_the_rest_of_the_template_unread() {
+        let out = run(
+            "a.svelte",
+            "<script>import { fmt } from './x';</script>\n<p>{ fmt(1)</p>\n{fmt(2)}\n",
+        );
+
+        assert!(template_refs(&out).is_empty());
+    }
+
+    #[test]
+    fn markup_in_an_expression_is_text_and_only_its_braces_are_code() {
+        let out = run(
+            "page.astro",
+            "---\nimport { price, title, fmt } from './x';\n---\n{items.map(i => <li title={i.t} class=\"price\" {...title}>Total price: {fmt(i.p)} <br> <b>title</b></li>)}\n{a < price} {a<title}\n",
+        );
+
+        assert_eq!(
+            template_refs(&out),
+            vec![
+                ("title", "use", None, 4),
+                ("fmt", "call", None, 4),
+                ("price", "use", None, 5),
+                ("title", "use", None, 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_quote_or_a_slash_in_markup_text_in_an_expression_does_not_swallow_the_template() {
+        let out = run(
+            "page.astro",
+            "---\nimport { fmt } from './x';\n---\n{ok && <p>use the ` key, it's <a href=http://x>here</a></p>}\n{fmt(1)}\n",
+        );
+
+        assert_eq!(template_refs(&out), vec![("fmt", "call", None, 5)]);
+    }
+
+    #[test]
+    fn a_less_than_in_vue_text_does_not_hide_a_mustache() {
+        let out = run(
+            "Row.vue",
+            "<script setup>\nimport { fmt } from './x';\n</script>\n<template>\n  <p>if a<b then {{ fmt(x) }} done</p>\n  <p>1 < 2 {{ fmt(y) }}</p>\n</template>\n",
+        );
+
+        assert_eq!(
+            template_refs(&out),
+            vec![("fmt", "call", None, 5), ("fmt", "call", None, 6)]
+        );
+    }
+
+    #[test]
+    fn calls_and_uses_of_different_namespaces_on_a_line_are_all_kept() {
+        let out = run(
+            "page.astro",
+            "---\nimport * as ns from './a';\nimport * as other from './b';\nimport { run } from './c';\n---\n{ns.run(1)} {other.run(2)}\n{run} {ns.run()}\n",
+        );
+
+        assert_eq!(
+            template_refs(&out),
+            vec![
+                ("run", "mcall", Some("ns"), 6),
+                ("run", "mcall", Some("other"), 6),
+                ("run", "use", None, 7),
+                ("run", "mcall", Some("ns"), 7),
+            ]
+        );
     }
 
     #[test]

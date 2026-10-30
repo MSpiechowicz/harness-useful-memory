@@ -611,11 +611,21 @@ searches the text of a project for a name: it prints `{"hint": "..."}` (or `{"hi
 without `--json`, and exits 0 whatever the answer (2 for wrong arguments). It never builds, refreshes or creates the
 index and starts no worker: it reads `code.sqlite3` read-only and answers only when the switch is on, `PATH` is a git
 repository the tools may read, its current index generation was validated by a worker, and `NAME` (`name`,
-`Type::name` or `Type.name`, 3 to 80 characters) is defined in the index. Off hides the four tools from `tools/list` (a server reads the switch when the client
+`Type::name` or `Type.name`, 3 to 80 characters) is defined in the index. `code repo --project PATH [--json]` says what
+the index holds for a project. It reads the index and asks `git` for the repository root, and never builds or
+refreshes anything or creates the index (`code.sqlite3`) or the build status folder. It prints `{"state": "indexed"|"none"|"tooLarge"|"failed"|"refused"|"off", "files": N,
+"symbols": N, "indexedAt": unixSeconds|null}`. `code build --project PATH [--json]` builds the index of a project
+that has none, like the first tool call would, and prints `{"built": true, "files": N}`. It is one build to Harness
+Desktop however many tries it takes (a repository too large for one call of two minutes is asked again with the time
+that is left of ten minutes, and its status file keeps one `buildId` and never shows an error in between), and it
+runs for about 617 seconds at most (rare short waits for a lock come on top). A project in any other state
+is left alone (`{"built": false, "reason": "indexed"}`), so opening a project again, or one that is too large, costs
+nothing. An error prints `{"built": false, "reason": "error", "error": "..."}`. Both exit 0 whatever the state (2 for
+wrong arguments). Off hides the four tools from `tools/list` (a server reads the switch when the client
 initializes), makes a call answer `The code index is off. Turn it on in Harness Desktop → Settings → Memory.`, and keeps
 the index file. A `code.toml` that is another user's, writable by others or not valid means off.
 
-**Build status.** A first index of a repository, or a refresh that touches 200 files or more at once (a branch switch),
+**Build status.** A first index of a repository that has source files, or a refresh that touches 200 files or more at once (a branch switch),
 is a build. It writes `code-builds/<first 16 hex digits of the SHA-256 of the root path>.json` in the data folder (mode
 0600, replaced atomically), so Harness Desktop can show its progress:
 
@@ -1245,10 +1255,10 @@ object has `scripts` totals instead of `notes`, no `relations` or `entitiesCut`,
 ```
 
 `harness-memory features` lists what this build supports, one per line (`push-json`, `scripts-remote-local`,
-`scripts-hide`, `scripts-push-json`, `settings`, `notes-lang`, `notes-useful`, `embedder`, `code-index` and `code-hint` among them), so a tool can
+`scripts-hide`, `scripts-push-json`, `settings`, `notes-lang`, `notes-useful`, `embedder`, `code-index`, `code-hint` and `code-prepare` among them), so a tool can
 check before it asks for them. `settings` is the `settings` command, `notes-lang` the `lang` of a note and the `--lang`
 filter, `notes-useful` the usefulness counters of a note with `--useful` and `--sort useful|lastUseful`, `embedder`
-the `embedder` command, `code-index` the `code` command and the `code_*` tools, and `code-hint` the `code hint` command.
+the `embedder` command, `code-index` the `code` command and the `code_*` tools, `code-hint` the `code hint` command, and `code-prepare` the `code repo` and `code build` commands.
 
 ### Security and backups
 

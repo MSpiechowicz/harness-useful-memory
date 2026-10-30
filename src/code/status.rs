@@ -12,15 +12,20 @@
 //! ```
 //!
 //! `kind` is `full` or `bulk`, `phase` is `building`, `ready` or `error`, times are Unix seconds.
+//!
+//! `code build` may ask for a very large repository again and again, each time a call of its own that runs out
+//! of time and goes on where the last one stopped (see [`Attempt`]). The attempts are one build to the person:
+//! an attempt that is followed by another does not end the file as an error, and the next one keeps its
+//! `buildId`, `kind` and `startedAt` and counts its progress on from where the last one stopped.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::store::{digest_hex, now};
-use super::{BuildKind, BuildObserver};
+use super::{BuildKind, BuildObserver, TOO_SLOW};
 use crate::support::private::{private_folder, read_private, write_atomic};
 
 /// The folder in the data folder that holds the status files.
@@ -49,6 +54,19 @@ pub fn path_of(data: &Path, root: &Path) -> PathBuf {
     data.join(FOLDER).join(format!("{}.json", &digest[..16]))
 }
 
+/// Where a call stands in the attempts that make up one build (see the module docs). The default is a call
+/// that stands alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Attempt {
+    /// The id of the build an earlier attempt began and the status file showed `building`: that file is taken
+    /// over, not replaced by a new build, only while it still shows this id (another session may have written
+    /// its own meanwhile).
+    pub continued: Option<i64>,
+    /// Another attempt follows if this one runs out of time: it does not end the file as an error.
+    pub more_follows: bool,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Document {
@@ -65,12 +83,26 @@ struct Document {
     error: Option<String>,
 }
 
+/// What a `building` status file says of the build it shows.
+struct Earlier {
+    build_id: i64,
+    kind: BuildKind,
+    started_at: i64,
+    files_total: usize,
+    files_done: usize,
+}
+
 /// Writes the status file of the builds of one repository.
 pub struct StatusFile {
     data: PathBuf,
     root: PathBuf,
     document: Option<Document>,
     written: Option<Instant>,
+    attempt: Attempt,
+    /// The files that earlier attempts of the build read: this attempt counts on from there.
+    carried: usize,
+    /// The id of the `builds` row of the build this writer began, if it did.
+    began: Option<i64>,
 }
 
 impl StatusFile {
@@ -81,12 +113,57 @@ impl StatusFile {
             root: root.to_path_buf(),
             document: None,
             written: None,
+            attempt: Attempt::default(),
+            carried: 0,
+            began: None,
         }
+    }
+
+    /// Makes this writer the one of an attempt of a build that takes several.
+    pub fn attempt(mut self, attempt: Attempt) -> Self {
+        self.attempt = attempt;
+
+        self
+    }
+
+    /// The id of the `builds` row of the build this writer began, once it did. The file may show an earlier
+    /// attempt's id instead (see [`Attempt`]), which an earlier writer began.
+    pub fn began(&self) -> Option<i64> {
+        self.began
     }
 
     /// The file this writer writes.
     pub fn path(&self) -> PathBuf {
         path_of(&self.data, &self.root)
+    }
+
+    /// The build the file on disk shows while it is `building`.
+    fn building(&self) -> Option<Earlier> {
+        let bytes = read_private(&self.path(), READ_MAX).ok().flatten()?;
+        let document = serde_json::from_slice::<Value>(&bytes).ok()?;
+
+        if document.get("phase").and_then(Value::as_str) != Some("building") {
+            return None;
+        }
+
+        let count = |name: &str| {
+            document
+                .get(name)
+                .and_then(Value::as_u64)
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(0)
+        };
+
+        Some(Earlier {
+            build_id: document.get("buildId").and_then(Value::as_i64)?,
+            kind: document
+                .get("kind")
+                .and_then(Value::as_str)
+                .and_then(BuildKind::parse)?,
+            started_at: document.get("startedAt").and_then(Value::as_i64)?,
+            files_total: count("filesTotal"),
+            files_done: count("filesDone"),
+        })
     }
 
     fn write(&mut self) {
@@ -114,20 +191,35 @@ impl BuildObserver for StatusFile {
     fn on_start(&mut self, id: i64, kind: BuildKind, total: usize) {
         remove_old(&self.data.join(FOLDER), &self.path());
 
+        self.began = Some(id);
+
+        let earlier = self
+            .attempt
+            .continued
+            .and_then(|expected| self.building().filter(|earlier| earlier.build_id == expected));
+
+        self.carried = earlier.as_ref().map_or(0, |earlier| earlier.files_done);
+
+        // a later attempt has fewer files left to read: the total stays the one the person was told, unless
+        // more files turned up
+        let total = earlier.as_ref().map_or(total, |earlier| {
+            earlier.files_total.max(self.carried.saturating_add(total))
+        });
+
         self.document = Some(Document {
             version: VERSION,
-            build_id: id,
+            build_id: earlier.as_ref().map_or(id, |earlier| earlier.build_id),
             root: self.root.to_string_lossy().into_owned(),
             repo_name: self
                 .root
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-            kind: kind.as_str(),
+            kind: earlier.as_ref().map_or(kind, |earlier| earlier.kind).as_str(),
             phase: "building",
             files_total: total,
-            files_done: 0,
-            started_at: now(),
+            files_done: self.carried,
+            started_at: earlier.as_ref().map_or_else(now, |earlier| earlier.started_at),
             finished_at: None,
             error: None,
         });
@@ -138,7 +230,7 @@ impl BuildObserver for StatusFile {
         let due = self.written.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY);
 
         if let Some(document) = &mut self.document {
-            document.files_done = done;
+            document.files_done = self.carried.saturating_add(done).min(document.files_total);
         }
 
         if due {
@@ -162,6 +254,14 @@ impl BuildObserver for StatusFile {
         let Some(document) = &mut self.document else {
             return;
         };
+
+        // another attempt goes on: the person still sees one build that runs
+        if self.attempt.more_follows && outcome == Err(TOO_SLOW) {
+            self.write();
+            self.document = None;
+
+            return;
+        }
 
         document.finished_at = Some(now());
 
@@ -217,9 +317,14 @@ fn mark_interrupted(data: &Path, path: &Path, ids: &[i64]) {
     }
 }
 
+/// The id of the build the status file of the repository at `root` says is `building`, if it does.
+pub fn building_id(data: &Path, root: &Path) -> Option<i64> {
+    StatusFile::new(data, root).building().map(|earlier| earlier.build_id)
+}
+
 /// Turns the status file `path` into `ready` when it still says `building` the build `owner` (a session that
 /// shared that build finished the work, and the owner may be dead).
-fn finish_joined(data: &Path, path: &Path, owner: i64) {
+pub fn finish_joined(data: &Path, path: &Path, owner: i64) {
     let Ok(Some(bytes)) = read_private(path, READ_MAX) else {
         return;
     };
@@ -438,6 +543,183 @@ mod tests {
         let failed = read(&status.path());
         assert_eq!(failed["phase"], "error");
         assert_eq!(failed["error"], "repository too large to index");
+    }
+
+    #[test]
+    fn attempts_that_ran_out_of_time_are_one_build_that_never_shows_an_error() {
+        let data = tempfile::tempdir().expect("data");
+        let root = Path::new("/work/app");
+        let first = Attempt {
+            continued: None,
+            more_follows: true,
+        };
+        let middle = Attempt {
+            continued: Some(7),
+            more_follows: true,
+        };
+        let last = Attempt {
+            continued: Some(7),
+            more_follows: false,
+        };
+
+        let mut one = StatusFile::new(data.path(), root).attempt(first);
+
+        one.on_start(7, BuildKind::Bulk, 1000);
+        one.on_progress(300);
+        one.on_finish(Err(TOO_SLOW));
+
+        let held = read(&one.path());
+
+        assert_eq!(held["phase"], "building");
+        assert_eq!(held["error"], Value::Null);
+        assert_eq!(held["filesDone"], 300);
+        assert_eq!(building_id(data.path(), root), Some(7));
+
+        // the next attempt has 700 files left, on a row of its own: the person sees the same build go on
+        let mut two = StatusFile::new(data.path(), root).attempt(middle);
+
+        two.on_start(8, BuildKind::Bulk, 700);
+        assert_eq!(read(&two.path())["buildId"], 7);
+        assert_eq!(read(&two.path())["filesDone"], 300);
+
+        two.on_progress(100);
+        two.on_finish(Err(TOO_SLOW));
+        assert_eq!(read(&two.path())["filesDone"], 400);
+        assert_eq!(read(&two.path())["phase"], "building");
+
+        let mut three = StatusFile::new(data.path(), root).attempt(last);
+
+        three.on_start(9, BuildKind::Full, 600);
+        three.on_progress(50);
+        three.on_finish(Ok(()));
+
+        let done = read(&three.path());
+
+        assert_eq!(done["phase"], "ready");
+        assert_eq!(done["buildId"], 7);
+        assert_eq!(done["kind"], "bulk");
+        assert_eq!(done["filesTotal"], 1000);
+        assert_eq!(done["filesDone"], 1000);
+        assert_eq!(done["startedAt"], held["startedAt"]);
+        assert_eq!(building_id(data.path(), root), None);
+    }
+
+    #[test]
+    fn a_writer_knows_the_row_it_began_even_when_the_file_shows_an_earlier_attempts_build() {
+        let data = tempfile::tempdir().expect("data");
+        let root = Path::new("/work/app");
+        let mut one = StatusFile::new(data.path(), root).attempt(Attempt {
+            continued: None,
+            more_follows: true,
+        });
+
+        assert_eq!(one.began(), None);
+
+        one.on_start(7, BuildKind::Full, 10);
+        one.on_finish(Err(TOO_SLOW));
+        assert_eq!(one.began(), Some(7));
+
+        let mut two = StatusFile::new(data.path(), root).attempt(Attempt {
+            continued: Some(7),
+            more_follows: false,
+        });
+
+        two.on_start(8, BuildKind::Full, 10);
+        assert_eq!(read(&two.path())["buildId"], 7);
+        assert_eq!(two.began(), Some(8));
+    }
+
+    #[test]
+    fn the_last_attempt_that_runs_out_of_time_ends_the_build_as_an_error() {
+        let data = tempfile::tempdir().expect("data");
+        let root = Path::new("/work/app");
+        let mut one = StatusFile::new(data.path(), root).attempt(Attempt {
+            continued: None,
+            more_follows: true,
+        });
+
+        one.on_start(7, BuildKind::Full, 10);
+        one.on_finish(Err(TOO_SLOW));
+
+        let mut last = StatusFile::new(data.path(), root).attempt(Attempt {
+            continued: Some(7),
+            more_follows: false,
+        });
+
+        last.on_start(8, BuildKind::Full, 10);
+        last.on_finish(Err(TOO_SLOW));
+
+        let failed = read(&last.path());
+
+        assert_eq!(
+            (failed["phase"].clone(), failed["buildId"].clone()),
+            (json!("error"), json!(7))
+        );
+        assert_eq!(failed["error"], TOO_SLOW);
+    }
+
+    #[test]
+    fn an_attempt_that_fails_for_another_reason_ends_the_build_and_one_after_an_end_starts_a_new_one() {
+        let data = tempfile::tempdir().expect("data");
+        let root = Path::new("/work/app");
+        let mut one = StatusFile::new(data.path(), root).attempt(Attempt {
+            continued: None,
+            more_follows: true,
+        });
+
+        one.on_start(7, BuildKind::Full, 10);
+        one.on_finish(Err("cancelled"));
+        assert_eq!(read(&one.path())["phase"], "error");
+
+        // a continued attempt finds no `building` file to take over
+        let mut next = StatusFile::new(data.path(), root).attempt(Attempt {
+            continued: Some(7),
+            more_follows: false,
+        });
+
+        next.on_start(8, BuildKind::Full, 10);
+        assert_eq!(read(&next.path())["buildId"], 8);
+        assert_eq!(read(&next.path())["phase"], "building");
+    }
+
+    #[test]
+    fn an_attempt_does_not_take_over_a_building_file_another_session_wrote_after_the_check() {
+        let data = tempfile::tempdir().expect("data");
+        let root = Path::new("/work/app");
+        let mut one = StatusFile::new(data.path(), root).attempt(Attempt {
+            continued: None,
+            more_follows: true,
+        });
+
+        one.on_start(7, BuildKind::Bulk, 1000);
+        one.on_progress(300);
+        one.on_finish(Err(TOO_SLOW));
+
+        // the parent checked the file showed build 7: the worker is told to continue that one
+        let mut worker = StatusFile::new(data.path(), root).attempt(Attempt {
+            continued: building_id(data.path(), root),
+            more_follows: false,
+        });
+
+        // another session replaced the file before the worker got the write lock
+        let mut foreign = StatusFile::new(data.path(), root);
+
+        foreign.on_start(50, BuildKind::Full, 20);
+        foreign.written = Instant::now().checked_sub(PROGRESS_EVERY);
+        foreign.on_progress(5);
+        assert_eq!(read(&foreign.path())["filesDone"], 5);
+
+        worker.on_start(51, BuildKind::Bulk, 700);
+
+        let shown = read(&worker.path());
+
+        // its own build, not the foreign 50 nor the earlier 7, and none of their progress
+        assert_eq!(shown["buildId"], 51);
+        assert_eq!(worker.began(), Some(51));
+        assert_eq!(shown["kind"], "bulk");
+        assert_eq!(shown["filesDone"], 0);
+        assert_eq!(shown["filesTotal"], 700);
+        assert_eq!(building_id(data.path(), root), Some(51));
     }
 
     #[cfg(unix)]

@@ -210,6 +210,8 @@ pub struct Graph {
     /// Word literals (see `words`): a short plain word or command written in code, with the definitions that
     /// write it.
     words: HashMap<String, Vec<usize>>,
+    /// The parts of strings that name no definition (`'http_polling'`), with the definitions that write them.
+    loose_words: HashMap<String, Vec<usize>>,
     /// Per Rust crate: the module names its files define.
     pkg_mods: HashMap<String, HashSet<String>>,
     /// Written types of variables, parameters and fields.
@@ -322,6 +324,15 @@ fn lang_name(lang: &str) -> Option<&'static str> {
         .find(|name| *name == lang)
 }
 
+/// True for a file in a top-level folder of tooling around the code (`scripts/`, `bench/`, `examples/`): an
+/// overview or a question in words is about the code itself first. A deeper folder of that name (`src/scripts/`)
+/// is code.
+fn is_tooling_path(path: &str) -> bool {
+    const TOOLING: &[&str] = &["scripts", "script", "bench", "benches", "examples", "example"];
+
+    path.split_once('/').is_some_and(|(first, _)| TOOLING.contains(&first))
+}
+
 /// True for a path that holds tests (by folder or file name).
 fn is_test(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
@@ -411,8 +422,10 @@ impl Graph {
 
         let mut files = Vec::new();
         let mut file_index: HashMap<i64, usize> = HashMap::new();
+        // a file that was not read (unreadable, too large, or a bundle a tool wrote) is stamped with no text and
+        // holds no definition: it is no file of the graph, the map would list it with nothing in it
         let mut statement = conn
-            .prepare("SELECT id, path, lang, mtime_ns, size FROM files WHERE repo_id = ?1 ORDER BY path")
+            .prepare("SELECT id, path, lang, mtime_ns, size FROM files WHERE repo_id = ?1 AND hash <> '' ORDER BY path")
             .map_err(db)?;
         let rows = statement
             .query_map([repo], |row| {
@@ -574,6 +587,7 @@ impl Graph {
         let mut loose: HashMap<String, Vec<Mention>> = HashMap::new();
         let mut mentions = 0_usize;
         let mut words: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut loose_words: HashMap<String, Vec<usize>> = HashMap::new();
         let mut word_places = 0_usize;
         let mut bases = dispatch::Bases::default();
         let mut statement = conn
@@ -642,11 +656,18 @@ impl Graph {
                 continue;
             }
 
-            // the parts of a string that names a function (`"git_file_lines"`) are words the definition writes
+            // the parts of a string that names a function (`"git_file_lines"`) are words the definition writes; the
+            // parts of one that names nothing defined (a tag or a key: `'http_polling'`) are weaker words
             if kind == "str"
                 && let Some(sym) = from.and_then(|id| sym_index.get(&id).copied())
             {
-                words::keep_parts(&mut words, &mut word_places, &name, sym);
+                let into = if by_name.contains_key(&name) {
+                    &mut words
+                } else {
+                    &mut loose_words
+                };
+
+                words::keep_parts(into, &mut word_places, &name, sym);
             }
 
             // a string that names nothing the repository defines can never resolve: it stays in the index file
@@ -737,6 +758,7 @@ impl Graph {
             packages,
             loose,
             words,
+            loose_words,
             pkg_mods,
             types,
             soft: Vec::new(),
@@ -913,7 +935,7 @@ impl Graph {
         }
 
         // a word literal is kept with the definitions that write it
-        for (word, syms) in &self.words {
+        for (word, syms) in self.words.iter().chain(&self.loose_words) {
             text += 64 + long(word) + syms.len() * 8;
         }
 

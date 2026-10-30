@@ -190,6 +190,9 @@ expression: "replies[0][\"result\"]"
         },
         "required": [],
         "additionalProperties": false
+      },
+      "_meta": {
+        "anthropic/alwaysLoad": true
       }
     },
     {

@@ -10,6 +10,8 @@ src/lib/TodoItem.svelte
   <TodoItem>
 src/App.svelte
 
+Next: code_symbol for where a name above is defined and who uses it, code_impact before changing it. To trace how a request or data flows, call code_path once (from `src/App.svelte` to `src/lib/store.ts`, or between any two names or files) instead of reading the files in between.
+
 == symbol TodoItem
 component TodoItem  src/lib/TodoItem.svelte:1-8
   <TodoItem>

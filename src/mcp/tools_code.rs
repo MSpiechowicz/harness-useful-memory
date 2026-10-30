@@ -3,7 +3,7 @@
 
 use serde_json::{Value, json};
 
-use super::tools::{text, tool};
+use super::tools::{always_loaded, text, tool};
 
 /// The map budget in tokens: default and bounds.
 pub(super) const MAP_BUDGET_DEFAULT: i64 = 700;
@@ -32,9 +32,14 @@ pub(super) const QUERY_CHARS_MAX: usize = 300;
 pub(super) const INSTRUCTION: &str = "- Before grep: code_map, code_symbol, code_impact, code_path. A to B: code_path \
 (symbol, file, command or words). Grepped for a start? Use code_path from there.";
 
-/// The code index tools.
+/// The code index tools, each loaded up front (see [`always_loaded`]): they are the ones an agent is asked to use
+/// before grep.
 pub(super) fn definitions() -> Vec<Value> {
-    vec![code_map(), code_symbol(), code_impact(), code_path()]
+    let mut tools = vec![code_map(), code_symbol(), code_impact(), code_path()];
+
+    tools.iter_mut().for_each(always_loaded);
+
+    tools
 }
 
 fn code_map() -> Value {
@@ -45,13 +50,10 @@ fn code_map() -> Value {
         json!({
             "project_path": project_path(),
             "focus": text("Path prefix to centre the map on, such as src/api"),
-            "budget": {
-                "type": "integer",
-                "minimum": MAP_BUDGET_MIN,
-                "maximum": MAP_BUDGET_MAX,
-                "default": MAP_BUDGET_DEFAULT,
-                "description": "Size of the map in tokens",
-            },
+            "budget": ranged(
+                MAP_BUDGET_DEFAULT,
+                &format!("Size of the map in tokens, {MAP_BUDGET_MIN} to {MAP_BUDGET_MAX}"),
+            ),
         }),
         &["project_path"],
     )
@@ -65,13 +67,10 @@ fn code_symbol() -> Value {
         json!({
             "project_path": project_path(),
             "symbol": text("name, Type::name, module::name, path/fragment::name or a file path"),
-            "limit": {
-                "type": "integer",
-                "minimum": SYMBOL_LIMIT_MIN,
-                "maximum": SYMBOL_LIMIT_MAX,
-                "default": SYMBOL_LIMIT_DEFAULT,
-                "description": "Entries per list",
-            },
+            "limit": ranged(
+                SYMBOL_LIMIT_DEFAULT,
+                &format!("Entries per list, {SYMBOL_LIMIT_MIN} to {SYMBOL_LIMIT_MAX}"),
+            ),
         }),
         &["project_path", "symbol"],
     )
@@ -85,13 +84,10 @@ fn code_impact() -> Value {
         json!({
             "project_path": project_path(),
             "symbol": text("name, Type::name, module::name, path/fragment::name or a file path"),
-            "depth": {
-                "type": "integer",
-                "minimum": IMPACT_DEPTH_MIN,
-                "maximum": IMPACT_DEPTH_MAX,
-                "default": IMPACT_DEPTH_DEFAULT,
-                "description": "Caller hops",
-            },
+            "depth": ranged(
+                IMPACT_DEPTH_DEFAULT,
+                &format!("Caller hops, {IMPACT_DEPTH_MIN} to {IMPACT_DEPTH_MAX}"),
+            ),
         }),
         &["project_path", "symbol"],
     )
@@ -110,16 +106,24 @@ fn code_path() -> Value {
                  or event name, or plain words of the question"
             ),
             "to": text("Where the chain ends, written the same way"),
-            "max_depth": {
-                "type": "integer",
-                "minimum": PATH_DEPTH_MIN,
-                "maximum": PATH_DEPTH_MAX,
-                "default": PATH_DEPTH_DEFAULT,
-                "description": "Longest chain in hops",
-            },
+            "max_depth": ranged(
+                PATH_DEPTH_DEFAULT,
+                &format!("Longest chain in hops, {PATH_DEPTH_MIN} to {PATH_DEPTH_MAX}"),
+            ),
         }),
         &["project_path", "from", "to"],
     )
+}
+
+/// A number the server keeps within its range (a value outside it is cut to the nearest end). The range is
+/// said in the description, not as `minimum`/`maximum`: a client that validates the schema would refuse the
+/// call instead (`budget: must be <= 4000`), and the agent would have to call again.
+fn ranged(default: i64, description: &str) -> Value {
+    json!({
+        "type": "integer",
+        "default": default,
+        "description": format!("{description} (a value outside is cut to the nearest end)"),
+    })
 }
 
 fn project_path() -> Value {

@@ -23,6 +23,7 @@ use crate::code::status::StatusFile;
 use crate::code::supervise::Worker;
 use crate::code::{CodeIndex, Graph, Refresh, switch, worker};
 use crate::project::code_root_refusal;
+use crate::support::Env;
 use crate::support::private::data_folder;
 use crate::support::redact::redact_formats;
 
@@ -249,37 +250,39 @@ fn answer(
 /// The code index, opened by the first call that needs it.
 fn index(server: &mut Server) -> Result<&mut CodeIndex, String> {
     if server.code.is_none() {
-        let path = crate::database_path(server.projects.env())
-            .ok_or("the data folder is unknown")?
-            .with_file_name("code.sqlite3");
-
-        let mut index = CodeIndex::open(&path)?;
-
-        // the index is read in a process of its own that is killed past its limits, unless a unit test
-        // asks for the old way
-        // (only a debug build honours that: a release build always reads the repository in a worker)
-        if !(cfg!(debug_assertions) && server.projects.env().var(worker::INPROCESS_VAR) == Some("1")) {
-            index.set_worker(Worker::new(server.projects.env())?);
-        }
-
-        // a debug build lets the tests shorten the time one call may take
-        if cfg!(debug_assertions)
-            && let Some(ms) = server
-                .projects
-                .env()
-                .var(worker::BUDGET_VAR)
-                .and_then(|value| value.parse::<u64>().ok())
-        {
-            index.set_budget(Duration::from_millis(ms));
-        }
-
-        server.code = Some(index);
+        server.code = Some(open_index(server.projects.env())?);
     }
 
     server
         .code
         .as_mut()
         .ok_or_else(|| "the code index is not open".to_owned())
+}
+
+/// Opens the code index file of this computer with the worker that reads repositories, as a tool call and
+/// `code build` both need it.
+pub(crate) fn open_index(env: &Env) -> Result<CodeIndex, String> {
+    let path = crate::database_path(env)
+        .ok_or("the data folder is unknown")?
+        .with_file_name("code.sqlite3");
+
+    let mut index = CodeIndex::open(&path)?;
+
+    // the index is read in a process of its own that is killed past its limits, unless a unit test
+    // asks for the old way
+    // (only a debug build honours that: a release build always reads the repository in a worker)
+    if !(cfg!(debug_assertions) && env.var(worker::INPROCESS_VAR) == Some("1")) {
+        index.set_worker(Worker::new(env)?);
+    }
+
+    // a debug build lets the tests shorten the time one call may take
+    if cfg!(debug_assertions)
+        && let Some(ms) = env.var(worker::BUDGET_VAR).and_then(|value| value.parse::<u64>().ok())
+    {
+        index.set_budget(Duration::from_millis(ms));
+    }
+
+    Ok(index)
 }
 
 /// What the refresh did, for whoever reads the server's stderr.

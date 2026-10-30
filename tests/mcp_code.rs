@@ -7,7 +7,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use common::mcp::{call, canonical, env, is_error, repo_with_remote, run, text};
 use common::stdio::BINARY;
@@ -98,6 +98,18 @@ impl Machine {
 
         statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query")
+            .map(|row| row.expect("row"))
+            .collect()
+    }
+
+    /// The ids of the `builds` rows of the code index.
+    fn builds_ids(&self) -> Vec<i64> {
+        let conn = rusqlite::Connection::open(self.data().join("code.sqlite3")).expect("code.sqlite3");
+        let mut statement = conn.prepare("SELECT id FROM builds ORDER BY id").expect("prepare");
+
+        statement
+            .query_map([], |row| row.get(0))
             .expect("query")
             .map(|row| row.expect("row"))
             .collect()
@@ -227,10 +239,33 @@ fn the_tool_schemas_require_a_project_path_and_stay_short() {
         assert_eq!(tool["inputSchema"]["required"], required, "{name}");
         assert_eq!(tool["inputSchema"]["additionalProperties"], false, "{name}");
 
+        // the range is said, not enforced in the schema: a client that validates it would refuse an
+        // out-of-range call (`budget: must be <= 4000`) where the server cuts the value to the nearest end
         let (field, min, max) = bounded;
-        assert_eq!(tool["inputSchema"]["properties"][field]["minimum"], min, "{name}");
-        assert_eq!(tool["inputSchema"]["properties"][field]["maximum"], max, "{name}");
+        let property = &tool["inputSchema"]["properties"][field];
+        assert!(
+            property.get("minimum").is_none() && property.get("maximum").is_none(),
+            "{name}: {property}"
+        );
+        let said = property["description"].as_str().expect("description");
+        assert!(said.contains(&format!("{min} to {max}")), "{name}: {said}");
+        // loaded up front by Claude Code, not deferred behind ToolSearch
+        assert_eq!(tool["_meta"]["anthropic/alwaysLoad"], true, "{name}");
     }
+}
+
+#[test]
+fn an_out_of_range_number_is_cut_to_the_nearest_end_not_refused() {
+    let machine = Machine::new();
+    let mut server = machine.server(&[]);
+
+    let map = tool(
+        &mut server,
+        "code_map",
+        json!({ "project_path": machine.repo.to_str().expect("utf-8"), "budget": 7000 }),
+    );
+    assert!(!is_error(&map), "{map}");
+    assert!(text(&map).contains("src/lib.rs"), "{}", text(&map));
 }
 
 #[test]
@@ -1137,4 +1172,370 @@ fn a_hint_is_quick_and_exits_zero_whatever_the_answer_and_two_for_wrong_argument
     );
 
     assert_eq!((code, out.trim()), (0, r#"{"hint":null}"#));
+}
+
+// ---- `code repo` and `code build` --------------------------------------------------------------------------
+
+/// `harness-memory code repo|build --project PROJECT --json` on the machine's data folder: (exit code, the
+/// JSON object it printed).
+fn prepare_command(data: &Path, verb: &str, project: &Path) -> (i32, Value) {
+    let output = Command::new(BINARY)
+        .args(["code", verb, "--project"])
+        .arg(project)
+        .arg("--json")
+        .env("HARNESS_MEMORY_DIR", data)
+        .env_remove("HARNESS_MEMORY_CODE_INDEX")
+        .output()
+        .expect("runs");
+
+    (
+        output.status.code().expect("exit code"),
+        serde_json::from_slice(&output.stdout).expect("one JSON object"),
+    )
+}
+
+fn repo_of(machine: &Machine, project: &Path) -> Value {
+    let (code, value) = prepare_command(&machine.data(), "repo", project);
+
+    assert_eq!(code, 0);
+
+    value
+}
+
+fn build_of(machine: &Machine, project: &Path) -> Value {
+    let (code, value) = prepare_command(&machine.data(), "build", project);
+
+    assert_eq!(code, 0);
+
+    value
+}
+
+/// Changes the row of the machine's repository in `code.sqlite3`.
+fn update_repo(machine: &Machine, set: &str) {
+    rusqlite::Connection::open(machine.data().join("code.sqlite3"))
+        .expect("code.sqlite3")
+        .execute(
+            &format!("UPDATE repos SET {set} WHERE root = ?1"),
+            [machine.repo.to_string_lossy()],
+        )
+        .expect("update");
+}
+
+#[test]
+fn the_repo_state_reads_what_a_build_made_and_creates_nothing() {
+    let machine = Machine::new();
+    let nowhere = machine.dir.path().join("no-data-folder-yet");
+
+    // no index, and no data folder at all
+    for data in [machine.data(), nowhere.clone()] {
+        let (code, value) = prepare_command(&data, "repo", &machine.repo);
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            value,
+            json!({ "state": "none", "files": 0, "symbols": 0, "indexedAt": null })
+        );
+        assert!(!data.join("code.sqlite3").exists(), "{data:?}");
+        assert!(!data.join("code-builds").exists());
+    }
+
+    assert!(!nowhere.exists(), "the data folder was not made");
+
+    let output = Command::new(BINARY)
+        .args(["code", "repo", "--project"])
+        .arg(&machine.repo)
+        .env("HARNESS_MEMORY_DIR", machine.data())
+        .env_remove("HARNESS_MEMORY_CODE_INDEX")
+        .output()
+        .expect("runs");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "The code index has nothing of this project yet.\n"
+    );
+
+    assert_eq!(build_of(&machine, &machine.repo), json!({ "built": true, "files": 2 }));
+
+    let indexed = repo_of(&machine, &machine.repo);
+
+    assert_eq!(indexed["state"], "indexed");
+    assert_eq!(indexed["files"], 2);
+    assert!(indexed["symbols"].as_i64().expect("symbols") >= 3, "{indexed}");
+    assert!(indexed["indexedAt"].as_i64().expect("indexedAt") > 0, "{indexed}");
+
+    // from a folder inside the repository too
+    assert_eq!(repo_of(&machine, &machine.repo.join("src")), indexed);
+
+    // reading changes nothing
+    let before = std::fs::read(machine.data().join("code.sqlite3")).expect("database");
+
+    repo_of(&machine, &machine.repo);
+
+    assert_eq!(
+        std::fs::read(machine.data().join("code.sqlite3")).expect("database"),
+        before
+    );
+}
+
+#[test]
+fn the_repo_state_names_why_a_project_is_not_indexed() {
+    let machine = Machine::new();
+
+    assert_eq!(build_of(&machine, &machine.repo)["built"], true);
+
+    // a generation that moved since its last check is still an index
+    update_repo(&machine, "generation = generation + 1");
+    assert_eq!(repo_of(&machine, &machine.repo)["state"], "indexed");
+
+    update_repo(&machine, "too_large = 'x'");
+    assert_eq!(repo_of(&machine, &machine.repo)["state"], "tooLarge");
+
+    update_repo(&machine, "too_large = NULL, failed = 'x'");
+    assert_eq!(repo_of(&machine, &machine.repo)["state"], "failed");
+
+    // a first build that never validated is nothing yet
+    update_repo(&machine, "failed = NULL, validated_generation = -1");
+    assert_eq!(repo_of(&machine, &machine.repo)["state"], "none");
+
+    // a folder that is no git repository
+    let plain = machine.dir.path().join("plain");
+
+    std::fs::create_dir_all(&plain).expect("plain");
+    assert_eq!(repo_of(&machine, &plain)["state"], "refused");
+    assert_eq!(repo_of(&machine, &machine.dir.path().join("gone"))["state"], "refused");
+
+    // off, whatever the index holds
+    switch::set_enabled(&machine.data(), false).expect("off");
+    assert_eq!(repo_of(&machine, &machine.repo)["state"], "off");
+    assert_eq!(repo_of(&machine, &plain)["state"], "off");
+}
+
+#[test]
+fn the_first_build_writes_one_status_file_and_a_second_does_nothing() {
+    let machine = Machine::new();
+
+    assert_eq!(build_of(&machine, &machine.repo), json!({ "built": true, "files": 2 }));
+    assert_eq!(machine.builds(), vec![("full".to_owned(), "ok".to_owned())]);
+
+    let status = machine.status();
+
+    assert_eq!(
+        (status["kind"].clone(), status["phase"].clone()),
+        (json!("full"), json!("ready"))
+    );
+    assert_eq!(status["filesTotal"], 2);
+    assert_eq!(status["filesDone"], 2);
+
+    let file = machine.status_files().remove(0);
+    let bytes = std::fs::read(&file).expect("status file");
+
+    for _ in 0..3 {
+        assert_eq!(
+            build_of(&machine, &machine.repo),
+            json!({ "built": false, "reason": "indexed" })
+        );
+    }
+
+    assert_eq!(machine.builds().len(), 1);
+    assert_eq!(machine.status_files(), vec![file.clone()]);
+    assert_eq!(std::fs::read(&file).expect("status file again"), bytes);
+
+    // what an agent's call finds afterwards is the index the build made
+    let mut server = machine.server(&[]);
+
+    assert!(!is_error(&symbol(&mut server, &machine.repo, "compute_total")));
+    assert_eq!(machine.builds().len(), 1);
+    assert_eq!(std::fs::read(&file).expect("status file after a call"), bytes);
+}
+
+#[test]
+fn a_build_that_ran_out_of_time_and_went_on_is_one_build_that_never_shows_an_error() {
+    let machine = Machine::new();
+    let done = Arc::new(AtomicBool::new(false));
+    let folder = machine.data().join("code-builds");
+
+    // what Harness Desktop would see: the status file read every few milliseconds while the command runs
+    let watcher = {
+        let (done, folder) = (done.clone(), folder.clone());
+
+        std::thread::spawn(move || {
+            let mut seen: Vec<(String, i64)> = Vec::new();
+
+            while !done.load(Ordering::SeqCst) {
+                let file = std::fs::read_dir(&folder)
+                    .ok()
+                    .and_then(|mut entries| entries.next())
+                    .and_then(|entry| std::fs::read(entry.ok()?.path()).ok())
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+
+                if let Some(file) = file {
+                    let state = (
+                        file["phase"].as_str().expect("phase").to_owned(),
+                        file["buildId"].as_i64().expect("buildId"),
+                    );
+
+                    if seen.last() != Some(&state) {
+                        seen.push(state);
+                    }
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+
+            seen
+        })
+    };
+
+    // the first call stalls past its budget of a second, the second goes on and finishes
+    let output = Command::new(BINARY)
+        .args(["code", "build", "--project"])
+        .arg(&machine.repo)
+        .arg("--json")
+        .env("HARNESS_MEMORY_DIR", machine.data())
+        .env("HARNESS_MEMORY_CODE_BUDGET_MS", "1000")
+        .env("HARNESS_MEMORY_CODE_WORKER_TEST", "stall")
+        .env_remove("HARNESS_MEMORY_CODE_INDEX")
+        .output()
+        .expect("runs");
+
+    done.store(true, Ordering::SeqCst);
+
+    let seen = watcher.join().expect("watcher");
+    let answer: Value = serde_json::from_slice(&output.stdout).expect("one JSON object");
+
+    assert_eq!(answer, json!({ "built": true, "files": 2 }));
+
+    // two calls of the index, each with a row of its own
+    assert_eq!(
+        machine.builds(),
+        vec![
+            ("full".to_owned(), "error".to_owned()),
+            ("full".to_owned(), "ok".to_owned())
+        ]
+    );
+
+    // one build: one id, building and then ready, and no error in between
+    let first = machine.builds_ids().remove(0);
+
+    assert_eq!(
+        seen,
+        vec![("building".to_owned(), first), ("ready".to_owned(), first)],
+        "{seen:?}"
+    );
+
+    let status = machine.status();
+
+    assert_eq!(
+        (status["phase"].clone(), status["error"].clone()),
+        (json!("ready"), Value::Null)
+    );
+    assert_eq!(status["buildId"], first);
+    assert_eq!(status["filesDone"], status["filesTotal"]);
+}
+
+#[test]
+fn a_project_the_index_gave_up_on_is_not_built_again() {
+    let machine = Machine::new();
+
+    assert_eq!(build_of(&machine, &machine.repo)["built"], true);
+
+    for (set, reason) in [
+        ("too_large = 'x'", "tooLarge"),
+        ("too_large = NULL, failed = 'x'", "failed"),
+    ] {
+        update_repo(&machine, set);
+
+        assert_eq!(
+            build_of(&machine, &machine.repo),
+            json!({ "built": false, "reason": reason })
+        );
+    }
+
+    assert_eq!(machine.builds().len(), 1);
+}
+
+#[test]
+fn a_build_with_the_switch_off_or_for_a_refused_folder_creates_nothing() {
+    let machine = Machine::new();
+
+    switch::set_enabled(&machine.data(), false).expect("off");
+
+    assert_eq!(
+        build_of(&machine, &machine.repo),
+        json!({ "built": false, "reason": "off" })
+    );
+    assert!(!machine.data().join("code.sqlite3").exists());
+    assert!(machine.status_files().is_empty());
+
+    switch::set_enabled(&machine.data(), true).expect("on");
+
+    let plain = machine.dir.path().join("plain");
+
+    std::fs::create_dir_all(&plain).expect("plain");
+
+    assert_eq!(
+        build_of(&machine, &plain),
+        json!({ "built": false, "reason": "refused" })
+    );
+    assert!(!machine.data().join("code.sqlite3").exists());
+    assert!(machine.status_files().is_empty());
+}
+
+#[test]
+fn a_repository_of_manifests_only_is_built_without_a_toast() {
+    let machine = Machine::new();
+    let repo = canonical(&repo_with_remote(
+        machine.dir.path(),
+        "manifests",
+        "https://github.com/acme/manifests.git",
+    ));
+
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"manifests\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(repo.join("package.json"), "{\"name\":\"manifests\"}\n").expect("package.json");
+
+    assert_eq!(build_of(&machine, &repo), json!({ "built": true, "files": 0 }));
+    assert!(machine.status_files().is_empty(), "{:?}", machine.status_files());
+    assert!(machine.builds().is_empty());
+    assert_eq!(repo_of(&machine, &repo)["state"], "indexed");
+
+    // the first source file is a first build
+    std::fs::write(repo.join("src/lib.rs"), LIB).expect("lib");
+
+    let mut server = machine.server(&[]);
+
+    assert!(!is_error(&symbol(&mut server, &repo, "compute_total")));
+    assert_eq!(machine.builds(), vec![("full".to_owned(), "ok".to_owned())]);
+    assert_eq!(machine.status()["filesTotal"], 1);
+}
+
+#[test]
+fn the_repo_and_build_commands_exit_two_for_wrong_arguments() {
+    let machine = Machine::new();
+
+    for verb in ["repo", "build"] {
+        for args in [
+            &[verb][..],
+            &[verb, "--json"],
+            &[verb, "--project", "/x", "extra"],
+            &[verb, "--project", "/x", "--yes"],
+            &[verb, "--project", "/x", "--project", "/y"],
+        ] {
+            let output = Command::new(BINARY)
+                .arg("code")
+                .args(args)
+                .env("HARNESS_MEMORY_DIR", machine.data())
+                .output()
+                .expect("runs");
+
+            assert_eq!(output.status.code(), Some(2), "{args:?}");
+            assert!(output.stdout.is_empty(), "{args:?}");
+        }
+    }
+
+    assert!(!machine.data().join("code.sqlite3").exists());
 }

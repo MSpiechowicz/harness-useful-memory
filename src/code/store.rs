@@ -39,7 +39,13 @@ use super::walk::{Entry, TOO_LARGE};
 /// `implements`, Rust `impl Trait for Type`), and the name a Python `with` statement binds (`as client`).
 /// 14: `refs.handler`, a mention of a constant written where something is handled (a `case` label, an operand
 /// of an equality test, the pattern of an `if let`): a shared constant bridges `code_path` only to those.
-pub const SCHEMA_VERSION: i64 = 14;
+/// 15: no source file a tool wrote (a bundle, generated or minified code) holds definitions; an index of 14 may
+/// still hold the bundles it read, so it is built again.
+/// 16: a name a JS/TS file (or a component's script) imports is a `use` reference wherever the file uses it as a
+/// value (`siteContent.en`), whatever its case; an index of 15 lacks those references, so it is built again.
+/// 17: a name a component imports is a `use` or `call` reference where its template expressions use it
+/// (`{alternatePath(locale)}`, `{{ format(x) }}`); an index of 16 lacks those references, so it is built again.
+pub const SCHEMA_VERSION: i64 = 17;
 
 /// The refusal of a file written by a newer harness-memory.
 pub const NEWER: &str = "the code index was written by a newer harness-memory";

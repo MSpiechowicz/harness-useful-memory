@@ -3,11 +3,13 @@ source: tests/code_golden.rs
 expression: "fixture_output(\"astro\")"
 ---
 == map
+src/pages/index.astro
 src/layouts/Layout.astro
   <Layout>
 src/lib/posts.ts
   function getPosts(): Post[]
-src/pages/index.astro
+
+Next: code_symbol for where a name above is defined and who uses it, code_impact before changing it. To trace how a request or data flows, call code_path once (from `src/pages/index.astro` to `src/lib/posts.ts`, or between any two names or files) instead of reading the files in between.
 
 == symbol Layout
 component Layout  src/layouts/Layout.astro:1-12

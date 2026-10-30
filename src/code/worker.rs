@@ -33,7 +33,8 @@
 //! time one call may take, and `HARNESS_MEMORY_CODE_WORKER_TEST` is
 //! `alloc` (allocate past the memory limit), `spin` (never finish), `abort`, or `kill` (the worker ends itself
 //! with SIGKILL, as the system's out of memory killer would), run when the refresh has read the first file
-//! of its build or ended, and `late-abort`, which aborts after the generation was validated. The worker
+//! of its build or ended, `late-abort`, which aborts after the generation was validated, and `stall`, which
+//! sleeps for a second and a half there (past a budget of a second) unless the call continues an earlier one. The worker
 //! writes its process id to `code-worker.pid` in the data folder first.
 
 use std::cell::Cell;
@@ -46,7 +47,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::status::StatusFile;
+use super::status::{Attempt, StatusFile};
 use super::{BuildKind, BuildObserver, CodeIndex, Counts, Refresh, Skipped, pace};
 use crate::project::{canonical_home, code_root_refusal};
 use crate::support::Env;
@@ -100,6 +101,9 @@ const ORPHAN_GRACE: Duration = Duration::from_secs(5);
 /// The words of the worker's refusal of a root.
 const NOT_FOR_THE_WORKER: &str = "the worker was asked for a folder the code index does not read";
 
+/// How long the test hook `stall` sleeps.
+const STALL: Duration = Duration::from_millis(1500);
+
 /// The file the test hook writes the worker's process id to.
 pub const PID_FILE: &str = "code-worker.pid";
 
@@ -117,6 +121,9 @@ pub struct Request {
     pub root: String,
     /// The time the refresh and the trial may take together.
     pub budget_ms: u64,
+    /// Where the call stands in the attempts of one `code build` (a tool call stands alone).
+    #[serde(default)]
+    pub attempt: Attempt,
 }
 
 /// What the worker prints.
@@ -139,6 +146,7 @@ pub struct Report {
     pub not_utf8: usize,
     pub unsafe_or_large: usize,
     pub truncated: usize,
+    pub generated: usize,
     pub stale: bool,
     /// The build this refresh was: its id and kind.
     pub build_id: Option<i64>,
@@ -171,6 +179,7 @@ impl Report {
             not_utf8: refresh.skipped.not_utf8,
             unsafe_or_large: refresh.skipped.unsafe_or_large,
             truncated: refresh.skipped.truncated,
+            generated: refresh.skipped.generated,
             stale: refresh.stale,
             build_id: refresh.build.map(|(id, _)| id),
             build_kind: refresh.build.map(|(_, kind)| kind.as_str().to_owned()),
@@ -193,6 +202,7 @@ impl Report {
                 not_utf8: self.not_utf8,
                 unsafe_or_large: self.unsafe_or_large,
                 truncated: self.truncated,
+                generated: self.generated,
             },
             ms: self.ms.into(),
             build: self.build_id.zip(self.build_kind.as_deref().and_then(BuildKind::parse)),
@@ -321,9 +331,9 @@ fn work(env: &Env, request: &Request) -> Result<Report, String> {
         .ok_or("the data folder is unknown")?
         .with_file_name("code.sqlite3");
     let root = PathBuf::from(&request.root);
-    let hook = Hook::new(env, &data);
+    let hook = Hook::new(env, &data, request.attempt);
     let mut observer = Observed {
-        status: StatusFile::new(&data, &root),
+        status: StatusFile::new(&data, &root).attempt(request.attempt),
         hook: &hook,
     };
     let stop = server_gone;
@@ -393,6 +403,8 @@ enum Misbehaviour {
     Kill,
     /// Aborts once the generation is validated.
     LateAbort,
+    /// Sleeps past a one second budget, in the first attempt of a build only.
+    Stall,
 }
 
 /// The test hook; none in a release build.
@@ -404,7 +416,7 @@ struct Hook {
 }
 
 impl Hook {
-    fn new(env: &Env, data: &Path) -> Self {
+    fn new(env: &Env, data: &Path, attempt: Attempt) -> Self {
         let mode = if cfg!(debug_assertions) {
             match env.var(TEST_VAR) {
                 Some("alloc") => Some(Misbehaviour::Alloc),
@@ -412,6 +424,7 @@ impl Hook {
                 Some("abort") => Some(Misbehaviour::Abort),
                 Some("kill") => Some(Misbehaviour::Kill),
                 Some("late-abort") => Some(Misbehaviour::LateAbort),
+                Some("stall") if attempt.continued.is_none() => Some(Misbehaviour::Stall),
                 _ => None,
             }
         } else {
@@ -449,6 +462,7 @@ impl Hook {
 
         match mode {
             Misbehaviour::LateAbort => {}
+            Misbehaviour::Stall => std::thread::sleep(STALL),
             Misbehaviour::Abort => std::process::abort(),
             Misbehaviour::Kill => {
                 #[cfg(unix)]
@@ -611,6 +625,7 @@ mod tests {
                 not_utf8: 3,
                 unsafe_or_large: 5,
                 truncated: 7,
+                generated: 6,
             },
             build: Some((12, BuildKind::Bulk)),
             stale: true,

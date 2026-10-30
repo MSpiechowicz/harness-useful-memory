@@ -3,11 +3,13 @@ source: tests/code_golden.rs
 expression: "fixture_output(\"vue\")"
 ---
 == map
-src/composables/useCounter.ts
-  function useCounter(start = 0)
 src/Counter.vue
   <Counter>
+src/composables/useCounter.ts
+  function useCounter(start = 0)
 src/App.vue
+
+Next: code_symbol for where a name above is defined and who uses it, code_impact before changing it. To trace how a request or data flows, call code_path once (from `src/App.vue` to `src/composables/useCounter.ts`, or between any two names or files) instead of reading the files in between.
 
 == symbol Counter
 component Counter  src/Counter.vue:1-9

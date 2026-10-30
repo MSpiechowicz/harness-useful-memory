@@ -20,6 +20,7 @@ mod literals;
 mod python;
 mod rust;
 mod sfc;
+mod sfc_template;
 mod tags;
 mod ts;
 
@@ -653,6 +654,7 @@ pub(super) fn push_use(
     qual: Option<String>,
     node: Node,
     src: &[u8],
+    line: usize,
 ) {
     if name.is_empty() {
         return;
@@ -670,7 +672,7 @@ pub(super) fn push_use(
         kind: "use",
         qual,
         recv: None,
-        line: node.start_position().row + 1,
+        line,
         handler: handled(node, src),
     });
 }

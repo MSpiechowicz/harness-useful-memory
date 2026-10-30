@@ -292,7 +292,15 @@ impl<'a> Walk<'a> {
                         .child_by_field_name("object")
                         .and_then(|object| dotted(object, self.src, 0));
 
-                    push_use(self.out, scope.current, name, qual, node, self.src);
+                    push_use(
+                        self.out,
+                        scope.current,
+                        name,
+                        qual,
+                        node,
+                        self.src,
+                        node.start_position().row + 1,
+                    );
                 }
             }
             // `case Color.RED:` names a constant through its class, where an event is handled
@@ -305,7 +313,15 @@ impl<'a> Walk<'a> {
                     .collect();
 
                 if !owners.is_empty() {
-                    push_use(self.out, scope.current, name, Some(owners.join(".")), node, self.src);
+                    push_use(
+                        self.out,
+                        scope.current,
+                        name,
+                        Some(owners.join(".")),
+                        node,
+                        self.src,
+                        node.start_position().row + 1,
+                    );
                 }
             }
             "call"
@@ -328,7 +344,15 @@ impl<'a> Walk<'a> {
                 let in_annotation = std::iter::successors(Some(parent), |p| p.parent()).any(|p| p.kind() == "type");
 
                 if screaming && !in_annotation && !is_call_target(node) && !super::is_own_name(node) {
-                    push_use(self.out, scope.current, name, None, node, self.src);
+                    push_use(
+                        self.out,
+                        scope.current,
+                        name,
+                        None,
+                        node,
+                        self.src,
+                        node.start_position().row + 1,
+                    );
                 }
             }
         }

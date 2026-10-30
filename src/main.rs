@@ -58,7 +58,7 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--o
                      [--project PATH] [--client NAME] < patch.json | scripts save --json [--project PATH] [--client NAME] \
                      < script.json | held list --json \
                      [--chat KEY] | held save <heldId> --json [< draft.json] | held skip <heldId> --json | settings get --json | \
-                     settings set english_notes=true|false --json | code status|enable|disable [--json] | code hint --project PATH --query TEXT [--json] | --version]";
+                     settings set english_notes=true|false --json | code status|enable|disable [--json] | code hint --project PATH --query TEXT [--json] | code repo|build --project PATH [--json] | --version]";
 
 /// What this build can do that older ones could not, as `harness-memory features` lists it: the
 /// `remote+local` note routing, hiding team notes on this computer, `push --json`, and the same for
@@ -69,8 +69,9 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--o
 /// `lang` of a note, the English notes setting), the shared embedder (`embedder`), and the offline
 /// fallback (`offline_fallback`), and the usefulness counters of a note (`notes list --sort
 /// useful|lastUseful`, `--useful ever|never`, the `shown`, `useful` and `lastUsefulAt` of a note), and the
-/// code index (`code status|enable|disable`, the `code_*` tools) and its one-line hint (`code hint`).
-const FEATURES: [&str; 15] = [
+/// code index (`code status|enable|disable`, the `code_*` tools) and its one-line hint (`code hint`),
+/// and getting a project ready (`code repo`, `code build`).
+const FEATURES: [&str; 16] = [
     "notes-remote-local",
     "notes-hide",
     "push-json",
@@ -86,6 +87,7 @@ const FEATURES: [&str; 15] = [
     "notes-useful",
     "code-index",
     "code-hint",
+    "code-prepare",
 ];
 
 /// mimalloc hands freed memory back to the operating system, which the embedder's idle unload of

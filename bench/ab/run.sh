@@ -50,12 +50,15 @@ if not arms or any(a not in ("a", "b", "c") for a in arms):
 
 # What the Harness Desktop family hook "Use the code graph first" (HookSeed::CodeGraphFirst) adds to every prompt.
 FAMILY_HOOK_TEXT = (
-    "If the Harness Memory code tools (code_map, code_symbol, code_impact, code_path) are available, use them for "
-    "code-structure questions before grep or reading files, and pass project_path. Use code_map for an unfamiliar "
-    "area, code_symbol for where something is defined and who uses it, code_impact before changing a signature, and "
-    "one code_path call to trace how A reaches B (a symbol, a file path, a command name or plain words work as an "
-    "endpoint). If you grep to find a starting point, switch to code_path from the function you found. Use grep only "
-    "for literal text, error messages, config values, or when a code tool says the repository is not indexed."
+    "Before your first tool call, decide which Harness Memory code tool answers the question and call it first: "
+    "code_map for an overview of the repository or an area, code_symbol for where a name is defined and used, "
+    "code_impact for what a change affects, code_path for how A reaches B. Pass project_path, the repository root. "
+    "grep, find and file reads come after, for literal text and for details the graph does not show. A small "
+    "repository is no reason to skip them: one code_map call costs less than listing and reading files. A question "
+    "about a flow (how a request, an event or data gets from one part to another) is answered by code_path from the "
+    "entry point to the part it ends in, after code_map named both: do not reconstruct the flow by reading files one "
+    "by one. If the code tools are listed as deferred tools, load them with ToolSearch first. If they are not "
+    "available in this chat, say so once and go on with the usual tools."
 )
 if args.repeat < 1:
     sys.exit("--repeat must be at least 1")
@@ -211,7 +214,9 @@ def summarize(task, arm, repeat, completed, seconds, directory):
     }
     # stream-json: one event per line; the last `result` event carries usage and the answer, the `assistant`
     # events carry the tool calls (which tools the agent chose is what the code index is meant to change)
-    reply, tools = None, {}
+    # `sequence` is the order of the calls; `code` keeps each code tool call with its reply, to see what the agent
+    # did after a reply (`user` events carry the tool results)
+    reply, tools, sequence, code, pending = None, {}, [], [], {}
     for line in completed.stdout.splitlines():
         try:
             event = json.loads(line)
@@ -224,6 +229,18 @@ def summarize(task, arm, repeat, completed, seconds, directory):
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     name = str(block.get("name", "")).replace("mcp__harness-memory__", "")
                     tools[name] = tools.get(name, 0) + 1
+                    sequence.append(name)
+                    if name.startswith("code_"):
+                        call = {"tool": name, "at": len(sequence) - 1, "input": block.get("input"), "reply": None}
+                        code.append(call)
+                        pending[block.get("id")] = call
+        elif event.get("type") == "user":
+            for block in (event.get("message") or {}).get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("tool_use_id") in pending:
+                    content = block.get("content")
+                    if isinstance(content, list):
+                        content = "\n".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+                    pending.pop(block.get("tool_use_id"))["reply"] = str(content or "")[:6000]
     if reply is None:
         record.update(error="no result event on stdout", stderr=completed.stderr[-500:])
         return record
@@ -239,6 +256,8 @@ def summarize(task, arm, repeat, completed, seconds, directory):
         + (usage.get("cache_creation_input_tokens") or 0),
         output_tokens=usage.get("output_tokens") or 0,
         tools=tools,
+        sequence=sequence,
+        code=code,
         code_calls=sum(count for name, count in tools.items() if name.startswith("code_")),
         grep_calls=tools.get("Grep", 0),
         turns=reply.get("num_turns") or 0,
@@ -330,8 +349,11 @@ for task in tasks:
                     timeout=args.timeout,
                 )
             except subprocess.TimeoutExpired:
-                records.append({"task": task["id"], "arm": arm, "repeat": repeat, "repo": task["repo"],
-                                "error": f"timed out after {args.timeout}s"})
+                record = {"task": task["id"], "arm": arm, "repeat": repeat, "repo": task["repo"],
+                          "error": f"timed out after {args.timeout}s"}
+                records.append(record)
+                with open(out_path, "a") as handle:
+                    handle.write(json.dumps(record) + "\n")
                 continue
             record = summarize(task, arm, repeat, completed, time.monotonic() - started, directory)
             records.append(record)

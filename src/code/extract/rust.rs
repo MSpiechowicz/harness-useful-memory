@@ -599,7 +599,15 @@ impl Walk<'_> {
                     && !is_own_name(node)
                     && !is_callee(node)
                 {
-                    push_use(self.out, from, text(node, src), None, node, src);
+                    push_use(
+                        self.out,
+                        from,
+                        text(node, src),
+                        None,
+                        node,
+                        src,
+                        node.start_position().row + 1,
+                    );
                 }
             }
             "scoped_identifier"
@@ -617,7 +625,7 @@ impl Walk<'_> {
                         _ => None,
                     };
 
-                    push_use(self.out, from, name, qual, node, src);
+                    push_use(self.out, from, name, qual, node, src, node.start_position().row + 1);
                 }
             }
             "type_identifier" if !is_own_name(node) => {

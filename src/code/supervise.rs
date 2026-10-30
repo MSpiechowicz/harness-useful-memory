@@ -13,6 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::status::Attempt;
 use super::worker::{self, Report, Request};
 use crate::support::Env;
 use crate::support::git::TEAM_VARS;
@@ -133,11 +134,13 @@ impl Worker {
     }
 
     /// Runs a worker on `root` that may take `budget`, killing it when that and the [`GRACE`] are spent or
-    /// when `stop` says so. Fails only when the process cannot be started.
-    pub fn run(&self, root: &Path, budget: Duration, stop: &dyn Fn() -> bool) -> Result<Run, String> {
+    /// when `stop` says so. `attempt` says where the call stands in the attempts of one `code build`. Fails
+    /// only when the process cannot be started.
+    pub fn run(&self, root: &Path, budget: Duration, attempt: Attempt, stop: &dyn Fn() -> bool) -> Result<Run, String> {
         let request = Request {
             root: root.to_string_lossy().into_owned(),
             budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+            attempt,
         };
         let mut bytes = serde_json::to_vec(&request).map_err(|_| "cannot write the worker's request".to_owned())?;
 

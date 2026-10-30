@@ -7,11 +7,13 @@ src/lib/theme.ts
   function applyTheme(name: string)
 src/lib/components/Card.svelte
   <Card>
+src/routes/+page.svelte
 src/lib/format.ts
   function formatDate(iso: string)
 .storybook/preview.ts
-src/routes/+page.svelte
 svelte.config.js
+
+Next: code_symbol for where a name above is defined and who uses it, code_impact before changing it. To trace how a request or data flows, call code_path once (from `src/routes/+page.svelte` to `src/lib/theme.ts`, or between any two names or files) instead of reading the files in between.
 
 == symbol Card
 component Card  src/lib/components/Card.svelte:1-8

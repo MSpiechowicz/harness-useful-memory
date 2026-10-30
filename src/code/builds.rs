@@ -1,8 +1,8 @@
 //! Which refreshes count as a build, the `builds` rows that record them, and the hook that reports their
 //! progress.
 //!
-//! A refresh that re-reads a handful of files is silent. A refresh of a repository that has no index yet
-//! (`Full`) or that touches [`BULK_THRESHOLD`] files or more (`Bulk`) is a build: it gets a `builds` row
+//! A refresh that re-reads a handful of files is silent. A refresh of a repository that has no index yet and
+//! has source files to read (`Full`) or that touches [`BULK_THRESHOLD`] files or more (`Bulk`) is a build: it gets a `builds` row
 //! (only the process that holds the write lock creates it, and only when no other session's build of the
 //! repository is running: that one is joined, not repeated) and tells its [`BuildObserver`]. The status
 //! file Harness Desktop reads is written by an observer, not here.
@@ -42,13 +42,16 @@ impl BuildKind {
     }
 }
 
-/// Whether a refresh is a build: `Full` when the repository has no indexed files, `Bulk` when
-/// `changed + removed` reaches [`BULK_THRESHOLD`], otherwise `None`. Decided after the second walk,
-/// inside the write transaction.
+/// Whether a refresh is a build: `Full` when the repository has no indexed files and there are some to
+/// read (a repository without source files has nothing to announce), `Bulk` when `changed + removed`
+/// reaches [`BULK_THRESHOLD`], otherwise `None`. Decided after the second walk, inside the write
+/// transaction. The counts are of source files: manifests are left out.
 pub fn toast_kind(prior_files: usize, changed: usize, removed: usize) -> Option<BuildKind> {
     if prior_files == 0 {
-        Some(BuildKind::Full)
-    } else if changed.saturating_add(removed) >= BULK_THRESHOLD {
+        return (changed > 0).then_some(BuildKind::Full);
+    }
+
+    if changed.saturating_add(removed) >= BULK_THRESHOLD {
         Some(BuildKind::Bulk)
     } else {
         None
@@ -276,7 +279,8 @@ mod tests {
     fn a_repository_without_files_gets_a_full_build() {
         assert_eq!(toast_kind(0, 1, 0), Some(BuildKind::Full));
         assert_eq!(toast_kind(0, 5000, 0), Some(BuildKind::Full));
-        assert_eq!(toast_kind(0, 0, 0), Some(BuildKind::Full));
+        // nothing to read, so nothing to announce
+        assert_eq!(toast_kind(0, 0, 0), None);
     }
 
     #[test]

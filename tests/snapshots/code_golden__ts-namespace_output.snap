@@ -7,12 +7,14 @@ src/lib/math.ts
   function double(n: number)
   triple = (n: number) => n * 3
   class Counter
-src/lib/index.ts
-src/lib/other.ts
 src/ui/Badge.vue
 src/ui/Hero.astro
 src/ui/Panel.svelte
 src/ui/report.ts
+src/lib/index.ts
+src/lib/other.ts
+
+Next: code_symbol for where a name above is defined and who uses it, code_impact before changing it. To trace how a request or data flows, call code_path once (from `src/ui/report.ts` to `src/lib/math.ts`, or between any two names or files) instead of reading the files in between.
 
 == symbol Counter
 class Counter  src/lib/math.ts:7-11

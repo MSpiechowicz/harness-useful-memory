@@ -3,18 +3,21 @@ source: tests/code_golden.rs
 expression: "fixture_output(\"dispatch\")"
 ---
 == map
+py/httpx_like/_client.py
+  class Client:
+  Client: def request(self, method, url):
 py/httpx_like/_transports.py
   class BaseTransport:
   BaseTransport: def handle_request(self, request):
   class HTTPTransport(BaseTransport):
-py/httpx_like/_client.py
-  class Client:
-  Client: def request(self, method, url):
+words/billing.py
 ts/src/notify.ts
   interface Notifier
   Notifier: send(message: string): void
   class Base
   Base: run(): void {}
+py/httpx_like/_api.py
+ts/src/app.ts
 words/audit_a/audit.py
   def audit(order):
 words/audit_b/audit.py
@@ -22,10 +25,9 @@ words/audit_b/audit.py
 words/audit_c/audit.py
   def audit(order):
 py/httpx_like/__init__.py
-py/httpx_like/_api.py
 rs/src/lib.rs
-ts/src/app.ts
-words/billing.py
+
+Next: code_symbol for where a name above is defined and who uses it, code_impact before changing it. To trace how a request or data flows, call code_path once (from `words/billing.py` to `py/httpx_like/_transports.py`, or between any two names or files) instead of reading the files in between.
 
 == symbol httpx_like.get
 fn get  py/httpx_like/_api.py:9-10

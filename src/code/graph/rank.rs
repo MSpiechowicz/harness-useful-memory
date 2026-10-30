@@ -1,4 +1,4 @@
-//! Weighted PageRank over files.
+//! Weighted PageRank over files, from the references of the code itself (not of tests, tooling or copies).
 
 use std::collections::HashMap;
 
@@ -19,6 +19,8 @@ pub(super) struct Ranks {
     pub files: Vec<f64>,
     /// Per symbol: the rank that flows into it from other files.
     pub syms: Vec<f64>,
+    /// Per file: a generated copy of another file (see [`Graph::copied_files`]).
+    pub copies: Vec<bool>,
 }
 
 impl Graph {
@@ -31,6 +33,7 @@ impl Graph {
             Err(_) => Ranks {
                 files: Vec::new(),
                 syms: Vec::new(),
+                copies: Vec::new(),
             },
         }
     }
@@ -45,17 +48,31 @@ impl Graph {
         let n = self.files.len();
         let mut out_weight = vec![0.0_f64; n];
         let mut edges: Vec<(usize, usize, usize, f64)> = Vec::new(); // (from file, to file, symbol, weight)
+        // what tests, the tooling around the code (`scripts/`) and generated copies use does not make it central:
+        // a test of its own would hand a small helper all of its rank. Under the focus everything counts: a map of
+        // `scripts/` is a map of what the scripts use
+        let copies = self.copied_files();
+        let focused = |path: &str| focus.is_some_and(|prefix| !prefix.is_empty() && path.starts_with(prefix));
+        let counts = |file: usize| {
+            self.files.get(file).is_some_and(|f| {
+                focused(&f.path)
+                    || (!f.test && !super::is_tooling_path(&f.path) && !copies.get(file).copied().unwrap_or(false))
+            })
+        };
 
         for (ri, targets) in self.res.iter().enumerate() {
-            let Some(src) = self.refs.get(ri).map(|r| r.file) else {
+            let Some(src) = self.refs.get(ri).map(|r| r.file).filter(|src| counts(*src)) else {
                 continue;
             };
 
-            let soft = if self.soft.get(ri).copied().unwrap_or(false) {
-                SOFT_WEIGHT
-            } else {
-                1.0
-            };
+            // a name matched by its name alone, or a constant read (a table, a config object), says less about which
+            // file the code is built around than a call does
+            let soft =
+                if self.soft.get(ri).copied().unwrap_or(false) || self.refs.get(ri).is_some_and(|r| r.kind == "use") {
+                    SOFT_WEIGHT
+                } else {
+                    1.0
+                };
 
             for (sym, weight) in targets {
                 let Some(dst) = self.syms.get(*sym).map(|s| s.file) else {
@@ -147,6 +164,10 @@ impl Graph {
 
         tick()?;
 
-        Ok(Ranks { files: rank, syms })
+        Ok(Ranks {
+            files: rank,
+            syms,
+            copies,
+        })
     }
 }
