@@ -582,6 +582,8 @@ fn the_paths_of_the_files_kept_are_capped_in_total() {
     );
 }
 
+// macOS refuses a path over 1,024 bytes, so the tree cannot be made there
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_path_over_a_kilobyte_below_the_root_is_left_out_and_counted_whatever_the_root_is() {
     let dir = root();

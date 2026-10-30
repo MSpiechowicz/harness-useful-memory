@@ -67,6 +67,8 @@ fn sites(answer: &str) -> Vec<&str> {
 
 // ---- what the agent reads ------------------------------------------------------------------------------
 
+// Windows forbids line breaks and control characters in file names
+#[cfg(unix)]
 #[test]
 fn paths_and_signatures_with_line_breaks_and_controls_are_written_out_in_every_answer() {
     let mut repo = Repo::new();
@@ -651,6 +653,8 @@ fn suggestions_compare_a_bounded_number_of_names_and_skip_names_far_longer_than_
     assert_eq!(few, graph.suggest_among("fetch_diff", 3));
 }
 
+// Windows forbids line breaks and control characters in file names
+#[cfg(unix)]
 #[test]
 fn the_names_a_path_question_echoes_are_written_out_like_any_text_from_outside() {
     let mut repo = Repo::new();

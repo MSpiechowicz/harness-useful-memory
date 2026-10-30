@@ -514,7 +514,7 @@ mod tests {
             Some(CodeRootRefusal::HiddenInHome)
         );
         assert_eq!(
-            code_root_refusal(&home, dir.path().parent().expect("parent")),
+            code_root_refusal(&home, home.parent().expect("parent")),
             Some(CodeRootRefusal::Broad)
         );
 
