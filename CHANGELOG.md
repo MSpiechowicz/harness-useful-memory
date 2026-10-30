@@ -1,3 +1,12 @@
+# [2.11.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.10.0...v2.11.0) (2026-10-30)
+
+
+### Features
+
+* **code:** code index and code_* tools (WIP checkpoint before flow fixes) ([f088373](https://github.com/MSpiechowicz/harness-useful-memory/commit/f088373e259582ac89c07f6e37c0a3b25e681f7f))
+* **code:** stricter code_path endpoints, override dispatch, handler-only bridges ([ec10327](https://github.com/MSpiechowicz/harness-useful-memory/commit/ec103276b9e593ec2503af8ec1398869f0313516))
+* **code:** template refs, generated-file skip, map next steps and code repo/build CLI ([ec5a0ce](https://github.com/MSpiechowicz/harness-useful-memory/commit/ec5a0ce2375e26f17aa73cde22e6f2b60c0e8815))
+
 # [2.10.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.9.2...v2.10.0) (2026-10-28)
 
 
