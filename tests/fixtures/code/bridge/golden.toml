@@ -1,0 +1,100 @@
+# A constant shared by a few definitions bridges `code_path` from the definition that sends or sets it to the
+# ones that handle it: a `case` label or an equality test on it. A definition that only passes the constant
+# on as an argument (a log line, a format) is no handler, and the chain does not run through it.
+# Every fact was read from the files of this folder.
+
+# ---- Go --------------------------------------------------------------------------------------------------
+
+[[path]]
+from = "GoSend"
+to = "GoHandle"
+note = "GoSend sets EvtGoPing (events.go:8) and GoHandle has `case EvtGoPing:` (:19)"
+hops = 2
+through = ["GoSend", "EvtGoPing", "GoHandle"]
+
+[[path]]
+from = "GoSend"
+to = "GoIsPing"
+note = "GoIsPing compares kind == EvtGoPing (events.go:28)"
+hops = 2
+through = ["GoSend", "EvtGoPing", "GoIsPing"]
+
+[[path]]
+from = "GoSend"
+to = "GoLog"
+note = "GoLog only passes EvtGoPing on as an argument (events.go:13): it handles nothing, so nothing leads there"
+text_only = true
+contains = ["no chain within 6 hops between `GoSend` and `GoLog`"]
+not_contains = ["→ GoLog"]
+
+# ---- TypeScript ------------------------------------------------------------------------------------------
+
+[[path]]
+from = "tsSend"
+to = "tsHandle"
+note = "tsSend passes EVT_TS_PING to push (events.ts:4) and tsHandle has `case EVT_TS_PING:` (:14)"
+hops = 2
+through = ["tsSend", "EVT_TS_PING", "tsHandle"]
+
+[[path]]
+from = "tsSend"
+to = "tsIsPing"
+note = "tsIsPing compares kind === EVT_TS_PING (events.ts:22)"
+hops = 2
+through = ["tsSend", "EVT_TS_PING", "tsIsPing"]
+
+[[path]]
+from = "tsSend"
+to = "tsLog"
+note = "tsLog only passes EVT_TS_PING on as an argument (events.ts:9): it handles nothing, so nothing leads there"
+text_only = true
+contains = ["no chain within 6 hops between `tsSend` and `tsLog`"]
+not_contains = ["→ tsLog"]
+
+# ---- Python ----------------------------------------------------------------------------------------------
+
+[[path]]
+from = "py_send"
+to = "py_is_ping"
+note = "py_is_ping compares kind == EVT_PY_PING (events.py:14)"
+hops = 2
+through = ["py_send", "EVT_PY_PING", "py_is_ping"]
+
+[[path]]
+from = "py_send"
+to = "py_is_known"
+note = "py_is_known tests kind in (EVT_PY_PING, ...) (events.py:18)"
+hops = 2
+through = ["py_send", "EVT_PY_PING", "py_is_known"]
+
+[[path]]
+from = "py_send"
+to = "py_log"
+note = "py_log only passes EVT_PY_PING on as an argument (events.py:10): it handles nothing, so nothing leads there"
+text_only = true
+contains = ["no chain within 6 hops between `py_send` and `py_log`"]
+not_contains = ["→ py_log"]
+
+# ---- Rust ------------------------------------------------------------------------------------------------
+
+[[path]]
+from = "rs_send"
+to = "rs_handle"
+note = "rs_send pushes EVT_RS_PING (lib.rs:4) and rs_handle has the match arm `EVT_RS_PING =>` (:14)"
+hops = 2
+through = ["rs_send", "EVT_RS_PING", "rs_handle"]
+
+[[path]]
+from = "rs_send"
+to = "rs_is_ping"
+note = "rs_is_ping compares kind == EVT_RS_PING (lib.rs:20)"
+hops = 2
+through = ["rs_send", "EVT_RS_PING", "rs_is_ping"]
+
+[[path]]
+from = "rs_send"
+to = "rs_log"
+note = "rs_log only passes EVT_RS_PING on as an argument (lib.rs:9, inside format!): it handles nothing, so nothing leads there"
+text_only = true
+contains = ["no chain within 6 hops between `rs_send` and `rs_log`"]
+not_contains = ["→ rs_log"]

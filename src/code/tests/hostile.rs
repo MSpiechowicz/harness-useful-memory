@@ -57,6 +57,80 @@ fn eighty_thousand_self_calling_functions_of_one_name_make_no_edges_and_finish_f
 }
 
 #[test]
+fn thousands_of_subclasses_of_one_base_and_a_chain_of_bases_keep_the_search_bounded() {
+    let mut fixture = Fixture::new();
+    let mut classes = String::from("class Base:\n    def run(self):\n        pass\n");
+
+    // a flat fan-out, and a chain of classes each deriving from the one before it
+    for n in 0..5_000 {
+        classes.push_str(&format!("class F{n}(Base):\n    def run(self):\n        pass\n"));
+    }
+
+    for n in 1..2_000 {
+        classes.push_str(&format!("class C{n}(C{}):\n    def run(self):\n        pass\n", n - 1));
+    }
+
+    classes.push_str("class C0(Base):\n    def run(self):\n        pass\n");
+    fixture.write("a/classes.py", &classes);
+    fixture.write(
+        "a/main.py",
+        "from classes import Base\n\ndef go(base: Base):\n    base.run()\n\ndef nowhere():\n    pass\n",
+    );
+
+    let root = fixture.root().to_path_buf();
+    let started = Instant::now();
+    let (graph, _) = fixture.index.graph(&root, &|| false).expect("graph");
+
+    // the first overrides are reached, the search for something that nothing leads to ends, and both are quick
+    let missed = graph.path("go", "nowhere", 6);
+    let first = graph.path("go", "F0.run", 3);
+
+    assert!(missed.starts_with("no chain within 6 hops"), "{missed}");
+    assert!(first.contains("via subclass/impl of Base::run"), "{first}");
+    assert!(started.elapsed() < Duration::from_secs(60), "{:?}", started.elapsed());
+}
+
+#[test]
+fn one_class_redefined_many_times_and_a_hub_calling_its_base_keep_a_search_without_chain_quick() {
+    let mut fixture = Fixture::new();
+
+    fixture.write("a/base.py", "class Base:\n    def run(self):\n        pass\n");
+
+    // `F0` with an override of `run` in each of many files: all of them are overrides of `Base.run`
+    for file in 0..10 {
+        let mut classes = String::from("from base import Base\n\n");
+
+        for _ in 0..5_000 {
+            classes.push_str("class F0(Base):\n    def run(self):\n        pass\n");
+        }
+
+        fixture.write(&format!("a/f{file}.py"), &classes);
+    }
+
+    // a hub that calls `Base.run` thousands of times, and a function that nothing leads to
+    let mut hub = String::from("from base import Base\n\ndef hub(b: Base):\n");
+
+    for _ in 0..20_000 {
+        hub.push_str("    b.run()\n");
+    }
+
+    hub.push_str("\ndef nowhere():\n    pass\n");
+    fixture.write("a/hub.py", &hub);
+
+    let root = fixture.root().to_path_buf();
+    let (graph, _) = fixture.index.graph(&root, &|| false).expect("graph");
+    let started = Instant::now();
+    let missed = graph.path("hub", "nowhere", 8);
+    let took = started.elapsed();
+
+    assert!(missed.starts_with("no chain within 8 hops"), "{missed}");
+    assert!(
+        took < Duration::from_secs(if cfg!(debug_assertions) { 10 } else { 1 }),
+        "{took:?}"
+    );
+}
+
+#[test]
 fn a_name_defined_in_thousands_of_files_is_too_ambiguous_to_link() {
     let mut fixture = Fixture::new();
 

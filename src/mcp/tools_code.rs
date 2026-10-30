@@ -21,7 +21,7 @@ pub(super) const IMPACT_DEPTH_MIN: i64 = 1;
 pub(super) const IMPACT_DEPTH_MAX: i64 = 4;
 
 /// The `max_depth` of `code_path`: default and bounds.
-pub(super) const PATH_DEPTH_DEFAULT: i64 = 6;
+pub(super) const PATH_DEPTH_DEFAULT: i64 = 8;
 pub(super) const PATH_DEPTH_MIN: i64 = 1;
 pub(super) const PATH_DEPTH_MAX: i64 = 10;
 

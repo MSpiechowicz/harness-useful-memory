@@ -6,8 +6,8 @@
 use tree_sitter::{Language, Node, Parser};
 
 use super::{
-    Extract, Import, MAX_DEPTH, Placement, constant_like, ident_like, is_own_name, push_bind, push_def, push_mcall,
-    push_ref, push_ref_recv, push_word, text, written_type,
+    Extract, Import, MAX_DEPTH, Placement, constant_like, ident_like, is_own_name, push_base, push_bind, push_def,
+    push_mcall, push_ref, push_ref_recv, push_use, push_word, text, written_type,
 };
 
 /// Reads a TS/JS file.
@@ -600,6 +600,18 @@ fn passed_to(object: Node, src: &[u8]) -> Option<String> {
     }
 }
 
+/// The name of a base type as written: `B`, `B<T>`, `ns.B` and `ns.B<T>` give `B`. Anything else (a call, type
+/// arguments, a comment) names none.
+fn base_name(node: Node, src: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" | "type_identifier" => Some(text(node, src).to_string()),
+        "generic_type" => base_name(node.child_by_field_name("name")?, src),
+        "nested_type_identifier" => base_name(node.child_by_field_name("name")?, src),
+        "member_expression" => Some(text(node.child_by_field_name("property")?, src).to_string()),
+        _ => None,
+    }
+}
+
 impl Walk<'_> {
     fn node(&mut self, node: Node, current: Option<usize>, ctx: Option<&str>, depth: usize) {
         if depth > MAX_DEPTH {
@@ -647,6 +659,7 @@ impl Walk<'_> {
 
             if matches!(kind, "class" | "interface") {
                 self.class_sym = Some(sym);
+                self.heritage(node, text(name, src), line);
             }
 
             if kind == "class" {
@@ -683,6 +696,40 @@ impl Walk<'_> {
         }
 
         self.class_sym = saved_class;
+    }
+
+    /// The types a class or interface extends or implements (`class A extends B implements I, J`,
+    /// `interface A extends B, C`).
+    fn heritage(&mut self, node: Node, derived: &str, line: usize) {
+        let mut cursor = node.walk();
+        let clauses: Vec<Node> = node
+            .children(&mut cursor)
+            .filter(|child| matches!(child.kind(), "class_heritage" | "extends_type_clause"))
+            .collect();
+
+        for clause in clauses {
+            let mut inner = clause.walk();
+
+            for part in clause.named_children(&mut inner) {
+                match part.kind() {
+                    "extends_clause" | "implements_clause" => {
+                        let mut types = part.walk();
+
+                        for ty in part.named_children(&mut types) {
+                            if let Some(base) = base_name(ty, self.src) {
+                                push_base(self.out, derived, &base, line);
+                            }
+                        }
+                    }
+                    // `extends X` of a JavaScript class, and of an interface
+                    _ => {
+                        if let Some(base) = base_name(part, self.src) {
+                            push_base(self.out, derived, &base, line);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Records the return type of the definition `sym` made from `node`.
@@ -929,7 +976,7 @@ impl Walk<'_> {
                 }
 
                 if constant_like(name) && value_position(node, parent) {
-                    push_ref(self.out, from, name, "use", None, line);
+                    push_use(self.out, from, name, None, node, src);
                 }
             }
             "member_expression" => {
@@ -949,7 +996,7 @@ impl Walk<'_> {
                             && p.child_by_field_name("function").is_some_and(|f| f.id() == node.id())
                     })
                 {
-                    push_ref(self.out, from, name, "use", Some(text(object, src).to_string()), line);
+                    push_use(self.out, from, name, Some(text(object, src).to_string()), node, src);
                 }
             }
             "string" => {
@@ -1051,5 +1098,31 @@ mod tests {
                 ("local", "local", None),
             ]
         );
+    }
+
+    /// The `base` references of a file as (base, derived).
+    fn bases(out: &Extract) -> Vec<(&str, &str)> {
+        out.refs
+            .iter()
+            .filter(|r| r.kind == "base")
+            .map(|r| (r.name.as_str(), r.qual.as_deref().unwrap_or("")))
+            .collect()
+    }
+
+    #[test]
+    fn a_class_or_interface_records_what_it_extends_or_implements() {
+        let out = run(
+            "ts/a.ts",
+            "class A extends Base<T> implements I, ns.J {}\ninterface K extends L, M<X> {}\nclass Plain {}\nclass D extends mixin(Base) {}\n",
+        );
+
+        assert_eq!(
+            bases(&out),
+            [("Base", "A"), ("I", "A"), ("J", "A"), ("L", "K"), ("M", "K")]
+        );
+
+        let js = run("ts/b.js", "class A extends B {}\nclass C extends ns.D {}\n");
+
+        assert_eq!(bases(&js), [("B", "A"), ("D", "C")]);
     }
 }

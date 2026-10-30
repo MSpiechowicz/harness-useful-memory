@@ -36,6 +36,7 @@ use super::packages::normalize;
 use super::store::db;
 use super::walk::TOO_LARGE;
 
+mod dispatch;
 mod endpoint;
 mod go;
 mod infer;
@@ -144,6 +145,9 @@ struct Ref {
     /// The receiver expression of a method call (see `infer`).
     recv: Option<String>,
     line: i64,
+    /// A mention of a constant where something is handled (a `case` label or an equality test): the only kind
+    /// of use a shared constant bridges `code_path` to.
+    handler: bool,
 }
 
 /// Where a string that names no definition is written.
@@ -224,6 +228,8 @@ pub struct Graph {
     go_dirs: HashMap<String, Vec<usize>>,
     /// Per property name: the functions object literals put there.
     props: HashMap<String, props::Prop>,
+    /// Which types extend or implement which (see `dispatch`).
+    bases: dispatch::Bases,
     /// What the scans may still visit (see [`SCAN_BUDGET`]).
     scan_left: AtomicUsize,
 }
@@ -569,9 +575,10 @@ impl Graph {
         let mut mentions = 0_usize;
         let mut words: HashMap<String, Vec<usize>> = HashMap::new();
         let mut word_places = 0_usize;
+        let mut bases = dispatch::Bases::default();
         let mut statement = conn
             .prepare(
-                "SELECT file_id, from_symbol, name, kind, qual, recv, line FROM refs WHERE repo_id = ?1 ORDER BY id",
+                "SELECT file_id, from_symbol, name, kind, qual, recv, line, handler FROM refs WHERE repo_id = ?1 ORDER BY id",
             )
             .map_err(db)?;
         let rows = statement
@@ -584,6 +591,7 @@ impl Graph {
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)? != 0,
                 ))
             })
             .map_err(db)?;
@@ -595,7 +603,7 @@ impl Graph {
                 return Err(TOO_LARGE.into());
             }
 
-            let (file_id, from, name, kind, qual, recv, line) = row.map_err(db)?;
+            let (file_id, from, name, kind, qual, recv, line, handler) = row.map_err(db)?;
             let Some(&file) = file_index.get(&file_id) else {
                 continue;
             };
@@ -604,6 +612,16 @@ impl Graph {
             if kind == "word" {
                 if let Some(sym) = from.and_then(|id| sym_index.get(&id).copied()) {
                     words::keep(&mut words, &mut word_places, &name, sym);
+                }
+
+                continue;
+            }
+
+            // a type that extends or implements another is no reference: it only tells where a call on the base
+            // may also go
+            if kind == "base" {
+                if let (Some(derived), Some(lang)) = (qual, files.get(file).map(|f| f.lang)) {
+                    bases.keep(lang, name, derived);
                 }
 
                 continue;
@@ -672,6 +690,7 @@ impl Graph {
                 qual,
                 recv,
                 line,
+                handler,
             });
         }
 
@@ -727,6 +746,7 @@ impl Graph {
             type_defs,
             go_dirs,
             props: HashMap::new(),
+            bases,
             scan_left: AtomicUsize::new(SCAN_BUDGET),
         };
 
@@ -896,6 +916,8 @@ impl Graph {
         for (word, syms) in &self.words {
             text += 64 + long(word) + syms.len() * 8;
         }
+
+        text += self.bases.estimated_bytes();
 
         self.refs
             .len()
@@ -1260,8 +1282,12 @@ impl Graph {
             .map_or(1.0, |t| t.1)
     }
 
-    /// Definitions a query names: `name`, `Type::name`, `module::name` or `path/fragment::name`; the most
-    /// used non-test ones first.
+    /// Definitions a query names: `name`, `Type::name`, `module::name`, `module.name` or `path/fragment::name`;
+    /// the most used non-test ones first.
+    ///
+    /// A qualifier is read as the owning type first (`Client.get`), then as a module or package (`httpx.get` is the
+    /// function `get` defined in the package `httpx`, not a method of any type that happens to be defined in a
+    /// file of it), then as any part of a path.
     fn find(&self, query: &str) -> Vec<usize> {
         let split = query
             .rsplit_once("::")
@@ -1273,20 +1299,24 @@ impl Graph {
         let mut hits: Vec<usize> = self.by_name.get(name).cloned().unwrap_or_default();
 
         if let Some(qual) = qual {
-            hits.retain(|s| {
-                let Some(sym) = self.syms.get(*s) else {
-                    return false;
-                };
-                let Some(file) = self.files.get(sym.file) else {
-                    return false;
-                };
+            hits.retain(|s| self.in_qualifier(*s, qual));
 
-                sym.parent.as_deref() == Some(qual)
-                    || file.path.contains(qual)
-                    || qual
-                        .split("::")
-                        .all(|seg| file.segs.iter().any(|x| x == seg) || file.pkg == seg)
-            });
+            // the best reading that finds anything wins
+            let reading = |s: &usize| {
+                let top_level = self.syms.get(*s).is_some_and(|sym| sym.parent.is_none());
+
+                if self.syms.get(*s).is_some_and(|sym| sym.parent.as_deref() == Some(qual)) {
+                    0
+                } else if top_level {
+                    1
+                } else {
+                    2
+                }
+            };
+
+            if let Some(best) = hits.iter().map(reading).min() {
+                hits.retain(|s| reading(s) == best);
+            }
         }
 
         hits.sort_by_key(|s| {
@@ -1298,6 +1328,24 @@ impl Graph {
         });
 
         hits
+    }
+
+    /// True when the definition `s` is in what the qualifier `qual` names: the type that owns it, or a file whose
+    /// path, module path or package holds it.
+    fn in_qualifier(&self, s: usize, qual: &str) -> bool {
+        let Some(sym) = self.syms.get(s) else {
+            return false;
+        };
+        let Some(file) = self.files.get(sym.file) else {
+            return false;
+        };
+
+        sym.parent.as_deref() == Some(qual)
+            || file.path.contains(qual)
+            || (qual.contains('.') && file.path.contains(&qual.replace('.', "/")))
+            || qual
+                .split("::")
+                .all(|seg| file.segs.iter().any(|x| x == seg) || file.pkg == seg)
     }
 
     /// TS module specifier -> files it can mean. `None` = not found among the repository's relative paths and

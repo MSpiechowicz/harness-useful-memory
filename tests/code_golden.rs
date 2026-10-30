@@ -47,6 +47,10 @@
 //! through = ["git_file_lines (by name)", "file_lines"]  # lines start with these, in this order
 //! not_through = ["Dialogs::len"]   # no line starts with these
 //! reverse = true                   # the chain is the other way round (the answer says so)
+//! contains = ["via subclass/impl"] # raw substrings of the output
+//! not_contains = ["(by name)"]     # raw substrings the output lacks
+//! text_only = true                 # the answer is no chain (candidates, no chain found): only `contains` and
+//!                                  # `not_contains` are checked
 //! ```
 
 use std::collections::BTreeMap;
@@ -123,6 +127,9 @@ struct PathFact {
     through: Vec<String>,
     not_through: Vec<String>,
     reverse: bool,
+    contains: Vec<String>,
+    not_contains: Vec<String>,
+    text_only: bool,
 }
 
 /// One checked statement, for the report.
@@ -425,6 +432,26 @@ fn check_path(graph: &Graph, fact: &PathFact, report: &mut Report) {
     let label = format!("path {} -> {}", fact.from, fact.to);
     let head = text.lines().next().unwrap_or_default();
 
+    for wanted in &fact.contains {
+        report.push(
+            format!("{label}: shows `{wanted}`"),
+            &fact.pending,
+            (!text.contains(wanted.as_str())).then(|| format!("missing from\n{text}")),
+        );
+    }
+
+    for unwanted in &fact.not_contains {
+        report.push(
+            format!("{label}: lacks `{unwanted}`"),
+            &fact.pending,
+            text.contains(unwanted.as_str()).then(|| format!("present in\n{text}")),
+        );
+    }
+
+    if fact.text_only {
+        return;
+    }
+
     if let Some(hops) = fact.hops {
         let wanted = format!(": {hops} {}", if hops == 1 { "hop" } else { "hops" });
 
@@ -437,6 +464,7 @@ fn check_path(graph: &Graph, fact: &PathFact, report: &mut Report) {
 
     let reversed = head.starts_with("no chain from");
     let none = head.starts_with("no chain within")
+        || head.starts_with("the words do not name one definition")
         || head.starts_with("no definition")
         || head.starts_with("No symbol, file or command matches");
 
@@ -680,6 +708,8 @@ fixture_tests! {
     fixture_sveltekit, pending_fixture_sveltekit, snapshot_fixture_sveltekit => "sveltekit";
     fixture_ts_namespace, pending_fixture_ts_namespace, snapshot_fixture_ts_namespace => "ts-namespace";
     fixture_esm_js, pending_fixture_esm_js, snapshot_fixture_esm_js => "esm-js";
+    fixture_dispatch, pending_fixture_dispatch, snapshot_fixture_dispatch => "dispatch";
+    fixture_bridge, pending_fixture_bridge, snapshot_fixture_bridge => "bridge";
 }
 
 // ---- the public repositories ----------------------------------------------------------------------------

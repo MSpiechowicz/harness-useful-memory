@@ -88,6 +88,7 @@ impl Graph {
                         qual: None,
                         recv: None,
                         line: 0,
+                        handler: false,
                     };
 
                     self.resolve_ref(&call)
@@ -131,6 +132,7 @@ impl Graph {
             qual: member.map(str::to_string),
             recv: None,
             line: 0,
+            handler: false,
         };
         let mut targets: Vec<usize> = self
             .resolve_ref(&value)

@@ -113,14 +113,19 @@ pub struct Ref {
     pub name: String,
     /// `call`, `mcall`, `macro`, `type`, `new`, `component`, `str` (a string literal naming a symbol), `use`,
     /// `fnref` (a function passed as a value), `prop` (a function kept in a property of an object literal:
-    /// `name` is the property, `qual` the value as written, `recv` the function the literal is passed to) or
-    /// `word` (a short plain-word string literal inside a definition, see [`word_like`]).
+    /// `name` is the property, `qual` the value as written, `recv` the function the literal is passed to),
+    /// `base` (a type derives from or implements another: `name` is the base, `qual` the derived type, see
+    /// [`push_base`]) or `word` (a short plain-word string literal inside a definition, see [`word_like`]).
     pub kind: &'static str,
     /// `git` in `git::diff()`, `Env` in `Env::new()`, `Foo` in `Foo.bar()`.
     pub qual: Option<String>,
     /// The receiver variable of a method call (filled by the receiver-type speed-up).
     pub recv: Option<String>,
     pub line: usize,
+    /// A mention of a constant (a `use`, or a Go name qualified by its package) written where something is
+    /// handled: a `case` label, an operand of an equality test or the pattern of an `if let` (see [`handled`]).
+    /// False for everything else.
+    pub handler: bool,
 }
 
 /// A name brought into a file.
@@ -597,6 +602,17 @@ pub(super) fn push_ref(
     push_ref_recv(out, from, name, kind, qual, None, line);
 }
 
+/// Appends the fact that the type `derived` extends, implements or derives from the type `base` (a Python
+/// base class, a TS `extends` or `implements`, a Rust `impl Trait for Type`). It is no use of the base: the
+/// graph only reads it to let a call on a base method also reach the overrides.
+pub(super) fn push_base(out: &mut Extract, derived: &str, base: &str, line: usize) {
+    if derived.is_empty() || derived == base {
+        return;
+    }
+
+    push_ref(out, None, base, "base", Some(derived.to_string()), line);
+}
+
 /// Appends a reference with the expression its receiver was written as (a method call, or a qualified call).
 pub(super) fn push_ref_recv(
     out: &mut Extract,
@@ -625,7 +641,110 @@ pub(super) fn push_ref_recv(
         qual,
         recv,
         line,
+        handler: false,
     });
+}
+
+/// Appends a mention of a constant, `handler` saying that it is written where something is handled.
+pub(super) fn push_use(
+    out: &mut Extract,
+    from: Option<usize>,
+    name: &str,
+    qual: Option<String>,
+    node: Node,
+    src: &[u8],
+) {
+    if name.is_empty() {
+        return;
+    }
+
+    if !fits(name) {
+        out.dropped += 1;
+
+        return;
+    }
+
+    out.add_ref(Ref {
+        from,
+        name: name.to_string(),
+        kind: "use",
+        qual,
+        recv: None,
+        line: node.start_position().row + 1,
+        handler: handled(node, src),
+    });
+}
+
+/// How far up from a mention [`handled`] looks.
+const MAX_HANDLER_CLIMB: usize = 8;
+
+/// Nodes that only wrap a name or a list of names on the way to a `case` label or a comparison.
+const WRAPPERS: &[&str] = &[
+    "parenthesized_expression",
+    "expression_list",
+    "member_expression",
+    "selector_expression",
+    "attribute",
+    "dotted_name",
+    "scoped_identifier",
+    "tuple_struct_pattern",
+    "tuple_pattern",
+    "struct_pattern",
+    "or_pattern",
+    "reference_pattern",
+    "field_pattern",
+    "union_pattern",
+    "class_pattern",
+    "tuple",
+    "list",
+    "set",
+    "array",
+];
+
+/// True when the mention `node` of a constant is written where something is handled, not where it is sent or
+/// passed on: the label of a `case` (Go and TS `switch`, Go `select`, a Rust `match` arm, a Python `match`), an
+/// operand of an equality test (`==`, `!=`, `===`, `!==`, and `in` and `is` in Python) or the pattern of a
+/// Rust `if let`. An event is set in one definition and handled in another: only the handling one is where
+/// the event leads to.
+pub(super) fn handled(node: Node, src: &[u8]) -> bool {
+    let mut child = node;
+
+    for _ in 0..MAX_HANDLER_CLIMB {
+        let Some(parent) = child.parent() else {
+            return false;
+        };
+        let within = |field: &str| {
+            parent
+                .child_by_field_name(field)
+                .is_some_and(|inner| inner.id() == child.id())
+        };
+
+        match parent.kind() {
+            "expression_case" | "switch_case" => return within("value"),
+            "communication_case" => return within("communication") && child.kind() != "send_statement",
+            "match_pattern" => return !within("condition"),
+            "let_condition" => return within("pattern"),
+            "case_pattern" => return true,
+            "binary_expression" => {
+                return parent
+                    .child_by_field_name("operator")
+                    .is_some_and(|op| matches!(text(op, src), "==" | "!=" | "===" | "!=="));
+            }
+            "comparison_operator" => {
+                let mut cursor = parent.walk();
+
+                return parent
+                    .children(&mut cursor)
+                    .any(|op| matches!(op.kind(), "==" | "!=" | "in" | "not in" | "is" | "is not"));
+            }
+            kind if WRAPPERS.contains(&kind) => {}
+            _ => return false,
+        }
+
+        child = parent;
+    }
+
+    false
 }
 
 /// Appends a variable, parameter or field whose type is written (`ty`) or follows from `=expr`.
@@ -927,6 +1046,42 @@ mod tests {
 
     fn run(path: &str, src: &str) -> Extract {
         extract(&mut Parser::new(), path, src)
+    }
+
+    /// Whether each mention of `name` in `src` is where something is handled, in order.
+    fn handlers(path: &str, src: &str, name: &str) -> Vec<bool> {
+        run(path, src)
+            .refs
+            .into_iter()
+            .filter(|r| r.name == name && r.kind != "base")
+            .map(|r| r.handler)
+            .collect()
+    }
+
+    #[test]
+    fn a_constant_is_handled_in_a_case_label_or_an_equality_test_and_only_passed_on_elsewhere() {
+        let go = "package p\nimport \"example.com/events\"\nfunc f(k string) {\n\tswitch k {\n\tcase events.Ping, Pong:\n\t}\n\tselect {\n\tcase ch <- Pong:\n\t}\n\tif k != Pong {\n\t}\n\tlog(Pong)\n\tx := events.Ping\n}\n";
+
+        // Pong: case label, a send in select, `!=`, an argument. events.Ping: case label, an assignment
+        assert_eq!(handlers("a.go", go, "Pong"), [true, false, true, false]);
+        assert_eq!(handlers("a.go", go, "Ping"), [true, false]);
+
+        let ts = "function f(k) {\n  switch (k) {\n    case Evt.New:\n    case PING:\n  }\n  if (k === PING || k !== Evt.New) {}\n  log(PING, Evt.New);\n}\n";
+
+        assert_eq!(handlers("a.ts", ts, "PING"), [true, true, false]);
+        assert_eq!(handlers("a.ts", ts, "New"), [true, true, false]);
+
+        let py = "def f(k):\n    match k:\n        case Color.RED | Color.BLUE:\n            pass\n    if k == PING or k in (PING, PONG) or k is not PONG:\n        pass\n    log(PING)\n";
+
+        assert_eq!(handlers("a.py", py, "PING"), [true, true, false]);
+        assert_eq!(handlers("a.py", py, "RED"), [true]);
+        assert_eq!(handlers("a.py", py, "PONG"), [true, true]);
+
+        let rs = "fn f(k: u8) {\n    match k {\n        PING => {}\n        Evt::New(_) if g(PING) => {}\n        _ => {}\n    }\n    if let Evt::Done = k {}\n    if k == PING {}\n    run(PING, Evt::New);\n}\n";
+
+        assert_eq!(handlers("a.rs", rs, "PING"), [true, false, true, false]);
+        assert_eq!(handlers("a.rs", rs, "New"), [true, false]);
+        assert_eq!(handlers("a.rs", rs, "Done"), [true]);
     }
 
     /// The signature stored for the definition named `name` in `src`.

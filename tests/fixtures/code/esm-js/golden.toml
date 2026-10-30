@@ -42,6 +42,15 @@ through = ["runCommand", "createCommandRunner", "doctor", "runDoctorSetup", "cod
 [[path]]
 from = "/useful-skills doctor"
 to = "harness-memory features"
-note = "words, no symbol: `doctor` is a function of command-core.js (also the literal written in runCommand), and `harness-memory` and `features` are the literals probeCodeGraph passes to execute at doctor-setup.js:8; command-core.js:4 calls host.runDoctor (runDoctorSetup), :27 codeGraphStep, :22 services.probeCodeGraph"
+note = "words, no symbol: nothing holds `useful-skills`, so it is not counted. `doctor` is a function of command-core.js (also the literal written in runCommand), and `harness-memory` and `features` are the literals probeCodeGraph passes to execute at doctor-setup.js:8. command-core.js:4 calls host.runDoctor (runDoctorSetup), :27 codeGraphStep, :22 services.probeCodeGraph"
 hops = 3
 through = ["doctor", "runDoctorSetup", "codeGraphStep", "probeCodeGraph"]
+contains = ["from: words `doctor` → doctor command-core.js:3", "(no match: `useful-skills`)"]
+
+[[path]]
+from = "doctor setup"
+to = "harness-memory features"
+note = "words, no symbol: runDoctorSetup (doctor-setup.js:26) holds `doctor` and `setup` in its name, `harness-memory` and `features` are the literals probeCodeGraph passes to execute at doctor-setup.js:8, and :27 calls codeGraphStep, :22 services.probeCodeGraph"
+hops = 2
+through = ["runDoctorSetup", "codeGraphStep", "probeCodeGraph"]
+contains = ["endpoints guessed from words: check the first and last hop"]

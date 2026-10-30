@@ -1,0 +1,110 @@
+---
+source: tests/code_golden.rs
+expression: "fixture_output(\"bridge\")"
+---
+== map
+go/events.go
+  Box struct
+  func GoSend(box *Box)
+  func GoLog(sink []string) []string
+  func GoHandle(kind string) bool
+  func GoIsPing(kind string) bool
+  EvtGoPing = "…"
+py/events.py
+  def py_send(bus):
+  def py_log(lines):
+  def py_is_ping(kind):
+  def py_is_known(kind):
+  EVT_PY_PING = "…"
+rs/src/lib.rs
+  pub fn rs_send(bus: &mut Vec<u8>)
+  pub fn rs_log() -> String
+  pub fn rs_handle(kind: u8) -> bool
+  pub fn rs_is_ping(kind: u8) -> bool
+  pub const EVT_RS_PING: u8 = 1;
+ts/events.ts
+  function tsSend(bus: string[])
+  function tsLog(lines: string[])
+  function tsHandle(kind: string)
+  function tsIsPing(kind: string)
+  EVT_TS_PING = "…"
+
+== path GoSend -> GoHandle
+`GoSend` → `GoHandle`: 2 hops
+    GoSend  go/events.go:7
+  → EvtGoPing  go/events.go:4
+        at go/events.go:8 | box.last = EvtGoPing
+  → GoHandle  go/events.go:17
+        at go/events.go:19 | case EvtGoPing:
+
+== path GoSend -> GoIsPing
+`GoSend` → `GoIsPing`: 2 hops
+    GoSend  go/events.go:7
+  → EvtGoPing  go/events.go:4
+        at go/events.go:8 | box.last = EvtGoPing
+  → GoIsPing  go/events.go:27
+        at go/events.go:28 | return kind == EvtGoPing
+
+== path GoSend -> GoLog
+no chain within 6 hops between `GoSend` and `GoLog` (tried both directions)
+got as far as GoSend → EvtGoPing → GoHandle (2 hops, 4 reached) go/events.go:17
+
+== path tsSend -> tsHandle
+`tsSend` → `tsHandle`: 2 hops
+    tsSend  ts/events.ts:3
+  → EVT_TS_PING  ts/events.ts:1
+        at ts/events.ts:4 | bus.push(EVT_TS_PING);
+  → tsHandle  ts/events.ts:12
+        at ts/events.ts:14 | case EVT_TS_PING:
+
+== path tsSend -> tsIsPing
+`tsSend` → `tsIsPing`: 2 hops
+    tsSend  ts/events.ts:3
+  → EVT_TS_PING  ts/events.ts:1
+        at ts/events.ts:4 | bus.push(EVT_TS_PING);
+  → tsIsPing  ts/events.ts:21
+        at ts/events.ts:22 | return kind === EVT_TS_PING;
+
+== path tsSend -> tsLog
+no chain within 6 hops between `tsSend` and `tsLog` (tried both directions)
+got as far as tsSend → EVT_TS_PING → tsHandle (2 hops, 4 reached) ts/events.ts:12
+
+== path py_send -> py_is_ping
+`py_send` → `py_is_ping`: 2 hops
+    py_send  py/events.py:4
+  → EVT_PY_PING  py/events.py:1
+        at py/events.py:5 | bus.append(EVT_PY_PING)
+  → py_is_ping  py/events.py:13
+        at py/events.py:14 | return kind == EVT_PY_PING
+
+== path py_send -> py_is_known
+`py_send` → `py_is_known`: 2 hops
+    py_send  py/events.py:4
+  → EVT_PY_PING  py/events.py:1
+        at py/events.py:5 | bus.append(EVT_PY_PING)
+  → py_is_known  py/events.py:17
+        at py/events.py:18 | return kind in (EVT_PY_PING, "…")
+
+== path py_send -> py_log
+no chain within 6 hops between `py_send` and `py_log` (tried both directions)
+got as far as py_send → EVT_PY_PING → py_is_ping (2 hops, 4 reached) py/events.py:13
+
+== path rs_send -> rs_handle
+`rs_send` → `rs_handle`: 2 hops
+    rs_send  rs/src/lib.rs:3
+  → EVT_RS_PING  rs/src/lib.rs:1
+        at rs/src/lib.rs:4 | bus.push(EVT_RS_PING);
+  → rs_handle  rs/src/lib.rs:12
+        at rs/src/lib.rs:14 | EVT_RS_PING => true,
+
+== path rs_send -> rs_is_ping
+`rs_send` → `rs_is_ping`: 2 hops
+    rs_send  rs/src/lib.rs:3
+  → EVT_RS_PING  rs/src/lib.rs:1
+        at rs/src/lib.rs:4 | bus.push(EVT_RS_PING);
+  → rs_is_ping  rs/src/lib.rs:19
+        at rs/src/lib.rs:20 | kind == EVT_RS_PING
+
+== path rs_send -> rs_log
+no chain within 6 hops between `rs_send` and `rs_log` (tried both directions)
+got as far as rs_send → EVT_RS_PING → rs_handle (2 hops, 4 reached) rs/src/lib.rs:12

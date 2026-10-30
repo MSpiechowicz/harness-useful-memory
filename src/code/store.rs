@@ -35,7 +35,11 @@ use super::walk::{Entry, TOO_LARGE};
 /// may open a regular expression (a literal after one used to be kept).
 /// 11: `prop` references, a function kept in a property of an object literal (`{ key: fn }`).
 /// 12: `word` references, a short plain-word string literal inside a definition (`"doctor"`, `"git status"`).
-pub const SCHEMA_VERSION: i64 = 12;
+/// 13: `base` references (a type extends or implements another: Python base classes, TS `extends` and
+/// `implements`, Rust `impl Trait for Type`), and the name a Python `with` statement binds (`as client`).
+/// 14: `refs.handler`, a mention of a constant written where something is handled (a `case` label, an operand
+/// of an equality test, the pattern of an `if let`): a shared constant bridges `code_path` only to those.
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// The refusal of a file written by a newer harness-memory.
 pub const NEWER: &str = "the code index was written by a newer harness-memory";
@@ -92,7 +96,8 @@ CREATE TABLE IF NOT EXISTS symbols(
 CREATE TABLE IF NOT EXISTS refs(
   id INTEGER PRIMARY KEY, repo_id INTEGER NOT NULL, file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
   from_symbol INTEGER REFERENCES symbols(id) ON DELETE CASCADE,
-  name TEXT NOT NULL, kind TEXT NOT NULL, qual TEXT, recv TEXT, line INTEGER NOT NULL);
+  name TEXT NOT NULL, kind TEXT NOT NULL, qual TEXT, recv TEXT, line INTEGER NOT NULL,
+  handler INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS binds(
   repo_id INTEGER NOT NULL, file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
   scope_symbol INTEGER, name TEXT NOT NULL, type TEXT NOT NULL, kind TEXT NOT NULL);
@@ -752,8 +757,8 @@ impl<'a> Txn<'a> {
         let mut insert = self
             .conn
             .prepare_cached(
-                "INSERT INTO refs(repo_id, file_id, from_symbol, name, kind, qual, recv, line) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO refs(repo_id, file_id, from_symbol, name, kind, qual, recv, line, handler) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )
             .map_err(db)?;
 
@@ -769,7 +774,8 @@ impl<'a> Txn<'a> {
                     reference.kind,
                     reference.qual,
                     reference.recv,
-                    reference.line as i64
+                    reference.line as i64,
+                    reference.handler
                 ])
                 .map_err(db)?;
         }

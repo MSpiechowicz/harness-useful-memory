@@ -229,6 +229,7 @@ pub(super) fn extract(parser: &mut Parser, lang: &'static TagLang, src: &str, ou
                     qual,
                     recv,
                     line,
+                    handler: false,
                 },
             ));
         }
@@ -285,6 +286,7 @@ pub(super) fn extract(parser: &mut Parser, lang: &'static TagLang, src: &str, ou
                         qual: None,
                         recv: None,
                         line: node.start_position().row + 1,
+                        handler: false,
                     },
                 ));
             }
@@ -306,6 +308,8 @@ pub(super) fn extract(parser: &mut Parser, lang: &'static TagLang, src: &str, ou
                         qual: Some(qual.to_string()),
                         recv: None,
                         line: field.start_position().row + 1,
+                        // `case events.EvtNew:` mentions a constant of the package, which reads like a call
+                        handler: super::handled(field, bytes),
                     },
                 ));
             }

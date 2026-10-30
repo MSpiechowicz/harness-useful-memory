@@ -4,7 +4,7 @@ use tree_sitter::{Node, Parser};
 
 use super::{
     DROPPED, Extract, Import, MAX_DEPTH, MAX_STR, Placement, constant_like, fits, ident_like, is_own_name, last_seg,
-    push_bind, push_def, push_mcall, push_ref, push_word, text, written_type,
+    push_base, push_bind, push_def, push_mcall, push_ref, push_use, push_word, text, written_type,
 };
 
 /// Reads a Rust file.
@@ -364,6 +364,17 @@ impl Walk<'_> {
 
                     return;
                 }
+
+                // `impl Trait for Type`: the type implements the trait
+                if let (Some(owner), Some(tr)) = (owner.as_deref(), node.child_by_field_name("trait")) {
+                    let tr = if tr.kind() == "generic_type" {
+                        tr.child_by_field_name("type").unwrap_or(tr)
+                    } else {
+                        tr
+                    };
+
+                    push_base(self.out, owner, &last_seg(text(tr, src)), line);
+                }
             }
             "use_declaration" => {
                 if let Some(argument) = node.child_by_field_name("argument") {
@@ -588,7 +599,7 @@ impl Walk<'_> {
                     && !is_own_name(node)
                     && !is_callee(node)
                 {
-                    push_ref(self.out, from, text(node, src), "use", None, line);
+                    push_use(self.out, from, text(node, src), None, node, src);
                 }
             }
             "scoped_identifier"
@@ -606,7 +617,7 @@ impl Walk<'_> {
                         _ => None,
                     };
 
-                    push_ref(self.out, from, name, "use", qual, line);
+                    push_use(self.out, from, name, qual, node, src);
                 }
             }
             "type_identifier" if !is_own_name(node) => {
@@ -751,5 +762,20 @@ mod tests {
                 ("git", "git", "crate::git"),
             ]
         );
+    }
+
+    #[test]
+    fn an_impl_of_a_trait_records_the_trait_for_the_type() {
+        let out = run(
+            "trait Sink { fn write(&self); }\nstruct F;\nimpl Sink for F { fn write(&self) {} }\nimpl<T> a::Wrap<T> for Vec<T> {}\nimpl F { fn own(&self) {} }\n",
+        );
+        let bases: Vec<(&str, &str)> = out
+            .refs
+            .iter()
+            .filter(|r| r.kind == "base")
+            .map(|r| (r.name.as_str(), r.qual.as_deref().unwrap_or("")))
+            .collect();
+
+        assert_eq!(bases, [("Sink", "F"), ("Wrap", "Vec")]);
     }
 }

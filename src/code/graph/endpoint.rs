@@ -40,6 +40,14 @@ pub(super) enum Reading {
     Words,
 }
 
+/// The candidates of an end made of words that name no one definition.
+pub(super) struct Unsure {
+    /// What was wrong, as `no definition holds all of a, b`.
+    pub why: String,
+    /// The best few definitions, one line each.
+    pub lines: Vec<String>,
+}
+
 /// The definitions an end of a query stands for.
 pub(super) struct Endpoint {
     pub reading: Reading,
@@ -49,6 +57,12 @@ pub(super) struct Endpoint {
     pub module_refs: Vec<usize>,
     /// What the text was taken for, when more than one definition stands for it.
     pub note: Option<String>,
+    /// Words that name no one definition (see `words`): `code_path` does not guess a chain from them.
+    pub unsure: Option<Unsure>,
+    /// What words were taken for when one definition alone is the end: the note of that definition.
+    pub sure_note: Option<String>,
+    /// How many of the first definitions are the end when words are not unsure.
+    pub sure: usize,
 }
 
 impl Endpoint {
@@ -58,6 +72,9 @@ impl Endpoint {
             syms: Vec::new(),
             module_refs: Vec::new(),
             note: None,
+            unsure: None,
+            sure_note: None,
+            sure: 0,
         }
     }
 
@@ -93,6 +110,9 @@ impl Graph {
                 syms: found,
                 module_refs: Vec::new(),
                 note,
+                unsure: None,
+                sure_note: None,
+                sure: 0,
             };
         }
 
@@ -195,6 +215,9 @@ impl Graph {
             syms,
             module_refs,
             note: Some(note),
+            unsure: None,
+            sure_note: None,
+            sure: 0,
         }
     }
 
@@ -236,6 +259,9 @@ impl Graph {
             syms,
             module_refs: Vec::new(),
             note: Some(note),
+            unsure: None,
+            sure_note: None,
+            sure: 0,
         }
     }
 

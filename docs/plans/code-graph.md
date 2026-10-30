@@ -271,13 +271,13 @@ of repository content.
 
 ### Deviations from the first draft
 
-- Schema version 11 instead of 3 (`PRAGMA user_version`; an older file is dropped and rebuilt). 2: receiver types
+- Schema version 14 instead of 3 (`PRAGMA user_version`; an older file is dropped and rebuilt). 2: receiver types
   (`binds`, `symbols.ret`, `refs.recv`); 3: `repos.used_at`; 4: the row totals and `too_large` on `repos`; 5: bindings
   in the repository totals; 6: `repos.validated_generation`, `repos.failed` and `builds.pid` for the worker process;
   7: no string literal value in a value signature; 8: no string literal content in any signature, no `str` reference
   that holds a credential format or has the digits of a random key, and `repos.validated_bytes` (the size of the
   graph a worker validated); 9: string literals in type positions (TS/JS and Python) are shown again, values stay
-  blanked; 10: the literal scan follows comments, parenthesised return types, Python lambda parameters and a `/` that may open a regular expression; 11: `prop` references (a function kept in a property of an object literal). The planned `refs(repo_id, name)` index was dropped.
+  blanked; 10: the literal scan follows comments, parenthesised return types, Python lambda parameters and a `/` that may open a regular expression; 11: `prop` references (a function kept in a property of an object literal); 12: `word` references; 13: `base` references; 14: `refs.handler` (see below). The planned `refs(repo_id, name)` index was dropped.
 - The walk lists folders itself (`std::fs::read_dir`, one entry at a time) instead of through the `ignore` crate's
   walker, whose sorting reads a whole folder, with full paths, before it yields an entry: the caps count what is read.
   A folder holds at most 50,000 entries (more is `repository too large to index`), the walk is at most 128 folders deep
@@ -440,7 +440,7 @@ of repository content.
 - Words as ends (schema 12, `graph/words.rs`): a text that is no symbol, file or known string is read as words.
   The text is cut into words (letters, digits, `_`, `-`; at least 3 characters; filler dropped: the, and, for,
   from, with, when, how, what, which, that, this, into, then, its, are, has, have, does, ask(s), file(s),
-  request(s), changed, user(s); at most 6), and each word is matched, without regard to case, against (a) the
+  changed, user(s); `request(s)` was one until schema 14; at most 6), and each word is matched, without regard to case, against (a) the
   names of definitions (the whole name, `runDoctorSetup` = `run-doctor-setup`, then a part of it by camel and
   snake segments; at most 64 definitions of one name) and (b) word literals: a string literal inside a definition
   that is one lowercase word or a short command (`^[a-z][a-z-]{2,31}$` or `^/?[a-z][a-z-]{1,30}( [a-z][a-z-]{1,30})?$`,
@@ -465,5 +465,85 @@ of repository content.
   (with similar names suggested as before when there are some). The instruction line and the `code_path`
   description now say the ends may be plain words and that a grep for a starting point should become a `code_path`
   call from it (instructions 1,995 characters with the English line on, description at most 220).
+- Strict words, package ends, overrides and no-chain progress (schema 13), after the benchmark regressed (17/21 and
+  2,430k tokens against 20/21 and 1,896k) on three traces: fzf `terminal input reading` -> `fuzzy match algorithm`
+  built a chain on the single word `match`, `httpx.get` meant the 6 methods named `get`, and a call on a
+  `BaseTransport` never reached `HTTPTransport.handle_request`. This replaces the guessing of "Words as ends" above:
+  - Schema 13: `base` references, one per class base (Python, also `a.Base` and `Base[T]`), TS `extends` / `implements`
+    (class and interface) and Rust `impl Trait for Type`: `name` = the base, `qual` = the derived type. They are
+    no references of the graph (not loaded into `Graph.refs`). Python `with Client() as client` binds `client` like
+    `client = Client()`, which the `httpx.get` chain needs (`request` opens its client that way). Go has no
+    overrides: its interfaces are satisfied without being named.
+  - Words (`words.rs`): every word must match, by the name, a word literal or, newly, a part of the path of the file
+    (the lowest tier, only for a definition that another word found). The end is one definition only when it alone
+    holds every word and beats the next one on (production, kind, words, strength), or when the definitions that tie
+    share one name (`git_file_lines` in two files). Otherwise the end is unsure: `code_symbol` and `code_impact`
+    use the ranked list as before, `code_path` answers `the words do not name one definition, so no chain is
+    guessed`, up to 5 candidates per unsure end as `name path:line  (words held)`, and asks to call again with a
+    name. A chain built from words says `endpoints guessed from words: check the first and last hop` and takes only
+    the sure definitions as ends (the slack search over eight starts is gone). More filler words are dropped (about,
+    can, did, will, would, there, their, where, why ...). The local goldens that expected a chain from
+    `/useful-skills doctor` (one word of it, `useful-skills`, matches no definition) were rewritten to expect the list.
+  - `package.function` (`Graph::find`): a qualifier is read as the owning type first (`Client.get`), then as a module or
+    package (`httpx.get` = top-level `get` of a file under a folder `httpx`, a file stem, a Rust module path or a
+    crate), then as any part of a path; the first reading that finds anything wins.
+  - Overrides (`graph/dispatch.rs`): `Graph.bases` maps (language, base) to its derived types (64 per base, 200,000 in
+    all). `Graph::overrides(method)` walks the derived types breadth first (at most 64 types) and returns the methods
+    of the same name owned by them (production first, at most 8). They are weak links: no edge, no caller, no rank
+    or impact, only `code_path` follows them, in a second search after the strong links (production strong, production
+    with overrides, tests strong, tests with overrides), so a longer chain of calls beats a shorter one through an
+    override. The hop reads `Sub::m (via subclass/impl of Base::m)`.
+  - No chain: after both directions fail the reply adds the furthest point reached from the start (a definition that
+    makes a call named like the goal and was not followed first, then one with calls not followed, then the furthest),
+    the way to it, how many definitions were reached and the calls there that the repository defines but no strong
+    link follows (`send (3 defs)`, at most 6). `stopped at max_depth: raise it to go on` when the search ended at the
+    depth limit. The real `httpx.get` -> `HTTPTransport.handle_request` is 7 hops: found with `max_depth` 7 and up,
+    and at the default 6 the reply gets as far as `Client::_send_single_request` and says so.
+- Handlers only, softer words and bounded overrides (schema 14), after a security review and the benchmark:
+  - Schema 14: `refs.handler`, set on a mention of a constant (a `use`, and in Go a name qualified by its package) that
+    is written where something is handled: the label of a `case` (Go `expression_case` and `communication_case`
+    other than a send, TS/JS `switch_case`, a Rust `match` arm pattern without its guard, a Python `match` `case`
+    pattern, so `case Color.RED:` is now a `use` of `RED` with the qualifier `Color`), an operand of an equality test (`==`,
+    `!=`, `===`, `!==`; Python `==`, `!=`, `in`, `not in`, `is`, `is not`) or the pattern of a Rust `if let` / `while let`.
+    `matches!(x, Evt::New)` is not recognised (a macro body is a flat token list). A shared constant bridges
+    `code_path` only to the definitions that mention it like that: `Terminal::Loop` -> `FuzzyMatchV2` in fzf no longer
+    runs through `ExitError` and `main` (`exit(fzf.ExitError, err)` is an argument), while `t.eventBox.Set(EvtSearchNew,
+    ..)` -> `case EvtSearchNew:` still links the two. Fixture `bridge` covers Go, TS, Python and Rust.
+  - Overrides: a search keeps the overrides of each method it asked for (`Overrides`, one per query), the loop in
+    `steps()` asks once per target, `overrides()` reads at most 16 methods of one type and stops once 8 production
+    overrides are found. A class redefined in thousands of files with a hub of thousands of calls on its base answered
+    in 30 s, now in milliseconds (`hostile.rs`).
+  - Words: a word that no definition holds (in names, word literals or the path of the file of a definition another
+    word found) is not counted, and neither is a very common one (held by more than 500 definitions, or by more than
+    a twentieth of them and more than 20). The rest must all be held. `request(s)` is no filler word any more (it made
+    `HTTP request` mean `http`). A folder or name part matches in the singular and the plural (`component` finds
+    `src/components`). Ranking: test code last, kind, number of words, then words carried by the name (twice a word
+    only a string or folder holds), then the definition that names its file (`ApplicationDashboard` in
+    `ApplicationDashboard.tsx`), then strength; among equals the definition used in more places comes first. The
+    definitions of the lead's name are one end (`request` in two files), as long as the best definition of another name
+    ranks lower. The answer lists the words that were not counted (`not counted, none or too many hold them: x`).
+    The weights are `saturating_sub` and `u64`: 2,048 holders of a word used to underflow.
 - `code hint` (harness-memory 2.10): `features` gains `code-hint`. `src/code/hint.rs` opens `code.sqlite3` read-only
   (no write, no folder, no worker, no graph) and asks `symbols(repo_id, name)` once: see the README.
+
+## Status 2026-10-30 (night run, before local testing)
+
+Flow check, arm c, 7 flow tasks × 3 (`bench/ab/run.sh --arms c --repeat 3`, records copied to the gitignored
+`bench/local/results/`):
+
+| run | correct | input tokens | cost |
+|---|---|---|---|
+| before word endpoints | 20/21 | 1,896k | $1.265 |
+| words + call-site lines | 17/21 | 2,430k | $1.475 |
+| strict words, module functions, overrides, progress | 21/21 | 2,256k | $1.410 |
+| + handler-only bridges, softer words, DoS fixes (current) | 20/21 | 2,161k | $1.118 |
+
+Chains are more correct (httpx `get` → `HTTPTransport.handle_request`, no backwards chains through shared
+constants such as fzf `ExitError`), cost is 12% below the earlier run, input tokens are still 14% above it. The
+remaining cost comes from agents that start `code_path` with vague words, get a candidate list and grep. Next ideas:
+steer the tool/hook text toward names over words, and look at the desktop flow task (180k per run).
+
+Open Low findings from the second security pass (not fixed, for the user to decide):
+- L1 `dispatch.rs` override walk redone per distinct method; memoise subtypes per (lang, owner).
+- L2 `words.rs` `match_paths`/`has_part` re-checks the path per matched definition; compute once per file.
+- L3 `extract/python.rs` quadratic join for a long dotted name in a `case` pattern; stop past `MAX_STR`.

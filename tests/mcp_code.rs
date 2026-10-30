@@ -285,16 +285,17 @@ fn a_path_takes_the_words_of_a_question_and_a_text_that_matches_nothing_gets_gui
     )
     .expect("flow");
 
-    let words = path(
-        &mut server,
-        &machine.repo,
-        "/useful-skills doctor",
-        "harness-memory features",
-    );
+    let words = path(&mut server, &machine.repo, "doctor setup", "harness-memory features");
     assert!(!is_error(&words), "{words}");
     assert!(
+        text(&words).starts_with(
+            "`doctor setup` → `harness-memory features`: 1 hop\nfrom: words `doctor`, `setup` → run_doctor_setup src/flow.rs:2\n"
+        ),
+        "{}",
         text(&words)
-            .starts_with("`/useful-skills doctor` → `harness-memory features`: 2 hops\nfrom: words `doctor` → "),
+    );
+    assert!(
+        text(&words).contains("endpoints guessed from words: check the first and last hop\n"),
         "{}",
         text(&words)
     );
@@ -303,6 +304,22 @@ fn a_path_takes_the_words_of_a_question_and_a_text_that_matches_nothing_gets_gui
             .contains("  → probe  src/flow.rs:3\n        at src/flow.rs:2 | fn run_doctor_setup() { probe(); }\n"),
         "{}",
         text(&words)
+    );
+
+    // a word that nothing holds is not counted: `doctor` leads the end, and the reply says what found nothing
+    let vague = path(
+        &mut server,
+        &machine.repo,
+        "/useful-skills doctor",
+        "harness-memory features",
+    );
+    assert!(!is_error(&vague), "{vague}");
+    assert!(
+        text(&vague).starts_with(
+            "`/useful-skills doctor` → `harness-memory features`: 1 hop\nfrom: words `doctor` → run_doctor_setup src/flow.rs:2 (no match: `useful-skills`)\n"
+        ),
+        "{}",
+        text(&vague)
     );
 
     let none = path(&mut server, &machine.repo, "zzqq unknown words", "probe");
@@ -348,7 +365,7 @@ fn a_path_names_every_hop_with_its_location_and_tries_the_other_direction() {
 
     let none = path(&mut server, &machine.repo, "first", "lonely");
     assert!(!is_error(&none), "{none}");
-    assert!(text(&none).starts_with("no chain within 6 hops"), "{}", text(&none));
+    assert!(text(&none).starts_with("no chain within 8 hops"), "{}", text(&none));
 
     let short = tool(
         &mut server,

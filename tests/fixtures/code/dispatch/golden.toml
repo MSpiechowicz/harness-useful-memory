@@ -1,0 +1,117 @@
+# Calls on a base class, interface or trait method also reach the overrides (weak links, `via subclass/impl`),
+# `package.function` ends prefer the function of the package over methods of the same name, words that fit
+# several definitions get candidates instead of a chain, and a missing chain says how far the search got.
+# Every fact was read from the files of this folder.
+
+# ---- package.function ends -------------------------------------------------------------------------------------
+
+[[symbol]]
+query = "httpx_like.get"
+note = "the function `get` of _api.py (line 9), in the package folder httpx_like, not Client.get or Headers.get"
+defined = "py/httpx_like/_api.py:9"
+uses = ["request"]
+
+[[path]]
+from = "httpx_like.get"
+to = "open_connection"
+note = "get (_api.py:9) calls request (:4), whose with-statement makes `client` a Client (:6), Client.request (_client.py:13) calls self.send (:14), which calls transport.handle_request on a BaseTransport parameter (:20), and HTTPTransport.handle_request (_transports.py:10) calls open_connection (:11)"
+hops = 5
+through = ["get", "request", "Client::request", "Client::send", "HTTPTransport::handle_request (via subclass/impl of BaseTransport::handle_request)", "open_connection"]
+not_through = ["Client::get", "Headers::get"]
+contains = ["        at py/httpx_like/_client.py:20 | return transport.handle_request(url)"]
+
+# ---- inheritance and interface dispatch -------------------------------------------------------------------------
+
+[[path]]
+from = "Client.send"
+to = "HTTPTransport.handle_request"
+note = "Client.send calls handle_request on a BaseTransport (_client.py:20): the base method and every subclass override, HTTPTransport's (_transports.py:10) among them"
+hops = 1
+through = ["Client::send", "HTTPTransport::handle_request (via subclass/impl of BaseTransport::handle_request)"]
+
+[[path]]
+from = "Client.send"
+to = "MockTransport.handle_request"
+note = "the other override of the same base method"
+hops = 1
+through = ["Client::send", "MockTransport::handle_request (via subclass/impl of BaseTransport::handle_request)"]
+
+[[path]]
+from = "Client.send"
+to = "BaseTransport.handle_request"
+note = "the base method is reached by the strong link: no override is named"
+hops = 1
+through = ["Client::send", "BaseTransport::handle_request"]
+not_contains = ["via subclass/impl"]
+
+[[path]]
+from = "alert"
+to = "EmailNotifier.send"
+note = "alert (app.ts:3) calls send on a Notifier parameter (:4), an interface that EmailNotifier implements (notify.ts:5, send at :6)"
+hops = 1
+through = ["alert", "EmailNotifier::send (via subclass/impl of Notifier::send)"]
+
+[[path]]
+from = "alert"
+to = "deliverText"
+note = "through SmsNotifier.send (notify.ts:12), which calls deliverText (:13)"
+hops = 2
+through = ["alert", "SmsNotifier::send (via subclass/impl of Notifier::send)", "deliverText"]
+
+[[path]]
+from = "start"
+to = "shout"
+note = "start (app.ts:7) calls run on a Base (:8), Loud (notify.ts:21) extends it and its run (:22) calls shout (:23)"
+hops = 2
+through = ["start", "Loud::run (via subclass/impl of Base::run)", "shout"]
+
+[[path]]
+from = "log_line"
+to = "flush_to_disk"
+note = "log_line (lib.rs:19) calls write on a dyn Sink (:20), FileSink implements Sink (:7) and its write (:8) calls flush_to_disk (:9)"
+hops = 2
+through = ["log_line", "FileSink::write (via subclass/impl of Sink::write)", "flush_to_disk"]
+
+# ---- words ------------------------------------------------------------------------------------------------------
+
+[[path]]
+from = "mail invoice"
+to = "format total"
+note = "mail_invoice alone holds `mail` and `invoice` (render_invoice holds only `invoice`), format_total alone holds `format` and `total`: mail_invoice (billing.py:1) -> render_invoice (:5) -> format_total (:13)"
+hops = 2
+through = ["mail_invoice", "render_invoice", "format_total"]
+contains = ["endpoints guessed from words: check the first and last hop"]
+
+[[path]]
+from = "render"
+to = "format total"
+note = "render_invoice (billing.py:5) and render_receipt (:9) both hold `render`: no chain is guessed"
+text_only = true
+contains = [
+  "several definitions hold all of render. Closest:",
+  "render_invoice words/billing.py:5  (render)",
+  "render_receipt words/billing.py:9  (render)",
+  "Call code_path again with one of these names",
+]
+not_contains = ["hop", "format_total"]
+
+[[path]]
+from = "render invoice receipt"
+to = "format_total"
+note = "no definition holds all three words: the candidates are listed"
+text_only = true
+contains = ["no definition holds all of render, invoice, receipt. Closest:", "render_invoice words/billing.py:5"]
+not_contains = ["hop"]
+
+# ---- no chain: how far the search got ---------------------------------------------------------------------------
+
+[[path]]
+from = "render_receipt"
+to = "mail_invoice"
+note = "render_receipt (billing.py:9) calls format_total (:13), which calls audit, defined in three folders (audit_a, audit_b, audit_c), too ambiguous to follow; nothing calls mail_invoice"
+text_only = true
+contains = [
+  "no chain within 6 hops between `render_receipt` and `mail_invoice`",
+  "got as far as render_receipt → format_total (1 hop, 2 reached) words/billing.py:13",
+  "not followed from format_total: audit (3 defs)",
+]

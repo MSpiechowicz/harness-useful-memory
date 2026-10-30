@@ -708,39 +708,174 @@ fn doctor_repo() -> Repo {
 }
 
 #[test]
-fn words_that_name_no_symbol_stand_for_the_definitions_that_hold_them_and_the_answer_says_so() {
+fn words_that_one_definition_alone_holds_are_its_end_and_the_chain_says_it_was_guessed() {
     let mut repo = doctor_repo();
-    let answer = repo.graph().path("/useful-skills doctor", "harness-memory features", 6);
+    let answer = repo.graph().path("doctor setup", "harness-memory features", 6);
 
-    assert!(answer.contains(": 3 hops\n"), "{answer}");
+    assert!(answer.contains(": 2 hops\n"), "{answer}");
     assert!(
-        answer.contains("from: words `doctor` → runCommand src/command.ts:3, runDoctorSetup src/setup.ts:1"),
+        answer.contains("from: words `doctor`, `setup` → runDoctorSetup src/setup.ts:1\n"),
         "{answer}"
     );
-    assert!(answer.contains("(no match: `useful-skills`)"), "{answer}");
     assert!(
         answer.contains("to: words `harness-memory`, `features` → probeCodeGraph src/setup.ts:9\n"),
         "{answer}"
     );
-
-    // the chain starts at the command the question names, not at a helper that is nearer
-    assert!(answer.contains("    runCommand  src/command.ts:3\n  → runDoctorSetup  src/setup.ts:1\n"));
-    assert!(answer.contains("        at src/command.ts:4 | return argv[0] === \"…\" ? runDoctorSetup() : 0;\n"));
     assert!(
-        answer.contains("  → probeCodeGraph  src/setup.ts:9\n        at src/setup.ts:6 | return probeCodeGraph();\n")
+        answer.contains("endpoints guessed from words: check the first and last hop\n"),
+        "{answer}"
     );
+    assert!(answer.contains("    runDoctorSetup  src/setup.ts:1\n  → codeGraphStep  src/setup.ts:5\n"));
+    assert!(
+        answer.contains("  → probeCodeGraph  src/setup.ts:9\n        at src/setup.ts:6 | return probeCodeGraph();\n"),
+        "{answer}"
+    );
+
+    // a name is no guess
+    let plain = repo.graph().path("runDoctorSetup", "probeCodeGraph", 6);
+
+    assert!(!plain.contains("guessed"), "{plain}");
 }
 
 #[test]
-fn a_question_is_read_by_its_content_words_against_names_in_any_case_and_form() {
+fn words_that_several_definitions_hold_get_candidates_to_name_and_a_word_nobody_holds_is_not_counted() {
     let mut repo = doctor_repo();
-    let graph = repo.graph();
-    let answer = graph.path("the diff view loads the lines of a changed file", "git-file-lines", 4);
+    let answer = repo.graph().path("/useful-skills doctor", "harness-memory features", 6);
 
-    // `lines` is a part of `loadLines` and `git_file_lines`, and `git-file-lines` is the other name of the latter
+    // nothing holds `useful-skills`, so it is not counted: the definition that carries `doctor` in its name leads
+    // the three that hold it, and the answer says which word found nothing
+    assert!(answer.contains(": 2 hops\n"), "{answer}");
+    assert!(
+        answer.contains("from: words `doctor` → runDoctorSetup src/setup.ts:1 (no match: `useful-skills`)\n"),
+        "{answer}"
+    );
+    assert!(
+        answer.contains("endpoints guessed from words: check the first and last hop\n"),
+        "{answer}"
+    );
+
+    // two definitions that hold every word tie: both are listed
+    let mut shop = Repo::new();
+
+    shop.write(
+        "src/billing.ts",
+        "export function renderInvoice(n: number) {\n  return formatTotal(n);\n}\n\nexport function renderReceipt(n: number) {\n  return formatTotal(n);\n}\n\nexport function formatTotal(n: number) {\n  return n;\n}\n",
+    );
+
+    let tie = shop.graph().path("render", "formatTotal", 6);
+
+    assert!(
+        tie.contains("several definitions hold all of render. Closest:"),
+        "{tie}"
+    );
+    assert!(tie.contains("renderInvoice src/billing.ts:1  (render)"), "{tie}");
+    assert!(tie.contains("renderReceipt src/billing.ts:5  (render)"), "{tie}");
+    assert!(!tie.contains("→"), "{tie}");
+
+    // the same name in two files is one end, as a name is
+    shop.write(
+        "src/other.ts",
+        "export function formatTotal(n: number) {\n  return n + 1;\n}\n",
+    );
+
+    let same = shop.graph().path("renderInvoice", "format total", 6);
+
+    assert!(
+        same.contains("to: words `format`, `total` → formatTotal src/billing.ts:9, formatTotal src/other.ts:1"),
+        "{same}"
+    );
+    assert!(same.contains(": 1 hop\n"), "{same}");
+}
+
+#[test]
+fn a_word_held_by_thousands_of_definitions_is_not_counted_and_the_rare_word_leads() {
+    let mut repo = Repo::new();
+    let mut items = String::new();
+
+    // `get` is part of three thousand names: its weight used to underflow past 2048 holders
+    for n in 0..3_000 {
+        items.push_str(&format!("export function get_item{n}() {{\n  return {n};\n}}\n"));
+    }
+
+    repo.write("src/items.ts", &items);
+    repo.write(
+        "src/widget.ts",
+        "export function make_widget() {\n  return 1;\n}\n\nexport function get_widget() {\n  return make_widget();\n}\n",
+    );
+
+    let answer = repo.graph().path("get widget", "make_widget", 6);
+
+    // `get` is too common to count, `widget` is held by two definitions and get_widget holds both words
+    assert!(
+        answer.contains("from: words `get`, `widget` → get_widget src/widget.ts:5\n"),
+        "{answer}"
+    );
+    assert!(answer.contains(": 1 hop\n"), "{answer}");
+
+    // a common word alone is still an end: it is all there is to go by
+    let common = repo.graph().impact("get", 1);
+
+    assert!(common.contains("words `get` →"), "{common}");
+}
+
+#[test]
+fn request_is_a_word_of_a_question_and_a_folder_of_the_file_counts_for_the_definition() {
+    let mut repo = Repo::new();
+
+    repo.write(
+        "src/lib/api/request.ts",
+        "export function request(url: string) {\n  return url;\n}\n",
+    );
+    repo.write(
+        "src/net/sender.ts",
+        "export function sendRequest(url: string) {\n  return url;\n}\n",
+    );
+    repo.write(
+        "src/client.ts",
+        "import { request } from './lib/api/request';\n\nexport function load() {\n  return request('x');\n}\n",
+    );
+
+    let answer = repo.graph().path("load", "api request", 4);
+
+    assert!(
+        answer.contains("to: words `api`, `request` → request src/lib/api/request.ts:1\n"),
+        "{answer}"
+    );
+    assert!(answer.contains(": 1 hop\n"), "{answer}");
+
+    // a word that no definition holds does not veto the others
+    let unheld = repo.graph().path("load", "api request quux", 4);
+
+    assert!(
+        unheld.contains("to: words `api`, `request` → request src/lib/api/request.ts:1 (no match: `quux`)\n"),
+        "{unheld}"
+    );
+
+    // the singular finds the plural folder
+    let plural = repo.graph().path("load", "request lib apis", 4);
+
+    assert!(plural.contains("→ request src/lib/api/request.ts:1"), "{plural}");
+}
+
+#[test]
+fn a_word_that_names_the_file_of_a_definition_counts_for_it() {
+    let mut repo = doctor_repo();
+    let answer = repo
+        .graph()
+        .path("the diff view loads the lines of a changed file", "git-file-lines", 4);
+
+    // nothing holds `view`, so it is not counted: loadLines alone holds `diff` (its file), `loads` and `lines`
     assert!(answer.contains(": 1 hop\n"), "{answer}");
     assert!(
-        answer.contains("from: words `lines` → loadLines src/diff.ts:3, git_file_lines src-tauri/src/git.rs:1 (no match: `diff`, `view`, `loads`)"),
+        answer.contains("from: words `diff`, `loads`, `lines` → loadLines src/diff.ts:3 (no match: `view`)\n"),
+        "{answer}"
+    );
+
+    let answer = repo.graph().path("diff lines", "git-file-lines", 4);
+
+    assert!(answer.contains(": 1 hop\n"), "{answer}");
+    assert!(
+        answer.contains("from: words `diff`, `lines` → loadLines src/diff.ts:3\n"),
         "{answer}"
     );
     assert!(
@@ -752,10 +887,10 @@ fn a_question_is_read_by_its_content_words_against_names_in_any_case_and_form() 
         "{answer}"
     );
 
-    let exact = graph.symbol("RUNDOCTORSETUP", 5);
+    let exact = repo.graph().symbol("RUNDOCTORSETUP", 5);
 
     assert!(exact.contains("fn runDoctorSetup  src/setup.ts:1"), "{exact}");
-    assert!(graph.impact("doctor", 2).contains("words `doctor` →"));
+    assert!(repo.graph().impact("doctor", 2).contains("words `doctor` →"));
 }
 
 #[test]
@@ -1122,4 +1257,198 @@ fn a_site_is_read_only_when_its_line_is_shown() {
         answer.lines().filter(|line| line.contains("src/a.rs:")).count() > shown,
         "{answer}"
     );
+}
+
+// ---- package.function ends -----------------------------------------------------------------------------------
+
+#[test]
+fn a_module_qualifier_means_the_function_of_that_module_not_a_method_of_the_same_name() {
+    let mut repo = Repo::new();
+
+    repo.write(
+        "src/utils.ts",
+        "export function formatDate(d: Date): string {\n  return d.toString();\n}\n",
+    );
+    repo.write(
+        "src/fmt.ts",
+        "export class Fmt {\n  formatDate(d: Date): string {\n    return d.toString();\n  }\n}\n",
+    );
+    repo.write("web/__init__.py", "from ._api import fetch\n");
+    repo.write("web/_api.py", "def fetch(url):\n    return url\n");
+    repo.write(
+        "web/_client.py",
+        "class Client:\n    def fetch(self, url):\n        return url\n",
+    );
+    repo.write("Cargo.toml", "[package]\nname = \"net\"\nversion = \"0.1.0\"\n");
+    repo.write("src/http.rs", "pub fn send() {}\n");
+    repo.write(
+        "src/client.rs",
+        "pub struct Client;\n\nimpl Client {\n    pub fn send(&self) {}\n}\n",
+    );
+
+    let graph = repo.graph();
+
+    let one = graph.symbol("utils.formatDate", 5);
+    assert!(one.contains("fn formatDate  src/utils.ts:1"), "{one}");
+    assert!(!one.contains("Fmt::formatDate"), "{one}");
+
+    let python = graph.symbol("web.fetch", 5);
+    assert!(python.contains("fn fetch  web/_api.py:1"), "{python}");
+    assert!(!python.contains("Client::fetch"), "{python}");
+
+    let rust = graph.symbol("http::send", 5);
+    assert!(rust.contains("fn send  src/http.rs:1"), "{rust}");
+    assert!(!rust.contains("Client::send"), "{rust}");
+
+    // a type as the qualifier still means its method
+    assert!(
+        graph
+            .symbol("Fmt.formatDate", 5)
+            .contains("method Fmt::formatDate  src/fmt.ts:2")
+    );
+    assert!(
+        graph
+            .symbol("Client.fetch", 5)
+            .contains("Client::fetch  web/_client.py:2")
+    );
+    assert!(
+        graph
+            .symbol("Client::send", 5)
+            .contains("Client::send  src/client.rs:4")
+    );
+}
+
+// ---- calls on a base reach the overrides -----------------------------------------------------------------
+
+/// A base class with `count` subclasses that override `run`, a function that calls `run` on a base, and `finish`.
+fn hierarchy(count: usize) -> Repo {
+    let repo = Repo::new();
+    let mut classes = String::from("class Base:\n    def run(self):\n        pass\n\n");
+
+    for i in 0..count {
+        classes.push_str(&format!(
+            "class Sub{i:02}(Base):\n    def run(self):\n        finish{i:02}()\n\ndef finish{i:02}():\n    pass\n\n"
+        ));
+    }
+
+    repo.write("app/classes.py", &classes);
+    repo.write(
+        "app/main.py",
+        "from classes import Base\n\ndef go(base: Base):\n    base.run()\n",
+    );
+
+    repo
+}
+
+#[test]
+fn a_call_on_a_base_method_reaches_the_overrides_and_a_few_only() {
+    let mut repo = hierarchy(30);
+    let graph = repo.graph();
+    let first = graph.path("go", "Sub00.run", 3);
+
+    assert!(first.contains(": 1 hop\n"), "{first}");
+    assert!(
+        first.contains("  → Sub00::run (via subclass/impl of Base::run)  app/classes.py:"),
+        "{first}"
+    );
+    assert!(first.contains("        at app/main.py:4 | base.run()"), "{first}");
+
+    // the fan-out of one call is capped, so a base with hundreds of subclasses stays cheap
+    let last = graph.path("go", "Sub29.run", 3);
+
+    assert!(
+        last.starts_with("no chain within 3 hops between `go` and `Sub29.run`"),
+        "{last}"
+    );
+
+    // and the override is no caller: the weak link is no edge of the graph
+    assert!(graph.symbol("Sub00.run", 5).contains("used by 0 site(s)"));
+}
+
+#[test]
+fn a_chain_of_strong_links_wins_over_a_shorter_one_through_an_override() {
+    let mut repo = Repo::new();
+
+    repo.write(
+        "app/chain.py",
+        "class A:\n    def run(self):\n        pass\n\nclass B(A):\n    def run(self):\n        finish()\n\n\
+         def go(a: A):\n    a.run()\n    helper()\n\ndef helper():\n    middle()\n\ndef middle():\n    finish()\n\ndef finish():\n    pass\n",
+    );
+
+    let answer = repo.graph().path("go", "finish", 6);
+
+    // go -> B.run -> finish is shorter, but only through an override
+    assert!(answer.contains(": 3 hops\n"), "{answer}");
+    assert!(answer.contains("  → helper  app/chain.py"), "{answer}");
+    assert!(!answer.contains("via subclass/impl"), "{answer}");
+
+    // with no strong chain the override is used
+    let weak = repo.graph().path("go", "B.run", 6);
+
+    assert!(weak.contains("(via subclass/impl of A::run)"), "{weak}");
+}
+
+#[test]
+fn a_chain_through_an_override_goes_down_more_than_one_level_of_subclasses() {
+    let mut repo = Repo::new();
+
+    repo.write(
+        "src/shapes.ts",
+        "export interface Shape { area(): number }\nexport class Poly implements Shape { area(): number { return 1; } }\n\
+         export class Square extends Poly { area(): number { return side(); } }\nfunction side(): number { return 2; }\n",
+    );
+    repo.write(
+        "src/use.ts",
+        "import { Shape } from './shapes';\n\nexport function measure(s: Shape): number {\n  return s.area();\n}\n",
+    );
+
+    let answer = repo.graph().path("measure", "side", 4);
+
+    assert!(answer.contains(": 2 hops\n"), "{answer}");
+    assert!(
+        answer.contains("  → Square::area (via subclass/impl of Shape::area)"),
+        "{answer}"
+    );
+}
+
+// ---- no chain ------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_missing_chain_says_how_far_the_search_got_and_which_calls_it_did_not_follow() {
+    let mut repo = Repo::new();
+
+    repo.write(
+        "src/flow.ts",
+        "export function start() {\n  return middle();\n}\n\nfunction middle() {\n  return send(1);\n}\n\nexport function target() {\n  return 1;\n}\n",
+    );
+    repo.write("src/a.ts", "export function send(n: number) { return n; }\n");
+    repo.write("src/b.ts", "export function send(n: number) { return n; }\n");
+    repo.write("src/c.ts", "export function send(n: number) { return n; }\n");
+
+    let graph = repo.graph();
+    let answer = graph.path("start", "target", 4);
+
+    assert!(
+        answer.starts_with("no chain within 4 hops between `start` and `target` (tried both directions)\n"),
+        "{answer}"
+    );
+    assert!(
+        answer.contains("got as far as start → middle (1 hop, 2 reached) src/flow.ts:5\n"),
+        "{answer}"
+    );
+    assert!(
+        answer.contains("  not followed from middle: send (3 defs)\n"),
+        "{answer}"
+    );
+    assert!(answer.lines().count() <= 4, "{answer}");
+
+    // a definition with nothing that leads out
+    let none = graph.path("target", "start", 4);
+
+    assert!(none.contains("nothing leads out of target src/flow.ts:9\n"), "{none}");
+
+    // a search that ran into the depth limit says so
+    let short = graph.path("start", "target", 1);
+
+    assert!(short.contains("stopped at max_depth: raise it to go on\n"), "{short}");
 }

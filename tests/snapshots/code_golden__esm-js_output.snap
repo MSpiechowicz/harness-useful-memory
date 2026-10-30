@@ -82,11 +82,23 @@ no chain from `probeCodeGraph` to `runCommand`, reverse: `runCommand` → `probe
 
 == path /useful-skills doctor -> harness-memory features
 `/useful-skills doctor` → `harness-memory features`: 3 hops
-from: words `doctor` → doctor command-core.js:3, createCommandRunner command-core.js:2, doctorServices doctor-setup.js:15, runDoctorSetup doctor-setup.js:26 (no match: `useful-skills`)
+from: words `doctor` → doctor command-core.js:3 (no match: `useful-skills`)
 to: words `harness-memory`, `features` → probeCodeGraph doctor-setup.js:6
+endpoints guessed from words: check the first and last hop
     doctor  command-core.js:3
   → runDoctorSetup  doctor-setup.js:26
         at command-core.js:4 | const outcome = await host.runDoctor({ cwd, check, services: doctorServices });
+  → codeGraphStep  doctor-setup.js:21
+        at doctor-setup.js:27 | const code = await codeGraphStep({ services: doctorServices(services), cwd });
+  → probeCodeGraph  doctor-setup.js:6
+        at doctor-setup.js:22 | return services.probeCodeGraph({ cwd, signal });
+
+== path doctor setup -> harness-memory features
+`doctor setup` → `harness-memory features`: 2 hops
+from: words `doctor`, `setup` → runDoctorSetup doctor-setup.js:26
+to: words `harness-memory`, `features` → probeCodeGraph doctor-setup.js:6
+endpoints guessed from words: check the first and last hop
+    runDoctorSetup  doctor-setup.js:26
   → codeGraphStep  doctor-setup.js:21
         at doctor-setup.js:27 | const code = await codeGraphStep({ services: doctorServices(services), cwd });
   → probeCodeGraph  doctor-setup.js:6

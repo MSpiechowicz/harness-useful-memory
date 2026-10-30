@@ -24,8 +24,8 @@ use std::collections::HashSet;
 use tree_sitter::{Node, Parser};
 
 use super::{
-    DROPPED, Extract, Import, MAX_DEPTH, Placement, constant_like, fits, ident_like, push_bind, push_def, push_mcall,
-    push_ref, push_ref_recv, push_word, text, written_type,
+    DROPPED, Extract, Import, MAX_DEPTH, Placement, constant_like, fits, ident_like, push_base, push_bind, push_def,
+    push_mcall, push_ref, push_ref_recv, push_use, push_word, text, written_type,
 };
 
 /// Reads a Python file.
@@ -128,6 +128,7 @@ impl<'a> Walk<'a> {
             }
             "typed_parameter" | "typed_default_parameter" => self.parameter(node, scope),
             "for_statement" => self.for_loop(node, scope),
+            "with_item" => self.with_item(node, scope),
             "identifier" => self.mention(node, scope),
             "assignment" => {
                 self.assignment(node, scope);
@@ -194,6 +195,25 @@ impl<'a> Walk<'a> {
                 &format!("=@{iterated}"),
                 "var",
             );
+        }
+    }
+
+    /// `with Client() as client`: the name is what the expression is (a class called is its instance).
+    fn with_item(&mut self, node: Node, scope: Scope) {
+        let Some(pattern) = node.child_by_field_name("value").filter(|v| v.kind() == "as_pattern") else {
+            return;
+        };
+        let alias = pattern
+            .child_by_field_name("alias")
+            .and_then(|alias| match alias.kind() {
+                "identifier" => Some(alias),
+                _ => alias.named_child(0).filter(|inner| inner.kind() == "identifier"),
+            });
+
+        if let (Some(value), Some(alias)) = (pattern.named_child(0), alias)
+            && let Some(ty) = initialiser(value, self.src)
+        {
+            push_bind(self.out, scope.current, text(alias, self.src), &ty, "var");
         }
     }
 
@@ -272,7 +292,20 @@ impl<'a> Walk<'a> {
                         .child_by_field_name("object")
                         .and_then(|object| dotted(object, self.src, 0));
 
-                    push_ref(self.out, scope.current, name, "use", qual, line);
+                    push_use(self.out, scope.current, name, qual, node, self.src);
+                }
+            }
+            // `case Color.RED:` names a constant through its class, where an event is handled
+            "dotted_name" if constant_like(name) && super::handled(node, self.src) => {
+                let mut cursor = parent.walk();
+                let owners: Vec<&str> = parent
+                    .named_children(&mut cursor)
+                    .take_while(|part| part.id() != node.id())
+                    .map(|part| text(part, self.src))
+                    .collect();
+
+                if !owners.is_empty() {
+                    push_use(self.out, scope.current, name, Some(owners.join(".")), node, self.src);
                 }
             }
             "call"
@@ -295,7 +328,7 @@ impl<'a> Walk<'a> {
                 let in_annotation = std::iter::successors(Some(parent), |p| p.parent()).any(|p| p.kind() == "type");
 
                 if screaming && !in_annotation && !is_call_target(node) && !super::is_own_name(node) {
-                    push_ref(self.out, scope.current, name, "use", None, line);
+                    push_use(self.out, scope.current, name, None, node, self.src);
                 }
             }
         }
@@ -392,13 +425,17 @@ impl<'a> Walk<'a> {
         let Some(bases) = node.child_by_field_name("superclasses") else {
             return;
         };
+        let derived = self.out.syms.get(class).map(|sym| sym.name.clone()).unwrap_or_default();
         let mut cursor = bases.walk();
 
         for base in bases.named_children(&mut cursor) {
             let line = base.start_position().row + 1;
 
             match base.kind() {
-                "identifier" => push_ref(self.out, Some(class), text(base, self.src), "type", None, line),
+                "identifier" => {
+                    push_ref(self.out, Some(class), text(base, self.src), "type", None, line);
+                    push_base(self.out, &derived, text(base, self.src), line);
+                }
                 "attribute" => {
                     if let (Some(object), Some(name)) = (
                         base.child_by_field_name("object"),
@@ -407,6 +444,21 @@ impl<'a> Walk<'a> {
                         let qual = dotted(object, self.src, 0);
 
                         push_ref(self.out, Some(class), text(name, self.src), "type", qual, line);
+                        push_base(self.out, &derived, text(name, self.src), line);
+                    }
+                }
+                // `Base[int]`: the base is what is subscripted
+                "subscript" => {
+                    if let Some(value) = base.child_by_field_name("value") {
+                        let name = match value.kind() {
+                            "identifier" => Some(text(value, self.src)),
+                            "attribute" => value.child_by_field_name("attribute").map(|n| text(n, self.src)),
+                            _ => None,
+                        };
+
+                        if let Some(name) = name {
+                            push_base(self.out, &derived, name, line);
+                        }
                     }
                 }
                 _ => {}
@@ -902,5 +954,36 @@ mod tests {
         for source in junk {
             let _ = run(source);
         }
+    }
+
+    /// The `base` references of a file as (base, derived).
+    fn bases(out: &Extract) -> Vec<(&str, &str)> {
+        out.refs
+            .iter()
+            .filter(|r| r.kind == "base")
+            .map(|r| (r.name.as_str(), r.qual.as_deref().unwrap_or("")))
+            .collect()
+    }
+
+    #[test]
+    fn a_class_records_each_base_it_lists() {
+        let out = run(
+            "class A(Base, mixins.Mixin, Generic[T], metaclass=Meta):\n    pass\n\nclass B(a.Other[int]):\n    pass\n\nclass C:\n    pass\n",
+        );
+
+        assert_eq!(
+            bases(&out),
+            [("Base", "A"), ("Mixin", "A"), ("Generic", "A"), ("Other", "B")]
+        );
+        // the base is still a type reference of the class
+        assert!(out.refs.iter().any(|r| r.kind == "type" && r.name == "Base"));
+    }
+
+    #[test]
+    fn a_with_statement_binds_the_name_to_what_it_opens() {
+        let out = run("def f():\n    with Client() as client, open(p) as handle:\n        client.go()\n");
+        let binds: Vec<(&str, &str)> = out.binds.iter().map(|b| (b.name.as_str(), b.ty.as_str())).collect();
+
+        assert!(binds.contains(&("client", "=Client()")), "{binds:?}");
     }
 }

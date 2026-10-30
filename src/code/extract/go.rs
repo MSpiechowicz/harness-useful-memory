@@ -390,6 +390,7 @@ impl Reader<'_> {
             qual: None,
             recv: None,
             line: node.start_position().row + 1,
+            handler: super::handled(node, self.src),
         });
     }
 }

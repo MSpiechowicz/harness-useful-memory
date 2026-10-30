@@ -1,0 +1,128 @@
+---
+source: tests/code_golden.rs
+expression: "fixture_output(\"dispatch\")"
+---
+== map
+py/httpx_like/_transports.py
+  class BaseTransport:
+  BaseTransport: def handle_request(self, request):
+  class HTTPTransport(BaseTransport):
+py/httpx_like/_client.py
+  class Client:
+  Client: def request(self, method, url):
+ts/src/notify.ts
+  interface Notifier
+  Notifier: send(message: string): void
+  class Base
+  Base: run(): void {}
+words/audit_a/audit.py
+  def audit(order):
+words/audit_b/audit.py
+  def audit(order):
+words/audit_c/audit.py
+  def audit(order):
+py/httpx_like/__init__.py
+py/httpx_like/_api.py
+rs/src/lib.rs
+ts/src/app.ts
+words/billing.py
+
+== symbol httpx_like.get
+fn get  py/httpx_like/_api.py:9-10
+  def get(url):
+  uses:
+    request py/httpx_like/_api.py:4  at py/httpx_like/_api.py:10 | return request("…", url)
+  used by 0 site(s):
+
+== path httpx_like.get -> open_connection
+`httpx_like.get` → `open_connection`: 5 hops
+    get  py/httpx_like/_api.py:9
+  → request  py/httpx_like/_api.py:4
+        at py/httpx_like/_api.py:10 | return request("…", url)
+  → Client::request  py/httpx_like/_client.py:13
+        at py/httpx_like/_api.py:6 | return client.request(method, url)
+  → Client::send  py/httpx_like/_client.py:19
+        at py/httpx_like/_client.py:14 | return self.send(url, HTTPTransport())
+  → HTTPTransport::handle_request (via subclass/impl of BaseTransport::handle_request)  py/httpx_like/_transports.py:10
+        at py/httpx_like/_client.py:20 | return transport.handle_request(url)
+  → open_connection  py/httpx_like/_transports.py:19
+        at py/httpx_like/_transports.py:11 | return open_connection(request)
+
+== path Client.send -> HTTPTransport.handle_request
+`Client.send` → `HTTPTransport.handle_request`: 1 hop
+    Client::send  py/httpx_like/_client.py:19
+  → HTTPTransport::handle_request (via subclass/impl of BaseTransport::handle_request)  py/httpx_like/_transports.py:10
+        at py/httpx_like/_client.py:20 | return transport.handle_request(url)
+
+== path Client.send -> MockTransport.handle_request
+`Client.send` → `MockTransport.handle_request`: 1 hop
+    Client::send  py/httpx_like/_client.py:19
+  → MockTransport::handle_request (via subclass/impl of BaseTransport::handle_request)  py/httpx_like/_transports.py:15
+        at py/httpx_like/_client.py:20 | return transport.handle_request(url)
+
+== path Client.send -> BaseTransport.handle_request
+`Client.send` → `BaseTransport.handle_request`: 1 hop
+    Client::send  py/httpx_like/_client.py:19
+  → BaseTransport::handle_request  py/httpx_like/_transports.py:2
+        at py/httpx_like/_client.py:20 | return transport.handle_request(url)
+
+== path alert -> EmailNotifier.send
+`alert` → `EmailNotifier.send`: 1 hop
+    alert  ts/src/app.ts:3
+  → EmailNotifier::send (via subclass/impl of Notifier::send)  ts/src/notify.ts:6
+        at ts/src/app.ts:4 | notifier.send("…");
+
+== path alert -> deliverText
+`alert` → `deliverText`: 2 hops
+    alert  ts/src/app.ts:3
+  → SmsNotifier::send (via subclass/impl of Notifier::send)  ts/src/notify.ts:12
+        at ts/src/app.ts:4 | notifier.send("…");
+  → deliverText  ts/src/notify.ts:28
+        at ts/src/notify.ts:13 | deliverText(message);
+
+== path start -> shout
+`start` → `shout`: 2 hops
+    start  ts/src/app.ts:7
+  → Loud::run (via subclass/impl of Base::run)  ts/src/notify.ts:22
+        at ts/src/app.ts:8 | base.run();
+  → shout  ts/src/notify.ts:29
+        at ts/src/notify.ts:23 | shout();
+
+== path log_line -> flush_to_disk
+`log_line` → `flush_to_disk`: 2 hops
+    log_line  rs/src/lib.rs:19
+  → FileSink::write (via subclass/impl of Sink::write)  rs/src/lib.rs:8
+        at rs/src/lib.rs:20 | sink.write(line);
+  → flush_to_disk  rs/src/lib.rs:23
+        at rs/src/lib.rs:9 | flush_to_disk(line);
+
+== path mail invoice -> format total
+`mail invoice` → `format total`: 2 hops
+from: words `mail`, `invoice` → mail_invoice words/billing.py:1
+to: words `format`, `total` → format_total words/billing.py:13
+endpoints guessed from words: check the first and last hop
+    mail_invoice  words/billing.py:1
+  → render_invoice  words/billing.py:5
+        at words/billing.py:2 | return render_invoice(order)
+  → format_total  words/billing.py:13
+        at words/billing.py:6 | return format_total(order)
+
+== path render -> format total
+the words do not name one definition, so no chain is guessed
+from `render`: several definitions hold all of render. Closest:
+  render_invoice words/billing.py:5  (render)
+  render_receipt words/billing.py:9  (render)
+Call code_path again with one of these names (or Type::name) as the end.
+
+== path render invoice receipt -> format_total
+the words do not name one definition, so no chain is guessed
+from `render invoice receipt`: no definition holds all of render, invoice, receipt. Closest:
+  render_receipt words/billing.py:9  (render, receipt)
+  render_invoice words/billing.py:5  (render, invoice)
+  mail_invoice words/billing.py:1  (invoice)
+Call code_path again with one of these names (or Type::name) as the end.
+
+== path render_receipt -> mail_invoice
+no chain within 6 hops between `render_receipt` and `mail_invoice` (tried both directions)
+got as far as render_receipt → format_total (1 hop, 2 reached) words/billing.py:13
+  not followed from format_total: audit (3 defs)
