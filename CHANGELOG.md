@@ -1,3 +1,17 @@
+# [3.0.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.11.0...v3.0.0) (2026-11-01)
+
+
+* feat!: remove the code graph, it moved to harness-code ([5995870](https://github.com/MSpiechowicz/harness-useful-memory/commit/59958700ba60d0e623efd29988457bfbf8026563))
+
+
+### BREAKING CHANGES
+
+* code_map, code_symbol, code_impact and code_path and the
+`code` CLI (features code-index, code-hint, code-prepare) are removed. Use
+harness-code instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
 # [2.11.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.10.0...v2.11.0) (2026-10-30)
 
 
