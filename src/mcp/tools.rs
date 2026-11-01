@@ -8,7 +8,6 @@ use crate::limits::{
 };
 use crate::store::NoteKind;
 
-use super::tools_code;
 use super::tools_scripts::{script_delete, script_get, script_list, script_run, script_save};
 
 /// Sent in the `initialize` result; tells the agent when and how to use memory.
@@ -49,9 +48,8 @@ const ENGLISH_INSTRUCTION: &str = "\
 another language is refused: rewrite it.";
 
 /// The server instructions; with `english` (the English notes setting is on) they also ask for
-/// English notes and English keywords, with `code_on` (the code index is on) they point at the code
-/// tools.
-pub fn instructions(english: bool, code_on: bool) -> String {
+/// English notes and English keywords.
+pub fn instructions(english: bool) -> String {
     let mut text = INSTRUCTIONS.to_owned();
 
     if english {
@@ -59,17 +57,11 @@ pub fn instructions(english: bool, code_on: bool) -> String {
         text.push_str(ENGLISH_INSTRUCTION);
     }
 
-    if code_on {
-        text.push('\n');
-        text.push_str(tools_code::INSTRUCTION);
-    }
-
     text
 }
 
-/// Every tool, as `tools/list` returns them; with `english` the note tools ask for English too, and
-/// the code tools are listed only with `code_on` (the code index is on).
-pub fn definitions(english: bool, code_on: bool) -> Value {
+/// Every tool, as `tools/list` returns them; with `english` the note tools ask for English too.
+pub fn definitions(english: bool) -> Value {
     let mut tools = vec![
         note_save(),
         note_update(),
@@ -95,10 +87,6 @@ pub fn definitions(english: bool, code_on: bool) -> Value {
 
     // the search an agent is asked to make first is in front of it from the start
     always_loaded(&mut tools[2]);
-
-    if code_on {
-        tools.extend(tools_code::definitions());
-    }
 
     json!({ "tools": tools })
 }

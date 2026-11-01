@@ -150,7 +150,7 @@ const EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// signal if it has not ended by then (a transaction still open is rolled back with the process), and at
 /// once on a second one. Blocks both signals in the calling thread and every thread it starts afterwards,
 /// and waits for them on a thread of its own. A child process inherits the blocked signals (the standard
-/// library does not clear the signal mask): the code index worker unblocks them itself, and git and scripts
+/// library does not clear the signal mask): git and scripts
 /// are ended with SIGKILL, which cannot be blocked. Call it first thing, before anything starts a thread.
 #[cfg(unix)]
 pub fn stop_on_sigterm(stop: &Stop) {

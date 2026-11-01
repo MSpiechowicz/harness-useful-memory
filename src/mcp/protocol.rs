@@ -97,9 +97,8 @@ pub fn error(id: &Value, code: i64, message: &str) -> Value {
 }
 
 /// The `initialize` result: the client's protocol version when supported, else the newest. The
-/// instructions ask for English notes when `english` (the English notes setting is on) and point at
-/// the code tools when `code_on` (the code index is on).
-pub fn initialize_result(params: &Value, english: bool, code_on: bool) -> Value {
+/// instructions ask for English notes when `english` (the English notes setting is on).
+pub fn initialize_result(params: &Value, english: bool) -> Value {
     let asked = params.get("protocolVersion").and_then(Value::as_str);
     let version = asked
         .filter(|asked| PROTOCOL_VERSIONS.contains(asked))
@@ -109,6 +108,6 @@ pub fn initialize_result(params: &Value, english: bool, code_on: bool) -> Value 
         "protocolVersion": version,
         "capabilities": { "tools": { "listChanged": false } },
         "serverInfo": { "name": SERVER_NAME, "version": env!("HARNESS_MEMORY_VERSION") },
-        "instructions": instructions(english, code_on),
+        "instructions": instructions(english),
     })
 }

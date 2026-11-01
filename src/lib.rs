@@ -11,8 +11,6 @@
 //! - [`push`] and [`push_scripts`]: copy the local notes and scripts into a team database
 //!   ([`cli_push`] reads their options).
 //! - [`mcp`]: the stdio JSON-RPC server and its tools.
-//! - [`code`] and [`cli_code`]: the code index, where code is defined and who uses it, read from the
-//!   project's files, and the command that switches it.
 //! - [`embed`] and [`cli_embedder`]: the embedder, one process per computer that holds the vector
 //!   search model and answers every server over a local socket.
 //! - [`limits`]: per-call limits (the amount of memory itself is never capped).
@@ -35,7 +33,6 @@
 
 pub mod backend;
 mod cli;
-pub mod cli_code;
 mod cli_discard;
 pub mod cli_embedder;
 pub mod cli_held;
@@ -45,7 +42,6 @@ mod cli_scripts;
 pub mod cli_settings;
 pub mod cli_team_docs;
 pub mod cli_trust;
-pub mod code;
 pub mod embed;
 pub mod held;
 pub mod limits;

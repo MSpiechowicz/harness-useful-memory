@@ -12,6 +12,7 @@ pub(crate) mod embed;
 pub(crate) mod engine;
 mod graph;
 mod held_back;
+mod leftovers;
 mod listing;
 mod local;
 mod notes;
@@ -70,6 +71,11 @@ impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         prepare_file(path)
             .map_err(|error| StoreError::Backend(format!("cannot create the database: {}", error.kind())))?;
+
+        // Versions before 3.0 kept the code graph next to the database: it moved to Harness Code.
+        if let Some(folder) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            leftovers::remove_once(folder);
+        }
 
         let mut conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
