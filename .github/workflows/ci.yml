@@ -37,7 +37,13 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest
+      # nextest runs every test in its own process, in parallel across the test binaries, which is far faster than
+      # cargo test on Windows. It skips doctests, so those run on their own.
+      - run: cargo nextest run --locked --no-fail-fast
+      - run: cargo test --doc --locked
       - run: cargo build --release --locked
       - name: Smoke test the binary
         run: |
@@ -109,6 +115,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # cargo test, not nextest: the test binaries share these servers, so they run one after the other.
       - run: cargo test --locked
 
   # Supply-chain policy for the Rust dependencies (see deny.toml).

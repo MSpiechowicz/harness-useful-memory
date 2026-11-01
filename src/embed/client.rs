@@ -305,13 +305,20 @@ mod tests {
         let refused = within_limited(&COUNT, 3, Duration::from_secs(5), || 1);
 
         assert_eq!(refused, None);
-        assert!(
-            started.elapsed() < Duration::from_millis(300),
-            "{:?}",
-            started.elapsed()
-        );
+        // "at once" against the 5 s timeout: Windows CI runners are slow enough to miss a tight bound
+        let at_once = if cfg!(windows) {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_millis(300)
+        };
+        assert!(started.elapsed() < at_once, "{:?}", started.elapsed());
 
-        std::thread::sleep(Duration::from_millis(900));
+        // the abandoned 600 ms calls have ended by then, with room for a slow runner
+        std::thread::sleep(if cfg!(windows) {
+            Duration::from_secs(3)
+        } else {
+            Duration::from_millis(900)
+        });
 
         assert_eq!(within_limited(&COUNT, 3, Duration::from_secs(5), || 2), Some(2));
         assert_eq!(COUNT.load(Ordering::SeqCst), 0);
