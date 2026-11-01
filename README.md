@@ -1231,6 +1231,10 @@ works on its own.
   AI coding tools, in one local app
 - [**Harness Memory**](https://github.com/MSpiechowicz/harness-useful-memory) (this repository): project memory for
   your coding agents, as one local MCP server
+- [**Harness Knowledge**](https://github.com/MSpiechowicz/harness-useful-knowledge): project documentation for your
+  coding agents (guides, ADRs, API specs, PDFs), searched with hybrid ranking, as one local MCP server
+- [**Harness Code**](https://github.com/MSpiechowicz/harness-useful-code): a code graph for your coding agents that
+  answers where code is defined, who uses it and what a change breaks, as one local MCP server
 
 ## License
 
