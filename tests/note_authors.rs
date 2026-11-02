@@ -140,6 +140,8 @@ impl Setup {
             .current_dir(&self.repo)
             .env("HARNESS_MEMORY_DIR", self.data())
             .env("HOME", &self.home)
+            // Windows finds the home folder through USERPROFILE.
+            .env("USERPROFILE", &self.home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -165,7 +167,7 @@ impl Setup {
     /// An MCP server of client `omp` running in the repository.
     fn agent(&self) -> Client {
         let mut command = command(&self.data(), &self.repo);
-        command.env("HOME", &self.home);
+        command.env("HOME", &self.home).env("USERPROFILE", &self.home);
         Client::start(command)
     }
 

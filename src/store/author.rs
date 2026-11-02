@@ -142,7 +142,8 @@ fn cached_name(names: &Names, env: &Env, dir: Option<&Path>, ask: impl FnOnce(&E
     let dir = dir.map_or_else(|| env.home.clone(), Path::to_path_buf);
 
     // A folder that cannot be resolved cannot be told from another, so its answer is not kept.
-    let Ok(dir) = dir.canonicalize() else {
+    // dunce: a plain path on Windows too (std's \\?\C:\ form is one git cannot use with -C).
+    let Ok(dir) = dunce::canonicalize(&dir) else {
         return match ask(env, &dir) {
             Asked::Answer(name) => name,
             Asked::Unknown => None,
