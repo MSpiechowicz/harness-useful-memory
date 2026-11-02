@@ -1184,7 +1184,7 @@ const ENTITY_NORM_MAX: usize = 4 * ENTITY_MAX;
 
 /// The fields of a note a [`Note`] or a [`Hit`] needs, each bounded.
 fn note_fields() -> Document {
-    doc! {
+    let mut fields = doc! {
         "_id": number("$_id"),
         "project": cut("$project", PATH_MAX),
         "kind": cut("$kind", KIND_MAX),
@@ -1203,7 +1203,10 @@ fn note_fields() -> Document {
         "shown": number("$shown"),
         "useful": number("$useful"),
         "last_useful_at": optional_number("$last_useful_at"),
-    }
+    };
+    fields.extend(notes::author_projection());
+
+    fields
 }
 
 /// True when the English fields of a note describe its current revision. An older server edits a

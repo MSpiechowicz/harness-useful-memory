@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use super::blocks::{indent, push_provenance, quoted};
 use super::reply::date;
 use crate::backend::Place;
-use crate::store::{Provenance, ScriptSummary, clean, hidden_character, visible_body};
+use crate::store::{Author, Provenance, ScriptSummary, clean, hidden_character, visible_body};
 use crate::support::runner::{Finished, Output};
 use crate::support::time::rfc3339;
 
@@ -90,6 +90,8 @@ impl Shown<'_> {
             "readOnly": self.read_only,
             "hidden": self.hidden,
             "author": author_json(provenance),
+            "addedBy": person_json(summary.authors.added_by.as_ref()),
+            "updatedBy": person_json(summary.authors.updated_by.as_ref()),
             "createdAt": rfc3339(summary.created_at),
             "updatedAt": rfc3339(summary.updated_at),
             "runCount": summary.run_count,
@@ -253,6 +255,16 @@ pub fn author_json(provenance: &Provenance) -> Value {
             .map(|root| shown_text(&root.display().to_string(), ROOT_MAX))
             .filter(|root| !root.is_empty()),
     })
+}
+
+/// `{"name", "via"}` for who added or last changed a note or a script: the git name and the client
+/// of an agent's write (`null` for the user's own); `null` when no name is known.
+pub fn person_json(author: Option<&Author>) -> Value {
+    let Some(author) = author else {
+        return Value::Null;
+    };
+
+    json!({ "name": author.name, "via": author.via })
 }
 
 /// The repository key as replies show it: `git:` keys without the prefix (`github.com/o/r`),

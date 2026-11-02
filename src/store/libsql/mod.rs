@@ -24,12 +24,13 @@ mod team_docs;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::recheck::{AUTHORS_RECHECK, Recheck};
 use super::sqlite::embed;
 use super::sqlite::engine::{self, Engine};
 use super::sqlite::schema::{self, SCHEMA_VERSION, SchemaState};
 use super::sqlite::sql::Sql;
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, Saved, SearchQuery};
-use super::{Forgotten, NoteListQuery, NotePage, NoteText, StoreError, Target, VectorTarget, View};
+use super::{Forgotten, NoteListQuery, NotePage, NoteText, Patience, StoreError, Target, VectorTarget, View};
 use crate::backend::Place;
 use hrana::{Client, Outcome, Plan, Stream, execute};
 
@@ -47,6 +48,10 @@ pub struct LibsqlStore {
     extensions: bool,
     /// The usefulness counters of a note are in place (kept apart: see [`Engine::usage`]).
     usage: bool,
+    /// The author columns of a note and a script are in place (kept apart: see [`Engine::authors`]).
+    authors: bool,
+    /// When the author columns were last looked for, if they were not found.
+    recheck: Recheck,
 }
 
 impl std::fmt::Debug for LibsqlStore {
@@ -55,6 +60,7 @@ impl std::fmt::Debug for LibsqlStore {
             .field("newer", &self.newer)
             .field("extensions", &self.extensions)
             .field("usage", &self.usage)
+            .field("authors", &self.authors)
             .finish_non_exhaustive()
     }
 }
@@ -70,14 +76,19 @@ impl LibsqlStore {
             newer: false,
             extensions: false,
             usage: false,
+            authors: false,
+            recheck: Recheck::every(AUTHORS_RECHECK),
         };
 
         store.newer = store.migrate()? == SchemaState::Newer;
 
         if !store.newer {
-            let installed = engine::install(&mut store);
+            // The server queues writers itself and a request that reads cannot be sent as one
+            // attempt (see `write_once`), so this open always waits its turn.
+            let installed = engine::install(&mut store, Patience::Wait);
             store.extensions = installed.extensions;
             store.usage = installed.usage;
+            store.authors = installed.authors;
             engine::backfill(&mut store);
         }
 
@@ -198,6 +209,18 @@ impl Engine for LibsqlStore {
 
     fn usage(&self) -> bool {
         self.usage
+    }
+
+    fn authors(&self) -> bool {
+        self.authors
+    }
+
+    fn learn_authors(&mut self) {
+        self.authors = true;
+    }
+
+    fn recheck(&mut self) -> &mut Recheck {
+        &mut self.recheck
     }
 }
 

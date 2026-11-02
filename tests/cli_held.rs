@@ -6,6 +6,7 @@
 mod common;
 
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 use common::guards::{CHAT, Guarded, structured, tool};
@@ -17,7 +18,17 @@ use serde_json::{Value, json};
 /// `harness-memory <args>` on the data folder, started outside any repository, with `input` on
 /// standard input.
 fn cli(guarded: &Guarded, args: &[&str], input: &str) -> Output {
+    cli_at(guarded, None, args, input)
+}
+
+/// [`cli`] with `home` as the home folder, where git reads the user's name from.
+fn cli_at(guarded: &Guarded, home: Option<&Path>, args: &[&str], input: &str) -> Output {
     let mut command = Command::new(BINARY);
+
+    if let Some(home) = home {
+        command.env("HOME", home);
+    }
+
     command
         .args(args)
         .current_dir(guarded.work())
@@ -605,4 +616,153 @@ fn a_held_note_the_user_edits_into_another_language_is_saved_with_a_warning() {
 
     let found = tool(&mut chat, "note_get", json!({ "ids": [saved["saved"]["id"]] }));
     assert!(text(&found).contains("Synchronizacja notatek"), "{found}");
+}
+
+/// The author of the note `id` saved in the repository of `guarded`, as the list of the store shows it.
+fn authors_of(guarded: &Guarded, id: i64) -> harness_memory::store::Authors {
+    use harness_memory::store::{MemoryStore, SqliteStore};
+
+    let mut store = SqliteStore::open(&guarded.data().join("memory.sqlite3")).expect("store");
+    store
+        .peek(&common::both("github.com/acme/widget"), &[id])
+        .expect("peek")
+        .remove(0)
+        .authors
+}
+
+fn named(name: &str, via: Option<&str>) -> Option<harness_memory::store::Author> {
+    Some(harness_memory::store::Author {
+        name: name.to_owned(),
+        via: via.map(str::to_owned),
+    })
+}
+
+#[test]
+fn a_held_save_is_written_as_the_author_it_had_when_it_was_held() {
+    let guarded = asking();
+    std::fs::write(
+        guarded.dir.path().join("home/.gitconfig"),
+        "[user]\n\tname = Ada Lovelace\n\temail = ada@example.com\n",
+    )
+    .expect("gitconfig");
+
+    let mut chat = guarded.chat_server();
+    let held = held_id(&tool(&mut chat, "note_save", note("Held by Ada")));
+
+    let files = guarded.held_files();
+    assert_eq!(files[0]["author"], json!({ "name": "Ada Lovelace", "via": "omp" }));
+    assert!(!files[0].to_string().contains("ada@example.com"));
+
+    // Someone else saves it, on another account.
+    let other = guarded.dir.path().join("other");
+    std::fs::create_dir_all(&other).expect("mkdir");
+    std::fs::write(other.join(".gitconfig"), "[user]\n\tname = Grace Hopper\n").expect("gitconfig");
+
+    let output = cli_at(&guarded, Some(&other), &["held", "save", &held, "--json"], "");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let saved: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    let id = saved["saved"]["id"].as_i64().expect("id");
+
+    let authors = authors_of(&guarded, id);
+    assert_eq!(authors.added_by, named("Ada Lovelace", Some("omp")));
+    assert_eq!(authors.updated_by, named("Ada Lovelace", Some("omp")));
+}
+
+#[test]
+fn a_held_save_with_no_author_is_written_with_none() {
+    let guarded = asking();
+    let mut chat = guarded.chat_server();
+    let held = held_id(&tool(&mut chat, "note_save", note("Held by nobody")));
+
+    let files = guarded.held_files();
+    assert!(
+        files[0].get("author").is_none(),
+        "an item without an author names none: {}",
+        files[0]
+    );
+
+    // Saved on an account that does have a name: the held item is not given it.
+    let other = guarded.dir.path().join("other");
+    std::fs::create_dir_all(&other).expect("mkdir");
+    std::fs::write(other.join(".gitconfig"), "[user]\n\tname = Grace Hopper\n").expect("gitconfig");
+
+    let output = cli_at(&guarded, Some(&other), &["held", "save", &held, "--json"], "");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let saved: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+
+    let authors = authors_of(&guarded, saved["saved"]["id"].as_i64().expect("id"));
+    assert_eq!(authors, harness_memory::store::Authors::default());
+}
+
+/// Rewrites the `author` of the one held file; the revision stays valid, as the author is no part of it.
+fn set_held_author(guarded: &Guarded, author: Value) {
+    let chat = std::fs::read_dir(guarded.held())
+        .expect("held folder")
+        .map(|entry| entry.expect("entry").path())
+        .find(|path| path.is_dir())
+        .expect("a chat folder");
+    let file = std::fs::read_dir(chat)
+        .expect("chat folder")
+        .map(|entry| entry.expect("entry").path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "json"))
+        .expect("a held file");
+
+    let mut item: Value = serde_json::from_str(&std::fs::read_to_string(&file).expect("read")).expect("JSON");
+    item["author"] = author;
+    std::fs::write(file, item.to_string()).expect("write");
+}
+
+#[test]
+fn the_author_of_a_held_file_is_cleaned_again_when_the_save_is_approved() {
+    let guarded = asking();
+    let mut chat = guarded.chat_server();
+    let held = held_id(&tool(&mut chat, "note_save", note("Held then edited")));
+
+    set_held_author(&guarded, json!({ "name": "  Mallory  ", "via": "omp\u{1b}[31m" }));
+
+    let output = cli(&guarded, &["held", "save", &held, "--json"], "");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let saved: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    let id = saved["saved"]["id"].as_i64().expect("id");
+
+    let stored = authors_of(&guarded, id).added_by.expect("an author");
+    assert_eq!(stored.name, "Mallory");
+    assert!(
+        stored.via.as_deref().is_none_or(|via| !via.contains('\u{1b}')),
+        "{stored:?}"
+    );
+
+    // A name with control characters is no name.
+    let held = held_id(&tool(&mut chat, "note_save", note("Held then edited again")));
+    set_held_author(&guarded, json!({ "name": "Eve\u{1b}[2J", "via": null }));
+
+    let output = cli(&guarded, &["held", "save", &held, "--json"], "");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let saved: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+
+    assert_eq!(
+        authors_of(&guarded, saved["saved"]["id"].as_i64().expect("id")),
+        harness_memory::store::Authors::default()
+    );
+}
+
+#[test]
+fn the_list_shows_a_cleaned_author_and_never_a_hand_edited_one() {
+    let guarded = asking();
+    let mut chat = guarded.chat_server();
+    held_id(&tool(&mut chat, "note_save", note("Held then edited")));
+
+    set_held_author(&guarded, json!({ "name": "  Mallory  ", "via": "omp\u{1b}[31m" }));
+    let listed = ok(&guarded, &["held", "list", "--json"], "");
+    let author = &listed["held"][0]["author"];
+    assert_eq!(author["name"], "Mallory", "{listed}");
+    assert!(
+        author["via"].as_str().is_none_or(|via| !via.contains('\u{1b}')),
+        "{listed}"
+    );
+
+    set_held_author(&guarded, json!({ "name": "Eve\u{1b}[2J", "via": null }));
+    let listed = ok(&guarded, &["held", "list", "--json"], "");
+    assert!(listed["held"][0].get("author").is_none(), "{listed}");
+    assert!(!listed.to_string().contains("Eve"), "{listed}");
 }

@@ -1,8 +1,10 @@
 //! Where a tool call reads or writes: the `scope` argument, the repository `project_path` names
 //! (else the one the server runs in), and who is writing.
 
+use std::path::Path;
+
 use super::Server;
-use crate::store::{NoteKind, ProjectKey, Provenance, Target, View};
+use crate::store::{Author, NoteKind, ProjectKey, Provenance, Target, View};
 
 /// Sent when a repository-scope call has no repository.
 pub(super) const NO_PROJECT: &str = "cannot tell which repository this is (the server runs outside one, or in the home folder \
@@ -102,9 +104,25 @@ pub(super) fn provenance(server: &mut Server, project_path: Option<&str>) -> Pro
         named.clone()
     };
 
+    let author = author(server, own.as_deref());
+
     Provenance {
         via_override: named != own,
         root: own,
         source: server.client.clone(),
+        author,
+        original_added_by: None,
     }
+}
+
+/// Who is writing: the git name of the person working in `root` (else in the folder the server
+/// runs in), through the client of the server; the author the server was given, if any
+/// ([`Server::with_author`]). None when git has no name.
+pub(super) fn author(server: &Server, root: Option<&Path>) -> Option<Author> {
+    if let Some(fixed) = &server.author {
+        return fixed.clone();
+    }
+
+    let dir = root.or_else(|| server.projects.cwd());
+    Author::resolve(server.projects.env(), dir, server.client.as_deref())
 }

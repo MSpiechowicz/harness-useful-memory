@@ -217,6 +217,14 @@ fn pushing_into_postgres_is_idempotent() {
 }
 
 #[test]
+fn a_push_keeps_who_added_and_who_changed_a_note_in_postgres() {
+    let Some(db) = database() else { return };
+    let mut store = db.open();
+
+    push_support::authors_scenario(&mut store);
+}
+
+#[test]
 fn hidden_team_notes_are_never_written_over_in_postgres() {
     let Some(db) = database() else { return };
     let mut store = db.open();

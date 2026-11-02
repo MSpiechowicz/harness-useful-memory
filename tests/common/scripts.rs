@@ -26,7 +26,7 @@ pub const OTHER: &str = "github.com/acme/gadget";
 pub type Case = fn(&mut dyn ScriptStore);
 
 /// Every case, by name.
-pub const CASES: [(&str, Case); 9] = [
+pub const CASES: [(&str, Case); 10] = [
     ("saving_upserts_by_name", saving_upserts_by_name),
     ("bad_drafts_store_nothing", bad_drafts_store_nothing),
     ("lists_repo_first_then_by_name", lists_repo_first_then_by_name),
@@ -48,6 +48,7 @@ pub const CASES: [(&str, Case); 9] = [
         "deleting_many_takes_only_visible_ids",
         deleting_many_takes_only_visible_ids,
     ),
+    ("authors_are_added_kept_and_updated", authors_are_added_kept_and_updated),
 ];
 
 /// Runs every case, each on a store `fresh` returns empty.
@@ -56,6 +57,11 @@ pub fn conformance(fresh: &mut dyn FnMut() -> Box<dyn ScriptStore>) {
         eprintln!("script case {name}");
         case(fresh().as_mut());
     }
+}
+
+/// See [`super::authors::scripts`].
+pub fn authors_are_added_kept_and_updated(store: &mut dyn ScriptStore) {
+    super::authors::scripts(store);
 }
 
 /// A bash draft written by `tests` from `/work/<REPO>`.
@@ -70,6 +76,7 @@ pub fn script(name: &str, description: &str, body: &str) -> ScriptDraft {
             root: Some(PathBuf::from("/work").join(REPO)),
             source: Some("tests".to_owned()),
             via_override: false,
+            ..Provenance::default()
         },
     }
 }
@@ -124,6 +131,7 @@ pub fn saving_upserts_by_name(store: &mut dyn ScriptStore) {
             root: None,
             source: Some("codex".to_owned()),
             via_override: true,
+            ..Provenance::default()
         },
         ..script("open-prs", "Open PRs as JSON", "print('prs')\n")
     };

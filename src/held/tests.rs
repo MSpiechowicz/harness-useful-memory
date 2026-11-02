@@ -134,3 +134,35 @@ fn a_chat_holds_at_most_four_mebibytes() {
         ))
         .expect("another chat");
 }
+
+#[test]
+fn the_author_does_not_change_the_revision_so_an_older_reader_still_accepts_the_file() {
+    let dir = tempfile::tempdir().expect("temp");
+    let store = HeldStore::in_folder(dir.path().to_path_buf());
+    let chat = random_uuid().expect("uuid");
+
+    let mut signed = item(&chat, HeldTool::NoteSave, json!({ "title": "signed" }));
+    signed.author = Author::new("Ada Lovelace", Some("omp"));
+    let id = store.hold(signed.clone()).expect("held");
+
+    // The same item without an author has the revision it always had.
+    let mut anonymous = signed.clone();
+    anonymous.author = None;
+    assert_eq!(signed.digest(), anonymous.digest());
+
+    // An older version does not know `author`: reading the file it drops the field, and the
+    // revision it computes is the one written.
+    let text = std::fs::read_to_string(path_of(&store, &chat, &id)).expect("file");
+    let mut file: Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(file["author"], json!({ "name": "Ada Lovelace", "via": "omp" }));
+
+    file.as_object_mut().expect("object").remove("author");
+    let older: HeldItem = serde_json::from_value(file).expect("an older reader's item");
+    assert_eq!(older.author, None);
+    assert_eq!(older.digest(), older.revision);
+
+    // And the item is listed with its author, not hidden as altered.
+    let listed = store.list(Some(&chat)).expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].author, signed.author);
+}

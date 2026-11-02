@@ -455,6 +455,7 @@ fn collect(db: &mut dyn Sql, sql: &str, args: &[Value], scored: bool) -> Result<
                     root: root.map(PathBuf::from),
                     source: row.get(7)?,
                     via_override: row.get(9)?,
+                    ..Provenance::default()
                 },
                 score_milli: 0,
                 boost_milli: Hit::NO_BOOST,

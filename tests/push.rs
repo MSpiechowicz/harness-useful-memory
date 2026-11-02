@@ -26,6 +26,32 @@ fn pushing_into_another_sqlite_store_is_idempotent() {
 }
 
 #[test]
+fn a_push_keeps_who_added_and_who_changed_a_note() {
+    let dir = TempDir::new().expect("temp dir");
+    let mut remote = SqliteStore::open(&dir.path().join("team.sqlite3")).expect("team store");
+
+    push_support::authors_scenario(&mut remote);
+}
+
+#[test]
+fn a_push_keeps_who_added_and_who_changed_a_note_in_libsql() {
+    let Some(db) = libsql_support::Database::libsql() else {
+        return;
+    };
+
+    push_support::authors_scenario(db.open().as_mut());
+}
+
+#[test]
+fn a_push_keeps_who_added_and_who_changed_a_note_in_mongo() {
+    let Some((_db, mut store)) = mongo_support::store() else {
+        return;
+    };
+
+    push_support::authors_scenario(&mut store);
+}
+
+#[test]
 fn hidden_team_notes_are_never_written_over() {
     let dir = TempDir::new().expect("temp dir");
     let mut remote = SqliteStore::open(&dir.path().join("team.sqlite3")).expect("team store");

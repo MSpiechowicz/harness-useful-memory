@@ -20,6 +20,7 @@
 //! they are sent (see [`cut`]), and errors carry the SQLSTATE with a fixed description, never the
 //! server's message, stored text, the URL or a password.
 
+mod authors;
 mod connect;
 mod embed;
 mod graph;
@@ -37,7 +38,10 @@ use postgres::config::SslMode;
 use postgres::types::FromSql;
 use postgres::{Client, GenericClient, NoTls, Row, Transaction};
 
+use super::Patience;
 use super::clean;
+use super::patience::patience;
+use super::recheck::{AUTHORS_RECHECK, Recheck};
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, ProjectKey};
 use super::{Forgotten, NoteListQuery, NotePage, NoteText, Saved, SearchQuery, StoreError, Target, VectorTarget, View};
 use crate::backend::Place;
@@ -69,6 +73,10 @@ pub struct PostgresStore {
     /// The usefulness counters of a note are in place (kept apart: a read-only role can have the
     /// other extensions without them).
     usage: bool,
+    /// The author columns of a note and a script are in place (kept apart like `usage`).
+    authors: bool,
+    /// When the author columns were last looked for, if they were not found.
+    recheck: Recheck,
 }
 
 impl std::fmt::Debug for PostgresStore {
@@ -77,6 +85,7 @@ impl std::fmt::Debug for PostgresStore {
             .field("newer", &self.newer)
             .field("extensions", &self.extensions)
             .field("usage", &self.usage)
+            .field("authors", &self.authors)
             .finish_non_exhaustive()
     }
 }
@@ -85,7 +94,15 @@ impl PostgresStore {
     /// Connects to `url` (`postgres://` or `postgresql://`, see [`connect`] for the TLS rules)
     /// and migrates the schema. A database written by a newer server connects, but every
     /// operation then fails with [`StoreError::NewerSchema`].
+    ///
+    /// Adding the schema extensions waits up to 5 s for a lock, except in the MCP server
+    /// ([`crate::store::patience::skip_schema_waits`]): it gives up after a fraction of a second.
     pub fn connect(url: &str) -> Result<Self, StoreError> {
+        Self::connect_with(url, patience())
+    }
+
+    /// As [`Self::connect`] with the `patience` of adding the schema extensions chosen.
+    pub fn connect_with(url: &str, patience: Patience) -> Result<Self, StoreError> {
         let settings = connect::parse(url).map_err(|error| StoreError::Backend(error.to_string()))?;
         let mut client = open(&settings)?;
         let state = schema::migrate(&mut client)?;
@@ -96,10 +113,12 @@ impl PostgresStore {
             newer: state == SchemaState::Newer,
             extensions: false,
             usage: false,
+            authors: false,
+            recheck: Recheck::every(AUTHORS_RECHECK),
         };
 
         if !store.newer {
-            (store.extensions, store.usage) = store.install_extensions();
+            (store.extensions, store.usage, store.authors) = store.install_extensions(patience);
             store.backfill_lang();
         }
 
@@ -113,17 +132,22 @@ impl PostgresStore {
     }
 
     /// Adds the schema extensions the database lacks and reports whether it has them now, the
-    /// usage counters apart from the rest: `(extensions, usage)`. A database that refuses them (no
-    /// right to change the schema) is used with what it has, with one line on stderr.
-    fn install_extensions(&mut self) -> (bool, bool) {
-        match schema::ensure_extensions(&mut self.client) {
-            Ok(()) => (true, true),
+    /// usage counters and the author columns apart from the rest: `(extensions, usage, authors)`. A
+    /// database that refuses them (no right to change the schema) is used with what it has, with
+    /// one line on stderr.
+    fn install_extensions(&mut self, patience: Patience) -> (bool, bool, bool) {
+        match schema::ensure_extensions(&mut self.client, patience) {
+            Ok(()) => (true, true, true),
             Err(error) => {
-                extensions::warn_unavailable(&error);
+                // A lock not granted in time is no refusal: the next open tries again.
+                if patience == Patience::Wait || !error.to_string().contains("SQLSTATE 55P03") {
+                    extensions::warn_unavailable(&error);
+                }
 
                 let extensions = schema::extensions_present(&mut self.client).unwrap_or(false);
                 let usage = schema::usage_present(&mut self.client).unwrap_or(false);
-                (extensions, usage)
+                let authors = schema::authors_present(&mut self.client).unwrap_or(false);
+                (extensions, usage, authors)
             }
         }
     }
@@ -162,7 +186,28 @@ impl PostgresStore {
         Columns {
             lang: self.extensions,
             usage: self.usage,
+            authors: self.authors,
         }
+    }
+
+    /// Whether a write may name the author columns. A store that did not find them when it opened
+    /// (a lock it would not wait for, see [`Patience::Skip`]) looks again before a write, as often
+    /// as its [`Recheck`] allows: columns another process added since are written, so a changed
+    /// row does not keep the name of its last writer. A write between two looks names no author.
+    fn authors_for_write(&mut self) -> bool {
+        if self.authors {
+            return true;
+        }
+
+        if !self.recheck.due() {
+            return false;
+        }
+
+        if self.ready().is_ok() && schema::authors_present(&mut self.client).unwrap_or(false) {
+            self.authors = true;
+        }
+
+        self.authors
     }
 
     /// Fails once the database is known to be newer, and opens the connection again when it closed.
@@ -310,14 +355,16 @@ fn uncertain(error: StoreError) -> StoreError {
 impl MemoryStore for PostgresStore {
     fn remember(&mut self, target: &Target, draft: &NoteDraft) -> Result<Saved, StoreError> {
         let draft = clean::draft(draft)?;
+        let authors = self.authors_for_write();
         let extensions = self.extensions;
-        self.write(|tx| notes::remember(tx, target, &draft, extensions))
+        self.write(|tx| notes::remember(tx, target, &draft, extensions, authors))
     }
 
     fn update(&mut self, view: &View, id: i64, patch: &NotePatch) -> Result<Saved, StoreError> {
         let patch = clean::patch(patch)?;
+        let authors = self.authors_for_write();
         let extensions = self.extensions;
-        self.write(|tx| notes::update(tx, view, id, &patch, extensions))
+        self.write(|tx| notes::update(tx, view, id, &patch, extensions, authors))
     }
 
     fn get(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {

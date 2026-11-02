@@ -24,6 +24,7 @@ fn from(root: &str, title: &str, body: &str) -> NoteDraft {
         root: Some(PathBuf::from(root)),
         source: Some("tests".to_owned()),
         via_override: false,
+        ..Provenance::default()
     };
     note
 }
@@ -89,6 +90,7 @@ fn a_same_title_write_from_another_checkout_is_a_conflict_not_an_overwrite() {
             root: Some(PathBuf::from("/work/b/widget")),
             source: Some("omp".to_owned()),
             via_override: true,
+            ..Provenance::default()
         },
         ..NotePatch::default()
     };
@@ -130,6 +132,7 @@ fn a_note_last_written_through_project_path_is_replaced_by_id_only() {
             root: None,
             source: Some("pi".to_owned()),
             via_override: true,
+            ..Provenance::default()
         },
         ..NotePatch::default()
     };
@@ -296,6 +299,7 @@ fn a_version_1_database_is_migrated_and_keeps_its_notes() {
             root: Some(PathBuf::from("/work/github.com/acme/widget")),
             source: Some("omp".to_owned()),
             via_override: false,
+            ..Provenance::default()
         },
         "a repository note takes its repository's root"
     );

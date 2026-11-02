@@ -29,6 +29,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::store::Author;
+
 pub use store::{Claim, HeldStore, HoldError};
 
 /// The folder next to the database that holds the held items.
@@ -98,6 +100,13 @@ pub struct HeldItem {
     pub project_path: Option<String>,
     /// The chat's repository (a canonical git root), when there is one.
     pub repo_root: Option<String>,
+    /// Who the save is for (the git name of the person and the client), when it was held: saving it
+    /// records this author, not the one of whoever saves it. Items held before this field existed
+    /// have none and a missing one is left out of the file. It is no part of the [`Self::digest`]
+    /// either, so an older harness-memory reading the file computes the revision it wrote, and the
+    /// author is cleaned again by whatever saves the item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<Author>,
     /// The tool arguments in normal form: the fields the tool knows, as it reads them, with note
     /// text, tags, entities and script descriptions masked as the store masks them.
     pub arguments: Value,
@@ -120,6 +129,7 @@ impl HeldItem {
             tool,
             project_path: None,
             repo_root: None,
+            author: None,
             arguments,
             current,
             revision: String::new(),
@@ -127,12 +137,13 @@ impl HeldItem {
     }
 
     /// The lowercase hex SHA-256 of the item's canonical JSON (keys sorted, no blanks) without
-    /// its `revision`.
+    /// its `revision` and its `author`, which older versions did not know.
     pub fn digest(&self) -> String {
         let mut value = serde_json::to_value(self).unwrap_or(Value::Null);
 
         if let Value::Object(fields) = &mut value {
             fields.remove("revision");
+            fields.remove("author");
         }
 
         let text = serde_json::to_vec(&sorted(value)).unwrap_or_default();

@@ -24,6 +24,7 @@ fn from(root: &str, title: &str, body: &str) -> NoteDraft {
         root: Some(PathBuf::from(root)),
         source: Some("tests".to_owned()),
         via_override: false,
+        ..Provenance::default()
     };
     note
 }
@@ -97,6 +98,7 @@ fn another_checkout_conflicts(db: &Database) {
             root: Some(PathBuf::from("/work/b/widget")),
             source: Some("omp".to_owned()),
             via_override: true,
+            ..Provenance::default()
         },
         ..NotePatch::default()
     };
@@ -134,6 +136,7 @@ fn project_path_notes_are_replaced_by_id_only(db: &Database) {
             root: None,
             source: Some("pi".to_owned()),
             via_override: true,
+            ..Provenance::default()
         },
         ..NotePatch::default()
     };

@@ -143,6 +143,7 @@ fn a_request_shows_cleaned_client_and_writer_names() {
         root: Some(PathBuf::from(format!("/work/\u{202E}gpj\n{}", "r".repeat(600)))),
         source: Some(format!("claude\u{1B}[2J\u{200B}code{}", "s".repeat(100))),
         via_override: false,
+        ..Provenance::default()
     };
     fixture.save_into("memory.sqlite3", "foreign", "true", writer);
 

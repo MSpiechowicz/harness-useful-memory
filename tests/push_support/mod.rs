@@ -5,7 +5,9 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use harness_memory::push::{Action, Change, Options, Summary, push};
-use harness_memory::store::{Link, MemoryStore, NoteKind, NotePatch, ProjectKey, Provenance, SqliteStore, Target};
+use harness_memory::store::{
+    Author, Authors, Link, MemoryStore, NoteKind, NotePatch, ProjectKey, Provenance, SqliteStore, Target,
+};
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
@@ -31,6 +33,7 @@ pub fn local_memory() -> Local {
         root: Some(PathBuf::from("/work/widget")),
         source: Some("omp".to_owned()),
         via_override: false,
+        ..Provenance::default()
     };
     let cache = store.remember(&repo(REPO), &cache).expect("cache");
 
@@ -206,6 +209,7 @@ pub fn scenario(remote: &mut dyn MemoryStore) {
             root: Some(PathBuf::from("/work/widget")),
             source: Some("omp".to_owned()),
             via_override: false,
+            ..Provenance::default()
         }
     );
 
@@ -385,4 +389,87 @@ pub fn hidden_scenario(remote: &mut dyn MemoryStore) {
         .into_iter()
         .collect();
     assert_eq!(left, ["Build cache", "Deploy steps"]);
+}
+
+fn person(name: &str, via: Option<&str>) -> Option<Author> {
+    Some(Author {
+        name: name.to_owned(),
+        via: via.map(str::to_owned),
+    })
+}
+
+/// A note pushed to `remote` keeps who added it and who last changed it, and a later push of a
+/// change keeps who added the team's note.
+pub fn authors_scenario(remote: &mut dyn MemoryStore) {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join("memory.sqlite3");
+    let mut local = SqliteStore::open(&path).expect("local store");
+
+    let by = |author: Option<Author>| Provenance {
+        source: Some("omp".to_owned()),
+        author,
+        ..Provenance::default()
+    };
+
+    let mut cache = draft("Build cache", "Lives in target/", NoteKind::Location);
+    cache.provenance = by(person("Ada Lovelace", Some("omp")));
+    let saved = local.remember(&repo(REPO), &cache).expect("cache");
+
+    let patch = NotePatch {
+        body: Some("Lives in target/debug".to_owned()),
+        provenance: by(person("Grace Hopper", None)),
+        ..NotePatch::default()
+    };
+    local.update(&both(REPO), saved.id, &patch).expect("update");
+
+    local
+        .remember(
+            &repo(REPO),
+            &draft("Deploy steps", "Run make deploy", NoteKind::Decision),
+        )
+        .expect("deploy");
+    drop(local);
+
+    let first = push(&path, remote, &[], &all()).expect("push");
+    assert!(first.failed.is_empty(), "{:?}", first.failed);
+
+    let team = |remote: &mut dyn MemoryStore, title: &str| {
+        remote
+            .find_by_title(&repo(REPO), title)
+            .expect("find")
+            .unwrap_or_else(|| panic!("{title} was pushed"))
+            .authors
+    };
+
+    let cache = team(remote, "Build cache");
+    assert_eq!(cache.added_by, person("Ada Lovelace", Some("omp")));
+    assert_eq!(cache.updated_by, person("Grace Hopper", None));
+    assert_eq!(team(remote, "Deploy steps"), Authors::default());
+
+    // Changed here by someone else, pushed again: the team's note was added by the same one.
+    let mut local = SqliteStore::open(&path).expect("local store");
+    let patch = NotePatch {
+        body: Some("Lives in target/release".to_owned()),
+        provenance: by(person("Alan Turing", Some("omp"))),
+        ..NotePatch::default()
+    };
+    local.update(&both(REPO), saved.id, &patch).expect("update");
+    drop(local);
+
+    // Newer than the team's note, whatever the second the clock is at.
+    rusqlite::Connection::open(&path)
+        .expect("raw local")
+        .execute(
+            "UPDATE notes SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![now() + 3600, saved.id],
+        )
+        .expect("later");
+
+    let second = push(&path, remote, &[], &all()).expect("push again");
+    assert!(second.failed.is_empty(), "{:?}", second.failed);
+    assert_eq!(second.updated + second.overwritten, 1, "{second:?}");
+
+    let cache = team(remote, "Build cache");
+    assert_eq!(cache.added_by, person("Ada Lovelace", Some("omp")));
+    assert_eq!(cache.updated_by, person("Alan Turing", Some("omp")));
 }

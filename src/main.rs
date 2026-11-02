@@ -68,8 +68,9 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--o
 /// `held list|save|skip`), the `settings` command, the notes language (`notes list --lang`, the
 /// `lang` of a note, the English notes setting), the shared embedder (`embedder`), and the offline
 /// fallback (`offline_fallback`), and the usefulness counters of a note (`notes list --sort
-/// useful|lastUseful`, `--useful ever|never`, the `shown`, `useful` and `lastUsefulAt` of a note).
-const FEATURES: [&str; 13] = [
+/// useful|lastUseful`, `--useful ever|never`, the `shown`, `useful` and `lastUsefulAt` of a note), and
+/// who added and last changed a note or a script (`addedBy`, `updatedBy`).
+const FEATURES: [&str; 14] = [
     "notes-remote-local",
     "notes-hide",
     "push-json",
@@ -83,6 +84,7 @@ const FEATURES: [&str; 13] = [
     "embedder",
     "offline-fallback",
     "notes-useful",
+    "notes-authors",
 ];
 
 /// mimalloc hands freed memory back to the operating system, which the embedder's idle unload of
@@ -152,6 +154,9 @@ fn run() -> ExitCode {
     let Some(selection) = select(&env) else {
         return ExitCode::FAILURE;
     };
+
+    // A tool call never waits for another process to add the schema extensions.
+    harness_memory::store::patience::skip_schema_waits();
 
     let Some(server) = open_server(&env, &selection, std::env::current_dir().ok()) else {
         return ExitCode::FAILURE;

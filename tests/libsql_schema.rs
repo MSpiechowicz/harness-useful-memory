@@ -51,6 +51,7 @@ fn version_1_is_migrated_and_keeps_its_notes(db: &Database) {
             root: Some(PathBuf::from("/work/github.com/acme/widget")),
             source: Some("omp".to_owned()),
             via_override: false,
+            ..Provenance::default()
         }
     );
     assert_eq!(notes[1].provenance, Provenance::default());

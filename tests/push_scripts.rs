@@ -20,8 +20,8 @@ use harness_memory::backend::LOCAL_KEY;
 use harness_memory::push::{Action, Options, Overwrite};
 use harness_memory::push_scripts::{ScriptChange, ScriptPush, TeamScripts, push_scripts};
 use harness_memory::store::{
-    PreviousVersion, Scope, Script, ScriptRef, ScriptStore, SqliteStore, StoreError, Target, TrustOrigin, TrustRecord,
-    TrustStore, TrustedVersion, View,
+    Author, Authors, PreviousVersion, Scope, Script, ScriptRef, ScriptStore, SqliteStore, StoreError, Target,
+    TrustOrigin, TrustRecord, TrustStore, TrustedVersion, View,
 };
 use pretty_assertions::assert_eq;
 use script_teams::{Fresh, Team};
@@ -155,12 +155,13 @@ impl Fixture {
 
 type Case = fn(&Fixture);
 
-const CASES: [Case; 5] = [
+const CASES: [Case; 6] = [
     a_dry_run_classifies_every_script_and_writes_nothing,
     a_dry_run_fails_hidden_matches_as_the_push_does,
     overwrite_ids_pick_the_conflicts_and_trust_goes_with_trusted_versions,
     delete_copied_deletes_only_unchanged_copies,
     failed_scripts_are_uncounted_and_stay,
+    a_push_keeps_who_added_and_who_changed_a_script,
 ];
 
 fn run(fresh: Fresh) {
@@ -543,4 +544,38 @@ impl TrustStore for Failing {
     fn is_held_back(&mut self, place: &str, script_id: i64, name: &str, sha256: &str) -> Result<bool, StoreError> {
         self.inner.is_held_back(place, script_id, name, sha256)
     }
+}
+
+fn a_push_keeps_who_added_and_who_changed_a_script(fixture: &Fixture) {
+    let person = |name: &str, via: Option<&str>| {
+        Some(Author {
+            name: name.to_owned(),
+            via: via.map(str::to_owned),
+        })
+    };
+
+    let mut local = fixture.local_store();
+    let mut first = script("lint", "Lints", "just lint\n");
+    first.provenance.author = person("Ada Lovelace", Some("omp"));
+    local.save_script(&repo(REPO), &first).expect("saved");
+
+    let mut second = script("lint", "Lints the code", "just lint --all\n");
+    second.provenance.author = person("Grace Hopper", None);
+    local.save_script(&repo(REPO), &second).expect("saved again");
+    local
+        .save_script(&repo(REPO), &script("fmt", "Formats", "just fmt\n"))
+        .expect("nameless");
+    drop(local);
+
+    let mut trust = fixture.local_store();
+    let summary = fixture.push(&Options::default(), &mut trust, &[]);
+    assert!(summary.failed.is_empty(), "{:?}", summary.failed);
+
+    let lint = fixture.team_script(&both(REPO), "lint").summary.authors;
+    assert_eq!(lint.added_by, person("Ada Lovelace", Some("omp")));
+    assert_eq!(lint.updated_by, person("Grace Hopper", None));
+    assert_eq!(
+        fixture.team_script(&both(REPO), "fmt").summary.authors,
+        Authors::default()
+    );
 }

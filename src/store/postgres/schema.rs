@@ -8,7 +8,7 @@
 use postgres::{Client, GenericClient};
 
 use super::{backend, column};
-use crate::store::StoreError;
+use crate::store::{Patience, StoreError};
 
 /// The schema version this server writes.
 pub const SCHEMA_VERSION: i64 = 4;
@@ -299,8 +299,30 @@ SELECT count(*) = 3 FROM pg_attribute
 WHERE attrelid = to_regclass('notes') AND attname IN ('shown', 'useful', 'last_useful_at') AND NOT attisdropped
 ";
 
-/// True when every object of [`ensure_extensions`] but the usage counters exists (existence only,
-/// not the version). A read-only role may have these without [`usage_present`].
+/// Who added a note or a script and who changed it last: the git name and the MCP client of an
+/// agent's write (not `written_by`, which is the database role). Nullable, so an older server's
+/// inserts stay valid, and adding them rewrites no row.
+const AUTHORS: &str = "
+ALTER TABLE notes ADD COLUMN IF NOT EXISTS added_by_name TEXT;
+ALTER TABLE notes ADD COLUMN IF NOT EXISTS added_by_via TEXT;
+ALTER TABLE notes ADD COLUMN IF NOT EXISTS updated_by_name TEXT;
+ALTER TABLE notes ADD COLUMN IF NOT EXISTS updated_by_via TEXT;
+ALTER TABLE scripts ADD COLUMN IF NOT EXISTS added_by_name TEXT;
+ALTER TABLE scripts ADD COLUMN IF NOT EXISTS added_by_via TEXT;
+ALTER TABLE scripts ADD COLUMN IF NOT EXISTS updated_by_name TEXT;
+ALTER TABLE scripts ADD COLUMN IF NOT EXISTS updated_by_via TEXT;
+";
+
+/// One existence check of the eight columns of [`AUTHORS`].
+const AUTHORS_PRESENT: &str = "
+SELECT count(*) = 8 FROM pg_attribute
+WHERE attrelid IN (to_regclass('notes'), to_regclass('scripts'))
+  AND attname IN ('added_by_name', 'added_by_via', 'updated_by_name', 'updated_by_via') AND NOT attisdropped
+";
+
+/// True when every object of [`ensure_extensions`] but the usage counters and the author columns
+/// exists (existence only, not the version). A read-only role may have these without
+/// [`usage_present`] or [`authors_present`].
 pub(super) fn extensions_present(client: &mut impl GenericClient) -> Result<bool, StoreError> {
     let row = client.query_one(EXTENSIONS_PRESENT, &[]).map_err(backend)?;
 
@@ -314,13 +336,20 @@ pub(super) fn usage_present(client: &mut impl GenericClient) -> Result<bool, Sto
     column(&row, 0)
 }
 
+/// True when the notes and the scripts have the author columns.
+pub(super) fn authors_present(client: &mut impl GenericClient) -> Result<bool, StoreError> {
+    let row = client.query_one(AUTHORS_PRESENT, &[]).map_err(backend)?;
+
+    column(&row, 0)
+}
+
 /// Adds the objects the database lacks of the English search column with its index, `lang` with
-/// its reset trigger, and the usage counters. The schema version is neither read nor written. Everything runs in one
+/// its reset trigger, the usage counters and the author columns. The schema version is neither read nor written. Everything runs in one
 /// transaction under the migration lock, after a first look without it, so a database that has
 /// the extensions is only read, and servers starting together add them once. A lock that cannot be
 /// had within five seconds is an error, like a refused right.
-pub(super) fn ensure_extensions(client: &mut Client) -> Result<(), StoreError> {
-    if extensions_present(client)? && usage_present(client)? {
+pub(super) fn ensure_extensions(client: &mut Client, patience: Patience) -> Result<(), StoreError> {
+    if extensions_present(client)? && usage_present(client)? && authors_present(client)? {
         return Ok(());
     }
 
@@ -328,8 +357,14 @@ pub(super) fn ensure_extensions(client: &mut Client) -> Result<(), StoreError> {
 
     // `ALTER TABLE` waits for every open transaction on `notes` and, while it waits, queues every
     // other statement behind it. A short wait gives up instead (the caller opens without the
-    // extensions and tries again at the next open).
-    tx.batch_execute("SET LOCAL lock_timeout = '5s'").map_err(backend)?;
+    // extensions and tries again at the next open). The MCP server waits much less: a tool call
+    // must not stall behind it.
+    let wait = match patience {
+        Patience::Wait => "5s",
+        Patience::Skip => "250ms",
+    };
+    tx.batch_execute(&format!("SET LOCAL lock_timeout = '{wait}'"))
+        .map_err(backend)?;
     tx.execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATE_LOCK])
         .map_err(backend)?;
 
@@ -343,6 +378,10 @@ pub(super) fn ensure_extensions(client: &mut Client) -> Result<(), StoreError> {
 
     if !usage_present(&mut tx)? {
         tx.batch_execute(USAGE).map_err(backend)?;
+    }
+
+    if !authors_present(&mut tx)? {
+        tx.batch_execute(AUTHORS).map_err(backend)?;
     }
 
     tx.commit().map_err(backend)

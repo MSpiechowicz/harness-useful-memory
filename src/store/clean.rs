@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 
-use super::{Forget, Link, NoteDraft, NoteKind, NotePatch, Provenance, StoreError};
+use super::{Forget, Link, NoteDraft, NoteKind, NotePatch, Provenance, StoreError, author};
 use crate::limits::{BODY_MAX, ENTITIES_PER_NOTE, ENTITY_MAX, RELATION_MAX, TAG_MAX, TAGS_MAX, TITLE_MAX};
 use crate::support::redact::redact_text;
 use crate::support::text::display_safe;
@@ -54,14 +54,22 @@ pub struct Writer {
     pub root: Option<String>,
     pub source: Option<String>,
     pub via_override: bool,
+    /// Who adds the note, as `(name, via)`: stored when the write creates it.
+    pub added_by: (Option<String>, Option<String>),
+    /// Who changes it last, as `(name, via)`.
+    pub updated_by: (Option<String>, Option<String>),
 }
 
 impl Writer {
     pub fn new(provenance: &Provenance) -> Self {
+        let [added_name, added_via, updated_name, updated_via] = author::created_columns(provenance);
+
         Self {
             root: provenance.root.as_ref().map(|root| root.to_string_lossy().into_owned()),
             source: source(provenance.source.as_deref()),
             via_override: provenance.via_override,
+            added_by: (added_name, added_via),
+            updated_by: (updated_name, updated_via),
         }
     }
 }

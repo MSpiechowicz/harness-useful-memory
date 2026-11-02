@@ -15,6 +15,7 @@
 //! opens a store on first use. [`listing`] holds the
 //! types of [`MemoryStore::list_notes`].
 
+pub mod author;
 pub mod clean;
 pub(crate) mod extensions;
 pub(crate) mod fuse;
@@ -24,10 +25,12 @@ pub mod lazy;
 pub mod libsql;
 pub mod listing;
 pub mod mongo;
+pub mod patience;
 pub mod pending;
 pub mod postgres;
 pub(crate) mod rank;
 pub mod reach;
+pub(crate) mod recheck;
 pub mod routines;
 pub mod scripts;
 pub mod split;
@@ -39,12 +42,14 @@ use std::path::PathBuf;
 
 use crate::support::lang::Lang;
 
+pub use author::{Author, Authors};
 pub use hidden::{HiddenEntry, HiddenNote, HiddenNotes, HiddenScripts};
 pub use hooks::{HookDelete, HookDraft, HookPage, HookPut, HookStore, TeamHook, checked_hook, hook_sha256};
 pub use lazy::Lazy;
 pub use libsql::LibsqlStore;
 pub use listing::{LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort, UsefulFilter};
 pub use mongo::MongoStore;
+pub use patience::Patience;
 pub use postgres::PostgresStore;
 pub use reach::Reach;
 pub use routines::{RoutineDelete, RoutineDraft, RoutinePage, RoutinePut, RoutineStore, TeamRoutine, checked_routine};
@@ -218,6 +223,13 @@ pub struct Provenance {
     /// True when the agent named the repository with `project_path` and it is not the one the
     /// server runs in.
     pub via_override: bool,
+    /// The person behind the write (see [`Author`]); stored as who changed the record last, and
+    /// as who added it when the write creates it. `None` when no git name was found.
+    pub author: Option<Author>,
+    /// Only when a record is copied to another store: who added the original. A record the copy
+    /// creates takes it instead of `author` as who added it (`Some(None)`: the original has no
+    /// author).
+    pub original_added_by: Option<Option<Author>>,
 }
 
 /// A note to create (or to update when a note with the same title exists in the scope).
@@ -271,6 +283,9 @@ pub struct Note {
     /// How often the note was shown to an agent and found useful; `None` when the database has no
     /// such counters (a read-only role on a database an older server made).
     pub usage: Option<NoteUsage>,
+    /// Who added the note and who changed it last; none when the database has no author columns
+    /// (a read-only role on a database no newer server extended) or a note has none.
+    pub authors: Authors,
 }
 
 /// The usefulness counters of a note: how often an agent was shown it in search results, how often

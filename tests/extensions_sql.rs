@@ -9,7 +9,7 @@ mod libsql_support;
 use common::listing::listing;
 use common::{both, draft, query, repo};
 use harness_memory::store::sqlite::schema::{SCHEMA_VERSION, V1, V2, V3, V4, V5};
-use harness_memory::store::{NoteKind, NotePatch, NoteUsage, StoreError};
+use harness_memory::store::{Author, Authors, NoteKind, NotePatch, NoteUsage, Provenance, StoreError};
 use libsql_support::Database;
 use pretty_assertions::assert_eq;
 
@@ -34,6 +34,8 @@ store_cases!(
     counters_that_gave_up_leave_the_write_lock_free,
     a_counter_does_not_write_to_a_newer_schema,
     an_older_server_keeps_working_on_a_database_with_counters,
+    a_database_without_authors_gets_them_and_keeps_its_rows,
+    an_older_server_keeps_working_on_a_database_with_authors,
 );
 
 /// The extension objects the database has, out of the six there are.
@@ -501,4 +503,76 @@ fn an_older_server_keeps_working_on_a_database_with_counters(db: &Database) {
             last_useful_at: None
         })
     );
+}
+
+/// The author columns the database has, out of the eight there are (four on the notes, four on
+/// the scripts).
+fn author_columns(db: &Database) -> i64 {
+    db.integer(
+        "SELECT count(*) FROM (SELECT name FROM pragma_table_info('notes') UNION ALL
+                               SELECT name FROM pragma_table_info('scripts'))
+         WHERE name IN ('added_by_name', 'added_by_via', 'updated_by_name', 'updated_by_via')",
+    )
+}
+
+fn ada() -> Author {
+    Author {
+        name: "Ada Lovelace".to_owned(),
+        via: Some("claude-code".to_owned()),
+    }
+}
+
+fn a_database_without_authors_gets_them_and_keeps_its_rows(db: &Database) {
+    without_extensions(db);
+    assert_eq!(author_columns(db), 0);
+
+    let mut store = db.open();
+
+    assert_eq!(author_columns(db), 8);
+    assert_eq!(
+        db.integer("PRAGMA user_version"),
+        SCHEMA_VERSION,
+        "no schema version change"
+    );
+
+    // The notes that were there have no authors.
+    let page = store.list_notes(&listing(both(REPO))).expect("list");
+    assert_eq!(page.total, 2);
+
+    for row in &page.rows {
+        assert_eq!(row.authors, Authors::default(), "{}", row.title);
+    }
+
+    // A write now records them, and a note nobody named stays as it is.
+    let mut named = draft("Lint", ENGLISH, NoteKind::Note);
+    named.provenance = Provenance {
+        author: Some(ada()),
+        ..named.provenance
+    };
+    let saved = store.remember(&repo(REPO), &named).expect("remember");
+    let read = store.peek(&both(REPO), &[saved.id]).expect("peek");
+
+    assert_eq!(
+        read[0].authors,
+        Authors {
+            added_by: Some(ada()),
+            updated_by: Some(ada())
+        }
+    );
+    assert_eq!(db.integer("SELECT count(*) FROM notes WHERE added_by_name IS NULL"), 2);
+}
+
+fn an_older_server_keeps_working_on_a_database_with_authors(db: &Database) {
+    drop(db.open());
+    assert_eq!(author_columns(db), 8);
+
+    // What the previous server runs: it knows no author column and names none.
+    old_insert(db, "Release steps", "Tag the commit then publish the changelog");
+    db.batch("UPDATE notes SET revision = revision + 1, updated_at = 5 WHERE title = 'Release steps';");
+
+    let mut store = db.open();
+    let page = store.list_notes(&listing(both(REPO))).expect("list");
+
+    assert_eq!(page.total, 1);
+    assert_eq!(page.rows[0].authors, Authors::default());
 }

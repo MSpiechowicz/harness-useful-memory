@@ -24,6 +24,9 @@
 //!   `local`: where this note is kept), `readOnly` (a team note of a scope routed
 //!   `remote+local`, which cannot be changed from here), `hidden` (hidden on this computer),
 //!   `tags`, `entities`, `author` (`source` and `root`, shown like a script's writer),
+//!   `addedBy` and `updatedBy` (who added the note and who changed it last: `{"name", "via"}`,
+//!   the git `user.name` and the MCP client of an agent's write, `via` `null` for the user's own
+//!   save; `null` when no name was known or the database has no author columns),
 //!   `createdAt` and `updatedAt` (RFC 3339), `revision`, `hits`, `lang` (`en`, `other`, or
 //!   `null` when the note was not looked at yet or its language is not certain), and the
 //!   usefulness counters `shown` (how often agents were shown the note in search results),
@@ -83,7 +86,7 @@ use crate::backend::{Backend, NotesPlace, Place, Secrets, Selection};
 use crate::cli::{self, Args, Delete, PAGE_OPTIONS, PICK_VALUED, Page, Repos};
 use crate::limits::{LIST_PAGE_MAX, NEIGHBORS_LIMIT_MAX};
 use crate::mcp::Vectors;
-use crate::mcp::{author_json, place_label, repo_label};
+use crate::mcp::{author_json, person_json, place_label, repo_label};
 use crate::open::{lone_notes_place, notes_place, open_hidden, open_notes};
 use crate::store::{
     Forget, HiddenNotes, LangFilter, MemoryStore, Note, NoteKind, NoteListQuery, NoteOrigin, NoteRow, NoteSort,
@@ -579,6 +582,8 @@ impl Opened {
             "tags": row.tags,
             "entities": row.entities,
             "author": author_json(&row.provenance),
+            "addedBy": person_json(row.authors.added_by.as_ref()),
+            "updatedBy": person_json(row.authors.updated_by.as_ref()),
             "createdAt": rfc3339(row.created_at),
             "updatedAt": rfc3339(row.updated_at),
             "revision": row.revision,

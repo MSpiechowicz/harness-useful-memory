@@ -272,6 +272,8 @@ fn lists_gets_and_deletes(folders: &Folders, repo_place: &str, global_place: &st
             "tags",
             "entities",
             "author",
+            "addedBy",
+            "updatedBy",
             "createdAt",
             "updatedAt",
             "revision",

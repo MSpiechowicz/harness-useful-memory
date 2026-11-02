@@ -22,7 +22,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
-use super::{Provenance, Scope, StoreError, Target, View};
+use super::{Authors, Provenance, Scope, StoreError, Target, View};
 use crate::backend::Place;
 use crate::limits::{SCRIPT_BODY_MAX, SCRIPT_DESCRIPTION_MAX, SCRIPT_NAME_MAX, SCRIPT_TIMEOUT_MAX};
 use crate::support::redact::{has_credentials, redact_text};
@@ -100,6 +100,9 @@ pub struct ScriptSummary {
     pub last_run_at: Option<i64>,
     /// `None` when the last run was killed or ended by a signal.
     pub last_exit_code: Option<i32>,
+    /// Who added the script and who changed it last; none when the database has no author columns
+    /// or a script has none.
+    pub authors: Authors,
 }
 
 /// A stored script.
@@ -536,6 +539,7 @@ pub(crate) struct Stored {
     pub run_count: i64,
     pub last_run_at: Option<i64>,
     pub last_exit_code: Option<i64>,
+    pub authors: Authors,
 }
 
 /// `stored` as a script, with its timeout clamped to 1 to [`SCRIPT_TIMEOUT_MAX`] seconds and its
@@ -596,6 +600,7 @@ fn check_stored(stored: Stored) -> Result<Script, String> {
         run_count: stored.run_count,
         last_run_at: stored.last_run_at,
         last_exit_code: stored.last_exit_code.and_then(|code| i32::try_from(code).ok()),
+        authors: stored.authors,
     };
 
     Ok(Script {
@@ -840,6 +845,7 @@ mod tests {
             run_count: 0,
             last_run_at: None,
             last_exit_code: Some(i64::MAX),
+            authors: Authors::default(),
         }
     }
 

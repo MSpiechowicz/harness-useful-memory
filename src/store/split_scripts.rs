@@ -630,6 +630,7 @@ mod tests {
                 run_count: 0,
                 last_run_at: None,
                 last_exit_code: None,
+                authors: crate::store::Authors::default(),
             },
             body: "true".to_owned(),
         };

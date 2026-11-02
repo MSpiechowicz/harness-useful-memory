@@ -7,12 +7,14 @@
 use std::path::PathBuf;
 
 use super::SqliteStore;
+use super::authors;
 use super::engine::Engine;
 use super::held_back;
 use super::notes::scope_of;
 use super::sql::{Row, Sql, Value, args};
 use super::{now, target_project, view_params};
 use crate::limits::{SCRIPT_BODY_MAX, SCRIPT_DESCRIPTION_MAX, SCRIPT_NAME_MAX};
+use crate::store::clean::Writer;
 use crate::store::scripts::{Stored, read_back, skipped};
 use crate::store::scripts::{TRUSTED_VERSIONS_KEPT, UNAPPROVED_KEPT};
 use crate::store::{
@@ -34,12 +36,16 @@ const VISIBLE: &str = "(s.project_id = ?1 OR (?1 = -1 AND s.project_id IS NOT NU
 /// The columns [`stored_from_row`] reads, text cut one character over its limit and the timeout
 /// read as an integer whatever was stored, so a row changed by hand cannot make a reply of any
 /// size or fail a list (see [`read_back`]).
-fn columns() -> String {
+///
+/// The last four are the authors, which a database without the author columns reads as NULL.
+fn columns(authors: bool) -> String {
+    let authors = authors::select("s", authors);
+
     format!(
         "s.id, s.project_id, p.key, substr(s.name, 1, {name}), substr(s.description, 1, {description}), \
          substr(s.language, 1, {LANGUAGE_MAX}), CAST(s.timeout_secs AS INTEGER), s.source, s.writer_root, \
          s.via_override, s.created_at, s.updated_at, s.run_count, s.last_run_at, s.last_exit_code, \
-         substr(s.body, 1, {body})",
+         substr(s.body, 1, {body}), {authors}",
         name = SCRIPT_NAME_MAX + 1,
         description = SCRIPT_DESCRIPTION_MAX + 1,
         body = SCRIPT_BODY_MAX + 1,
@@ -49,8 +55,9 @@ fn columns() -> String {
 pub(crate) fn save(engine: &mut impl Engine, target: &Target, draft: &ScriptDraft) -> Result<SavedScript, StoreError> {
     let draft = checked_draft(draft)?;
     let sha256 = script_sha256(draft.language, &draft.body);
+    let authors = super::engine::authors_for_write(engine);
 
-    engine.write(|db| save_in(db, target, &draft, &sha256))
+    engine.write(|db| save_in(db, target, &draft, &sha256, authors))
 }
 
 /// The visible scripts, repository scripts first, then by name. The query is matched here rather
@@ -65,11 +72,13 @@ pub(crate) fn list(
         .filter(|text| !text.is_empty())
         .map(str::to_lowercase);
 
+    let authors = engine.authors();
+
     let scripts = engine.read(|db| {
         let (repo, global) = view_params(db, view)?;
         let sql = format!(
             "SELECT {} {FROM} WHERE {VISIBLE} ORDER BY s.project_id IS NULL, s.name",
-            columns()
+            columns(authors)
         );
 
         let rows = db.query(&sql, args![repo, global])?;
@@ -93,7 +102,8 @@ pub(crate) fn list(
 }
 
 pub(crate) fn get(engine: &mut impl Engine, view: &View, script: &ScriptRef) -> Result<Option<Script>, StoreError> {
-    engine.read(|db| find(db, view, script))
+    let authors = engine.authors();
+    engine.read(|db| find(db, view, script, authors))
 }
 
 pub(crate) fn delete(engine: &mut impl Engine, view: &View, script: &ScriptRef) -> Result<bool, StoreError> {
@@ -143,7 +153,13 @@ pub(crate) fn record_run(engine: &mut impl Engine, id: i64, exit_code: Option<i3
     })
 }
 
-fn save_in(db: &mut dyn Sql, target: &Target, draft: &ScriptDraft, sha256: &str) -> Result<SavedScript, StoreError> {
+fn save_in(
+    db: &mut dyn Sql,
+    target: &Target,
+    draft: &ScriptDraft,
+    sha256: &str,
+    authors: bool,
+) -> Result<SavedScript, StoreError> {
     let project = target_project(db, target)?;
     let now = now();
     let timeout = i64::try_from(draft.timeout_secs)
@@ -200,7 +216,11 @@ fn save_in(db: &mut dyn Sql, target: &Target, draft: &ScriptDraft, sha256: &str)
         }
     };
 
-    let sql = format!("SELECT {} {FROM} WHERE s.id = ?1", columns());
+    if authors {
+        authors::set(db, "scripts", id, &Writer::new(writer), created)?;
+    }
+
+    let sql = format!("SELECT {} {FROM} WHERE s.id = ?1", columns(authors));
     let script = db
         .query(&sql, args![id])?
         .iter()
@@ -212,9 +232,9 @@ fn save_in(db: &mut dyn Sql, target: &Target, draft: &ScriptDraft, sha256: &str)
 
 /// The script `script` names when it is visible in `view`; a name resolves in the repository
 /// first, then in the global scope. A row [`read_back`] leaves out counts as missing.
-fn find(db: &mut dyn Sql, view: &View, script: &ScriptRef) -> Result<Option<Script>, StoreError> {
+fn find(db: &mut dyn Sql, view: &View, script: &ScriptRef, authors: bool) -> Result<Option<Script>, StoreError> {
     let (repo, global) = view_params(db, view)?;
-    let columns = columns();
+    let columns = columns(authors);
 
     let rows = match script {
         ScriptRef::Id(id) => {
@@ -275,6 +295,7 @@ fn stored_from_row(row: &Row) -> Result<Stored, StoreError> {
             root: root.map(PathBuf::from),
             source: row.get(7)?,
             via_override: row.get(9)?,
+            ..Provenance::default()
         },
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
@@ -282,6 +303,7 @@ fn stored_from_row(row: &Row) -> Result<Stored, StoreError> {
         last_run_at: row.get(13)?,
         last_exit_code: row.get(14)?,
         body: row.get(15)?,
+        authors: authors::read(row, 16)?,
     })
 }
 
@@ -289,8 +311,13 @@ impl SqliteStore {
     /// Every script of the file, every repository's, oldest first, with its repository (`None` for a
     /// global script): what `scripts push` copies and `scripts discard-local` deletes.
     pub fn every_script(&mut self) -> Result<Vec<(Script, Option<ProjectKey>)>, StoreError> {
+        let authors = self.authors;
+
         self.read(|db| {
-            let sql = format!("SELECT {}, p.root_path, p.remote {FROM} ORDER BY s.id", columns());
+            let sql = format!(
+                "SELECT {}, p.root_path, p.remote {FROM} ORDER BY s.id",
+                columns(authors)
+            );
             let rows = db.query(&sql, &[])?;
             let mut scripts = Vec::with_capacity(rows.len());
 
@@ -301,12 +328,12 @@ impl SqliteStore {
 
                 let project = match &script.summary.project {
                     Some(key) => {
-                        let root: Option<String> = row.get(16)?;
+                        let root: Option<String> = row.get(20)?;
 
                         Some(ProjectKey {
                             key: key.clone(),
                             root: PathBuf::from(root.unwrap_or_default()),
-                            remote: row.get(17)?,
+                            remote: row.get(21)?,
                         })
                     }
                     None => None,

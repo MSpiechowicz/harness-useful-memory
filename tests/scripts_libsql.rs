@@ -52,6 +52,7 @@ cases!(
     runs_are_counted,
     a_run_of_a_missing_script_is_no_error,
     deleting_many_takes_only_visible_ids,
+    authors_are_added_kept_and_updated,
 );
 
 #[test]

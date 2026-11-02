@@ -85,6 +85,11 @@ fn postgres_scripts_deleting_many_takes_only_visible_ids() {
 }
 
 #[test]
+fn postgres_scripts_authors_are_added_kept_and_updated() {
+    conforms(common::scripts::authors_are_added_kept_and_updated);
+}
+
+#[test]
 fn a_schema_1_database_migrates_to_the_current_schema_and_keeps_its_notes() {
     let Some(db) = database() else { return };
     let mut store = db.open();

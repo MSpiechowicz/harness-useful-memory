@@ -37,8 +37,8 @@ use crate::store::pending::Entry;
 use crate::store::split::narrow_by;
 use crate::store::split_scripts::hidden_name_error;
 use crate::store::{
-    ProjectKey, Scope, Script, ScriptDraft, ScriptRef, ScriptStore, SqliteStore, StoreError, Target, TrustStore,
-    TrustedVersion, View, script_sha256,
+    ProjectKey, Provenance, Scope, Script, ScriptDraft, ScriptRef, ScriptStore, SqliteStore, StoreError, Target,
+    TrustStore, TrustedVersion, View, script_sha256,
 };
 
 /// One local script a push took, and what it did (or, for a dry run, would do) with it.
@@ -315,7 +315,12 @@ fn draft_of(local: &Script) -> ScriptDraft {
         language: summary.language,
         body: local.body.clone(),
         timeout_secs: summary.timeout_secs,
-        provenance: summary.provenance.clone(),
+        provenance: Provenance {
+            // Copied along: the team's script is added by whoever added this one.
+            author: summary.authors.updated_by.clone(),
+            original_added_by: Some(summary.authors.added_by.clone()),
+            ..summary.provenance.clone()
+        },
     }
 }
 

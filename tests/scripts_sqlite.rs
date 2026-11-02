@@ -81,6 +81,7 @@ fn a_version_2_database_is_migrated_and_keeps_its_notes() {
             root: Some(PathBuf::from("/elsewhere")),
             source: Some("omp".to_owned()),
             via_override: false,
+            ..Provenance::default()
         }
     );
 

@@ -10,7 +10,7 @@ mod postgres_support;
 use common::listing::listing;
 use common::{both, draft, query, repo};
 use harness_memory::store::postgres::schema::SCHEMA_VERSION;
-use harness_memory::store::{MemoryStore, NoteKind, NotePatch, NoteUsage, UsefulFilter};
+use harness_memory::store::{Author, Authors, MemoryStore, NoteKind, NotePatch, NoteUsage, Provenance, UsefulFilter};
 use postgres::Client;
 use postgres_support::{Database, database};
 use pretty_assertions::assert_eq;
@@ -579,4 +579,217 @@ fn a_role_that_cannot_change_the_schema_keeps_the_language_without_the_counters(
 
     store.record_shown(&[page.rows[0].id]).expect("counts nothing");
     store.record_useful(&[page.rows[0].id], 5).expect("counts nothing");
+}
+
+/// The author columns the schema has, out of the eight there are (four on the notes, four on the
+/// scripts).
+fn author_columns(client: &mut Client) -> i64 {
+    count(
+        client,
+        "SELECT count(*) FROM pg_attribute WHERE attrelid IN (to_regclass('notes'), to_regclass('scripts'))
+             AND attname IN ('added_by_name', 'added_by_via', 'updated_by_name', 'updated_by_via')
+             AND NOT attisdropped",
+    )
+}
+
+fn drop_authors(client: &mut Client) {
+    client
+        .batch_execute(
+            "ALTER TABLE notes DROP COLUMN added_by_name, DROP COLUMN added_by_via,
+                 DROP COLUMN updated_by_name, DROP COLUMN updated_by_via;
+             ALTER TABLE scripts DROP COLUMN added_by_name, DROP COLUMN added_by_via,
+                 DROP COLUMN updated_by_name, DROP COLUMN updated_by_via;",
+        )
+        .expect("drop the authors");
+}
+
+fn ada() -> Author {
+    Author {
+        name: "Ada Lovelace".to_owned(),
+        via: Some("claude-code".to_owned()),
+    }
+}
+
+#[test]
+fn a_database_without_authors_gets_them_and_keeps_its_notes() {
+    let _serial = serial();
+    let Some(db) = database() else { return };
+    let mut store = open(&db);
+    store
+        .remember(&repo(REPO), &draft("Lint", ENGLISH, NoteKind::Note))
+        .expect("remember");
+    drop(store);
+
+    let mut admin = db.admin();
+    drop_authors(&mut admin);
+    assert_eq!(author_columns(&mut admin), 0);
+
+    let mut store = open(&db);
+    assert_eq!(author_columns(&mut admin), 8);
+    assert_eq!(schema_version(&mut admin), SCHEMA_VERSION, "no schema version change");
+
+    let page = store.list_notes(&listing(both(REPO))).expect("list");
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0].authors, Authors::default());
+
+    let mut named = draft("Release steps", ENGLISH, NoteKind::Note);
+    named.provenance = Provenance {
+        author: Some(ada()),
+        ..named.provenance
+    };
+    let saved = store.remember(&repo(REPO), &named).expect("remember");
+    let read = store.peek(&both(REPO), &[saved.id]).expect("peek");
+
+    assert_eq!(
+        read[0].authors,
+        Authors {
+            added_by: Some(ada()),
+            updated_by: Some(ada())
+        }
+    );
+}
+
+#[test]
+fn a_role_that_cannot_add_the_authors_reads_none_and_still_writes() {
+    let _serial = serial();
+    let Some(db) = database() else { return };
+    let mut owner = open(&db);
+    owner
+        .remember(&repo(REPO), &draft("Sync job", ENGLISH, NoteKind::Note))
+        .expect("remember");
+    drop(owner);
+
+    let mut admin = db.admin();
+    drop_authors(&mut admin);
+
+    let name = format!("hm_noauthors_{}", std::process::id());
+    let schema = count_text(&mut admin, "SELECT current_schema()");
+    admin
+        .batch_execute(&format!(
+            "CREATE ROLE {name} LOGIN PASSWORD 'limited';
+             GRANT USAGE ON SCHEMA \"{schema}\" TO {name};
+             GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA \"{schema}\" TO {name};
+             GRANT USAGE ON ALL SEQUENCES IN SCHEMA \"{schema}\" TO {name};"
+        ))
+        .expect("create the limited role");
+    let _role = LimitedRole {
+        admin: db.admin(),
+        name: name.clone(),
+    };
+
+    let url = db.url();
+    let (scheme, rest) = url.split_once("://").expect("a URL");
+    let (_, host) = rest.split_once('@').expect("a URL with a user");
+    let mut store =
+        harness_memory::store::PostgresStore::connect(&format!("{scheme}://{name}:limited@{host}")).expect("connect");
+
+    assert_eq!(author_columns(&mut admin), 0, "the role could not add the authors");
+
+    let page = store.list_notes(&listing(both(REPO))).expect("list");
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0].authors, Authors::default());
+
+    // A write names no author column, so it works and records nobody.
+    let mut named = draft("Release steps", ENGLISH, NoteKind::Note);
+    named.provenance = Provenance {
+        author: Some(ada()),
+        ..named.provenance
+    };
+    let saved = store.remember(&repo(REPO), &named).expect("remember");
+    let read = store.peek(&both(REPO), &[saved.id]).expect("peek");
+    assert_eq!(read[0].authors, Authors::default());
+}
+
+/// The MCP server opens without waiting for a lock that blocks the `ALTER TABLE`: it reads the notes
+/// with no authors, and a later open adds the columns.
+#[test]
+fn a_skipping_open_gives_up_a_blocked_author_install_at_once_and_a_later_open_adds_the_columns() {
+    use harness_memory::store::{Patience, PostgresStore};
+
+    let _serial = serial();
+    let Some(db) = database() else { return };
+    let mut store = open(&db);
+    store
+        .remember(&repo(REPO), &draft("Lint", ENGLISH, NoteKind::Note))
+        .expect("remember");
+    drop(store);
+
+    let mut admin = db.admin();
+    drop_authors(&mut admin);
+
+    let mut holder = db.admin();
+    holder
+        .batch_execute("BEGIN; SELECT count(*) FROM notes;")
+        .expect("a transaction that has read notes");
+
+    let started = std::time::Instant::now();
+    let mut store = PostgresStore::connect_with(db.url(), Patience::Skip).expect("connect");
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(author_columns(&mut admin), 0, "nothing was added");
+
+    let page = store.list_notes(&listing(both(REPO))).expect("list");
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0].authors, Authors::default());
+    drop(store);
+
+    holder.batch_execute("COMMIT").expect("release");
+    let store = PostgresStore::connect_with(db.url(), Patience::Skip).expect("connect");
+    drop(store);
+
+    assert_eq!(author_columns(&mut admin), 8);
+}
+
+/// A store that opened without the columns (the lock was blocked) learns that another process added
+/// them: a change it makes names its own writer and never leaves the previous one in place.
+#[test]
+fn a_skipping_store_that_missed_the_author_columns_names_its_writer_once_they_came() {
+    use harness_memory::store::{Patience, PostgresStore};
+
+    let _serial = serial();
+    let Some(db) = database() else { return };
+    let mut store = open(&db);
+    let saved = store
+        .remember(&repo(REPO), &draft("Lint", ENGLISH, NoteKind::Note))
+        .expect("remember");
+    drop(store);
+
+    let mut admin = db.admin();
+    drop_authors(&mut admin);
+
+    let mut holder = db.admin();
+    holder
+        .batch_execute("BEGIN; SELECT count(*) FROM notes;")
+        .expect("a transaction that has read notes");
+
+    let mut skipping = PostgresStore::connect_with(db.url(), Patience::Skip).expect("connect");
+    assert_eq!(author_columns(&mut admin), 0, "nothing was added");
+
+    // Another process adds the columns, and a person changes the note.
+    holder.batch_execute("COMMIT").expect("release");
+    drop(open(&db));
+    admin
+        .batch_execute("UPDATE notes SET added_by_name = 'Alice', updated_by_name = 'Alice'")
+        .expect("Alice's change");
+
+    let patch = NotePatch {
+        body: Some("Lint with clippy".to_owned()),
+        provenance: Provenance {
+            author: Some(ada()),
+            ..Provenance::default()
+        },
+        ..NotePatch::default()
+    };
+    skipping.update(&both(REPO), saved.id, &patch).expect("update");
+
+    let note = skipping.peek(&both(REPO), &[saved.id]).expect("peek").remove(0);
+    assert_eq!(note.authors.updated_by, Some(ada()));
+    assert_eq!(
+        note.authors.added_by.map(|author| author.name),
+        Some("Alice".to_owned())
+    );
 }

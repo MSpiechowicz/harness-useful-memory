@@ -305,6 +305,14 @@ const USAGE_COLUMNS: [(&str, &str); 3] = [
     ("last_useful_at", "INTEGER"),
 ];
 
+/// The author columns of a note and of a script: who added it and who changed it last, as the
+/// git name and the MCP client of an agent's write. All nullable, so an older server's inserts
+/// stay valid and a record has none until a server that knows them writes it.
+const AUTHOR_COLUMNS: [&str; 4] = ["added_by_name", "added_by_via", "updated_by_name", "updated_by_via"];
+
+/// The tables that have [`AUTHOR_COLUMNS`].
+const AUTHOR_TABLES: [&str; 2] = ["notes", "scripts"];
+
 /// True when every object of [`ensure_extensions`] but the usage counters exists (existence only,
 /// not the version). A read-only role may have these without [`usage_present`].
 pub(crate) fn extensions_present(db: &mut dyn Sql) -> Result<bool, StoreError> {
@@ -314,6 +322,28 @@ pub(crate) fn extensions_present(db: &mut dyn Sql) -> Result<bool, StoreError> {
 /// True when the usefulness counters of the notes exist.
 pub(crate) fn usage_present(db: &mut dyn Sql) -> Result<bool, StoreError> {
     Ok(usage_columns(db)?.len() == USAGE_COLUMNS.len())
+}
+
+/// True when the notes and the scripts have the author columns.
+pub(crate) fn authors_present(db: &mut dyn Sql) -> Result<bool, StoreError> {
+    for table in AUTHOR_TABLES {
+        if author_columns(db, table)?.len() != AUTHOR_COLUMNS.len() {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+/// The names of the author columns the table `table` has.
+fn author_columns(db: &mut dyn Sql, table: &str) -> Result<Vec<String>, StoreError> {
+    db.column(
+        &format!(
+            "SELECT name FROM pragma_table_info('{table}') WHERE name IN ({})",
+            AUTHOR_COLUMNS.map(|name| format!("'{name}'")).join(", ")
+        ),
+        args![],
+    )
 }
 
 /// The names of the usage counters the `notes` table has.
@@ -372,7 +402,8 @@ pub(crate) fn ensure_extensions(db: &mut dyn Sql) -> Result<(), StoreError> {
         add_search_extensions(db, &found)?;
     }
 
-    add_usage_columns(db)
+    add_usage_columns(db)?;
+    add_author_columns(db)
 }
 
 fn add_search_extensions(db: &mut dyn Sql, found: &Found) -> Result<(), StoreError> {
@@ -401,6 +432,20 @@ fn add_search_extensions(db: &mut dyn Sql, found: &Found) -> Result<(), StoreErr
 
     db.batch("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")?;
     db.batch(LANG_RESET)
+}
+
+fn add_author_columns(db: &mut dyn Sql) -> Result<(), StoreError> {
+    for table in AUTHOR_TABLES {
+        let present = author_columns(db, table)?;
+
+        for name in AUTHOR_COLUMNS {
+            if !present.iter().any(|found| found == name) {
+                db.batch(&format!("ALTER TABLE {table} ADD COLUMN {name} TEXT"))?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn add_usage_columns(db: &mut dyn Sql) -> Result<(), StoreError> {

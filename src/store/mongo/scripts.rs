@@ -12,7 +12,7 @@
 use mongodb::bson::{Bson, Document, doc};
 use mongodb::options::ReturnDocument;
 
-use super::notes::provenance_of;
+use super::notes::{author_fields, author_projection, authors_of, provenance_of};
 use super::{Ctx, Fail, META, MongoStore, PATH_MAX, SCRIPTS, SOURCE_MAX, counter_value, cut, flag, int, is_number};
 use super::{now, number, project_of, scope_of, scope_value, text, visible};
 use crate::limits::{SCRIPT_BODY_MAX, SCRIPT_DESCRIPTION_MAX, SCRIPT_NAME_MAX};
@@ -121,6 +121,8 @@ fn save(ctx: &mut Ctx<'_>, target: &Target, draft: &ScriptDraft) -> Result<Saved
         "updated_at": now,
     };
     fields.extend(writer_fields(&draft.provenance));
+    let writer = clean::Writer::new(&draft.provenance);
+    fields.extend(author_fields("updated_by", &writer.updated_by));
 
     let replaced = ctx.find_one_and_update(
         SCRIPTS,
@@ -145,6 +147,7 @@ fn save(ctx: &mut Ctx<'_>, target: &Target, draft: &ScriptDraft) -> Result<Saved
         "last_exit_code": Bson::Null,
     };
     document.extend(fields);
+    document.extend(author_fields("added_by", &writer.added_by));
     ctx.insert_one(SCRIPTS, document.clone())?;
 
     saved(&document, true)
@@ -240,7 +243,7 @@ fn writer_fields(provenance: &Provenance) -> Document {
 /// The fields a [`Script`] needs, the text ones cut one character over their limit (see
 /// [`read_back`]).
 fn script_fields() -> Document {
-    doc! {
+    let mut fields = doc! {
         "_id": number("$_id"),
         "project": cut("$project", PATH_MAX),
         "name": cut("$name", SCRIPT_NAME_MAX + 1),
@@ -256,7 +259,10 @@ fn script_fields() -> Document {
         "run_count": number("$run_count"),
         "last_run_at": number_or_null("$last_run_at"),
         "last_exit_code": number_or_null("$last_exit_code"),
-    }
+    };
+    fields.extend(author_projection());
+
+    fields
 }
 
 /// The number at `path`; `null` when it is not a number.
@@ -292,5 +298,6 @@ fn script_of(document: &Document) -> Option<Script> {
         run_count: int(document, "run_count"),
         last_run_at: optional_int(document, "last_run_at"),
         last_exit_code: optional_int(document, "last_exit_code"),
+        authors: authors_of(document),
     })
 }

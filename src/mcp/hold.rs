@@ -16,7 +16,7 @@ use super::calls::{RememberArgs, Reply, UpdateArgs, parse};
 use super::calls_scripts::{SaveArgs, draft_of};
 use super::guard_repos::chat_repos;
 use super::guards::{Reason, held, kind_of, refused};
-use super::scope::{kind, scope_arg, target, view};
+use super::scope::{kind, provenance, scope_arg, target, view};
 use super::script_blocks::shown_text;
 use crate::held::{HeldItem, HeldStore, HeldTool, HoldError};
 use crate::store::{NoteDraft, NotePatch, Provenance, ScriptRef, Target, View, clean};
@@ -63,6 +63,7 @@ pub(super) fn hold(
     let mut item = HeldItem::new(chat, &client, tool, Value::Object(normal), current);
     item.project_path = project_path;
     item.repo_root = repo_root;
+    item.author = provenance(server, arguments.get("project_path").and_then(Value::as_str)).author;
 
     match HeldStore::in_folder(data).hold(item) {
         Ok(held_id) => held(&held_id),

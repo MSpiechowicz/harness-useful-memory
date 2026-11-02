@@ -8,6 +8,7 @@
 //! through [`sql::Sql`] and the operations through [`engine::Engine`], so the libSQL backend
 //! ([`crate::store::libsql`]) shares them: one SQL dialect, one behaviour.
 
+mod authors;
 pub(crate) mod embed;
 pub(crate) mod engine;
 mod graph;
@@ -29,9 +30,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-use super::VectorTarget;
+use super::patience::patience;
+use super::recheck::Recheck;
 use super::{Edge, Forget, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NotePatch, ProjectKey};
 use super::{Forgotten, NoteListQuery, NotePage, NoteText, Saved, Scope, SearchQuery, StoreError, Target, View};
+use super::{Patience, VectorTarget};
 use crate::backend::Place;
 use engine::Engine;
 use local::Local;
@@ -52,6 +55,10 @@ pub struct SqliteStore {
     extensions: bool,
     /// The usefulness counters of a note are in place (kept apart: see [`Engine::usage`]).
     usage: bool,
+    /// The author columns of a note and a script are in place (kept apart: see [`Engine::authors`]).
+    authors: bool,
+    /// When the author columns were last looked for (every write: the file is local).
+    recheck: Recheck,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -60,6 +67,7 @@ impl std::fmt::Debug for SqliteStore {
             .field("newer", &self.newer)
             .field("extensions", &self.extensions)
             .field("usage", &self.usage)
+            .field("authors", &self.authors)
             .finish_non_exhaustive()
     }
 }
@@ -68,7 +76,15 @@ impl SqliteStore {
     /// Opens (creating when missing) the database at `path` and migrates it. On Unix a created
     /// parent folder is private (0700) and the file is 0600. A database written by a newer server
     /// opens, but every operation then fails with [`StoreError::NewerSchema`].
+    ///
+    /// Adding the schema extensions waits for another process's write lock, except in the MCP
+    /// server ([`crate::store::patience::skip_schema_waits`]): it opens with what the file has.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
+        Self::open_with(path, patience())
+    }
+
+    /// As [`Self::open`] with the `patience` of adding the schema extensions chosen.
+    pub fn open_with(path: &Path, patience: Patience) -> Result<Self, StoreError> {
         prepare_file(path)
             .map_err(|error| StoreError::Backend(format!("cannot create the database: {}", error.kind())))?;
 
@@ -96,12 +112,15 @@ impl SqliteStore {
             newer: state == SchemaState::Newer,
             extensions: false,
             usage: false,
+            authors: false,
+            recheck: Recheck::always(),
         };
 
         if !store.newer {
-            let installed = engine::install(&mut store);
+            let installed = engine::install(&mut store, patience);
             store.extensions = installed.extensions;
             store.usage = installed.usage;
+            store.authors = installed.authors;
             engine::backfill(&mut store);
         }
 
@@ -112,6 +131,12 @@ impl SqliteStore {
     /// settings); false when it is newer or refused them.
     pub fn has_extensions(&self) -> bool {
         self.extensions
+    }
+
+    /// True when the database has the author columns of the notes and the scripts; false when it
+    /// is newer or refused them.
+    pub fn has_authors(&self) -> bool {
+        self.authors
     }
 
     /// True when the database was written by a newer server.
@@ -202,6 +227,18 @@ impl Engine for SqliteStore {
 
     fn usage(&self) -> bool {
         self.usage
+    }
+
+    fn authors(&self) -> bool {
+        self.authors
+    }
+
+    fn learn_authors(&mut self) {
+        self.authors = true;
+    }
+
+    fn recheck(&mut self) -> &mut Recheck {
+        &mut self.recheck
     }
 }
 

@@ -566,6 +566,7 @@ fn candidate(row: &Row, excerpt: impl Fn(&str) -> String) -> Result<Candidate, S
                 root: root.map(PathBuf::from),
                 source: column(row, 6)?,
                 via_override: column(row, 8)?,
+                ..Provenance::default()
             },
             score_milli: 0,
             boost_milli: Hit::NO_BOOST,

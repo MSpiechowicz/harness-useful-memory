@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use postgres::{GenericClient, Row, Transaction};
 
+use super::authors;
 use super::search::fold;
 use super::{KIND_MAX, LANG_MAX, PATH_MAX, SOURCE_MAX, backend, column, cut, graph, now, target_project};
 use super::{target_project_existing, view_params};
@@ -14,8 +15,8 @@ use crate::store::{Forgotten, Note, NoteKind, NoteUsage, Provenance, Saved, Scop
 use crate::support::lang;
 
 /// The columns [`note_from_row`] reads, from `notes n LEFT JOIN projects p`, with the text cut to
-/// the limits (see [`cut`]). The last four are the language and the usefulness counters, which a
-/// database without them has no columns for.
+/// the limits (see [`cut`]). The last eight are the language, the usefulness counters and the
+/// authors, which a database without them has no columns for.
 pub(super) fn note_columns(columns: Columns) -> String {
     note_select(&cut("n.body", BODY_MAX), columns)
 }
@@ -40,7 +41,8 @@ fn note_select(body: &str, columns: Columns) -> String {
 
     format!(
         "n.id, n.project_id, {key}, {kind}, {title}, {body}, {tags}, {source}, \
-         n.created_at, n.updated_at, n.revision, n.hits, {root}, n.via_override, {lang}, {usage}",
+         n.created_at, n.updated_at, n.revision, n.hits, {root}, n.via_override, {lang}, {usage}, {authors}",
+        authors = authors::select("n", columns.authors),
         key = cut("p.key", PATH_MAX),
         kind = cut("n.kind", KIND_MAX),
         title = cut("n.title", TITLE_MAX),
@@ -53,13 +55,14 @@ fn note_select(body: &str, columns: Columns) -> String {
 /// The visibility condition of a view (`$2` the project id, `$3` whether global is visible).
 pub(super) const VISIBLE: &str = "(n.project_id = $2::bigint OR ($2::bigint = -1 AND n.project_id IS NOT NULL) OR ($3::boolean AND n.project_id IS NULL))";
 
-/// Saves the draft. With `extensions` the note's `lang` is stored too, in a statement after the
-/// content (see [`set_lang`]).
+/// Saves the draft. With `extensions` the note's `lang` is stored too, and with `authors` who wrote
+/// it, each in a statement after the content (see [`set_lang`], [`authors::set`]).
 pub(super) fn remember(
     tx: &mut Transaction<'_>,
     target: &Target,
     draft: &CleanDraft,
     extensions: bool,
+    authors: bool,
 ) -> Result<Saved, StoreError> {
     let project = target_project(tx, target)?;
     let now = now();
@@ -143,6 +146,10 @@ pub(super) fn remember(
         set_lang(tx, id, &draft.title, &draft.body)?;
     }
 
+    if authors {
+        authors::set(tx, "notes", id, writer, created)?;
+    }
+
     for name in &draft.entities {
         let entity = graph::ensure_entity(tx, project, name)?;
         tx.execute(
@@ -162,6 +169,7 @@ pub(super) fn update(
     id: i64,
     patch: &CleanPatch,
     extensions: bool,
+    authors: bool,
 ) -> Result<Saved, StoreError> {
     let Some(note) = load(tx, view, id, Columns::NONE)? else {
         return Err(not_found(id));
@@ -200,6 +208,10 @@ pub(super) fn update(
 
     if extensions {
         set_lang(tx, id, &title, &body)?;
+    }
+
+    if authors {
+        authors::set(tx, "notes", id, writer, false)?;
     }
 
     saved(tx, id, false)
@@ -443,6 +455,7 @@ pub(super) fn note_from_row(row: &Row) -> Result<Note, StoreError> {
             root: root.map(PathBuf::from),
             source: column(row, 7)?,
             via_override: column(row, 13)?,
+            ..Provenance::default()
         },
         created_at: column(row, 8)?,
         updated_at: column(row, 9)?,
@@ -452,6 +465,7 @@ pub(super) fn note_from_row(row: &Row) -> Result<Note, StoreError> {
             .as_deref()
             .and_then(lang::Lang::parse),
         usage: usage_from_row(row)?,
+        authors: authors::read(row, 18)?,
     })
 }
 

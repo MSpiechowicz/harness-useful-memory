@@ -7,9 +7,11 @@ use std::path::PathBuf;
 
 use postgres::{GenericClient, Row, Transaction};
 
+use super::authors;
 use super::notes::scope_of;
 use super::{PATH_MAX, PostgresStore, SOURCE_MAX, backend, column, cut, now, target_project, view_params};
 use crate::limits::{SCRIPT_BODY_MAX, SCRIPT_DESCRIPTION_MAX, SCRIPT_NAME_MAX};
+use crate::store::clean::Writer;
 use crate::store::scripts::{Stored, read_back, skipped};
 use crate::store::{Provenance, SavedScript, Script, ScriptDraft, ScriptRef, ScriptStore, ScriptSummary};
 use crate::store::{StoreError, Target, View, checked_draft, script_sha256};
@@ -24,11 +26,14 @@ const FROM: &str = "FROM scripts s LEFT JOIN projects p ON p.id = s.project_id";
 const VISIBLE: &str = "(s.project_id = $1::bigint OR ($1::bigint = -1 AND s.project_id IS NOT NULL) OR ($2::boolean AND s.project_id IS NULL))";
 
 /// The columns [`stored_from_row`] reads, text cut one character over its limit (see [`cut`]), so
-/// [`read_back`] recognizes a value over the limit.
-fn columns() -> String {
+/// [`read_back`] recognizes a value over the limit. The last four are the authors, which a
+/// database without the author columns reads as NULL.
+fn columns(authors: bool) -> String {
     format!(
         "s.id, s.project_id, {key}, {name}, {description}, {language}, s.timeout_secs, {source}, {root}, \
-         s.via_override, s.created_at, s.updated_at, s.run_count, s.last_run_at, s.last_exit_code, {body}",
+         s.via_override, s.created_at, s.updated_at, s.run_count, s.last_run_at, s.last_exit_code, {body}, \
+         {authors}",
+        authors = authors::select("s", authors),
         key = cut("p.key", PATH_MAX),
         name = cut("s.name", SCRIPT_NAME_MAX),
         description = cut("s.description", SCRIPT_DESCRIPTION_MAX),
@@ -42,15 +47,18 @@ fn columns() -> String {
 impl ScriptStore for PostgresStore {
     fn save_script(&mut self, target: &Target, draft: &ScriptDraft) -> Result<SavedScript, StoreError> {
         let draft = checked_draft(draft)?;
-        self.write(|tx| save(tx, target, &draft))
+        let authors = self.authors_for_write();
+        self.write(|tx| save(tx, target, &draft, authors))
     }
 
     fn list_scripts(&mut self, view: &View, query: Option<&str>) -> Result<Vec<ScriptSummary>, StoreError> {
-        self.read(|client| list(client, view, query))
+        let authors = self.authors;
+        self.read(|client| list(client, view, query, authors))
     }
 
     fn get_script(&mut self, view: &View, script: &ScriptRef) -> Result<Option<Script>, StoreError> {
-        self.read(|client| find(client, view, script))
+        let authors = self.authors;
+        self.read(|client| find(client, view, script, authors))
     }
 
     fn delete_script(&mut self, view: &View, script: &ScriptRef) -> Result<bool, StoreError> {
@@ -93,7 +101,12 @@ impl ScriptStore for PostgresStore {
 
 /// Inserts `draft` in the scope `target`, or replaces the script with its name there (keeping the
 /// run statistics and `created_at`).
-fn save(tx: &mut Transaction<'_>, target: &Target, draft: &ScriptDraft) -> Result<SavedScript, StoreError> {
+fn save(
+    tx: &mut Transaction<'_>,
+    target: &Target,
+    draft: &ScriptDraft,
+    authors: bool,
+) -> Result<SavedScript, StoreError> {
     let project = target_project(tx, target)?;
     let now = now();
     let sha256 = script_sha256(draft.language, &draft.body);
@@ -160,7 +173,12 @@ fn save(tx: &mut Transaction<'_>, target: &Target, draft: &ScriptDraft) -> Resul
         }
     };
 
-    let script = load(tx, id)?.ok_or_else(|| StoreError::Backend("the saved script was not found".to_owned()))?;
+    if authors {
+        authors::set(tx, "scripts", id, &Writer::new(provenance), created)?;
+    }
+
+    let script =
+        load(tx, id, authors)?.ok_or_else(|| StoreError::Backend("the saved script was not found".to_owned()))?;
 
     Ok(SavedScript { script, created })
 }
@@ -168,7 +186,12 @@ fn save(tx: &mut Transaction<'_>, target: &Target, draft: &ScriptDraft) -> Resul
 /// The scripts visible in `view`, repository scripts first, then by name (by code point, like
 /// SQLite); `query` (trimmed, blank keeps all) keeps those whose name or description contains it,
 /// ignoring case.
-fn list(client: &mut impl GenericClient, view: &View, query: Option<&str>) -> Result<Vec<ScriptSummary>, StoreError> {
+fn list(
+    client: &mut impl GenericClient,
+    view: &View,
+    query: Option<&str>,
+    authors: bool,
+) -> Result<Vec<ScriptSummary>, StoreError> {
     let (repo, global) = view_params(client, view)?;
     let query = query.map(str::trim).filter(|text| !text.is_empty());
 
@@ -180,7 +203,7 @@ fn list(client: &mut impl GenericClient, view: &View, query: Option<&str>) -> Re
                 OR strpos(lower(s.name), lower($3::text)) > 0
                 OR strpos(lower(s.description), lower($3::text)) > 0)
          ORDER BY s.project_id IS NULL, s.name COLLATE \"C\", s.id",
-        columns()
+        columns(authors)
     );
 
     let rows = client.query(&sql, &[&repo, &global, &query]).map_err(backend)?;
@@ -193,9 +216,14 @@ fn list(client: &mut impl GenericClient, view: &View, query: Option<&str>) -> Re
 
 /// The script `script` names when it is visible in `view` (a name: in the repository first, then
 /// in the global scope); a row [`read_back`] leaves out counts as missing.
-fn find(client: &mut impl GenericClient, view: &View, script: &ScriptRef) -> Result<Option<Script>, StoreError> {
+fn find(
+    client: &mut impl GenericClient,
+    view: &View,
+    script: &ScriptRef,
+    authors: bool,
+) -> Result<Option<Script>, StoreError> {
     let (repo, global) = view_params(client, view)?;
-    let columns = columns();
+    let columns = columns(authors);
 
     let rows = match script {
         ScriptRef::Id(id) => {
@@ -236,8 +264,8 @@ fn resolve(client: &mut impl GenericClient, view: &View, script: &ScriptRef) -> 
 }
 
 /// Script `id` with its body, whatever its scope.
-fn load(client: &mut impl GenericClient, id: i64) -> Result<Option<Script>, StoreError> {
-    let sql = format!("SELECT {} {FROM} WHERE s.id = $1", columns());
+fn load(client: &mut impl GenericClient, id: i64, authors: bool) -> Result<Option<Script>, StoreError> {
+    let sql = format!("SELECT {} {FROM} WHERE s.id = $1", columns(authors));
     let rows = client.query(&sql, &[&id]).map_err(backend)?;
 
     Ok(rows.iter().find_map(script_from_row))
@@ -271,6 +299,7 @@ fn stored_from_row(row: &Row) -> Result<Stored, StoreError> {
             root: root.map(PathBuf::from),
             source: column(row, 7)?,
             via_override: column(row, 9)?,
+            ..Provenance::default()
         },
         created_at: column(row, 10)?,
         updated_at: column(row, 11)?,
@@ -278,5 +307,6 @@ fn stored_from_row(row: &Row) -> Result<Stored, StoreError> {
         last_run_at: column(row, 13)?,
         last_exit_code: exit_code.map(i64::from),
         body: column(row, 15)?,
+        authors: authors::read(row, 16)?,
     })
 }

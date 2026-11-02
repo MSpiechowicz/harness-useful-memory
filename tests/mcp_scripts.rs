@@ -108,6 +108,8 @@ fn scripts_round_trip_with_their_structured_shapes() {
             "readOnly",
             "hidden",
             "author",
+            "addedBy",
+            "updatedBy",
             "createdAt",
             "updatedAt",
             "runCount",

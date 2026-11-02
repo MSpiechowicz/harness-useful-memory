@@ -9,10 +9,11 @@ use mongodb::bson::{Bson, Document, doc};
 
 use super::search::{english_terms, terms};
 use super::{Ctx, ENTITIES, Fail, NOTES, RELATIONS, graph, int, now, project_of, scope_of, scope_value, strings};
-use super::{PATH_MAX, cut, flag, id_only, note_fields, number, text, visible};
+use super::{PATH_MAX, SOURCE_MAX, cut, flag, id_only, note_fields, number, text, visible};
 use crate::limits::{BODY_MAX, ENTITY_MAX, GET_IDS_MAX};
 use crate::store::{
-    Forgotten, Note, NoteDraft, NoteKind, NotePatch, NoteUsage, Provenance, Saved, StoreError, Target, View, clean,
+    Authors, Forgotten, Note, NoteDraft, NoteKind, NotePatch, NoteUsage, Provenance, Saved, StoreError, Target, View,
+    clean,
 };
 use crate::support::lang;
 use crate::support::redact::redact_text;
@@ -43,25 +44,78 @@ struct Writer {
     root: Option<String>,
     source: Option<String>,
     via_override: bool,
+    /// Who adds the note and who changes it last, as the stored `(name, via)` pairs.
+    added_by: (Option<String>, Option<String>),
+    updated_by: (Option<String>, Option<String>),
 }
 
 impl Writer {
     fn new(provenance: &Provenance) -> Self {
+        let clean::Writer {
+            root,
+            source,
+            via_override,
+            added_by,
+            updated_by,
+        } = clean::Writer::new(provenance);
+
         Self {
-            root: provenance.root.as_ref().map(|root| root.to_string_lossy().into_owned()),
-            source: clean::source(provenance.source.as_deref()),
-            via_override: provenance.via_override,
+            root,
+            source,
+            via_override,
+            added_by,
+            updated_by,
         }
     }
 
-    /// The writer fields of a note document.
+    /// The writer fields of a note document: who wrote it last, but not who added it (see
+    /// [`Self::added_fields`]).
     fn fields(&self) -> Document {
-        doc! {
+        let mut fields = doc! {
             "source": self.source.clone(),
             "writer_root": self.root.clone(),
             "via_override": self.via_override,
-        }
+        };
+        fields.extend(author_fields("updated_by", &self.updated_by));
+
+        fields
     }
+
+    /// The fields of a note document that say who added it.
+    fn added_fields(&self) -> Document {
+        author_fields("added_by", &self.added_by)
+    }
+}
+
+/// The fields `<prefix>_name` and `<prefix>_via` of a document, `null` for an unknown author.
+pub(super) fn author_fields(prefix: &str, author: &(Option<String>, Option<String>)) -> Document {
+    doc! {
+        format!("{prefix}_name"): author.0.clone(),
+        format!("{prefix}_via"): author.1.clone(),
+    }
+}
+
+/// The author fields a read asks for, each bounded. A document an older server wrote has none, and
+/// reads as no author.
+pub(super) fn author_projection() -> Document {
+    let limit = crate::limits::TEAM_DOC_AUTHOR_MAX;
+
+    doc! {
+        "added_by_name": cut("$added_by_name", limit),
+        "added_by_via": cut("$added_by_via", SOURCE_MAX),
+        "updated_by_name": cut("$updated_by_name", limit),
+        "updated_by_via": cut("$updated_by_via", SOURCE_MAX),
+    }
+}
+
+/// Who added and who last changed the stored note or script `document`.
+pub(super) fn authors_of(document: &Document) -> Authors {
+    Authors::stored([
+        text(document, "added_by_name"),
+        text(document, "added_by_via"),
+        text(document, "updated_by_name"),
+        text(document, "updated_by_via"),
+    ])
 }
 
 /// A stored note with the normalized names of its entities.
@@ -206,6 +260,7 @@ pub(super) fn remember(
                 "entities": Vec::<String>::new(),
             };
             note.extend(fields);
+            note.extend(writer.added_fields());
 
             if extensions {
                 note.extend(english_fields(&draft.title, &draft.body, &words, 1));
@@ -488,6 +543,7 @@ pub(super) fn provenance_of(document: &Document) -> Provenance {
         root: text(document, "writer_root").map(PathBuf::from),
         source: text(document, "source"),
         via_override: document.get_bool("via_override").unwrap_or(false),
+        ..Provenance::default()
     }
 }
 
@@ -524,6 +580,7 @@ pub(super) fn stored(document: &Document) -> Stored {
         hits: int(document, "hits"),
         lang: text(document, "lang").as_deref().and_then(lang::Lang::parse),
         usage: Some(usage_of(document)),
+        authors: authors_of(document),
     };
 
     Stored {

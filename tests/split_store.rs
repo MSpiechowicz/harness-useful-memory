@@ -461,6 +461,7 @@ fn conflicts_titles_and_similar_notes_show_the_shown_ids(fixture: &Fixture) {
             root: Some(PathBuf::from(root)),
             source: Some("tests".to_owned()),
             via_override: false,
+            ..Provenance::default()
         };
         note
     };

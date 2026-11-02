@@ -1,7 +1,7 @@
 //! What the additive schema extensions of every backend share.
 //!
 //! The extensions (English search objects, the `lang` of a note, the settings, the usefulness
-//! counters of a note) are added to a database without a new schema version, so an older server
+//! counters and the authors of a note) are added to a database without a new schema version, so an older server
 //! keeps using it. Each backend adds what is missing on every open (`ensure_extensions`), then fills `lang` (and on MongoDB the
 //! English terms) of the notes an older server wrote, a page at a time for a bounded time per
 //! open ([`BACKFILL_BUDGET`]). A database that does not let this server add them (no DDL right) is
@@ -24,15 +24,18 @@ pub(crate) const ENGLISH_NOTES: &str = "english_notes";
 
 /// Which of the optional columns of a note a database has, so a statement names only those.
 ///
-/// The usage counters are tracked apart from the other extensions: a read-only role on a database
-/// that an older server upgraded has `lang` but cannot add the counters, and must keep showing the
-/// language.
+/// The usage counters and the author columns are tracked apart from the other extensions: a
+/// read-only role on a database that an older server upgraded has `lang` but cannot add the
+/// counters or the authors, and must keep showing the language.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Columns {
     /// The `lang` column.
     pub lang: bool,
     /// The usefulness counters (`shown`, `useful`, `last_useful_at`).
     pub usage: bool,
+    /// The author columns of the notes and the scripts (`added_by_name`, `added_by_via`,
+    /// `updated_by_name`, `updated_by_via`).
+    pub authors: bool,
 }
 
 impl Columns {
@@ -40,6 +43,7 @@ impl Columns {
     pub(crate) const NONE: Self = Self {
         lang: false,
         usage: false,
+        authors: false,
     };
 }
 

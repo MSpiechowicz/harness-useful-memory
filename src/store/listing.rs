@@ -21,7 +21,7 @@ use std::cmp::Ordering;
 
 use crate::backend::Place;
 use crate::limits::{HIDDEN_MAX, LIST_PAGE_MAX, QUERY_MAX};
-use crate::store::{Note, NoteKind, NoteUsage, Provenance, Scope, StoreError, View, clean};
+use crate::store::{Authors, Note, NoteKind, NoteUsage, Provenance, Scope, StoreError, View, clean};
 use crate::support::lang::Lang;
 
 /// Which notes a listing keeps by their language.
@@ -206,6 +206,8 @@ pub struct NoteRow {
     pub lang: Option<Lang>,
     /// The usefulness counters, when the database has them.
     pub usage: Option<NoteUsage>,
+    /// Who added the note and who changed it last.
+    pub authors: Authors,
 }
 
 impl From<Note> for NoteRow {
@@ -225,6 +227,7 @@ impl From<Note> for NoteRow {
             hits: note.hits,
             lang: note.lang,
             usage: note.usage,
+            authors: note.authors,
         }
     }
 }

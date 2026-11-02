@@ -37,7 +37,7 @@ pub(crate) use approval::approval_of;
 pub use approval::{ALIVE_FILE, APPROVAL_WAIT_VAR, REQUESTS_FOLDER, SCRIPT_APPROVAL_WAIT};
 pub use guards::{GUARDS_FOLDER, HELD_TEXT};
 pub use input::stop_on_sigterm;
-pub(crate) use script_blocks::{Approval, Shown, author_json, place_label, repo_label};
+pub(crate) use script_blocks::{Approval, Shown, author_json, person_json, place_label, repo_label};
 pub use vectors::Vectors;
 
 use std::collections::HashSet;
@@ -50,7 +50,7 @@ use serde_json::{Value, json};
 use crate::backend::{NotesPlace, Place};
 use crate::limits::LINE_MAX;
 use crate::project::ProjectResolver;
-use crate::store::{MemoryStore, ScriptStore, TrustStore};
+use crate::store::{Author, MemoryStore, ScriptStore, TrustStore};
 use crate::support::runner::Stop;
 use input::Watch;
 use protocol::{INVALID_PARAMS, INVALID_REQUEST, Line, METHOD_NOT_FOUND, PARSE_ERROR};
@@ -72,6 +72,9 @@ pub struct Server {
     trust_team_scripts: bool,
     projects: ProjectResolver,
     client: Option<String>,
+    /// The author every write is recorded with, when it is not looked up from git
+    /// ([`Self::with_author`]): `Some(None)` for none.
+    author: Option<Option<Author>>,
     /// Whether the English notes setting was on when the client initialized (`false` when it was
     /// off or could not be read); the instructions and tool descriptions follow it.
     english: bool,
@@ -137,6 +140,7 @@ impl Server {
             trust_team_scripts: false,
             projects,
             client: None,
+            author: None,
             english: false,
             vectors: None,
             vector_notice: false,
@@ -218,6 +222,13 @@ impl Server {
     /// commands that save through the tool bodies.
     pub fn with_client(mut self, client: Option<String>) -> Self {
         self.client = client;
+        self
+    }
+
+    /// The server recording `author` (none: no author) for every write instead of looking one up
+    /// from git: a held save is written as the person who was asked, when it was held.
+    pub fn with_author(mut self, author: Option<Author>) -> Self {
+        self.author = Some(author);
         self
     }
 

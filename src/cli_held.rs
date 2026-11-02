@@ -48,7 +48,7 @@ use crate::cli::{self, Args};
 use crate::held::{Claim, HELD_FILE_MAX, HeldItem, HeldStore, HeldTool};
 use crate::mcp::user;
 use crate::open::open_server;
-use crate::store::clean;
+use crate::store::{Author, clean};
 use crate::support::Env;
 use crate::support::paths::validate_project_dir;
 use crate::support::private::is_lowercase_uuid;
@@ -156,6 +156,14 @@ impl Saver {
         })
     }
 
+    /// The saver recording `author` for what it saves instead of looking one up from git.
+    pub(crate) fn writing_as(self, author: Option<Author>) -> Self {
+        Self {
+            server: self.server.with_author(author),
+            secrets: self.secrets,
+        }
+    }
+
     /// Prints the refusal `message` (credentials masked) with `code`; exit 1.
     pub(crate) fn refused(&self, code: Code, message: &str) -> ExitCode {
         refused(code, &self.secrets.scrub(message))
@@ -257,7 +265,16 @@ fn list(args: &[Option<&str>]) -> ExitCode {
     store.sweep();
 
     match store.list(chat) {
-        Ok(items) => {
+        Ok(mut items) => {
+            // The held files are plain text anybody with access to the folder may have edited: an
+            // author is cleaned as the store cleans one, and one that does not pass is not shown.
+            for item in &mut items {
+                item.author = item
+                    .author
+                    .take()
+                    .and_then(|author| Author::stored(Some(author.name), author.via));
+            }
+
             println!("{}", json!({ "held": items }));
             ExitCode::SUCCESS
         }
@@ -358,12 +375,15 @@ fn save(args: &[Option<&str>]) -> ExitCode {
         .as_deref()
         .and_then(|raw| validate_project_dir(&env, std::path::Path::new(raw)).ok());
 
-    let Some(mut saver) = Saver::open_in(&env, &selection, cwd, Some(claim.item.client.clone())) else {
+    let Some(saver) = Saver::open_in(&env, &selection, cwd, Some(claim.item.client.clone())) else {
         if let Err(message) = claim.restore() {
             eprintln!("harness-memory: {message}");
         }
         return ExitCode::FAILURE;
     };
+
+    // Written as the author the call had when it was held, not as whoever saves it now.
+    let mut saver = saver.writing_as(claim.item.author.clone());
 
     // An update shown against a note that changed since: the item is shown again against the note
     // as it is now.

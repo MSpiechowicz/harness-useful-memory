@@ -11,8 +11,9 @@ use crate::store::extensions::{
     BACKFILL_BUDGET, BACKFILL_PAGE, Columns, unavailable_setting, warn_backfill, warn_unavailable,
 };
 use crate::store::listing::excluded_json;
+use crate::store::recheck::Recheck;
 use crate::store::{Edge, Forget, Hit, Link, Neighborhood, Note, NoteDraft, NotePatch, Saved, SearchQuery, clean};
-use crate::store::{Forgotten, NoteListQuery, NotePage, StoreError, Target, View};
+use crate::store::{Forgotten, NoteListQuery, NotePage, Patience, StoreError, Target, View};
 
 /// The transactions of one SQLite-dialect store.
 pub(crate) trait Engine {
@@ -37,25 +38,61 @@ pub(crate) trait Engine {
     /// [`Self::extensions`], which a read-only role can have without them.
     fn usage(&self) -> bool;
 
+    /// True when the database has the author columns of a note and a script (see [`install`]);
+    /// apart from [`Self::extensions`] and [`Self::usage`], which a read-only role can have
+    /// without them.
+    fn authors(&self) -> bool;
+
+    /// Records that the database has the author columns, which this handle did not find at open.
+    fn learn_authors(&mut self);
+
+    /// When this handle last looked for the author columns it did not find (see [`Recheck`]).
+    fn recheck(&mut self) -> &mut Recheck;
+
     /// The optional columns of a note the database has.
     fn columns(&self) -> Columns {
         Columns {
             lang: self.extensions(),
             usage: self.usage(),
+            authors: self.authors(),
         }
     }
 }
 
+/// Whether a write may name the author columns. A handle that did not find them when it opened (a
+/// lock it would not wait for, see [`Patience::Skip`]) looks again before a write, as often as its
+/// [`Recheck`] allows: columns another process added since are written, so a changed row does not
+/// keep the name of its last writer. A write between two looks names no author.
+pub(crate) fn authors_for_write(engine: &mut impl Engine) -> bool {
+    if engine.authors() {
+        return true;
+    }
+
+    if !engine.recheck().due() {
+        return false;
+    }
+
+    if !engine.read(schema::authors_present).unwrap_or(false) {
+        return false;
+    }
+
+    engine.learn_authors();
+
+    true
+}
+
 pub(crate) fn remember(engine: &mut impl Engine, target: &Target, draft: &NoteDraft) -> Result<Saved, StoreError> {
     let draft = clean::draft(draft)?;
+    let authors = authors_for_write(engine);
     let extensions = engine.extensions();
-    engine.write(|db| notes::remember(db, target, &draft, extensions))
+    engine.write(|db| notes::remember(db, target, &draft, extensions, authors))
 }
 
 pub(crate) fn update(engine: &mut impl Engine, view: &View, id: i64, patch: &NotePatch) -> Result<Saved, StoreError> {
     let patch = clean::patch(patch)?;
+    let authors = authors_for_write(engine);
     let extensions = engine.extensions();
-    engine.write(|db| notes::update(db, view, id, &patch, extensions))
+    engine.write(|db| notes::update(db, view, id, &patch, extensions, authors))
 }
 
 /// A write: reading counts a hit on each note.
@@ -165,39 +202,72 @@ pub(crate) struct Installed {
     pub extensions: bool,
     /// The usefulness counters (see [`Engine::usage`]).
     pub usage: bool,
+    /// The author columns (see [`Engine::authors`]).
+    pub authors: bool,
 }
 
 /// Adds the schema extensions the database lacks (see [`schema::ensure_extensions`]) and reports
 /// which it has now. A database that refuses them is used with what it has, with one line on
-/// stderr.
-pub(crate) fn install(engine: &mut impl Engine) -> Installed {
-    let present = engine.read(|db| Ok((schema::extensions_present(db)?, schema::usage_present(db)?)));
+/// stderr. With [`Patience::Skip`] a lock another process holds is not waited for: the database is
+/// used with what it has, silently, and the next open tries again.
+pub(crate) fn install(engine: &mut impl Engine, patience: Patience) -> Installed {
+    let present = engine.read(|db| {
+        Ok((
+            schema::extensions_present(db)?,
+            schema::usage_present(db)?,
+            schema::authors_present(db)?,
+        ))
+    });
 
-    let (extensions, usage) = match present {
+    let (extensions, usage, authors) = match present {
         Ok(present) => present,
         Err(error) => {
             warn_unavailable(&error);
             return Installed {
                 extensions: false,
                 usage: false,
+                authors: false,
             };
         }
     };
 
-    if extensions && usage {
-        return Installed { extensions, usage };
+    if extensions && usage && authors {
+        return Installed {
+            extensions,
+            usage,
+            authors,
+        };
     }
 
-    match engine.write(schema::ensure_extensions) {
+    let added = match patience {
+        Patience::Wait => engine.write(schema::ensure_extensions),
+        Patience::Skip => engine.write_once(schema::ensure_extensions),
+    };
+
+    match added {
         Ok(()) => Installed {
             extensions: true,
             usage: true,
+            authors: true,
         },
         Err(error) => {
-            warn_unavailable(&error);
-            Installed { extensions, usage }
+            if patience == Patience::Wait || !is_busy(&error) {
+                warn_unavailable(&error);
+            }
+
+            Installed {
+                extensions,
+                usage,
+                authors,
+            }
         }
     }
+}
+
+/// True when `error` is another process holding the lock (SQLite's busy or locked code, the only
+/// detail a [`StoreError`] keeps of it).
+fn is_busy(error: &StoreError) -> bool {
+    matches!(error, StoreError::Backend(message) if message.contains("DatabaseBusy") || message.contains("DatabaseLocked"))
 }
 
 /// Fills `lang` of the notes an older server wrote, a page at a time and for at most
@@ -248,13 +318,15 @@ mod tests {
     use super::super::local::Local;
     use super::super::schema::{V1, V2, V3, V4, V5};
     use super::*;
-    use crate::store::{NoteKind, NoteSort, UsefulFilter};
+    use crate::store::recheck::AUTHORS_RECHECK;
+    use crate::store::{Author, Authors, NoteKind, NoteSort, Provenance, UsefulFilter};
     use crate::support::lang::Lang;
 
     /// A database a role without the right to change the schema reads: the write fails.
     struct ReadOnlyRole {
         conn: Connection,
         installed: Installed,
+        recheck: Recheck,
     }
 
     impl Engine for ReadOnlyRole {
@@ -272,6 +344,18 @@ mod tests {
 
         fn usage(&self) -> bool {
             self.installed.usage
+        }
+
+        fn authors(&self) -> bool {
+            self.installed.authors
+        }
+
+        fn learn_authors(&mut self) {
+            self.installed.authors = true;
+        }
+
+        fn recheck(&mut self) -> &mut Recheck {
+            &mut self.recheck
         }
     }
 
@@ -300,8 +384,179 @@ mod tests {
             installed: Installed {
                 extensions: false,
                 usage: false,
+                authors: false,
             },
+            recheck: Recheck::every(AUTHORS_RECHECK),
         }
+    }
+
+    /// The database a server that added the language and the counters but not the authors left,
+    /// holding a note and a script.
+    fn without_authors() -> ReadOnlyRole {
+        let conn = Connection::open_in_memory().expect("memory database");
+
+        for sql in [V1, V2, V3, V4, V5] {
+            conn.execute_batch(sql).expect("schema");
+        }
+
+        schema::ensure_extensions(&mut Local(&conn)).expect("extensions");
+
+        for table in ["notes", "scripts"] {
+            for column in ["added_by_name", "added_by_via", "updated_by_name", "updated_by_via"] {
+                conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column};"))
+                    .expect("drop column");
+            }
+        }
+
+        conn.execute_batch(
+            "INSERT INTO notes (kind, title, title_norm, body, created_at, updated_at, lang)
+                 VALUES ('note', 'First', 'first', 'The first note', 1, 1, 'en');
+             INSERT INTO scripts (language, name, body, sha256, timeout_secs, created_at, updated_at)
+                 VALUES ('sh', 'lint', 'true', 'x', 60, 1, 1);",
+        )
+        .expect("rows");
+
+        ReadOnlyRole {
+            conn,
+            installed: Installed {
+                extensions: false,
+                usage: false,
+                authors: false,
+            },
+            recheck: Recheck::every(AUTHORS_RECHECK),
+        }
+    }
+
+    /// A handle that may write and did not find the author columns, counting how often it looked
+    /// for them (every look is a read).
+    struct Skipping {
+        role: ReadOnlyRole,
+        looks: usize,
+    }
+
+    impl Engine for Skipping {
+        fn write<T>(&mut self, op: impl FnOnce(&mut dyn Sql) -> Result<T, StoreError>) -> Result<T, StoreError> {
+            op(&mut Local(&self.role.conn))
+        }
+
+        fn read<T>(&mut self, op: impl FnOnce(&mut dyn Sql) -> Result<T, StoreError>) -> Result<T, StoreError> {
+            self.looks += 1;
+            self.role.read(op)
+        }
+
+        fn extensions(&self) -> bool {
+            self.role.extensions()
+        }
+
+        fn usage(&self) -> bool {
+            self.role.usage()
+        }
+
+        fn authors(&self) -> bool {
+            self.role.authors()
+        }
+
+        fn learn_authors(&mut self) {
+            self.role.learn_authors();
+        }
+
+        fn recheck(&mut self) -> &mut Recheck {
+            self.role.recheck()
+        }
+    }
+
+    fn skipping() -> Skipping {
+        Skipping {
+            role: without_authors(),
+            looks: 0,
+        }
+    }
+
+    /// Saves a global note titled `title` as Grace Hopper and returns its id.
+    fn save(engine: &mut Skipping, title: &str) -> i64 {
+        let draft = NoteDraft {
+            title: title.to_owned(),
+            body: "Caches live in target".to_owned(),
+            kind: NoteKind::Note,
+            tags: Vec::new(),
+            entities: Vec::new(),
+            provenance: Provenance {
+                author: Author::new("Grace Hopper", None),
+                ..Provenance::default()
+            },
+        };
+
+        remember(engine, &Target::Global, &draft).expect("remember").id
+    }
+
+    fn added_by(engine: &Skipping, id: i64) -> Option<String> {
+        engine
+            .role
+            .conn
+            .query_row("SELECT added_by_name FROM notes WHERE id = ?1", [id], |row| row.get(0))
+            .expect("the author column")
+    }
+
+    #[test]
+    fn a_handle_that_missed_the_columns_looks_for_them_once_per_interval() {
+        let mut engine = skipping();
+
+        save(&mut engine, "First");
+        save(&mut engine, "Second");
+        assert_eq!(engine.looks, 1, "two writes close together look once");
+
+        engine.recheck().age(AUTHORS_RECHECK);
+        save(&mut engine, "Third");
+        assert_eq!(engine.looks, 2, "a write after the interval looks again");
+
+        save(&mut engine, "Fourth");
+        assert_eq!(engine.looks, 2);
+    }
+
+    #[test]
+    fn between_two_looks_a_write_names_no_author_and_the_next_look_names_the_writer() {
+        let mut engine = skipping();
+        save(&mut engine, "First");
+
+        // Another process adds the columns while this handle is not looking.
+        schema::ensure_extensions(&mut Local(&engine.role.conn)).expect("another process adds the columns");
+
+        let unseen = save(&mut engine, "Second");
+        assert!(!engine.authors(), "the columns are not known yet");
+        assert_eq!(added_by(&engine, unseen), None, "a write that cannot know names nobody");
+
+        engine.recheck().age(AUTHORS_RECHECK);
+        let seen = save(&mut engine, "Third");
+        assert!(engine.authors(), "the look found the columns");
+        assert_eq!(added_by(&engine, seen).as_deref(), Some("Grace Hopper"));
+    }
+
+    #[test]
+    fn a_role_that_cannot_add_the_authors_keeps_everything_else_and_shows_no_authors() {
+        let mut role = without_authors();
+        role.installed = install(&mut role, Patience::Wait);
+
+        assert_eq!(
+            role.installed,
+            Installed {
+                extensions: true,
+                usage: true,
+                authors: false
+            }
+        );
+
+        let page = list_notes(&mut role, &everything()).expect("list");
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].authors, Authors::default());
+        assert_eq!(page.rows[0].lang, Some(Lang::En));
+        assert!(page.rows[0].usage.is_some());
+
+        let note = peek(&mut role, &everything().view, &[page.rows[0].id]).expect("peek");
+        assert_eq!(note[0].authors, Authors::default());
+
+        let scripts = super::super::scripts::list(&mut role, &everything().view, None).expect("scripts");
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].authors, Authors::default());
     }
 
     fn everything() -> NoteListQuery {
@@ -328,13 +583,14 @@ mod tests {
     #[test]
     fn a_role_that_cannot_add_the_counters_keeps_the_language_and_shows_no_counters() {
         let mut role = without_counters();
-        role.installed = install(&mut role);
+        role.installed = install(&mut role, Patience::Wait);
 
         assert_eq!(
             role.installed,
             Installed {
                 extensions: true,
-                usage: false
+                usage: false,
+                authors: true
             }
         );
 

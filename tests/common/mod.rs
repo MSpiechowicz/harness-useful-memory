@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 pub mod approval;
+pub mod authors;
 pub mod embedder;
 pub mod guards;
 pub mod hooks;
@@ -75,6 +76,7 @@ pub fn draft(title: &str, body: &str, kind: NoteKind) -> NoteDraft {
             root: None,
             source: Some("tests".to_owned()),
             via_override: false,
+            ..Provenance::default()
         },
     }
 }

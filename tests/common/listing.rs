@@ -21,7 +21,7 @@ pub const OTHER: &str = "github.com/acme/gadget";
 pub type Case = fn(&mut dyn MemoryStore);
 
 /// Every case, by name.
-pub const CASES: [(&str, Case); 14] = [
+pub const CASES: [(&str, Case); 15] = [
     ("lists_visible_notes_newest_first", lists_visible_notes_newest_first),
     (
         "excluded_ids_leave_lists_and_searches",
@@ -54,6 +54,7 @@ pub const CASES: [(&str, Case); 14] = [
         "usefulness_is_counted_listed_sorted_and_filtered",
         usefulness_is_counted_listed_sorted_and_filtered,
     ),
+    ("authors_are_added_kept_and_updated", super::authors::notes),
 ];
 
 /// The first page (of up to 200) of `view`, newest first.

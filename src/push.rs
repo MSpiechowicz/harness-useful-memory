@@ -43,7 +43,7 @@ use rusqlite::{Connection, OpenFlags};
 
 use crate::limits::{ENTITIES_PER_NOTE, NEIGHBORS_LIMIT_MAX};
 use crate::store::split::hidden_title_error;
-use crate::store::{Forget, Link, MemoryStore, Note, NoteDraft, NoteKind, NotePatch, ProjectKey, Provenance};
+use crate::store::{Authors, Forget, Link, MemoryStore, Note, NoteDraft, NoteKind, NotePatch, ProjectKey, Provenance};
 use crate::store::{SqliteStore, StoreError, Target, View, clean};
 
 /// The label of the global scope in [`Change::scope`] and [`Summary::projects`].
@@ -737,6 +737,7 @@ fn read_local(path: &Path) -> Result<(Vec<LocalNote>, Vec<LocalLink>), StoreErro
     if store.is_newer() {
         return Err(StoreError::NewerSchema);
     }
+    let authors = store.has_authors();
     drop(store);
 
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
@@ -753,18 +754,24 @@ fn read_local(path: &Path) -> Result<(Vec<LocalNote>, Vec<LocalLink>), StoreErro
         entities.entry(row.get(0)?).or_default().push(row.get(1)?);
     }
 
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare(&format!(
         "SELECT n.id, p.key, p.root_path, p.remote, n.kind, n.title, n.body, n.tags, n.source, n.writer_root,
-                n.via_override, n.updated_at, n.revision
-         FROM notes n LEFT JOIN projects p ON p.id = n.project_id
-         ORDER BY n.id",
-    )?;
+                    n.via_override, n.updated_at, n.revision, {}
+             FROM notes n LEFT JOIN projects p ON p.id = n.project_id
+             ORDER BY n.id",
+        if authors {
+            "n.added_by_name, n.added_by_via, n.updated_by_name, n.updated_by_via"
+        } else {
+            "NULL, NULL, NULL, NULL"
+        }
+    ))?;
     let notes = statement
         .query_map([], |row| {
             let id: i64 = row.get(0)?;
             let kind: String = row.get(4)?;
             let tags: String = row.get(7)?;
             let root: Option<String> = row.get(9)?;
+            let authors = Authors::stored([row.get(13)?, row.get(14)?, row.get(15)?, row.get(16)?]);
 
             Ok(LocalNote {
                 id,
@@ -778,6 +785,9 @@ fn read_local(path: &Path) -> Result<(Vec<LocalNote>, Vec<LocalLink>), StoreErro
                     root: root.map(PathBuf::from),
                     source: row.get(8)?,
                     via_override: row.get(10)?,
+                    // Copied along: the team's note is added by whoever added this one.
+                    author: authors.updated_by,
+                    original_added_by: Some(authors.added_by),
                 },
                 updated_at: row.get(11)?,
                 revision: row.get(12)?,
