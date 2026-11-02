@@ -1,3 +1,15 @@
+# [3.1.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v3.0.0...v3.1.0) (2026-11-02)
+
+
+### Bug Fixes
+
+* **notes:** the git name of the writer is found on Windows too ([419c69a](https://github.com/MSpiechowicz/harness-useful-memory/commit/419c69a095b39d3561b798975f9f01bda84a18cd))
+
+
+### Features
+
+* **notes:** notes and scripts record who added and last updated them ([6f63685](https://github.com/MSpiechowicz/harness-useful-memory/commit/6f6368547e2a98ac03a32839442be3f8607eccf5))
+
 # [3.0.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v2.11.0...v3.0.0) (2026-11-01)
 
 
