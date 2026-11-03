@@ -38,6 +38,7 @@ pub mod cli_embedder;
 pub mod cli_held;
 pub mod cli_notes;
 pub mod cli_push;
+pub mod cli_recall;
 mod cli_scripts;
 pub mod cli_settings;
 pub mod cli_team_docs;

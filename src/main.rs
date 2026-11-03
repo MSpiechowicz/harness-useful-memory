@@ -12,8 +12,9 @@
 //! ([`harness_memory::cli_held`]), `harness-memory hooks config|list|get|put|delete` and
 //! `harness-memory routines config|list|get|put|delete` share Harness Desktop hooks and routines
 //! with the team ([`harness_memory::cli_team_docs`]), `harness-memory settings get|set` reads and
-//! changes the English notes setting ([`harness_memory::cli_settings`]), `harness-memory --version`
-//! prints the version.
+//! changes the English notes setting ([`harness_memory::cli_settings`]), `harness-memory recall --hook`
+//! prints the notes and saved scripts a chat message matches ([`harness_memory::cli_recall`]),
+//! `harness-memory --version` prints the version.
 
 use std::collections::BTreeSet;
 use std::io::{BufReader, Write};
@@ -29,7 +30,7 @@ use harness_memory::store::Scope;
 use harness_memory::support::Env;
 use harness_memory::support::runner::Stop;
 use harness_memory::support::time::rfc3339;
-use harness_memory::{cli_embedder, cli_held, cli_notes, cli_settings, cli_team_docs, cli_trust};
+use harness_memory::{cli_embedder, cli_held, cli_notes, cli_recall, cli_settings, cli_team_docs, cli_trust};
 use harness_memory::{database_path, serve};
 use serde_json::{Value, json};
 
@@ -58,7 +59,7 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--o
                      [--project PATH] [--client NAME] < patch.json | scripts save --json [--project PATH] [--client NAME] \
                      < script.json | held list --json \
                      [--chat KEY] | held save <heldId> --json [< draft.json] | held skip <heldId> --json | settings get --json | \
-                     settings set english_notes=true|false --json | --version]";
+                     settings set english_notes=true|false --json | recall --hook [--project PATH] [--limit N] | --version]";
 
 /// What this build can do that older ones could not, as `harness-memory features` lists it: the
 /// `remote+local` note routing, hiding team notes on this computer, `push --json`, and the same for
@@ -69,8 +70,9 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--o
 /// `lang` of a note, the English notes setting), the shared embedder (`embedder`), and the offline
 /// fallback (`offline_fallback`), and the usefulness counters of a note (`notes list --sort
 /// useful|lastUseful`, `--useful ever|never`, the `shown`, `useful` and `lastUsefulAt` of a note), and
-/// who added and last changed a note or a script (`addedBy`, `updatedBy`).
-const FEATURES: [&str; 14] = [
+/// who added and last changed a note or a script (`addedBy`, `updatedBy`), and `recall --hook`
+/// (`recall`).
+const FEATURES: [&str; 15] = [
     "notes-remote-local",
     "notes-hide",
     "push-json",
@@ -85,6 +87,7 @@ const FEATURES: [&str; 14] = [
     "offline-fallback",
     "notes-useful",
     "notes-authors",
+    "recall",
 ];
 
 /// mimalloc hands freed memory back to the operating system, which the embedder's idle unload of
@@ -127,6 +130,7 @@ fn main() -> ExitCode {
         [Some("notes"), rest @ ..] => cli_notes::notes(rest),
         [Some("held"), rest @ ..] => cli_held::held(rest),
         [Some("settings"), rest @ ..] => cli_settings::settings(rest),
+        [Some("recall"), rest @ ..] => cli_recall::recall(rest),
         [Some("embedder"), rest @ ..] => cli_embedder::embedder(rest),
         [Some("hooks"), rest @ ..] => cli_team_docs::hooks(rest),
         [Some("routines"), rest @ ..] => cli_team_docs::routines(rest),
