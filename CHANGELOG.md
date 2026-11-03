@@ -1,3 +1,10 @@
+# [3.2.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v3.1.0...v3.2.0) (2026-11-03)
+
+
+### Features
+
+* **recall:** harness-memory recall --hook finds the notes that match a chat message ([a5da194](https://github.com/MSpiechowicz/harness-useful-memory/commit/a5da19440b45f6ac3527d6c9fd4dbf1eb392423d))
+
 # [3.1.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v3.0.0...v3.1.0) (2026-11-02)
 
 
