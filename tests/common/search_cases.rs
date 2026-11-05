@@ -9,6 +9,9 @@ use super::{both, draft, query, repo};
 
 const REPO: &str = "github.com/acme/widget";
 
+/// The boost of a repository note in thousandths: a tie-break, not a head start (`rank::REPO_BOOST`).
+const REPO_BOOST_MILLI: u32 = 1020;
+
 fn titles(hits: &[Hit]) -> Vec<&str> {
     hits.iter().map(|hit| hit.title.as_str()).collect()
 }
@@ -122,6 +125,58 @@ pub fn a_query_word_naming_an_entity_or_a_path_boosts_the_note(store: &mut dyn M
     assert!(hits[1].score_milli > hits[2].score_milli);
 }
 
+/// The repository boost only breaks a tie: a global note that matches every word of the query ranks
+/// above repository notes that match some of them, and a repository note ranks above a global one
+/// that is just as relevant.
+pub fn a_repository_note_only_wins_a_tie(store: &mut dyn MemoryStore) {
+    fillers(store);
+
+    // Words found in many notes weigh next to nothing, so most notes are about something else.
+    for number in 1..=40 {
+        save(
+            store,
+            &format!("Unrelated entry number {number}"),
+            &format!("topic{number} filler"),
+        );
+    }
+
+    // Weaker than the global note: four of its five words.
+    for number in 1..=4 {
+        save(
+            store,
+            &format!("Otter payment gateway timeout wrapper {number}"),
+            "Wraps the vendor client",
+        );
+    }
+    let global = save_global(
+        store,
+        "Otter payment gateway timeout settings",
+        "Seconds before a charge request gives up",
+    );
+
+    let hits = search(store, "otter payment gateway timeout settings");
+
+    assert_eq!(hits.len(), 5, "{:?}", titles(&hits));
+    assert_eq!(hits[0].id, global, "{:?}", titles(&hits));
+
+    // The same note in the repository and in the global scope: the repository one is first.
+    save_global(
+        store,
+        "Zephyr cache eviction policy",
+        "Least recently used entries go first",
+    );
+    let repo_note = save(
+        store,
+        "Zephyr cache eviction policy",
+        "Least recently used entries go first",
+    );
+
+    let hits = search(store, "zephyr cache eviction policy");
+
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].id, repo_note, "{:?}", titles(&hits));
+}
+
 pub fn an_empty_store_finds_nothing(store: &mut dyn MemoryStore) {
     assert!(search(store, "anything at all").is_empty());
     assert!(search(store, "").is_empty());
@@ -199,12 +254,12 @@ pub fn hits_for_loads_the_notes_a_search_may_see(store: &mut dyn MemoryStore) {
 
     let hit = |id: i64| hits.iter().find(|hit| hit.id == id).expect("hit");
     assert!(
-        hit(named).boost_milli > 1250,
+        hit(named).boost_milli > REPO_BOOST_MILLI,
         "repository and entity: {}",
         hit(named).boost_milli
     );
     assert_eq!(hit(named).entities, ["Cache"]);
-    assert_eq!(hit(plain).boost_milli, 1250, "the repository alone");
+    assert_eq!(hit(plain).boost_milli, REPO_BOOST_MILLI, "the repository alone");
     assert_eq!(hit(global).boost_milli, 1000, "no boost");
 
     let snippet = &hit(plain).snippet;

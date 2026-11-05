@@ -391,6 +391,333 @@ fn the_notes_of_a_block_count_as_shown() {
     );
 }
 
+const OTTER_QUERY: &str = "otter payment gateway timeout settings";
+const OTTER_GLOBAL: &str = "Otter payment gateway timeout settings";
+
+/// Saves notes about other things, so that the words of the Otter notes are rare enough to weigh.
+fn unrelated_notes(widget: &mut Client) {
+    for number in 1..=20 {
+        remember(
+            widget,
+            json!({ "title": format!("Unrelated entry number {number}"), "body": format!("topic{number} filler"), "kind": "note" }),
+        );
+    }
+}
+
+/// Saves `count` repository notes about the Otter payment gateway client in the widget repository
+/// (each matches four of the five words of [`OTTER_QUERY`]) and the global note that matches all.
+fn seed_otter(folders: &Folders, count: usize) -> i64 {
+    let mut widget = folders.server(&folders.widget);
+    unrelated_notes(&mut widget);
+
+    for number in 1..=count {
+        remember(
+            &mut widget,
+            json!({
+                "title": format!("Otter payment gateway timeout wrapper {number}"),
+                "body": "Wraps the vendor client",
+                "kind": "note",
+            }),
+        );
+    }
+
+    let global = remember(
+        &mut widget,
+        json!({
+            "title": OTTER_GLOBAL,
+            "body": "Seconds before a charge request gives up",
+            "kind": "decision",
+            "scope": "global",
+        }),
+    );
+    assert!(widget.finish().success());
+
+    global
+}
+
+/// The titles of the notes `printed` shows, in order.
+fn printed_titles(printed: &str) -> Vec<String> {
+    printed
+        .lines()
+        .filter(|line| line.starts_with('#'))
+        .filter_map(|line| line.split_once("] "))
+        .map(|(_, title)| title.split(" {").next().unwrap_or(title).to_owned())
+        .collect()
+}
+
+/// Panics unless a note is counted as shown once exactly when `printed` shows it.
+fn assert_counted_as_printed(folders: &Folders, printed: &str) {
+    let titles = printed_titles(printed);
+
+    for (title, shown) in folders.shown() {
+        let expected = i64::from(titles.contains(&title));
+        assert_eq!(shown, expected, "{title:?} among {titles:?}");
+    }
+}
+
+#[test]
+fn an_exact_global_note_is_not_pushed_out_by_weaker_repository_notes() {
+    let folders = folders();
+    seed_otter(&folders, 4);
+
+    let output = folders.recall(OTTER_QUERY, &[]);
+    let printed = stdout(&output);
+    let titles = printed_titles(&printed);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_block_shape(&printed);
+    assert_eq!(titles.len(), 3, "{printed}");
+    assert_eq!(titles[0], OTTER_GLOBAL, "the best note first: {printed}");
+    assert_counted_as_printed(&folders, &printed);
+}
+
+#[test]
+fn a_global_note_that_is_less_relevant_takes_the_last_place() {
+    let folders = folders();
+    let mut widget = folders.server(&folders.widget);
+    unrelated_notes(&mut widget);
+
+    for number in 1..=4 {
+        remember(
+            &mut widget,
+            json!({
+                "title": format!("Otter payment gateway timeout settings {number}"),
+                "body": "Seconds before a charge request gives up",
+                "kind": "note",
+            }),
+        );
+    }
+    remember(
+        &mut widget,
+        json!({
+            "title": "Otter payment gateway timeout default",
+            "body": "A global default",
+            "kind": "decision",
+            "scope": "global",
+        }),
+    );
+    assert!(widget.finish().success());
+
+    let printed = stdout(&folders.recall(OTTER_QUERY, &[]));
+    let titles = printed_titles(&printed);
+
+    assert_block_shape(&printed);
+    assert_eq!(titles.len(), 3, "{printed}");
+    assert_eq!(
+        titles[2], "Otter payment gateway timeout default",
+        "the global note is last: {printed}"
+    );
+    assert!(
+        titles[..2].iter().all(|title| title.ends_with(char::is_numeric)),
+        "{printed}"
+    );
+    assert_counted_as_printed(&folders, &printed);
+}
+
+#[test]
+fn a_global_note_that_barely_matches_takes_no_place_from_strong_answers() {
+    let folders = folders();
+    let mut widget = folders.server(&folders.widget);
+    unrelated_notes(&mut widget);
+
+    for number in 1..=4 {
+        remember(
+            &mut widget,
+            json!({
+                "title": format!("Otter payment gateway timeout settings {number}"),
+                "body": "Seconds before a charge request gives up",
+                "kind": "note",
+            }),
+        );
+    }
+    remember(
+        &mut widget,
+        json!({
+            "title": "A long story about unrelated matters and other things",
+            "body": "It mentions otter, then payment, then gateway in passing, among many other words about nothing in particular",
+            "kind": "decision",
+            "scope": "global",
+        }),
+    );
+    assert!(widget.finish().success());
+
+    let printed = stdout(&folders.recall(OTTER_QUERY, &[]));
+    let titles = printed_titles(&printed);
+
+    assert_eq!(titles.len(), 3, "{printed}");
+    assert!(
+        titles.iter().all(|title| title.ends_with(char::is_numeric)),
+        "{printed}"
+    );
+    assert_counted_as_printed(&folders, &printed);
+}
+
+#[test]
+fn a_large_global_note_takes_no_place_and_the_repository_notes_print_as_before() {
+    let folders = folders();
+    let mut widget = folders.server(&folders.widget);
+    unrelated_notes(&mut widget);
+
+    for number in 1..=4 {
+        remember(
+            &mut widget,
+            json!({
+                "title": format!("Otter payment gateway timeout settings {number}"),
+                "body": "Seconds before a charge request gives up",
+                "kind": "note",
+            }),
+        );
+    }
+
+    // Nine entities of 80 characters make its block far larger than a place is held for.
+    let entities: Vec<String> = (1..=9).map(|number| format!("{number}{}", "e".repeat(79))).collect();
+    remember(
+        &mut widget,
+        json!({
+            "title": "Otter payment gateway default",
+            "body": "A global default",
+            "kind": "decision",
+            "scope": "global",
+            "entities": entities,
+        }),
+    );
+    assert!(widget.finish().success());
+
+    let printed = stdout(&folders.recall(OTTER_QUERY, &[]));
+    let titles = printed_titles(&printed);
+
+    assert_block_shape(&printed);
+    assert_eq!(titles.len(), 3, "{printed}");
+    assert!(
+        titles.iter().all(|title| title.ends_with(char::is_numeric)),
+        "all three repository notes, whole: {printed}"
+    );
+    assert!(!printed.contains('…'), "{printed}");
+    assert_counted_as_printed(&folders, &printed);
+}
+
+#[test]
+fn without_a_global_match_the_best_repository_notes_print_as_before() {
+    let folders = folders();
+    seed_otter(&folders, 4);
+
+    // Only the repository notes match: "wrapper vendor client" is in no global note.
+    let printed = stdout(&folders.recall("wrapper vendor client", &[]));
+    let titles = printed_titles(&printed);
+
+    assert_block_shape(&printed);
+    assert_eq!(titles.len(), 3, "{printed}");
+    assert!(
+        titles
+            .iter()
+            .all(|title| title.starts_with("Otter payment gateway timeout wrapper")),
+        "{printed}"
+    );
+    assert_counted_as_printed(&folders, &printed);
+}
+
+#[test]
+fn another_repositorys_notes_are_never_recalled_reserved_or_not() {
+    let folders = folders();
+    let mut gadget = folders.server(&folders.gadget);
+
+    for number in 1..=4 {
+        remember(
+            &mut gadget,
+            json!({
+                "title": format!("Gadget otter payment gateway timeout settings {number}"),
+                "body": "Private to the gadget repository",
+                "kind": "note",
+            }),
+        );
+    }
+    assert!(gadget.finish().success());
+
+    // Without a global match, and then with one that the slot holds.
+    let before = stdout(&folders.recall(OTTER_QUERY, &[]));
+    assert!(!before.contains("Gadget"), "{before}");
+
+    seed_otter(&folders, 4);
+
+    let after = stdout(&folders.recall(OTTER_QUERY, &[]));
+    assert_block_shape(&after);
+    assert!(after.contains(OTTER_GLOBAL), "{after}");
+    assert!(!after.contains("Gadget"), "{after}");
+}
+
+#[test]
+fn the_global_note_survives_the_byte_limit() {
+    let folders = folders();
+    let mut widget = folders.server(&folders.widget);
+    unrelated_notes(&mut widget);
+
+    for number in 1..=5 {
+        remember(
+            &mut widget,
+            json!({
+                "title": format!("Otter payment gateway timeout settings long note {number} {}", "x".repeat(60)),
+                "body": format!("Otter payment gateway timeout settings {}", "y ".repeat(200)),
+                "kind": "note",
+                "entities": ["Payment gateway client", "Charge request timeout", "Vendor client wrapper"],
+            }),
+        );
+    }
+    remember(
+        &mut widget,
+        json!({
+            "title": format!("Otter payment gateway default {}", "g".repeat(80)),
+            "body": "A global default for the gateway",
+            "kind": "decision",
+            "scope": "global",
+        }),
+    );
+    assert!(widget.finish().success());
+
+    let output = folders.recall(OTTER_QUERY, &["--limit", "5"]);
+    let printed = stdout(&output);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_block_shape(&printed);
+    assert!(printed.contains("] Otter payment gateway default g"), "{printed}");
+    assert_counted_as_printed(&folders, &printed);
+    assert_eq!(
+        printed_titles(&printed).len(),
+        4,
+        "the limit left two repository notes out: {printed}"
+    );
+}
+
+#[test]
+fn a_limit_of_one_keeps_the_best_note() {
+    let folders = folders();
+    let mut widget = folders.server(&folders.widget);
+    unrelated_notes(&mut widget);
+    remember(
+        &mut widget,
+        json!({
+            "title": OTTER_GLOBAL,
+            "body": "Seconds before a charge request gives up",
+            "kind": "note",
+        }),
+    );
+    remember(
+        &mut widget,
+        json!({
+            "title": "Otter timeout default",
+            "body": "A global default",
+            "kind": "decision",
+            "scope": "global",
+        }),
+    );
+    assert!(widget.finish().success());
+
+    let printed = stdout(&folders.recall(OTTER_QUERY, &["--limit", "1"]));
+
+    assert_block_shape(&printed);
+    assert_eq!(printed_titles(&printed), [OTTER_GLOBAL], "{printed}");
+    assert_counted_as_printed(&folders, &printed);
+}
+
 /// A team database that does not answer (nothing listens on its port) with notes and scripts routed
 /// to this computer too, and no local file yet: a message neither creates nor migrates the local
 /// database, whatever it asks for.

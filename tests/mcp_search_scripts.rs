@@ -24,6 +24,11 @@ fn repo_server(dir: &TempDir) -> Server {
     server(dir, &dir.path().join("home"), &root)
 }
 
+/// A server as `recall --hook` runs it, in the same repository.
+fn recall_server(dir: &TempDir) -> Server {
+    repo_server(dir).for_recall()
+}
+
 fn tool(server: &mut Server, name: &str, arguments: Value) -> Value {
     run(server, &[call(1, name, arguments)]).remove(0)
 }
@@ -212,6 +217,196 @@ fn a_global_script_shadowed_by_a_repository_script_is_named_by_id() {
     let lines = listed(&search(&mut server, "deploy"));
     assert!(lines.contains(&"- deploy: Deploy this repository (bash) → script_run name=deploy".to_owned()));
     assert!(lines.contains(&format!("- deploy: Deploy anything (bash) → script_run id={id}")));
+}
+
+/// Makes the global script `name` the oldest, so it ranks last among scripts that match equally.
+fn oldest(dir: &TempDir, name: &str) {
+    sql(
+        dir,
+        "memory.sqlite3",
+        "UPDATE scripts SET updated_at = 1 WHERE name = ?1 AND project_id IS NULL",
+        [name],
+    );
+}
+
+#[test]
+fn the_best_global_script_is_listed_first_even_when_five_repository_scripts_rank_above_it() {
+    let dir = TempDir::new().expect("temp");
+    let mut server = recall_server(&dir);
+
+    for number in 1..=6 {
+        save(
+            &mut server,
+            "repo",
+            &format!("deploy-repo-{number}"),
+            "Deploy this repository",
+        );
+    }
+    save(&mut server, "global", "deploy-global", "Deploy this repository");
+    oldest(&dir, "deploy-global");
+
+    let listed = names(&search(&mut server, "deploy repository"));
+
+    assert_eq!(listed.len(), 5, "{listed:?}");
+    assert_eq!(listed[0], "deploy-global");
+    assert!(
+        listed[1..].iter().all(|name| name.starts_with("deploy-repo-")),
+        "{listed:?}"
+    );
+}
+
+#[test]
+fn a_global_script_with_a_line_too_long_in_bytes_is_not_moved() {
+    let dir = TempDir::new().expect("temp");
+    let mut server = recall_server(&dir);
+
+    for number in 1..=4 {
+        save(
+            &mut server,
+            "repo",
+            &format!("deploy-repo-{number}"),
+            "Deploy this repository",
+        );
+    }
+
+    let long = format!("Deploy {}", "\u{1F680}".repeat(100));
+    save(&mut server, "global", "deploy-global", &long);
+    oldest(&dir, "deploy-global");
+
+    let listed = names(&search(&mut server, "deploy repository"));
+
+    assert_ne!(listed[0], "deploy-global", "{listed:?}");
+    assert!(
+        listed[..4].iter().all(|name| name.starts_with("deploy-repo-")),
+        "{listed:?}"
+    );
+}
+
+#[test]
+fn a_global_script_inside_the_five_moves_to_the_front() {
+    let dir = TempDir::new().expect("temp");
+    let mut server = recall_server(&dir);
+
+    save(&mut server, "repo", "deploy-repo-a", "Deploy staging build");
+    save(&mut server, "repo", "deploy-repo-b", "Deploy staging build");
+    save(&mut server, "global", "deploy-global", "Deploy staging");
+
+    // It matches two of the three words the best scripts match, which is half of them rounded up.
+    let mut listed = names(&search(&mut server, "deploy staging build"));
+    assert_eq!(listed[0], "deploy-global", "{listed:?}");
+
+    listed.sort();
+    assert_eq!(listed, ["deploy-global", "deploy-repo-a", "deploy-repo-b"]);
+}
+
+#[test]
+fn a_global_script_matching_less_than_half_of_the_words_stays_where_it_ranks() {
+    let dir = TempDir::new().expect("temp");
+    let mut server = recall_server(&dir);
+
+    save(&mut server, "repo", "deploy-repo-a", "Deploy staging build");
+    save(&mut server, "repo", "deploy-repo-b", "Deploy staging build");
+    save(&mut server, "global", "deploy-global", "Deploy");
+
+    let listed = names(&search(&mut server, "deploy staging build"));
+
+    assert_eq!(listed.len(), 3, "{listed:?}");
+    assert_eq!(listed[2], "deploy-global", "last, as it ranks: {listed:?}");
+}
+
+#[test]
+fn a_global_script_matching_a_word_only_past_the_cut_description_is_not_moved() {
+    let dir = TempDir::new().expect("temp");
+    let mut server = recall_server(&dir);
+
+    for number in 1..=6 {
+        save(
+            &mut server,
+            "repo",
+            &format!("deploy-repo-{number}"),
+            "Deploy this repository",
+        );
+    }
+
+    // The only word it matches is at character 140 of the description, cut away in its line.
+    let hidden = format!("{}deploy", "filler ".repeat(20));
+    save(&mut server, "global", "ship-global", &hidden);
+
+    let listed = names(&search(&mut server, "deploy repository"));
+
+    assert_eq!(listed.len(), 5, "{listed:?}");
+    assert!(
+        listed.iter().all(|name| name.starts_with("deploy-repo-")),
+        "no global script in front of them: {listed:?}"
+    );
+}
+
+#[test]
+fn note_search_lists_scripts_in_plain_ranking() {
+    let dir = TempDir::new().expect("temp");
+    let mut server = repo_server(&dir);
+
+    for number in 1..=6 {
+        save(
+            &mut server,
+            "repo",
+            &format!("deploy-repo-{number}"),
+            "Deploy this repository",
+        );
+    }
+    save(&mut server, "global", "deploy-global", "Deploy this repository");
+    oldest(&dir, "deploy-global");
+
+    // The global script ranks last of the seven that tie, so the tool lists the six's first five.
+    let listed = names(&search(&mut server, "deploy repository"));
+
+    assert_eq!(listed.len(), 5, "{listed:?}");
+    assert!(listed.iter().all(|name| name.starts_with("deploy-repo-")), "{listed:?}");
+
+    // And one that ranks inside the five stays where it ranks.
+    let other = TempDir::new().expect("temp");
+    let mut server = repo_server(&other);
+    save(&mut server, "repo", "deploy-repo-a", "Deploy staging build");
+    save(&mut server, "global", "deploy-global", "Deploy staging");
+
+    assert_eq!(
+        names(&search(&mut server, "deploy staging build")),
+        ["deploy-repo-a", "deploy-global"]
+    );
+}
+
+#[test]
+fn a_global_script_a_repository_script_hides_is_not_held_a_place() {
+    let dir = TempDir::new().expect("temp");
+    let mut server = recall_server(&dir);
+
+    for number in 1..=5 {
+        save(
+            &mut server,
+            "repo",
+            &format!("deploy-{number}"),
+            "Deploy this repository",
+        );
+    }
+    save(&mut server, "global", "deploy-1", "Deploy this repository");
+    oldest(&dir, "deploy-1");
+
+    // `deploy-1` is run by name as the repository's script, so the five that rank first stay.
+    let listed = listed(&search(&mut server, "deploy repository"));
+    assert_eq!(listed.len(), 5, "{listed:?}");
+    assert!(
+        listed
+            .iter()
+            .all(|line| line.ends_with(&format!("name={}", line_name(line)))),
+        "every line runs by name: {listed:?}"
+    );
+}
+
+/// The name a list line starts with.
+fn line_name(line: &str) -> &str {
+    line.strip_prefix("- ")
+        .and_then(|rest| rest.split(':').next())
+        .expect("name")
 }
 
 #[test]

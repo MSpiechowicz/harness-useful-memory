@@ -21,10 +21,11 @@
 //!    against what a lone title word per query term would give (`r = relevance / (5 * n)`, then
 //!    `r / (1 + r)`, so it stays under 1). A candidate without relevance from its backend is
 //!    shared by this same text relevance.
-//! 4. The score is share times quality, times [`REPO_BOOST`] for a note of this repository, times
-//!    [`CONTEXT_BOOST`] when a query word is the name of one of the note's entities or a segment
-//!    of a path in its body or entities. Repository and global notes share this one order, and
-//!    a best answer with a weak match still scores low, so lists from two databases merge by it.
+//! 4. The score is share times quality, times [`REPO_BOOST`] for a note of this repository (a
+//!    tie-break, see there), times [`CONTEXT_BOOST`] when a query word is the name of one of the
+//!    note's entities or a segment of a path in its body or entities. Repository and global notes
+//!    share this one order, and a best answer with a weak match still scores low, so lists from two
+//!    databases merge by it.
 //! 5. Ties go to the more recently updated note, then the one read more often, then the higher id.
 
 use std::cmp::Reverse;
@@ -37,10 +38,12 @@ use unicode_normalization::char::is_combining_mark;
 use crate::limits::QUERY_TOKENS_MAX;
 use crate::support::text::is_query_stopword;
 
-/// Multiplies the score of a note of the repository the search is for (a global note is 1.0): an
-/// equally relevant repository note wins, a clearly more relevant global one still beats a weak
-/// repository one.
-pub(crate) const REPO_BOOST: f64 = 1.25;
+/// Multiplies the score of a note of the repository the search is for (a global note is 1.0). It is
+/// a tie-break: a repository note wins only when it is effectively level with a global one, about
+/// one place apart in the fused order (rank 1 scores 1000 and rank 2 984, which 1.02 lifts to 1004,
+/// while rank 3 at 968 stays behind at 987). A global note that is clearly more relevant than a
+/// repository one keeps its place.
+pub(crate) const REPO_BOOST: f64 = 1.02;
 
 /// Multiplies the score of a note that a query word names (an entity or a path segment).
 pub(crate) const CONTEXT_BOOST: f64 = 1.15;

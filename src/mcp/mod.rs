@@ -50,6 +50,7 @@ use serde_json::{Value, json};
 use crate::backend::{NotesPlace, Place};
 use crate::limits::LINE_MAX;
 use crate::project::ProjectResolver;
+use crate::store::author::DESKTOP_CLIENT;
 use crate::store::{Author, MemoryStore, ScriptStore, TrustStore};
 use crate::support::runner::Stop;
 use input::Watch;
@@ -90,6 +91,8 @@ pub struct Server {
     /// The notes counted as shown / as useful in this session already: each counts once.
     shown_counted: HashSet<i64>,
     useful_counted: HashSet<i64>,
+    /// Whether this server answers a recall ([`Self::for_recall`]).
+    recall: bool,
 }
 
 /// A usefulness counter to write after the reply that caused it went out, so counting never
@@ -148,6 +151,7 @@ impl Server {
             after: Vec::new(),
             shown_counted: HashSet::new(),
             useful_counted: HashSet::new(),
+            recall: false,
         }
     }
 
@@ -177,8 +181,14 @@ impl Server {
         }
     }
 
-    /// Queues the notes `ids` that were not counted as shown in this session yet.
-    fn queue_shown(&mut self, ids: &[i64]) {
+    /// Queues the notes `ids` that were not counted as shown in this session yet. Nothing is queued
+    /// for Harness Desktop itself: it searches in the background (to save or import notes), which
+    /// is not an agent being shown a note.
+    pub fn queue_shown(&mut self, ids: &[i64]) {
+        if self.client.as_deref() == Some(DESKTOP_CLIENT) {
+            return;
+        }
+
         let new = uncounted(ids, &self.shown_counted);
 
         if !new.is_empty() {
@@ -193,6 +203,14 @@ impl Server {
         if !new.is_empty() {
             self.after.push(Counted::Useful(new, at));
         }
+    }
+
+    /// The server answering `recall --hook`: its `note_search` holds a place for a global note in a
+    /// short list, and does not count the notes it finds as shown, because the recall prints fewer
+    /// of them and counts those itself ([`Self::queue_shown`]).
+    pub fn for_recall(mut self) -> Self {
+        self.recall = true;
+        self
     }
 
     /// The server whose running script `stop` stops (see [`stop_on_sigterm`]); [`serve`] also

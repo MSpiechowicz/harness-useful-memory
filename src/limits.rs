@@ -46,6 +46,11 @@ pub const SNIPPET_TOKENS: usize = 24;
 /// Snippet length, in characters.
 pub const SNIPPET_MAX: usize = 240;
 
+/// Most bytes a global note takes in a recall block with other notes: about 40% of the notes budget
+/// of the block, so an ordinary note fits whole (its header, a 120-character title and a 240-character
+/// snippet). A larger one takes no held place, and is cut when it ranks among the notes anyway.
+pub const GLOBAL_SLOT_BYTES_MAX: usize = 600;
+
 /// Similar notes listed after `note_save`.
 pub const SIMILAR_MAX: usize = 3;
 

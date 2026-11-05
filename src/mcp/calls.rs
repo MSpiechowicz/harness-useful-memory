@@ -1,5 +1,7 @@
 //! `tools/call`: argument parsing, scope resolution and the compact text replies.
 
+use std::path::Path;
+
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -9,10 +11,12 @@ use super::blocks::{FRAME, hit_block, note_block, rewrite_line, saved_line, simi
 use super::reply::{Capped, now};
 use super::scope::{kind, own_root, provenance, scope_arg, target, view};
 use crate::limits::{
-    DEPTH_MAX, FEEDBACK_REASON_MAX, GET_REPLY_MAX, LIST_REPLY_MAX, NEIGHBORS_LIMIT_DEFAULT, SEARCH_LIMIT_DEFAULT,
-    SEARCH_LIMIT_MAX, SIMILAR_MAX,
+    DEPTH_MAX, FEEDBACK_REASON_MAX, GET_REPLY_MAX, GLOBAL_SLOT_BYTES_MAX, LIST_REPLY_MAX, NEIGHBORS_LIMIT_DEFAULT,
+    SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, SIMILAR_MAX,
 };
-use crate::store::{Forget, Link, NoteDraft, NoteOrigin, NotePatch, Saved, SearchQuery, Target, View, clean};
+use crate::store::{
+    Forget, Hit, Link, NoteDraft, NoteOrigin, NotePatch, Saved, Scope, SearchQuery, Target, View, clean,
+};
 use crate::support::lang::Lang;
 
 /// A tool result.
@@ -267,19 +271,28 @@ fn search(server: &mut Server, args: SearchArgs, reserved: usize) -> Result<Stri
         None
     };
 
+    // Only a recall (a server of its own, see [`Server::for_recall`]) holds a place for a global
+    // note, so no argument of a tool call can ask for it. It needs a repository whose notes could
+    // crowd the global ones out, and room for more than one note.
+    let reserve = server.recall && limit > 1 && view.repo.is_some() && view.global;
+
     let query = SearchQuery {
         text: args.query.unwrap_or_default(),
         kind: args.kind.as_deref().map(kind).transpose()?,
         view,
-        limit,
+        limit: if reserve { SEARCH_LIMIT_MAX } else { limit },
         checkout,
         exclude: Vec::new(),
     };
 
     let found = super::vectors::search(server, &query).map_err(|error| error.to_string())?;
-    let hits = found.hits;
-    let scripts = super::search_scripts::block(server, &query.view, &query.text);
     let home = server.projects.home();
+    let hits = if reserve {
+        with_global_slot(found.hits, limit, found.fused, &home)
+    } else {
+        found.hits
+    };
+    let scripts = super::search_scripts::block(server, &query.view, &query.text);
 
     // The saved scripts always fit: the notes get the room they and the notice leave.
     let room = scripts.as_ref().map_or(0, |block| block.len() + 1);
@@ -312,9 +325,10 @@ fn search(server: &mut Server, args: SearchArgs, reserved: usize) -> Result<Stri
 
     let mut text = reply.finish();
 
-    // The desktop searches in the background (to save or import notes): that is not an agent
-    // being shown a note. The counter is written after the reply (see [`Server::after_reply`]) and never fails the search.
-    if server.client.as_deref() != Some(DESKTOP_CLIENT) && !shown.is_empty() {
+    // The counter is written after the reply (see [`Server::after_reply`]) and never fails the
+    // search. A recall prints less than this reply (its block has a byte limit) and counts the notes
+    // it prints itself. Harness Desktop's own searches are not counted ([`Server::queue_shown`]).
+    if !server.recall && !shown.is_empty() {
         server.queue_shown(&shown);
     }
 
@@ -326,8 +340,54 @@ fn search(server: &mut Server, args: SearchArgs, reserved: usize) -> Result<Stri
     Ok(text)
 }
 
-/// The client name Harness Desktop initializes the server with.
-const DESKTOP_CLIENT: &str = "harness-desktop";
+/// The least share of the best note's score a global note needs for the place a recall keeps for it
+/// when the search was by keywords alone: a guaranteed place must not go to a weak match next to a
+/// strong answer from the repository. A keyword score is the note's relevance, so shares compare.
+const GLOBAL_SLOT_SHARE: f64 = 0.5;
+
+/// The least fused score, in thousandths, a global note needs for that place when the keyword and
+/// vector lists were fused, which is what a note found by both lists has. A fused score depends on
+/// ranks alone (`(1 / (60 + keyword rank) + 1 / (60 + vector rank)) * 61 / 2`, times the context
+/// boost, at most 1.15, which a global note can get), so a share of the best score tells nothing:
+/// - a note in one list scores at most `61 / 2 / 61 * 1.15 = 0.575`, in the first place of its list,
+/// - a note in both lists scores at least `61 / 80 = 0.762`, with both ranks at 20, the deepest
+///   either list goes (`SEARCH_LIMIT_MAX`).
+///
+/// Anything between separates the two.
+const GLOBAL_SLOT_BOTH_LISTS_MILLI: u32 = 660;
+
+/// The first `limit` of the ranked `hits`, with the last of them given to the best global hit that is
+/// eligible when none of those is global: a repository's notes never push every global note that
+/// answers the query out of a short list. A global note is eligible when its block is within
+/// [`GLOBAL_SLOT_BYTES_MAX`] (shown with `home`), and it answers the query: both lists found it when
+/// the hits are `fused`, else its score is [`GLOBAL_SLOT_SHARE`] of the best hit's.
+fn with_global_slot(mut hits: Vec<Hit>, limit: usize, fused: bool, home: &Path) -> Vec<Hit> {
+    let wider = hits.split_off(limit.min(hits.len()));
+
+    if hits.iter().any(|hit| hit.scope == Scope::Global) {
+        return hits;
+    }
+
+    let best_score = f64::from(hits.first().map_or(0, |hit| hit.score_milli));
+    let answers = |hit: &Hit| {
+        if fused {
+            hit.score_milli >= GLOBAL_SLOT_BOTH_LISTS_MILLI
+        } else {
+            f64::from(hit.score_milli) >= best_score * GLOBAL_SLOT_SHARE
+        }
+    };
+
+    let global = wider
+        .into_iter()
+        .filter(|hit| hit.scope == Scope::Global)
+        .find(|hit| answers(hit) && hit_block(hit, home).len() <= GLOBAL_SLOT_BYTES_MAX);
+
+    if let (Some(global), Some(last)) = (global, hits.last_mut()) {
+        *last = global;
+    }
+
+    hits
+}
 
 /// The body of `note_feedback`: counts the notes among `args.ids` this caller can see as useful.
 /// The reason is for the agent to word its answer: harness-memory keeps none of it.
@@ -572,4 +632,112 @@ pub(super) fn parse<T: DeserializeOwned>(arguments: Value) -> Result<T, String> 
     serde_json::from_value(arguments).map_err(|error| {
         format!("invalid arguments: {error}. Check the tool's input schema in tools/list for the required fields")
     })
+}
+
+#[cfg(test)]
+mod global_slot_tests {
+    use super::*;
+    use crate::store::{NoteKind, Provenance};
+
+    fn hit(id: i64, scope: Scope, score_milli: u32) -> Hit {
+        Hit {
+            id,
+            kind: NoteKind::Note,
+            scope,
+            title: format!("note {id}"),
+            snippet: String::new(),
+            updated_at: 0,
+            entities: Vec::new(),
+            provenance: Provenance::default(),
+            score_milli,
+            boost_milli: Hit::NO_BOOST,
+        }
+    }
+
+    fn ids(hits: &[Hit]) -> Vec<i64> {
+        hits.iter().map(|hit| hit.id).collect()
+    }
+
+    fn repo_notes() -> Vec<Hit> {
+        vec![
+            hit(1, Scope::Repo, 1000),
+            hit(2, Scope::Repo, 980),
+            hit(3, Scope::Repo, 960),
+            hit(4, Scope::Repo, 940),
+        ]
+    }
+
+    fn slotted(hits: Vec<Hit>, fused: bool) -> Vec<i64> {
+        ids(&with_global_slot(hits, 3, fused, Path::new("/home/nobody")))
+    }
+
+    #[test]
+    fn by_keywords_a_global_note_that_answers_the_query_takes_the_last_place() {
+        let mut hits = repo_notes();
+        hits.push(hit(5, Scope::Global, 500));
+
+        assert_eq!(slotted(hits, false), [1, 2, 5]);
+    }
+
+    #[test]
+    fn by_keywords_a_weak_global_note_next_to_a_strong_answer_takes_no_place() {
+        let mut hits = repo_notes();
+        hits.push(hit(5, Scope::Global, 499));
+
+        assert_eq!(slotted(hits, false), [1, 2, 3]);
+    }
+
+    #[test]
+    fn fused_only_a_global_note_both_lists_found_takes_the_last_place() {
+        // In one list a note scores 575 at most (first, with the context boost), in both at least 762.
+        let mut one_list = repo_notes();
+        one_list.push(hit(5, Scope::Global, 575));
+        assert_eq!(slotted(one_list, true), [1, 2, 3]);
+
+        let mut both = repo_notes();
+        both.push(hit(5, Scope::Global, 762));
+        assert_eq!(slotted(both, true), [1, 2, 5]);
+    }
+
+    #[test]
+    fn the_best_eligible_global_note_gets_the_place() {
+        let mut hits = repo_notes();
+        hits.push(hit(5, Scope::Global, 600));
+        hits.push(hit(6, Scope::Global, 800));
+        hits.push(hit(7, Scope::Global, 790));
+
+        // The first (best) global note is in one list only: the next one gets the place.
+        assert_eq!(slotted(hits, true), [1, 2, 6]);
+    }
+
+    #[test]
+    fn a_global_note_too_large_takes_no_place_and_the_repository_notes_stay() {
+        let mut large = hit(5, Scope::Global, 900);
+        large.entities = (0..10).map(|number| format!("{number}{}", "e".repeat(79))).collect();
+        let mut hits = repo_notes();
+        hits.push(large);
+
+        assert_eq!(slotted(hits.clone(), true), [1, 2, 3]);
+        assert_eq!(slotted(hits, false), [1, 2, 3]);
+
+        // The same note with a few entities fits.
+        let mut small = hit(5, Scope::Global, 900);
+        small.entities = vec!["Gateway".to_owned()];
+        let mut hits = repo_notes();
+        hits.push(small);
+
+        assert_eq!(slotted(hits, true), [1, 2, 5]);
+    }
+
+    #[test]
+    fn a_global_note_already_kept_changes_nothing() {
+        let hits = vec![
+            hit(1, Scope::Repo, 1000),
+            hit(2, Scope::Global, 980),
+            hit(3, Scope::Repo, 960),
+            hit(4, Scope::Global, 940),
+        ];
+
+        assert_eq!(slotted(hits, true), [1, 2, 3]);
+    }
 }

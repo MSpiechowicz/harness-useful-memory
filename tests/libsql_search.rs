@@ -30,6 +30,7 @@ store_cases!(
     a_topic_the_notes_lack_finds_nothing,
     a_note_needs_half_of_the_query_words,
     a_query_word_naming_an_entity_or_a_path_boosts_the_note,
+    a_repository_note_only_wins_a_tie,
     an_empty_store_finds_nothing,
     similar_notes_are_unchanged,
     hits_for_loads_the_notes_a_search_may_see,
@@ -286,6 +287,10 @@ fn a_note_needs_half_of_the_query_words(db: &Database) {
 
 fn a_query_word_naming_an_entity_or_a_path_boosts_the_note(db: &Database) {
     common::search_cases::a_query_word_naming_an_entity_or_a_path_boosts_the_note(&mut *db.open());
+}
+
+fn a_repository_note_only_wins_a_tie(db: &Database) {
+    common::search_cases::a_repository_note_only_wins_a_tie(&mut *db.open());
 }
 
 fn an_empty_store_finds_nothing(db: &Database) {

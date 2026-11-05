@@ -48,6 +48,10 @@ const BACKGROUND_MIN: usize = 10;
 /// How many notes the embedder is asked for.
 const VECTOR_DEPTH: usize = SEARCH_LIMIT_MAX;
 
+// `calls::GLOBAL_SLOT_BOTH_LISTS_MILLI` tells a note both lists found by the score of rank 20 in both:
+// a deeper list needs a new threshold.
+const _: () = assert!(VECTOR_DEPTH <= 20 && SEARCH_LIMIT_MAX <= 20);
+
 /// The embedder of this computer and the keys it names the stores by.
 #[derive(Debug, Clone)]
 pub struct Vectors {
@@ -150,6 +154,9 @@ pub(super) struct Found {
     pub hits: Vec<Hit>,
     /// A line to show before the notes.
     pub notice: Option<&'static str>,
+    /// Whether the hits were fused with the vector list, so their scores come from ranks (see
+    /// [`crate::store::fuse`]) and not from the keyword ranking alone.
+    pub fused: bool,
 }
 
 /// Answers `query`: a keyword search, fused with the vector search when that is on.
@@ -218,6 +225,7 @@ pub(super) fn search(server: &mut Server, query: &SearchQuery) -> Result<Found, 
     Ok(Found {
         hits: fuse(keyword, vector, limit),
         notice: None,
+        fused: true,
     })
 }
 
@@ -238,6 +246,7 @@ fn keyword_only(server: &mut Server, query: &SearchQuery, notice: Option<&'stati
     Ok(Found {
         hits: server.store.search(query)?,
         notice,
+        fused: false,
     })
 }
 

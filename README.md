@@ -454,8 +454,8 @@ directory is no project. The `global` scope is shared by all repositories.
 `note_search` ranks with stemmed English keyword search on every backend (SQLite, libSQL, PostgreSQL, MongoDB,
 DocumentDB). Stopwords are dropped from the query, and a query that is only stopwords finds no notes. A note has to match
 at least half (rounded up) of the remaining query stems and pass a per-backend score floor. Repository and global notes
-are ranked together, with a boost for the repository's notes and for notes whose entities or path segments equal a word
-of the query. `similar` (the list `note_save` returns) is unchanged.
+are ranked together. The repository's notes win only a tie (a small boost), and notes whose entities or path segments
+equal a word of the query get a boost too. `similar` (the list `note_save` returns) is unchanged.
 
 With vector search on, the keyword list is fused with a list of notes close in meaning (reciprocal rank fusion, k = 60).
 The vectors come from the [embedder](#the-embedder), and a note has to reach a cosine floor to count. Vector search is

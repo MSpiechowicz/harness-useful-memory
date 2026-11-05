@@ -9,6 +9,14 @@
 //! notes and the global ones, never the notes hidden on this computer. `--limit` is 1 to
 //! [`LIMIT_MAX`] notes (3 when not given).
 //!
+//! A repository's notes do not push every global note out of a short list: when none of the best
+//! `--limit` notes is global and a global note answers the query, the best such one takes the last
+//! place. A global note answers when both the keyword and the vector search found it (with vector
+//! search on) or when its keyword score is at least half of the best note's (without), and it must
+//! be an ordinary note: its block is at most [`crate::limits::GLOBAL_SLOT_BYTES_MAX`] bytes. The
+//! byte limit of the block ([`text`]) keeps the first such global note too. A single note
+//! (`--limit 1`) is the best one, and a search for no repository finds global notes only.
+//!
 //! It prints one `<harness-memory-recall>` block of at most [`text::RECALL_BUDGET`] bytes ([`text`]
 //! describes it), or nothing (exit 0) when the message says too little to search for, the local
 //! database does not exist yet and any notes or scripts are read from it (a message never creates
@@ -17,10 +25,11 @@
 //! A failure (the settings are wrong, the database cannot be opened or read) exits 1 with one line on
 //! stderr and prints nothing, never half a block. Usage errors exit 2.
 //!
-//! The notes of the block count as shown, as when an agent's `note_search` shows them (see
-//! [`crate::mcp::Server::after_reply`]): written after the block is printed and flushed, in a
-//! single attempt of at most [`COUNT_BUDGET`], and dropped silently when it fails. Memory settings
-//! only ever limit saving, never reading, so they do not change what this prints.
+//! The notes the block prints count as shown, as when an agent's `note_search` shows them (see
+//! [`crate::mcp::Server::after_reply`]), and the ones the byte limit or the global slot left out do
+//! not. They are written after the block is printed and flushed, in a single attempt of at most
+//! [`COUNT_BUDGET`], and dropped silently when it fails. Memory settings only ever limit saving,
+//! never reading, so they do not change what this prints.
 
 mod text;
 
@@ -189,14 +198,23 @@ fn find(
     // A hook never waits for another process to add the schema extensions.
     crate::store::patience::skip_schema_waits();
 
-    let Some(mut server) = open_server(&env, &selection, std::env::current_dir().ok()) else {
+    let Some(server) = open_server(&env, &selection, std::env::current_dir().ok()) else {
         return Err("the memory database cannot be opened".to_owned());
     };
+    let mut server = server.for_recall();
 
     let reply = search(&mut server, &query, project.as_deref(), limit)
         .map_err(|message| selection.backend.secrets().scrub(&message))?;
 
-    Ok(text::block_of(&reply).map(|block| (block, server)))
+    let Some(block) = text::block_of(&reply) else {
+        return Ok(None);
+    };
+
+    // Only the notes the block prints count as shown, not the ones its byte limit or the global
+    // slot left out.
+    server.queue_shown(&text::shown_ids(&block));
+
+    Ok(Some((block, server)))
 }
 
 /// True when a search under `selection` reads this computer's file: it is the only store, or any
@@ -212,7 +230,8 @@ fn reads_local(selection: &Selection) -> bool {
 }
 
 /// The text of the `note_search` reply for `query`: the notes of `project`'s repository (the working
-/// folder's without one) and the global ones, and the saved scripts that match.
+/// folder's without one) and the global ones, and the saved scripts that match. A recall server
+/// ([`Server::for_recall`]) keeps one of `limit` places for a global note when there is one.
 fn search(server: &mut Server, query: &str, project: Option<&str>, limit: usize) -> Result<String, String> {
     let mut arguments = json!({ "query": query, "limit": limit });
 

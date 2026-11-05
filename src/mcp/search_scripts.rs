@@ -4,11 +4,12 @@
 //! The search text is split into words the way note search splits it (alphanumeric runs,
 //! lowercased, accents dropped; common English words left out, the last word matching as a
 //! prefix), and a script matches when its name or description holds one of them. Scripts are
-//! ranked by the words they match, then by runs, then by the latest write. They come from the
-//! script store (the local file, the team database, or both with `remote+local`; the team scripts
-//! hidden on this computer are left out), and a script whose name or description holds a
-//! [`hidden_character`] is never listed. A failing script store leaves the block out and never
-//! fails the search.
+//! ranked by the words they match, then by runs, then by the latest write. For a recall (see
+//! [`Server::for_recall`]) the best global script that matches at least half as many words as the
+//! best script does, in what its line shows, is listed first. They come from the script store (the
+//! local file, the team database, or both with `remote+local`; the team scripts hidden on this
+//! computer are left out), and a script whose name or description holds a [`hidden_character`] is
+//! never listed. A failing script store leaves the block out and never fails the search.
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
@@ -26,12 +27,19 @@ use crate::support::text::STOPWORDS;
 /// Scripts listed after the notes.
 const LISTED_MAX: usize = 5;
 
+/// Most bytes of the line of a script a recall moves to the front: an ordinary line in English fits
+/// (a name and a 120-character description). A line of many multi-byte characters would leave the
+/// byte limit of the recall block no room for the scripts after it, so it stays where it ranks.
+const PROMOTED_LINE_BYTES_MAX: usize = 200;
+
 /// The longest description shown, in characters.
 const DESCRIPTION_MAX: usize = 120;
 
 /// The block of saved scripts visible in `view` that match `query`: [`SCRIPTS_FRAME`] and a
-/// `<saved-scripts>` element with one line per script. `None` when none matches or the script
-/// store failed (noted on stderr).
+/// `<saved-scripts>` element with one line per script, at most [`LISTED_MAX`]. For a recall server
+/// the best global script that `script_run` runs by name and whose line shows at least half as many
+/// of the search words as the best script matches (rounded up) comes first, wherever it ranks.
+/// `None` when none matches or the script store failed (noted on stderr).
 pub(super) fn block(server: &mut Server, view: &View, query: &str) -> Option<String> {
     let words = query_words(query);
 
@@ -69,6 +77,26 @@ pub(super) fn block(server: &mut Server, view: &View, query: &str) -> Option<Str
             summary.id,
         )
     });
+
+    // For a recall, the best global script that `script_run name=<name>` runs is listed first, so a
+    // short list (the recall block's byte limit leaves out the last ones) still has one, and a
+    // repository's scripts never crowd every global one out of the five. Its line must show at least
+    // half of the words the best script matches: a word the cut of the description hides is no
+    // reason to list it.
+    if server.recall {
+        let least = ranked.first().map_or(0, |(count, _)| count.div_ceil(2));
+        let global = ranked.iter().position(|(_, summary)| {
+            summary.scope == Scope::Global
+                && shown_matched(&words, summary) >= least
+                && by_name(server, summary, &summaries)
+                && line(summary, true).len() <= PROMOTED_LINE_BYTES_MAX
+        });
+
+        if let Some(index) = global {
+            let best = ranked.remove(index);
+            ranked.insert(0, best);
+        }
+    }
 
     let lines: Vec<String> = ranked
         .iter()
@@ -125,7 +153,20 @@ fn fold(word: &str) -> String {
 /// How many of the search `words` the name or description of `summary` holds (the last search
 /// word also as the start of a word).
 fn matched(words: &[String], summary: &ScriptSummary) -> usize {
-    let own: HashSet<String> = words_of(summary).into_iter().collect();
+    matched_in(words, &format!("{} {}", summary.name, summary.description))
+}
+
+/// How many of the search `words` the name and the description of `summary` as its line shows them
+/// (the description cut to [`DESCRIPTION_MAX`]) hold.
+fn shown_matched(words: &[String], summary: &ScriptSummary) -> usize {
+    let shown = format!("{} {}", clean::line(&summary.name), description(&summary.description));
+
+    matched_in(words, &shown)
+}
+
+/// How many of the search `words` the `text` holds.
+fn matched_in(words: &[String], text: &str) -> usize {
+    let own: HashSet<String> = self::words(text).into_iter().collect();
     let last = words.len() - 1;
 
     words
@@ -135,10 +176,6 @@ fn matched(words: &[String], summary: &ScriptSummary) -> usize {
             own.contains(*word) || (*index == last && own.iter().any(|known| known.starts_with(word.as_str())))
         })
         .count()
-}
-
-fn words_of(summary: &ScriptSummary) -> Vec<String> {
-    words(&format!("{} {}", summary.name, summary.description))
 }
 
 /// True when nothing the line shows hides a character.

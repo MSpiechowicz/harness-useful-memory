@@ -265,6 +265,11 @@ fn a_query_word_naming_an_entity_or_a_path_boosts_the_note() {
 }
 
 #[test]
+fn a_repository_note_only_wins_a_tie() {
+    with_store(common::search_cases::a_repository_note_only_wins_a_tie);
+}
+
+#[test]
 fn an_empty_store_finds_nothing() {
     with_store(common::search_cases::an_empty_store_finds_nothing);
 }

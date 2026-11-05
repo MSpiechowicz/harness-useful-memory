@@ -531,3 +531,251 @@ fn the_user_commands_keep_the_vectors_current_too() {
     );
     assert_eq!(embedder.ops("upsert")[1]["notes"][0]["body"], "Edited by the user.");
 }
+
+const OTTER_QUERY: &str = "otter payment gateway timeout settings";
+
+/// A repository `widget` of notes about other things, four repository notes that match four of the
+/// five words of [`OTTER_QUERY`] and one global note that matches all of them. The keyword order is
+/// the global note, then the repository notes. The embedder ranks the repository notes first and
+/// the global note last. Returns the server's folder, the repository, the global note's id and the
+/// repository notes' ids in keyword order.
+fn otter_corpus() -> (TempDir, std::path::PathBuf, i64, Vec<i64>) {
+    let dir = TempDir::new().expect("temp dir");
+    let repo = repo_with_remote(dir.path(), "widget", "https://github.com/acme/widget.git");
+    let mut plain = server(&dir, &dir.path().join("home"), &repo);
+
+    let mut save = |title: String, body: &str, scope: &str| {
+        let reply = run(
+            &mut plain,
+            &[call(
+                1,
+                "note_save",
+                json!({ "title": title, "body": body, "kind": "note", "scope": scope }),
+            )],
+        );
+        assert_eq!(reply[0]["result"]["isError"], false, "{}", reply[0]);
+    };
+
+    for number in 1..=20 {
+        save(
+            format!("Unrelated entry number {number}"),
+            &format!("topic{number} filler"),
+            "repo",
+        );
+    }
+    for number in 1..=4 {
+        save(
+            format!("Otter payment gateway timeout wrapper {number}"),
+            "Wraps the vendor client",
+            "repo",
+        );
+    }
+    save(
+        OTTER_QUERY.to_owned(),
+        "Seconds before a charge request gives up",
+        "global",
+    );
+
+    let keyword = ids_of(&asked(&mut plain, &repo, 8));
+    assert_eq!(keyword.len(), 5, "{keyword:?}");
+
+    (dir, repo, keyword[0], keyword[1..].to_vec())
+}
+
+/// The `note_search` reply for [`OTTER_QUERY`] in the repository `repo`, `limit` notes at most.
+fn asked(server: &mut Server, repo: &Path, limit: u32) -> String {
+    let arguments = json!({
+        "query": OTTER_QUERY,
+        "project_path": repo.to_string_lossy(),
+        "limit": limit,
+    });
+
+    text(&run(server, &[call(1, "note_search", arguments)])[0]).to_owned()
+}
+
+/// A server over the `otter_corpus` that asks an embedder ranking the repository notes first.
+fn otter_server(dir: &TempDir, repo: &Path, global: i64, repo_notes: &[i64]) -> (FakeEmbedder, Server) {
+    set_enabled(dir.path(), true).expect("enable");
+
+    let mut ranked: Vec<(&str, i64, f64)> = repo_notes
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (LOCAL_KEY, *id, 0.90 - 0.02 * index as f64))
+        .collect();
+    ranked.push((LOCAL_KEY, global, 0.70));
+
+    let embedder = FakeEmbedder::start(dir.path(), answering(&ranked));
+    let server = server(dir, &dir.path().join("home"), repo).with_vectors(vectors(dir.path()));
+
+    (embedder, server)
+}
+
+#[test]
+fn a_repository_note_a_place_ahead_does_not_beat_a_global_note_by_the_boost_alone() {
+    let (dir, repo, global, repo_notes) = otter_corpus();
+    let (_embedder, mut server) = otter_server(&dir, &repo, global, &repo_notes);
+
+    // The global note is first by keywords and last by meaning. The boost lifts a repository note
+    // over it only when it is about a place ahead, so the fourth repository note stays behind it.
+    let ids = ids_of(&asked(&mut server, &repo, 8));
+
+    assert_eq!(ids.len(), 5, "{ids:?}");
+    assert_eq!(ids.iter().position(|id| *id == global), Some(3), "{ids:?}");
+}
+
+#[test]
+fn a_recall_holds_the_last_place_for_a_global_note_and_note_search_does_not() {
+    let (dir, repo, global, repo_notes) = otter_corpus();
+    let (_embedder, mut server) = otter_server(&dir, &repo, global, &repo_notes);
+
+    // The tool: the three best notes, all of the repository, whatever extra arguments say.
+    let arguments = json!({
+        "query": OTTER_QUERY,
+        "project_path": repo.to_string_lossy(),
+        "limit": 3,
+        "reserve_global": true,
+    });
+    let tool = text(&run(&mut server, &[call(1, "note_search", arguments)])[0]).to_owned();
+    let tool_ids = ids_of(&tool);
+
+    assert_eq!(tool_ids.len(), 3, "{tool}");
+    assert!(!tool_ids.contains(&global), "{tool}");
+
+    // A recall server: the same three, the last one given to the global note.
+    let mut recall = server_over_recall(&dir, &repo);
+    let reply = asked(&mut recall, &repo, 3);
+    let ids = ids_of(&reply);
+
+    assert_eq!(ids, [tool_ids[0], tool_ids[1], global], "{reply}");
+
+    // One note asked for: the best one, nothing held back.
+    let one = ids_of(&asked(&mut recall, &repo, 1));
+    assert_eq!(one, [tool_ids[0]]);
+}
+
+/// A recall server over the `otter_corpus`, asking the same embedder as the one running.
+fn server_over_recall(dir: &TempDir, repo: &Path) -> Server {
+    server(dir, &dir.path().join("home"), repo)
+        .with_vectors(vectors(dir.path()))
+        .for_recall()
+}
+
+/// The notes `charge_corpus` made.
+struct Charge {
+    dir: TempDir,
+    repo: std::path::PathBuf,
+    /// The repository notes, in the order the words rank them.
+    repo_notes: Vec<i64>,
+    /// "Charge retry policy": no word of the query finds it, only the embedder does.
+    vector_only: i64,
+    /// "Otter payment gateway default" (when asked for): three words of the query find it, and the
+    /// embedder.
+    both: Option<i64>,
+}
+
+/// The id a `note_save` reply says it created.
+fn created_id(reply: &Value) -> i64 {
+    text(reply)
+        .lines()
+        .find_map(|line| line.strip_prefix("created note "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|id| id.parse().ok())
+        .expect("a created note")
+}
+
+/// A repository with four notes that match four of the five words of [`OTTER_QUERY`], a global note
+/// the embedder alone finds, and with `with_both` a global note the words and the embedder find.
+/// The embedder ranks the global notes before the repository notes.
+fn charge_corpus(with_both: bool) -> (Charge, FakeEmbedder) {
+    let dir = TempDir::new().expect("temp dir");
+    let repo = repo_with_remote(dir.path(), "widget", "https://github.com/acme/widget.git");
+    let mut plain = server(&dir, &dir.path().join("home"), &repo);
+
+    let mut save = |title: String, body: &str, scope: &str| -> i64 {
+        let arguments = json!({ "title": title, "body": body, "kind": "note", "scope": scope });
+        let reply = run(&mut plain, &[call(1, "note_save", arguments)]);
+        assert_eq!(reply[0]["result"]["isError"], false, "{}", reply[0]);
+
+        created_id(&reply[0])
+    };
+
+    for number in 1..=20 {
+        save(
+            format!("Unrelated entry number {number}"),
+            &format!("topic{number} filler"),
+            "repo",
+        );
+    }
+
+    let repo_notes: Vec<i64> = (1..=4)
+        .map(|number| {
+            save(
+                format!("Otter payment gateway timeout wrapper {number}"),
+                "Wraps the vendor client",
+                "repo",
+            )
+        })
+        .collect();
+    let vector_only = save(
+        "Charge retry policy".to_owned(),
+        "Back off before a second attempt",
+        "global",
+    );
+    let both = with_both.then(|| {
+        save(
+            "Otter payment gateway default".to_owned(),
+            "Used when nothing else is set",
+            "global",
+        )
+    });
+
+    set_enabled(dir.path(), true).expect("enable");
+
+    // The global notes first, then the repository notes.
+    let mut ranked: Vec<(&str, i64, f64)> = vec![(LOCAL_KEY, vector_only, 0.95)];
+    ranked.extend(both.map(|id| (LOCAL_KEY, id, 0.90)));
+    ranked.extend(
+        repo_notes
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (LOCAL_KEY, *id, 0.85 - 0.02 * index as f64)),
+    );
+    let embedder = FakeEmbedder::start(dir.path(), answering(&ranked));
+
+    let charge = Charge {
+        dir,
+        repo,
+        repo_notes,
+        vector_only,
+        both,
+    };
+
+    (charge, embedder)
+}
+
+#[test]
+fn a_global_note_only_the_vectors_find_takes_no_place_next_to_repository_notes() {
+    let (charge, _embedder) = charge_corpus(false);
+    let mut recall = server_over_recall(&charge.dir, &charge.repo);
+
+    // In one list a note scores 500 at best, far under the repository notes the words and the
+    // embedder both find, and it is no better than the keyword rule's half of the best score.
+    let ids = ids_of(&asked(&mut recall, &charge.repo, 3));
+
+    assert_eq!(ids.len(), 3, "{ids:?}");
+    assert!(ids.iter().all(|id| charge.repo_notes.contains(id)), "{ids:?}");
+    assert!(!ids.contains(&charge.vector_only));
+}
+
+#[test]
+fn a_global_note_both_lists_find_takes_the_place_the_vector_only_one_does_not() {
+    let (charge, _embedder) = charge_corpus(true);
+    let both = charge.both.expect("the global note both lists find");
+    let mut recall = server_over_recall(&charge.dir, &charge.repo);
+
+    let ids = ids_of(&asked(&mut recall, &charge.repo, 3));
+
+    assert_eq!(ids.len(), 3, "{ids:?}");
+    assert_eq!(ids[2], both, "the last place: {ids:?}");
+    assert!(!ids.contains(&charge.vector_only));
+}
