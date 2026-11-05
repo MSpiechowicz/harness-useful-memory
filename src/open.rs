@@ -12,7 +12,7 @@ use crate::mcp::Vectors;
 use crate::project::ProjectResolver;
 use crate::store::{
     HiddenNotes, HiddenScripts, Lazy, MemoryStore, Reach, Scope, ScriptStore, SplitScripts, SplitStore, SqliteStore,
-    TrustStore,
+    StoreError, TrustStore,
 };
 use crate::support::Env;
 
@@ -43,11 +43,17 @@ pub fn open_server(env: &Env, selection: &Selection, cwd: Option<PathBuf>) -> Op
 /// The reachability of the team database, remembered next to the local file so that every
 /// `harness-memory` process (the server, and each command Harness Desktop runs) shares one
 /// cooldown instead of waiting out the connection timeout itself.
-fn reach_of(env: &Env, selection: &Selection) -> Reach {
+pub fn reach_of(env: &Env, selection: &Selection) -> Reach {
     match crate::database_path(env) {
         Some(database) => Reach::beside(&database, &selection.backend.team_key()),
         None => Reach::default(),
     }
+}
+
+/// Why the team database could not be reached, while its cooldown runs: for a list to show next to
+/// `offline`. The message is scrubbed when it is recorded.
+pub fn offline_reason(env: &Env, selection: &Selection) -> Option<String> {
+    reach_of(env, selection).cooling()
 }
 
 /// The scripts: in the local SQLite file without a team database or with `scripts = "local"`
@@ -125,14 +131,21 @@ fn local_scripts(env: &Env) -> Box<dyn ScriptStore> {
 fn team_scripts(backend: &Backend, reach: Reach, fallback: bool) -> Box<dyn ScriptStore> {
     let team = backend.clone();
 
-    let store = Lazy::new(move || match backend::open_scripts(&team) {
-        Some(Err(message)) if fallback => {
+    let store = Lazy::classified(move || match backend::try_open_scripts(&team) {
+        Some(Err(StoreError::Unreachable(message))) if fallback => {
             eprintln!("harness-memory: {message}");
-            Err(message)
+            Err(StoreError::Unreachable(message))
         }
-        Some(Err(message)) => Err(format!("{message}. {SCRIPTS_HINT}")),
+        Some(Err(StoreError::Unreachable(message))) => {
+            Err(StoreError::Unreachable(format!("{message}. {SCRIPTS_HINT}")))
+        }
+        // The database answered: the hint about reaching it would mislead.
+        Some(Err(error)) => {
+            eprintln!("harness-memory: {}", error.reason());
+            Err(error)
+        }
         Some(Ok(store)) => Ok(store),
-        None => Err("no team database is set".to_owned()),
+        None => Err(StoreError::Unreachable("no team database is set".to_owned())),
     });
 
     Box::new(store.with_reach(reach))
@@ -246,7 +259,7 @@ fn open_team_notes(backend: &Backend, reach: Reach, fallback: bool) -> Box<dyn M
     let backend = backend.clone();
     let mut warned_newer = false;
 
-    let team = Lazy::new(move || match backend::open(&backend) {
+    let team = Lazy::classified(move || match backend::try_open(&backend) {
         Some(Ok(opened)) => {
             if opened.newer && !warned_newer {
                 warned_newer = true;
@@ -255,15 +268,20 @@ fn open_team_notes(backend: &Backend, reach: Reach, fallback: bool) -> Box<dyn M
 
             Ok(opened.store)
         }
-        Some(Err(message)) if fallback => {
+        Some(Err(StoreError::Unreachable(message))) if fallback => {
             eprintln!("harness-memory: {message}");
-            Err(message)
+            Err(StoreError::Unreachable(message))
         }
-        Some(Err(message)) => {
+        Some(Err(StoreError::Unreachable(message))) => {
             eprintln!("harness-memory: {message}");
-            Err(format!("{message}. {OFFLINE_HINT}"))
+            Err(StoreError::Unreachable(format!("{message}. {OFFLINE_HINT}")))
         }
-        None => Err("no team database is set".to_owned()),
+        // The database answered: the hint about reaching it would mislead.
+        Some(Err(error)) => {
+            eprintln!("harness-memory: {}", error.reason());
+            Err(error)
+        }
+        None => Err(StoreError::Unreachable("no team database is set".to_owned())),
     });
 
     Box::new(team.with_reach(reach))

@@ -86,7 +86,7 @@ pub(super) fn block(server: &mut Server, view: &View, query: &str) -> Option<Str
 /// stored text), never text a client sent.
 fn failure(error: &StoreError) -> String {
     match error {
-        StoreError::Backend(_) | StoreError::NewerSchema => error.to_string(),
+        StoreError::Backend(_) | StoreError::Unreachable(_) | StoreError::NewerSchema => error.to_string(),
         _ => "the script store refused the read".to_owned(),
     }
 }

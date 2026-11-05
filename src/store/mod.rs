@@ -528,6 +528,22 @@ pub enum StoreError {
     /// The database failed (the message carries no stored text).
     #[error("memory database error: {0}")]
     Backend(String),
+    /// The database could not be reached: no route, nothing listening, a host that does not resolve,
+    /// no answer in time or a server that takes no connections right now. Only this starts the
+    /// cooldown of a [`Reach`] and the offline fallback: a server that answered with a refusal or a
+    /// failed migration is reachable, and is a [`StoreError::Backend`].
+    #[error("memory database error: {0}")]
+    Unreachable(String),
+}
+
+impl StoreError {
+    /// The message without the prefix of `Display`, for a failure of the database itself.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Backend(message) | Self::Unreachable(message) => message.clone(),
+            other => other.to_string(),
+        }
+    }
 }
 
 impl From<rusqlite::Error> for StoreError {
@@ -724,7 +740,9 @@ pub trait MemoryStore: Send {
     }
 
     /// Whether the store can be used now: `false` for a [`Lazy`] store whose database cannot be
-    /// opened (a failed open is not tried again for a while, see [`reach`]). The default is `true`.
+    /// reached (that open is not tried again for a while, see [`reach`]). A database that answered
+    /// and failed to open counts as usable, so the call that needs it fails with the real reason
+    /// instead of falling back. The default is `true`.
     fn ready(&mut self) -> bool {
         true
     }

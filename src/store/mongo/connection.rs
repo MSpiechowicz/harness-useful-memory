@@ -278,10 +278,54 @@ pub(super) fn connect_error(error: &Error, url: &str) -> StoreError {
     }
 }
 
+/// True when the TLS handshake refused the server's certificate: the error, or the last error of
+/// a server the driver could not select, is rustls's `invalid peer certificate`. The text is only
+/// looked at, never shown.
+pub(super) fn certificate_refused(error: &Error) -> bool {
+    const REFUSED: &str = "invalid peer certificate";
+
+    match error.kind.as_ref() {
+        ErrorKind::ServerSelection { message, .. } => message.contains(REFUSED),
+        ErrorKind::Io(io) => io.to_string().contains(REFUSED),
+        _ => false,
+    }
+}
+
+/// True when the TLS check refused the server, its certificate or not: rustls's error inside an
+/// I/O error, or the last error of a server the driver could not select, which is only text. A reset
+/// or a timeout during the handshake is a connection that was lost, and is not this.
+pub(super) fn tls_refused(error: &Error) -> bool {
+    const REFUSED: [&str; 4] = [
+        "invalid peer certificate",
+        "received fatal alert",
+        "peer is incompatible",
+        "received corrupt message",
+    ];
+
+    match error.kind.as_ref() {
+        ErrorKind::ServerSelection { message, .. } => REFUSED.iter().any(|text| message.contains(text)),
+        ErrorKind::Io(io) => {
+            io.get_ref().is_some_and(|inner| inner.is::<rustls::Error>())
+                || REFUSED.iter().any(|text| io.to_string().contains(text))
+        }
+        _ => false,
+    }
+}
+
 /// A driver error as a short message: its kind and server error code (with the code name when it
 /// is a plain word), never server text or the URL.
 pub(super) fn backend(error: &Error) -> StoreError {
-    StoreError::Backend(message(error))
+    // The server answered: TLS settings to fix, not a network to wait for.
+    if tls_refused(error) {
+        return StoreError::Backend(message(error));
+    }
+
+    match error.kind.as_ref() {
+        ErrorKind::ServerSelection { .. } | ErrorKind::Io(_) | ErrorKind::DnsResolve { .. } => {
+            StoreError::Unreachable(message(error))
+        }
+        _ => StoreError::Backend(message(error)),
+    }
 }
 
 /// The message of [`backend`].
@@ -397,6 +441,27 @@ mod tests {
         ] {
             assert!(!is_local_host(host), "{host}");
         }
+    }
+
+    #[test]
+    fn a_lost_network_is_unreachable_and_a_refused_certificate_is_not() {
+        let refused = Error::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid peer certificate: UnknownIssuer",
+        ));
+        assert!(matches!(backend(&refused), StoreError::Backend(_)));
+
+        let alert = Error::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure),
+        ));
+        assert!(
+            matches!(backend(&alert), StoreError::Backend(_)),
+            "a TLS alert is an answer"
+        );
+
+        let reset = Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(matches!(backend(&reset), StoreError::Unreachable(_)));
     }
 
     #[test]

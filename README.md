@@ -864,8 +864,11 @@ With a team database a scope set to `"remote"` normally fails while the team dat
 down). By default (`offline_fallback = true`, or `HARNESS_MEMORY_OFFLINE_FALLBACK=1`) harness-memory serves that scope
 from this computer meanwhile: a scope set to `"remote"` or `"remote+local"` is read and saved in the local SQLite file,
 the team's notes and scripts are not shown, and every reply of an MCP tool, and `notes list` / `scripts list` with
-`"offline": true`, say so. The server prints the reason on stderr and does not try the team database again for a
-minute. The notes and scripts saved this way for a `"remote"` scope are listed in `pending-sync.json` next to the
+`"offline": true` and `"offlineReason"`, say so. The server prints the reason on stderr and does not try the team
+database again for a minute, and `harness-memory check` ends that minute as soon as it can connect. Only a database
+that cannot be reached counts: one that answers with a failure (a refused login, a migration that fails) is not served
+from this computer, and the call that needs it fails with the reason.
+The notes and scripts saved this way for a `"remote"` scope are listed in `pending-sync.json` next to the
 local database (by id, scope, title or name and the team database they were meant for; the file is private to you);
 when that team database opens again (at the next call, or when a later server starts) they are copied to it as
 `harness-memory push` copies them (a note with the title of a teammate's newer note stays as it is) and leave the list;

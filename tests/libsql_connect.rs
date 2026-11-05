@@ -59,7 +59,7 @@ fn an_unreachable_server_fails_without_naming_the_url_or_the_token() {
         let error = LibsqlStore::connect(url, Some(TOKEN)).expect_err("nothing listens");
         let message = error.to_string();
 
-        assert!(matches!(error, StoreError::Backend(_)), "{error:?}");
+        assert!(matches!(error, StoreError::Unreachable(_)), "{error:?}");
         assert!(!message.contains(TOKEN) && !message.contains(":9"), "{message}");
     }
 }

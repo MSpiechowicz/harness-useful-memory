@@ -2,6 +2,8 @@
 //! to the team database for them nor creates the local file (nor, with every note scope in the
 //! team database, opens the local notes store it never reads).
 
+use std::time::{Duration, Instant};
+
 use super::Countable;
 use super::Reach;
 use super::{Edge, Forget, Forgotten, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NoteListQuery, NotePage};
@@ -12,14 +14,20 @@ use super::{
 };
 
 /// Opens the store behind it.
-type Opener<S> = Box<dyn FnMut() -> Result<Box<S>, String> + Send>;
+type Opener<S> = Box<dyn FnMut() -> Result<Box<S>, StoreError> + Send>;
 
-/// A store opened by the first call. A failed open is reported as [`StoreError::Backend`] with
-/// the opener's message and tried again by the next call.
+/// How long a process repeats a failure of a database that answered before it tries again: one call
+/// asks the store several times, and each attempt would connect again.
+const REFUSED_REPEAT: Duration = Duration::from_secs(5);
+
+/// A store opened by the first call. A failed open is reported with the opener's message and tried
+/// again by the next call.
 pub struct Lazy<S: ?Sized> {
     open: Opener<S>,
     store: Option<Box<S>>,
     reach: Option<Reach>,
+    /// With a reach: the last open the database answered with a failure, and when.
+    refused: Option<(Instant, String)>,
 }
 
 impl<S: ?Sized> std::fmt::Debug for Lazy<S> {
@@ -31,12 +39,21 @@ impl<S: ?Sized> std::fmt::Debug for Lazy<S> {
 }
 
 impl<S: ?Sized> Lazy<S> {
-    /// A store `open` opens when it is first used; its error message must be safe to show.
-    pub fn new(open: impl FnMut() -> Result<Box<S>, String> + Send + 'static) -> Self {
+    /// A store `open` opens when it is first used; its error message must be safe to show. A
+    /// failure counts as [`StoreError::Unreachable`]: see [`Lazy::classified`] for an opener that
+    /// tells a database that answered from one that did not.
+    pub fn new(mut open: impl FnMut() -> Result<Box<S>, String> + Send + 'static) -> Self {
+        Self::classified(move || open().map_err(StoreError::Unreachable))
+    }
+
+    /// [`Lazy::new`] with an opener that says what kind of failure it met. Only
+    /// [`StoreError::Unreachable`] starts the cooldown and counts as not [`ready`](Self::usable).
+    pub fn classified(open: impl FnMut() -> Result<Box<S>, StoreError> + Send + 'static) -> Self {
         Self {
             open: Box::new(open),
             store: None,
             reach: None,
+            refused: None,
         }
     }
 
@@ -57,28 +74,41 @@ impl<S: ?Sized> Lazy<S> {
         Ok(&mut **self.store.insert(store))
     }
 
-    /// Opens the store, unless the reach says the last open failed a moment ago.
+    /// Opens the store, unless the reach says the database could not be reached a moment ago.
     fn open_store(&mut self) -> Result<Box<S>, StoreError> {
         if let Some(message) = self.reach.as_ref().and_then(Reach::cooling) {
-            return Err(StoreError::Backend(message));
+            return Err(StoreError::Unreachable(message));
         }
 
-        match (self.open)() {
-            Ok(store) => {
-                if let Some(reach) = &self.reach {
+        if let Some((at, message)) = &self.refused
+            && at.elapsed() < REFUSED_REPEAT
+        {
+            return Err(StoreError::Backend(message.clone()));
+        }
+
+        let opened = (self.open)();
+
+        if let Some(reach) = &self.reach {
+            self.refused = None;
+
+            match &opened {
+                Err(StoreError::Unreachable(message)) => reach.failed(message),
+                // Any other answer says the database can be reached.
+                Err(other) => {
                     reach.opened();
+                    self.refused = Some((Instant::now(), other.reason()));
                 }
-
-                Ok(store)
-            }
-            Err(message) => {
-                if let Some(reach) = &self.reach {
-                    reach.failed(&message);
-                }
-
-                Err(StoreError::Backend(message))
+                Ok(_) => reach.opened(),
             }
         }
+
+        opened
+    }
+
+    /// Whether the database can be reached: the call that needs a database that answered with a
+    /// failure gets that failure, instead of a fallback that hides it.
+    fn usable(&mut self) -> bool {
+        !matches!(self.store(), Err(StoreError::Unreachable(_)))
     }
 }
 
@@ -118,7 +148,7 @@ impl ScriptStore for Lazy<dyn ScriptStore> {
     }
 
     fn ready(&mut self) -> bool {
-        self.store().is_ok()
+        self.usable()
     }
 }
 
@@ -218,7 +248,7 @@ impl MemoryStore for Lazy<dyn MemoryStore> {
     }
 
     fn ready(&mut self) -> bool {
-        self.store().is_ok()
+        self.usable()
     }
 }
 
@@ -319,5 +349,57 @@ mod tests {
         assert!(lazy.is_trusted("team", 1, "x").expect("opened"));
         assert_eq!(lazy.previous("team", 1).expect("previous"), None);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    /// A reach beside a database in a folder of its own, and a lazy store whose opens end in `error`.
+    fn failing(dir: &tempfile::TempDir, error: fn() -> StoreError) -> (Reach, Lazy<dyn TrustStore>, Arc<AtomicUsize>) {
+        let reach = Reach::beside(&dir.path().join("memory.sqlite3"), "team");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&attempts);
+        let lazy: Lazy<dyn TrustStore> = Lazy::classified(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Err(error())
+        })
+        .with_reach(reach.clone());
+
+        (reach, lazy, attempts)
+    }
+
+    #[test]
+    fn a_database_that_cannot_be_reached_starts_the_cooldown_and_is_not_ready() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (reach, mut lazy, attempts) = failing(&dir, || StoreError::Unreachable("no route".to_owned()));
+
+        assert!(!lazy.usable());
+        assert_eq!(reach.cooling().as_deref(), Some("no route"));
+
+        let repeated = lazy.is_trusted("team", 1, "x").expect_err("still cooling");
+        assert!(matches!(repeated, StoreError::Unreachable(_)), "{repeated:?}");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "the cooldown holds the next open back"
+        );
+    }
+
+    #[test]
+    fn a_database_that_answered_with_a_failure_starts_no_cooldown_and_says_why() {
+        let dir = tempfile::tempdir().expect("dir");
+
+        let (reach, mut lazy, attempts) = failing(&dir, || StoreError::Backend("migration failed".to_owned()));
+
+        assert!(lazy.usable(), "reachable, so the call gets the real reason");
+        assert_eq!(reach.cooling(), None, "other processes keep using the database");
+
+        let error = lazy.is_trusted("team", 1, "x").expect_err("the reason");
+        assert!(
+            matches!(&error, StoreError::Backend(message) if message == "migration failed"),
+            "{error:?}"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "one call does not connect again and again"
+        );
     }
 }

@@ -254,7 +254,7 @@ fn an_unreachable_documentdb_cluster_points_at_the_vpn() {
     let error = MongoStore::connect_as(url, &flavor).expect_err("unreachable");
 
     let message = error.to_string();
-    assert!(matches!(error, StoreError::Backend(_)), "{error:?}");
+    assert!(matches!(error, StoreError::Unreachable(_)), "{error:?}");
     assert!(
         message.ends_with(
             "Amazon DocumentDB only accepts connections from inside its AWS network: connect to your VPN and try \

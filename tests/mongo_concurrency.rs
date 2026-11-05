@@ -307,7 +307,7 @@ fn mongo_loopback_servers_skip_tls_only_on_a_direct_connection() {
     // Accepted without TLS: only reaching the server fails (nothing listens on port 1).
     let url = "mongodb://127.0.0.1:1/?directConnection=true&tls=false&serverSelectionTimeoutMS=200";
     let error = MongoStore::connect(url).expect_err("unreachable");
-    assert!(matches!(error, StoreError::Backend(_)), "{error:?}");
+    assert!(matches!(error, StoreError::Unreachable(_)), "{error:?}");
 }
 
 #[test]
@@ -353,7 +353,7 @@ fn mongo_connection_errors_do_not_show_the_password() {
     // Nothing listens on port 1; the driver gives up after the server selection timeout.
     let url = "mongodb://alice:s3cret-pass@localhost:1/team?serverSelectionTimeoutMS=200&connectTimeoutMS=200";
     let error = MongoStore::connect(url).expect_err("unreachable");
-    assert!(matches!(error, StoreError::Backend(_)), "{error:?}");
+    assert!(matches!(error, StoreError::Unreachable(_)), "{error:?}");
     assert!(!error.to_string().contains("s3cret"), "{error}");
     assert!(!format!("{error:?}").contains("s3cret"), "{error:?}");
 

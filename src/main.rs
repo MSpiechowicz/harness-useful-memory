@@ -20,13 +20,13 @@ use std::collections::BTreeSet;
 use std::io::{BufReader, Write};
 use std::process::ExitCode;
 
-use harness_memory::backend::{self, Backend, CONFIG_VAR, NotesPlace, Routing, Secrets, Selection, URL_VAR};
+use harness_memory::backend::{self, Backend, CONFIG_VAR, NotesPlace, Opened, Routing, Secrets, Selection, URL_VAR};
 use harness_memory::cli_push::{PushArgs, overwrite, repo_key};
 use harness_memory::location::{DIR_VAR, override_is_relative};
 use harness_memory::mcp::stop_on_sigterm;
-use harness_memory::open::{open_hidden, open_server};
+use harness_memory::open::{open_hidden, open_server, reach_of};
 use harness_memory::push::{Action, Change, GLOBAL, Options, Summary, push};
-use harness_memory::store::Scope;
+use harness_memory::store::{Reach, Scope, StoreError};
 use harness_memory::support::Env;
 use harness_memory::support::runner::Stop;
 use harness_memory::support::time::rfc3339;
@@ -216,6 +216,7 @@ fn run_check() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    let reach = reach_of(&env, &selection);
     let selection_scripts = selection.scripts_place();
     let team = cli_trust::check_line(&selection)
         .map(|line| format!("\n{line}"))
@@ -234,7 +235,7 @@ fn run_check() -> ExitCode {
             return ExitCode::SUCCESS;
         }
 
-        let Some(newer) = check_team(&backend) else {
+        let Some(newer) = check_team(&backend, &reach) else {
             return ExitCode::FAILURE;
         };
 
@@ -243,10 +244,10 @@ fn run_check() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let opened = match backend::open(&backend) {
+    let opened = match open_checked(&backend, &reach) {
         Some(Ok(opened)) => opened,
-        Some(Err(message)) => {
-            eprintln!("harness-memory: {message}");
+        Some(Err(error)) => {
+            eprintln!("harness-memory: {}", error.reason());
             return ExitCode::FAILURE;
         }
         None => return ExitCode::FAILURE,
@@ -278,14 +279,28 @@ fn run_check() -> ExitCode {
 
 /// Opens the team database `backend` for the scripts: whether it was written by a newer server,
 /// or `None` with the reason printed.
-fn check_team(backend: &Backend) -> Option<bool> {
-    match backend::open(backend)? {
+fn check_team(backend: &Backend, reach: &Reach) -> Option<bool> {
+    match open_checked(backend, reach)? {
         Ok(opened) => Some(opened.newer),
-        Err(message) => {
-            eprintln!("harness-memory: {message}");
+        Err(error) => {
+            eprintln!("harness-memory: {}", error.reason());
             None
         }
     }
+}
+
+/// Opens the team database for `check`, which is never skipped, and records what it found out for
+/// every other command: one that could not be reached starts the cooldown, any other answer ends
+/// it, so a green check and the lists agree at once.
+fn open_checked(backend: &Backend, reach: &Reach) -> Option<Result<Opened, StoreError>> {
+    let opened = backend::try_open(backend)?;
+
+    match &opened {
+        Err(StoreError::Unreachable(message)) => reach.failed(message),
+        _ => reach.opened(),
+    }
+
+    Some(opened)
 }
 
 /// What the scripts line adds when the team database is newer than this server.

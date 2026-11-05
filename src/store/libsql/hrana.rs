@@ -225,7 +225,12 @@ impl Client {
         if let Some(message) = refused {
             // A gateway can answer 5xx after the server ran the request.
             return Err(Failed {
-                error: backend(message),
+                // A gateway in front of a server that is waking up or down.
+                error: if matches!(status, 502..=504) {
+                    StoreError::Unreachable(message)
+                } else {
+                    backend(message)
+                },
                 maybe_ran: status >= 500,
             });
         }
@@ -357,7 +362,7 @@ impl Stream<'_> {
         match self.finish("COMMIT") {
             Ok(()) => Ok(()),
             Err(Failed {
-                error: StoreError::Backend(reason),
+                error: StoreError::Backend(reason) | StoreError::Unreachable(reason),
                 maybe_ran: true,
             }) => Err(backend(format!(
                 "the libSQL server did not confirm the commit ({reason}), so the write may have been \
@@ -600,23 +605,24 @@ fn platform_roots() -> RootCerts {
     RootCerts::new_with_certs(&certs)
 }
 
-/// A transport failure, described without the URL.
+/// A transport failure, described without the URL: [`StoreError::Unreachable`] unless it is about
+/// TLS or the size of a reply, where the server did answer.
 fn transport(error: ureq::Error) -> StoreError {
-    let reason = match error {
-        ureq::Error::Timeout(_) => "the libSQL server did not answer in time".to_owned(),
-        ureq::Error::HostNotFound => "the libSQL host was not found".to_owned(),
-        ureq::Error::ConnectionFailed => "cannot connect to the libSQL server".to_owned(),
-        ureq::Error::Io(error) => match error.get_ref().and_then(|inner| inner.downcast_ref::<rustls::Error>()) {
-            Some(tls) => format!("TLS with the libSQL server failed ({tls})"),
-            None => format!("cannot reach the libSQL server ({})", error.kind()),
-        },
-        ureq::Error::Rustls(error) => format!("TLS with the libSQL server failed ({error})"),
-        ureq::Error::Tls(reason) => format!("TLS with the libSQL server failed ({reason})"),
-        ureq::Error::BodyExceedsLimit(_) => "the libSQL server's reply is too large".to_owned(),
-        _ => "the request to the libSQL server failed".to_owned(),
-    };
+    let unreachable = |reason: String| StoreError::Unreachable(reason);
 
-    backend(reason)
+    match error {
+        ureq::Error::Timeout(_) => unreachable("the libSQL server did not answer in time".to_owned()),
+        ureq::Error::HostNotFound => unreachable("the libSQL host was not found".to_owned()),
+        ureq::Error::ConnectionFailed => unreachable("cannot connect to the libSQL server".to_owned()),
+        ureq::Error::Io(error) => match error.get_ref().and_then(|inner| inner.downcast_ref::<rustls::Error>()) {
+            Some(tls) => backend(format!("TLS with the libSQL server failed ({tls})")),
+            None => unreachable(format!("cannot reach the libSQL server ({})", error.kind())),
+        },
+        ureq::Error::Rustls(error) => backend(format!("TLS with the libSQL server failed ({error})")),
+        ureq::Error::Tls(reason) => backend(format!("TLS with the libSQL server failed ({reason})")),
+        ureq::Error::BodyExceedsLimit(_) => backend("the libSQL server's reply is too large".to_owned()),
+        _ => backend("the request to the libSQL server failed".to_owned()),
+    }
 }
 
 fn backend(message: String) -> StoreError {

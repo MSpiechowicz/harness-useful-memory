@@ -866,6 +866,12 @@ impl std::fmt::Debug for Opened {
 /// Connects to a team backend. The error names the backend ([`Backend::describe`]) and is
 /// scrubbed of its secrets. `None` for [`Backend::Local`], which `main` opens itself.
 pub fn open(backend: &Backend) -> Option<Result<Opened, String>> {
+    try_open(backend).map(|opened| opened.map_err(|error| error.reason()))
+}
+
+/// [`open`] saying what kind of failure it met: [`StoreError::Unreachable`] while the database
+/// cannot be reached, else [`StoreError::Backend`]. The message is the same.
+pub fn try_open(backend: &Backend) -> Option<Result<Opened, StoreError>> {
     let opened = match backend {
         Backend::Local => return None,
         Backend::Postgres { url } => PostgresStore::connect(url).map(|store| Opened {
@@ -876,11 +882,16 @@ pub fn open(backend: &Backend) -> Option<Result<Opened, String>> {
         Backend::Mongo { .. } | Backend::DocumentDb { .. } => open_mongo(backend),
     };
 
-    Some(opened.map_err(|error| open_failed(backend, &error)))
+    Some(opened.map_err(|error| classified_failure(backend, &error)))
 }
 
 /// Connects to a team backend for scripts, like [`open`].
 pub fn open_scripts(backend: &Backend) -> Option<Result<Box<dyn ScriptStore>, String>> {
+    try_open_scripts(backend).map(|opened| opened.map_err(|error| error.reason()))
+}
+
+/// [`open_scripts`] saying what kind of failure it met, like [`try_open`].
+pub fn try_open_scripts(backend: &Backend) -> Option<Result<Box<dyn ScriptStore>, StoreError>> {
     let opened: Result<Box<dyn ScriptStore>, StoreError> = match backend {
         Backend::Local => return None,
         Backend::Postgres { url } => PostgresStore::connect(url).map(|store| Box::new(store) as Box<dyn ScriptStore>),
@@ -892,7 +903,7 @@ pub fn open_scripts(backend: &Backend) -> Option<Result<Box<dyn ScriptStore>, St
         }
     };
 
-    Some(opened.map_err(|error| open_failed(backend, &error)))
+    Some(opened.map_err(|error| classified_failure(backend, &error)))
 }
 
 /// Connects to a team backend for team documents (hooks, routines), like [`open`].
@@ -909,6 +920,16 @@ pub fn open_team_docs(backend: &Backend) -> Option<Result<Box<dyn TeamDocStore>,
     };
 
     Some(opened.map_err(|error| open_failed(backend, &error)))
+}
+
+/// [`open_failed`] as the same kind of failure as `error`.
+fn classified_failure(backend: &Backend, error: &StoreError) -> StoreError {
+    let message = open_failed(backend, error);
+
+    match error {
+        StoreError::Unreachable(_) => StoreError::Unreachable(message),
+        _ => StoreError::Backend(message),
+    }
 }
 
 /// `cannot open the team database (<backend>): <reason>`, scrubbed of the backend's secrets.

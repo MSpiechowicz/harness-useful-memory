@@ -29,6 +29,7 @@ use mongodb::error::{Error, ErrorKind};
 use mongodb::options::{AuthMechanism, ClientOptions, ReadPreference, SelectionCriteria};
 use tempfile::NamedTempFile;
 
+use super::connection::{certificate_refused, tls_refused};
 use crate::store::StoreError;
 
 /// The Amazon RDS global certificate bundle, which signs every DocumentDB server certificate.
@@ -171,32 +172,20 @@ pub(super) fn bundle_path(bundle: &NamedTempFile) -> std::path::PathBuf {
 pub(super) fn backend(error: &Error) -> StoreError {
     let message = super::connection::message(error);
 
-    let unreachable = matches!(
-        error.kind.as_ref(),
-        ErrorKind::ServerSelection { .. } | ErrorKind::Io(_)
-    );
+    if certificate_refused(error) {
+        return StoreError::Backend(format!("{message}. {CERTIFICATE_HINT}"));
+    }
 
-    let hint = if certificate_refused(error) {
-        CERTIFICATE_HINT
-    } else if unreachable {
-        VPN_HINT
-    } else {
+    // The VPN hint would mislead for a server that answered.
+    if tls_refused(error) {
         return StoreError::Backend(message);
-    };
-
-    StoreError::Backend(format!("{message}. {hint}"))
-}
-
-/// True when the TLS handshake refused the server's certificate: the error, or the last error of
-/// a server the driver could not select, is rustls's `invalid peer certificate`. The text is only
-/// looked at, never shown.
-fn certificate_refused(error: &Error) -> bool {
-    const REFUSED: &str = "invalid peer certificate";
+    }
 
     match error.kind.as_ref() {
-        ErrorKind::ServerSelection { message, .. } => message.contains(REFUSED),
-        ErrorKind::Io(io) => io.to_string().contains(REFUSED),
-        _ => false,
+        ErrorKind::ServerSelection { .. } | ErrorKind::Io(_) | ErrorKind::DnsResolve { .. } => {
+            StoreError::Unreachable(format!("{message}. {VPN_HINT}"))
+        }
+        _ => StoreError::Backend(message),
     }
 }
 
@@ -361,11 +350,19 @@ mod tests {
             std::io::ErrorKind::InvalidData,
             "invalid peer certificate: UnknownIssuer",
         ));
+        assert!(
+            matches!(backend(&refused), StoreError::Backend(_)),
+            "the server answered"
+        );
         let message = backend(&refused).to_string();
         assert!(message.ends_with(CERTIFICATE_HINT), "{message}");
         assert!(!message.contains("VPN") && !message.contains(';'), "{message}");
 
         let reset = Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(
+            matches!(backend(&reset), StoreError::Unreachable(_)),
+            "the offline fallback serves"
+        );
         let message = backend(&reset).to_string();
         assert!(message.ends_with(VPN_HINT), "{message}");
         assert!(!message.contains(';'), "{message}");

@@ -192,6 +192,20 @@ fn tls_rules_hold_against_a_server_without_tls() {
 }
 
 #[test]
+fn a_login_the_client_cannot_make_is_not_called_unreachable() {
+    let Some(db) = database() else { return };
+
+    // The same server without the password. A test server that asks for none has nothing to refuse.
+    let (start, rest) = db.url().split_once("://").expect("a URL");
+    let (login, place) = rest.split_once('@').expect("a login");
+    let user = login.split(':').next().unwrap_or(login);
+
+    if let Err(refused) = PostgresStore::connect(&format!("{start}://{user}@{place}")) {
+        assert!(matches!(refused, StoreError::Backend(_)), "{refused:?}");
+    }
+}
+
+#[test]
 fn each_write_records_the_database_role() {
     let Some(db) = database() else { return };
     let mut store = db.open();

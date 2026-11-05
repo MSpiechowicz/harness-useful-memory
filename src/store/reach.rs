@@ -133,11 +133,14 @@ impl Reach {
         }
     }
 
-    /// Records a successful open.
+    /// Records that the team database answered. Only the record about this team database is
+    /// removed: the file may hold another one's failure (a test of a URL not saved yet).
     pub fn opened(&self) {
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = None;
 
-        if let Some(shared) = &self.shared {
+        if let Some(shared) = &self.shared
+            && self.recorded_of(shared).is_some()
+        {
             let _removed = std::fs::remove_file(&shared.path);
         }
     }
@@ -159,13 +162,20 @@ impl Reach {
     /// The failure another process recorded for this team database, while its cooldown runs.
     fn recorded(&self) -> Option<String> {
         let shared = self.shared.as_ref()?;
-        let bytes = read_private(&shared.path, MAX_BYTES).ok().flatten()?;
-        let recorded: Recorded = serde_json::from_slice(&bytes).ok()?;
+        let recorded = self.recorded_of(shared)?;
 
         // A time in the future (a clock set back) is not trusted: the next open is tried.
         let age = now().checked_sub(recorded.at)?;
 
-        (recorded.team == shared.team && age < self.cooldown.as_secs()).then_some(recorded.message)
+        (age < self.cooldown.as_secs()).then_some(recorded.message)
+    }
+
+    /// The record in the file when it is about this team database.
+    fn recorded_of(&self, shared: &Shared) -> Option<Recorded> {
+        let bytes = read_private(&shared.path, MAX_BYTES).ok().flatten()?;
+        let recorded: Recorded = serde_json::from_slice(&bytes).ok()?;
+
+        (recorded.team == shared.team).then_some(recorded)
     }
 }
 
@@ -216,5 +226,16 @@ mod tests {
             None,
             "an open that worked clears it for everyone"
         );
+    }
+
+    #[test]
+    fn an_answer_leaves_the_failure_of_another_team_database() {
+        let dir = tempfile::tempdir().expect("dir");
+        let database = dir.path().join("memory.sqlite3");
+
+        Reach::beside(&database, "team-a").failed("down");
+        Reach::beside(&database, "team-b").opened();
+
+        assert_eq!(Reach::beside(&database, "team-a").cooling().as_deref(), Some("down"));
     }
 }

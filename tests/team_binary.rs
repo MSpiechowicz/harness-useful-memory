@@ -15,7 +15,8 @@ use std::process::{Command, Output, Stdio};
 
 use common::mcp::repo_with_remote;
 use common::stdio::{BINARY, Client, without_team_settings};
-use harness_memory::store::{Language, Provenance, ScriptDraft, ScriptStore, SqliteStore, Target};
+use harness_memory::backend::Backend;
+use harness_memory::store::{Language, Provenance, Reach, ScriptDraft, ScriptStore, SqliteStore, Target};
 use postgres_support::database;
 use serde_json::json;
 use tempfile::TempDir;
@@ -1218,4 +1219,50 @@ fn check_says_when_scripts_are_read_from_both() {
         "{}",
         stdout(&output)
     );
+}
+
+#[test]
+fn a_failed_check_starts_the_cooldown_with_its_reason() {
+    let machine = machine();
+    std::fs::create_dir_all(&machine.memory).expect("data folder");
+    let url = "postgres://alice:hunter2secret@127.0.0.1:1/memory?connect_timeout=2";
+
+    let output = run(binary(&machine, &["check"], Some(url)));
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+
+    let list = run(binary(&machine, &["notes", "list", "--json"], Some(url)));
+    let shown: serde_json::Value = serde_json::from_str(&stdout(&list)).expect("json");
+    assert_eq!(shown["offline"], true, "{shown}");
+
+    let reason = shown["offlineReason"].as_str().expect("the reason");
+    assert!(reason.contains("cannot open the team database"), "{reason}");
+    assert!(!reason.contains("hunter2secret"), "no password: {reason}");
+}
+
+#[test]
+fn a_green_check_ends_the_cooldown_for_the_lists_at_once() {
+    let Some(db) = database() else { return };
+    let machine = machine();
+    std::fs::create_dir_all(&machine.memory).expect("data folder");
+
+    let backend = Backend::Postgres {
+        url: db.url().to_owned(),
+    };
+    Reach::beside(&machine.memory.join("memory.sqlite3"), &backend.team_key()).failed("it was down");
+
+    let list = |machine: &Machine| -> serde_json::Value {
+        let output = run(binary(machine, &["notes", "list", "--json"], Some(db.url())));
+        serde_json::from_str(&stdout(&output)).expect("json")
+    };
+
+    let before = list(&machine);
+    assert_eq!(before["offline"], true, "{before}");
+    assert_eq!(before["offlineReason"], "it was down", "{before}");
+
+    let output = run(binary(&machine, &["check"], Some(db.url())));
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let after = list(&machine);
+    assert!(after.get("offline").is_none(), "{after}");
+    assert!(after.get("offlineReason").is_none(), "{after}");
 }

@@ -217,7 +217,7 @@ fn without_the_fallback_an_unreachable_team_database_fails_the_save() {
     let mut store = fixture.store(NotesPlace::Remote, false);
 
     let error = save(&mut store, "nowhere").expect_err("no team database");
-    assert!(matches!(error, StoreError::Backend(_)), "{error:?}");
+    assert!(matches!(error, StoreError::Unreachable(_)), "{error:?}");
     assert!(!store.offline());
     assert!(!fixture.pending().exists());
     assert!(
@@ -295,7 +295,7 @@ fn without_the_fallback_a_search_reaching_the_team_database_fails_instead_of_goi
     let error = store
         .search(&query("anything", both))
         .expect_err("the team database is down");
-    assert!(matches!(error, StoreError::Backend(_)), "{error:?}");
+    assert!(matches!(error, StoreError::Unreachable(_)), "{error:?}");
 }
 
 #[test]
@@ -401,4 +401,34 @@ mod scripts {
             .expect("get");
         assert_eq!(copied.expect("copied to the team database").body, "echo hi");
     }
+}
+
+#[test]
+fn a_team_database_that_answers_with_a_failure_is_not_offline_and_says_why() {
+    let fixture = Fixture::new();
+    let reach = Reach::beside(&fixture.local(), TEAM);
+    let team: Lazy<dyn MemoryStore> =
+        Lazy::classified(|| Err(StoreError::Backend("the migration needs a newer role".to_owned())));
+    let local = Box::new(SqliteStore::open(&fixture.local()).expect("local file"));
+    let mut store = SplitStore::routed(
+        Box::new(team.with_reach(reach.clone())),
+        local,
+        NotesPlace::Remote,
+        NotesPlace::Remote,
+        None,
+    )
+    .with_offline_fallback(&fixture.local(), TEAM.to_owned(), Secrets::default());
+
+    let error = save(&mut store, "kept nowhere").expect_err("the real reason");
+
+    assert!(
+        error.to_string().contains("the migration needs a newer role"),
+        "{error}"
+    );
+    assert!(!store.offline(), "it can be reached, so it is not called unreachable");
+    assert_eq!(reach.cooling(), None, "and no other process stops using it");
+    assert!(
+        fixture.local_titles("kept nowhere").is_empty(),
+        "nothing is saved here instead"
+    );
 }

@@ -194,6 +194,10 @@ fn list(args: &[Option<&str>]) -> ExitCode {
     // The notes shown are this computer's while the team database cannot be reached.
     if opened.store.offline() {
         shown["offline"] = json!(true);
+
+        if let Some(reason) = crate::open::offline_reason(&opened.env, &opened.selection) {
+            shown["offlineReason"] = json!(reason);
+        }
     }
 
     println!("{shown}");

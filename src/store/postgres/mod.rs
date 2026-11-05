@@ -105,7 +105,14 @@ impl PostgresStore {
     pub fn connect_with(url: &str, patience: Patience) -> Result<Self, StoreError> {
         let settings = connect::parse(url).map_err(|error| StoreError::Backend(error.to_string()))?;
         let mut client = open(&settings)?;
-        let state = schema::migrate(&mut client)?;
+        // A connection lost here is the database going away, not a migration that failed.
+        let state = schema::migrate(&mut client).map_err(|error| {
+            if client.is_closed() {
+                StoreError::Unreachable(error.reason())
+            } else {
+                error
+            }
+        })?;
 
         let mut store = Self {
             settings,
@@ -475,10 +482,80 @@ fn open(settings: &connect::Settings) -> Result<Client, StoreError> {
             settings.config.connect(tls)
         }
     }
-    .map_err(backend)?;
+    .map_err(connection)?;
 
-    client.batch_execute(SESSION).map_err(backend)?;
+    client.batch_execute(SESSION).map_err(connection)?;
     Ok(client)
+}
+
+/// A failed connection: [`StoreError::Unreachable`], unless the server answered with something that
+/// is not about taking connections right now (a refused login, a database that does not exist).
+fn connection(error: postgres::Error) -> StoreError {
+    // A server whose TLS or login the client refuses did answer: that is a setting to fix.
+    let answered = refused_by_tls(&error)
+        || refused_by_client(&error)
+        || error
+            .as_db_error()
+            .is_some_and(|db| !takes_no_connections(db.code().code()));
+    let failed = backend(error);
+
+    if answered {
+        return failed;
+    }
+
+    StoreError::Unreachable(failed.reason())
+}
+
+/// How the driver words an error of its TLS kind (it keeps the kind private). The driver files
+/// every failure of the handshake under it, a lost connection included.
+const TLS_KIND: &str = "error performing TLS handshake";
+
+/// Whether `error` is the TLS check refusing the server (a certificate, an alert, a server that does
+/// not speak TLS): rustls' error among its causes, directly or inside an I/O error, or an error of
+/// the driver's TLS kind that is not an I/O error at all (a server that answers the TLS request with
+/// "no TLS here"). An I/O error without rustls' error inside (a reset, "tls handshake eof") is a
+/// connection that was lost, so it is unreachable.
+fn refused_by_tls(error: &postgres::Error) -> bool {
+    if error.as_db_error().is_some() {
+        return false;
+    }
+
+    let mut plain_tls_kind = error.to_string().starts_with(TLS_KIND);
+    let mut cause = std::error::Error::source(error);
+
+    while let Some(inner) = cause {
+        if inner.is::<rustls::Error>() {
+            return true;
+        }
+
+        if let Some(io) = inner.downcast_ref::<std::io::Error>() {
+            if io.get_ref().is_some_and(|wrapped| wrapped.is::<rustls::Error>()) {
+                return true;
+            }
+
+            plain_tls_kind = false;
+        }
+
+        cause = inner.source();
+    }
+
+    plain_tls_kind
+}
+
+/// Whether the client gave up on a login the server asked for (no password in the URL, a method it
+/// cannot do). The driver's error kinds are private, so its text for them is what tells.
+fn refused_by_client(error: &postgres::Error) -> bool {
+    let text = error.to_string();
+
+    ["authentication error", "invalid configuration"]
+        .iter()
+        .any(|kind| text.starts_with(kind))
+}
+
+/// Whether SQLSTATE `code` says the server takes no connections now: a connection failure (class
+/// 08), too many connections or no resources (class 53), or a server starting or stopping (57P0x).
+fn takes_no_connections(code: &str) -> bool {
+    code.starts_with("08") || code.starts_with("53") || code.starts_with("57P0")
 }
 
 /// A [`StoreError::Backend`] for a client error. A database error becomes its SQLSTATE with a
@@ -650,6 +727,17 @@ fn target_project_existing(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_server_that_takes_no_connections_counts_as_unreachable() {
+        for code in ["08006", "53300", "57P01", "57P03"] {
+            assert!(takes_no_connections(code), "{code}");
+        }
+
+        for code in ["28P01", "3D000", "42501"] {
+            assert!(!takes_no_connections(code), "{code}");
+        }
+    }
 
     #[test]
     fn database_errors_are_described_by_their_code_only() {
