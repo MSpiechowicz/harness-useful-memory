@@ -1,3 +1,10 @@
+## [3.2.1](https://github.com/MSpiechowicz/harness-useful-memory/compare/v3.2.0...v3.2.1) (2026-11-05)
+
+
+### Bug Fixes
+
+* **team:** call a team database unreachable only when it cannot be reached ([5f38ec3](https://github.com/MSpiechowicz/harness-useful-memory/commit/5f38ec3f33ee3bbf4cd005d2e953a9cd14918c2e))
+
 # [3.2.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v3.1.0...v3.2.0) (2026-11-03)
 
 
