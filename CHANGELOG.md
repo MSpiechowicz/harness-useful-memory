@@ -1,3 +1,10 @@
+## [3.2.2](https://github.com/MSpiechowicz/harness-useful-memory/compare/v3.2.1...v3.2.2) (2026-11-05)
+
+
+### Bug Fixes
+
+* **recall:** keep a place for a matching global note and make the repository boost a tie-break ([620e9ae](https://github.com/MSpiechowicz/harness-useful-memory/commit/620e9ae05f659c27fdeb08f0f30ae023aebc6cb5))
+
 ## [3.2.1](https://github.com/MSpiechowicz/harness-useful-memory/compare/v3.2.0...v3.2.1) (2026-11-05)
 
 
