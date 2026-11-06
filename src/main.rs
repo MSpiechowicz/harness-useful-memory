@@ -70,9 +70,10 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--o
 /// `lang` of a note, the English notes setting), the shared embedder (`embedder`), and the offline
 /// fallback (`offline_fallback`), and the usefulness counters of a note (`notes list --sort
 /// useful|lastUseful`, `--useful ever|never`, the `shown`, `useful` and `lastUsefulAt` of a note), and
-/// who added and last changed a note or a script (`addedBy`, `updatedBy`), and `recall --hook`
-/// (`recall`).
-const FEATURES: [&str; 15] = [
+/// who added and last changed a note or a script (`addedBy`, `updatedBy`), and filtering and sorting
+/// the notes and scripts lists by who added them (`--author`, `--author-unknown`, `--sort addedBy`,
+/// the `authors` of the answer), and `recall --hook` (`recall`).
+const FEATURES: [&str; 16] = [
     "notes-remote-local",
     "notes-hide",
     "push-json",
@@ -87,6 +88,7 @@ const FEATURES: [&str; 15] = [
     "offline-fallback",
     "notes-useful",
     "notes-authors",
+    "notes-author-filter",
     "recall",
 ];
 

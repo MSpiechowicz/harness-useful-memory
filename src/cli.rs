@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use crate::backend::{self, Place, Selection};
 use crate::limits::{LIST_PAGE_DEFAULT, LIST_PAGE_MAX};
 use crate::project::ProjectResolver;
-use crate::store::{ProjectKey, Scope, View};
+use crate::store::{AuthorFacet, AuthorFilter, ProjectKey, Scope, View};
 use crate::support::Env;
 
 /// The options of the lists' paging: `--offset N`, `--limit N`, `--query TEXT`, `--order asc|desc`.
@@ -116,6 +116,12 @@ impl<'a> Args<'a> {
         }
     }
 
+    /// The filter of `--author NAME` and `--author-unknown` (see [`AUTHOR_VALUED`] and
+    /// [`AUTHOR_FLAG`]); `Err` for a name that is blank or not valid, and for both together.
+    pub(crate) fn author(&self) -> Result<AuthorFilter, ()> {
+        AuthorFilter::parse(self.value(AUTHOR_VALUED), self.flag(AUTHOR_FLAG)).map_err(|_| ())
+    }
+
     /// The place of `--place` (`local`: this computer's file, `team`: the team database); `Err`
     /// for any other value.
     pub(crate) fn place(&self) -> Result<Option<Place>, ()> {
@@ -126,6 +132,26 @@ impl<'a> Args<'a> {
             None => Ok(None),
         }
     }
+}
+
+/// The valued option that keeps the notes or scripts one person added (see [`Args::author`]).
+pub(crate) const AUTHOR_VALUED: &str = "--author";
+
+/// The flag that keeps the notes or scripts nobody known added (see [`Args::author`]).
+pub(crate) const AUTHOR_FLAG: &str = "--author-unknown";
+
+/// The `authors` object of a list: `{"people": [{"name", "count"}], "unknown": N}`, at most
+/// [`crate::limits::AUTHOR_FACET_MAX`] people, the `selected` one (the name the list is filtered by)
+/// among them with the `total` of the list when it is not among the most records.
+pub(crate) fn authors_json(facet: &AuthorFacet, selected: Option<&str>, total: usize) -> serde_json::Value {
+    let people: Vec<serde_json::Value> = facet
+        .clone()
+        .capped(selected, total)
+        .into_iter()
+        .map(|(name, count)| serde_json::json!({ "name": name, "count": count }))
+        .collect();
+
+    serde_json::json!({ "people": people, "unknown": facet.unknown() })
 }
 
 /// The valued options that name the repositories a command reads, with the flag `--all-repos`

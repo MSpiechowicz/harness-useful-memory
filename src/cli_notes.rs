@@ -6,9 +6,11 @@
 //! hidden on this computer are left out as they are for the agent.
 //!
 //! - `harness-memory notes list --json [--project PATH | --repo KEY | --all-repos] [--kind KIND] [--scope repo|global]
-//!   [--place local|team] [--lang en|other|unknown] [--useful any|ever|never] [--query TEXT]
-//!   [--sort updated|title|kind|scope|place|useful|lastUseful] [--order asc|desc] [--offset N] [--limit N]` prints `{"total": N, "kinds": [{"kind", "count"}], "scopes":
-//!   {"repo": N, "global": N}, "places": {"local": N, "team": N}, "notes": [...]}`: one page of the
+//!   [--place local|team] [--lang en|other|unknown] [--useful any|ever|never] [--author NAME |
+//!   --author-unknown] [--query TEXT]
+//!   [--sort updated|title|kind|scope|place|useful|lastUseful|addedBy] [--order asc|desc] [--offset N] [--limit N]` prints `{"total": N, "kinds": [{"kind", "count"}], "scopes":
+//!   {"repo": N, "global": N}, "places": {"local": N, "team": N}, "authors": {"people": [{"name",
+//!   "count"}], "unknown": N}, "notes": [...]}`: one page of the
 //!   notes (see [`crate::store::listing`] for the matching and the order). `--query` keeps the
 //!   notes whose title, body or tags contain it, ignoring case, `--kind` the notes of one kind,
 //!   `--scope` those of one scope, `--place` those kept in one place (`local`: this computer's
@@ -35,7 +37,15 @@
 //!   the notes of one language (`unknown`: those with a `null` lang), narrowing the page and
 //!   every count like `--query` does, and so does `--useful`: `ever` keeps the notes found useful
 //!   at least once, `never` those shown at least 3 times and never found useful (`any` keeps
-//!   every note). With a team database the
+//!   every note). `--author` keeps the notes one person added (the git `user.name`, matched
+//!   exactly, case-sensitive, whatever client the write went through) and `--author-unknown` those
+//!   with no known author (not together, a blank or invalid name is a usage error); like `--lang`
+//!   they narrow the page and every count. `authors` counts who added the notes every filter but
+//!   the author keeps, so a picker shows what each name would leave: the people with the most
+//!   notes first (then by name, ASCII letters folded), at most 200, the `--author` one always among
+//!   them (with the `total` when it is not among the most), and `unknown` for the notes with no
+//!   known author or a database without author columns. `--sort addedBy` orders by that name
+//!   (ASCII letters folded, ascending), the notes with no known author last either way. With a team database the
 //!   object also has `hiddenCount` (the team notes of the view hidden on this computer) and
 //!   `localCounts` (`{"repo": N, "global": N}`: the notes in the local file per scope, every
 //!   repository's, 0 without the file). `--hidden` lists only the hidden team notes of the view
@@ -83,14 +93,14 @@ mod hidden;
 mod save;
 
 use crate::backend::{Backend, NotesPlace, Place, Secrets, Selection};
-use crate::cli::{self, Args, Delete, PAGE_OPTIONS, PICK_VALUED, Page, Repos};
+use crate::cli::{self, AUTHOR_FLAG, AUTHOR_VALUED, Args, Delete, PAGE_OPTIONS, PICK_VALUED, Page, Repos};
 use crate::limits::{LIST_PAGE_MAX, NEIGHBORS_LIMIT_MAX};
 use crate::mcp::Vectors;
 use crate::mcp::{author_json, person_json, place_label, repo_label};
 use crate::open::{lone_notes_place, notes_place, open_hidden, open_notes};
 use crate::store::{
-    Forget, HiddenNotes, LangFilter, MemoryStore, Note, NoteKind, NoteListQuery, NoteOrigin, NoteRow, NoteSort,
-    UsefulFilter,
+    AuthorFilter, Forget, HiddenNotes, LangFilter, MemoryStore, Note, NoteKind, NoteListQuery, NoteOrigin, NoteRow,
+    NoteSort, UsefulFilter,
 };
 use crate::store::{ProjectKey, Scope, SqliteStore, StoreError, Target, View, clean};
 use crate::support::Env;
@@ -99,7 +109,7 @@ use crate::support::time::rfc3339;
 
 /// The usage of these commands, for the executable's usage line.
 pub const USAGE: &str = "notes list --json [--project PATH | --repo KEY | --all-repos] [--kind KIND] [--scope repo|global] \
-                         [--place local|team] [--lang en|other|unknown] [--useful any|ever|never] [--query TEXT] [--sort updated|title|kind|scope|place|useful|lastUseful] [--order asc|desc] [--offset N] [--limit N] \
+                         [--place local|team] [--lang en|other|unknown] [--useful any|ever|never] [--author NAME | --author-unknown] [--query TEXT] [--sort updated|title|kind|scope|place|useful|lastUseful|addedBy] [--order asc|desc] [--offset N] [--limit N] \
                          [--hidden] | notes repos --json | notes repos --json | notes get <id> --json [--project PATH | --repo KEY | --all-repos] [--hidden] | notes hide <id> \
                          [--project PATH | --repo KEY | --all-repos] [--json] | notes unhide <id> [--project PATH | --repo KEY | --all-repos] [--json] | notes delete \
                          <id> [--project PATH | --repo KEY | --all-repos] | notes delete --all --yes [--project PATH | --repo KEY] [--json] | notes \
@@ -184,6 +194,7 @@ fn list(args: &[Option<&str>]) -> ExitCode {
         "kinds": kinds,
         "scopes": scopes,
         "places": places,
+        "authors": cli::authors_json(&page.authors, query.author.name(), page.total),
         "notes": notes,
     });
 
@@ -230,6 +241,8 @@ fn repos(args: &[Option<&str>]) -> ExitCode {
             entity: None,
             lang: None,
             useful: None,
+            author: AuthorFilter::Any,
+            want_authors: false,
             sort: NoteSort::Updated,
             descending: true,
             offset,
@@ -393,10 +406,18 @@ fn parse_list(args: &[Option<&str>]) -> Option<(Repos, NoteListQuery, bool)> {
     let valued = [
         &PAGE_OPTIONS[..],
         &PICK_VALUED[..],
-        &["--kind", "--scope", "--place", "--sort", "--lang", "--useful"],
+        &[
+            "--kind",
+            "--scope",
+            "--place",
+            "--sort",
+            "--lang",
+            "--useful",
+            AUTHOR_VALUED,
+        ],
     ]
     .concat();
-    let parsed = Args::parse(args, &["--json", "--hidden", "--all-repos"], &valued)?;
+    let parsed = Args::parse(args, &["--json", "--hidden", "--all-repos", AUTHOR_FLAG], &valued)?;
 
     if !parsed.positional.is_empty() || !parsed.flag("--json") {
         return None;
@@ -427,6 +448,7 @@ fn parse_list(args: &[Option<&str>]) -> Option<(Repos, NoteListQuery, bool)> {
         Some("place") => NoteSort::Place,
         Some("useful") => NoteSort::Useful,
         Some("lastUseful") => NoteSort::LastUseful,
+        Some("addedBy") => NoteSort::AddedBy,
         Some(_) => return None,
     };
 
@@ -449,6 +471,9 @@ fn parse_list(args: &[Option<&str>]) -> Option<(Repos, NoteListQuery, bool)> {
         entity: None,
         lang,
         useful,
+        author: parsed.author().ok()?,
+        // The list a person reads shows who added the notes.
+        want_authors: true,
         sort,
         // The newest and the most useful notes come first.
         descending: descending.unwrap_or(matches!(
@@ -550,6 +575,8 @@ impl Opened {
             entity: None,
             lang: None,
             useful: None,
+            author: AuthorFilter::Any,
+            want_authors: false,
             sort: NoteSort::Updated,
             descending: true,
             offset: 0,
@@ -676,6 +703,8 @@ impl Opened {
             entity: Some(name.to_owned()),
             lang: None,
             useful: None,
+            author: AuthorFilter::Any,
+            want_authors: false,
             sort: NoteSort::Updated,
             descending: true,
             offset: 0,
@@ -757,8 +786,29 @@ mod tests {
             (Some(Place::Remote), Some(Scope::Repo), true)
         );
 
+        assert_eq!(query.author, AuthorFilter::Any);
+
+        let (_, query, _) =
+            parse_list(&args(&["--json", "--author", "  Ada Lovelace ", "--sort", "addedBy"])).expect("valid");
+        assert_eq!(
+            (query.author, query.sort, query.descending),
+            (AuthorFilter::Named("Ada Lovelace".to_owned()), NoteSort::AddedBy, false)
+        );
+
+        let (_, query, _) = parse_list(&args(&["--json", "--author-unknown", "--hidden"])).expect("valid");
+        assert_eq!(query.author, AuthorFilter::Unknown);
+
         for bad in [
             &[][..],
+            &["--json", "--author", ""],
+            &["--json", "--author", "  "],
+            &["--json", "--author", "Ada\tLovelace"],
+            &["--json", "--author"],
+            &["--json", "--author", "Ada", "--author", "Grace"],
+            &["--json", "--author", "Ada", "--author-unknown"],
+            &["--json", "--author-unknown", "--author-unknown"],
+            &["--json", "--author-unknown=1"],
+            &["--json", "--sort", "added_by"],
             &["--json", "extra"],
             &["--json", "--kind", "idea"],
             &["--json", "--sort", "hits"],

@@ -6,8 +6,8 @@
 //! updated-time sorts against the rows' own times and ids, and exact orders for title sorts.
 
 use harness_memory::store::{
-    Forgotten, LangFilter, Link, MemoryStore, NoteDraft, NoteKind, NoteListQuery, NotePage, NoteRow, NoteSort,
-    NoteUsage, Scope, SearchQuery, StoreError, Target, UsefulFilter, View,
+    Author, AuthorFilter, Forgotten, LangFilter, Link, MemoryStore, NoteDraft, NoteKind, NoteListQuery, NotePage,
+    NoteRow, NoteSort, NoteUsage, Scope, SearchQuery, StoreError, Target, UsefulFilter, View,
 };
 use harness_memory::support::lang::Lang;
 use pretty_assertions::assert_eq;
@@ -21,7 +21,7 @@ pub const OTHER: &str = "github.com/acme/gadget";
 pub type Case = fn(&mut dyn MemoryStore);
 
 /// Every case, by name.
-pub const CASES: [(&str, Case); 15] = [
+pub const CASES: [(&str, Case); 17] = [
     ("lists_visible_notes_newest_first", lists_visible_notes_newest_first),
     (
         "excluded_ids_leave_lists_and_searches",
@@ -55,6 +55,14 @@ pub const CASES: [(&str, Case); 15] = [
         usefulness_is_counted_listed_sorted_and_filtered,
     ),
     ("authors_are_added_kept_and_updated", super::authors::notes),
+    (
+        "added_by_filters_sorts_and_counts_who_added",
+        added_by_filters_sorts_and_counts_who_added,
+    ),
+    (
+        "added_by_pages_cover_the_list_and_the_facet_is_capped",
+        added_by_pages_cover_the_list_and_the_facet_is_capped,
+    ),
 ];
 
 /// The first page (of up to 200) of `view`, newest first.
@@ -68,6 +76,8 @@ pub fn listing(view: View) -> NoteListQuery {
         entity: None,
         lang: None,
         useful: None,
+        author: AuthorFilter::Any,
+        want_authors: true,
         sort: NoteSort::Updated,
         descending: true,
         offset: 0,
@@ -1165,4 +1175,481 @@ pub fn usefulness_is_counted_listed_sorted_and_filtered(store: &mut dyn MemorySt
         },
     );
     assert_eq!(again.total, 3);
+}
+
+/// `draft` written by `name` through the client `via` (nobody for `None`).
+fn written_by(draft: NoteDraft, name: Option<&str>, via: Option<&str>) -> NoteDraft {
+    let mut draft = draft;
+    draft.provenance.author = name.map(|name| Author {
+        name: name.to_owned(),
+        via: via.map(str::to_owned),
+    });
+
+    draft
+}
+
+/// The people and the unknown count `rows` say, as [`NotePage::authors`] lists them: the most
+/// notes first, then by ASCII-folded name, then by name.
+fn facet_of_rows(rows: &[NoteRow]) -> (Vec<(String, usize)>, usize) {
+    let mut people: Vec<(String, usize)> = Vec::new();
+    let mut unknown = 0;
+
+    for row in rows {
+        match &row.authors.added_by {
+            Some(author) => match people.iter_mut().find(|(name, _)| *name == author.name) {
+                Some(person) => person.1 += 1,
+                None => people.push((author.name.clone(), 1)),
+            },
+            None => unknown += 1,
+        }
+    }
+
+    people.sort_by(|(a, a_count), (b, b_count)| {
+        b_count
+            .cmp(a_count)
+            .then_with(|| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()))
+            .then_with(|| a.cmp(b))
+    });
+
+    (people, unknown)
+}
+
+fn facet_of_page(page: &NotePage) -> (Vec<(String, usize)>, usize) {
+    (page.authors.people(), page.authors.unknown())
+}
+
+/// The names of whoever added `rows`, `None` for an unknown author.
+fn added_by(rows: &[NoteRow]) -> Vec<Option<&str>> {
+    rows.iter()
+        .map(|row| row.authors.added_by.as_ref().map(|author| author.name.as_str()))
+        .collect()
+}
+
+/// Asserts `rows` are sorted by who added them, as `--sort addedBy` promises: names with ASCII
+/// letters folded in the direction asked, ties by id the same way, the unknown last either way.
+fn assert_added_by_order(rows: &[NoteRow], descending: bool) {
+    let direct = |order: std::cmp::Ordering| if descending { order.reverse() } else { order };
+
+    for pair in rows.windows(2) {
+        let name = |row: &NoteRow| {
+            row.authors
+                .added_by
+                .as_ref()
+                .map(|author| author.name.to_ascii_lowercase())
+        };
+
+        let order = match (name(&pair[0]), name(&pair[1])) {
+            (Some(a), Some(b)) => direct(a.cmp(&b).then(pair[0].id.cmp(&pair[1].id))),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => direct(pair[0].id.cmp(&pair[1].id)),
+        };
+
+        assert!(
+            order == std::cmp::Ordering::Less,
+            "{:?} (id {}) before {:?} (id {}), descending {descending}",
+            pair[0].authors.added_by,
+            pair[0].id,
+            pair[1].authors.added_by,
+            pair[1].id
+        );
+    }
+}
+
+/// Asserts the facet of `query` counts what the rows of the same query without an author filter
+/// say, whichever author filter `query` has.
+fn assert_facet_follows_rows(store: &mut dyn MemoryStore, query: &NoteListQuery) {
+    let everyone = list(
+        store,
+        &NoteListQuery {
+            author: AuthorFilter::Any,
+            ..query.clone()
+        },
+    );
+    let expected = facet_of_rows(&everyone.rows);
+    assert_eq!(facet_of_page(&everyone), expected, "{query:?}");
+
+    for author in [
+        AuthorFilter::Named("Ada".to_owned()),
+        AuthorFilter::Named("Nobody".to_owned()),
+        AuthorFilter::Unknown,
+    ] {
+        let page = list(
+            store,
+            &NoteListQuery {
+                author: author.clone(),
+                ..query.clone()
+            },
+        );
+        assert_eq!(
+            facet_of_page(&page),
+            expected,
+            "the facet ignores {author:?} for {query:?}"
+        );
+    }
+}
+
+/// The author filter keeps the notes one person added (exactly, case-sensitive, whatever client the
+/// write went through) or nobody known, and narrows the page, the total and the counts; the facet
+/// counts who added the notes every other filter keeps; the sort puts the unknown last.
+pub fn added_by_filters_sorts_and_counts_who_added(store: &mut dyn MemoryStore) {
+    let note = |title: &str, kind: NoteKind| tagged(title, "A body", kind, &[], &[]);
+    let cached = |title: &str, kind: NoteKind| tagged(title, "A body", kind, &[], &["cache"]);
+
+    let alpha = save(
+        store,
+        &repo(REPO),
+        &written_by(cached("Alpha", NoteKind::Fix), Some("Ada"), Some("claude-code")),
+    );
+    let bravo = save(
+        store,
+        &repo(REPO),
+        &written_by(note("Bravo", NoteKind::Decision), Some("Ada"), None),
+    );
+    let charlie = save(
+        store,
+        &Target::Global,
+        &written_by(note("Charlie", NoteKind::Fix), Some("ada"), None),
+    );
+    let delta = save(
+        store,
+        &repo(REPO),
+        &written_by(note("Delta", NoteKind::Note), Some("bob"), None),
+    );
+    let echo = save(
+        store,
+        &Target::Global,
+        &written_by(note("Echo", NoteKind::Note), None, None),
+    );
+    let foxtrot = save(
+        store,
+        &repo(REPO),
+        &written_by(note("Foxtrot", NoteKind::Fix), None, None),
+    );
+    let golf = save(
+        store,
+        &repo(REPO),
+        &written_by(cached("Golf", NoteKind::Problem), Some("Grace"), Some("omp")),
+    );
+    let hotel = save(
+        store,
+        &repo(REPO),
+        &written_by(note("Hotel", NoteKind::Fix), Some("Bob"), None),
+    );
+    save(
+        store,
+        &repo(OTHER),
+        &written_by(note("Other", NoteKind::Fix), Some("Zed"), None),
+    );
+
+    let named = |name: &str| AuthorFilter::Named(name.to_owned());
+    let with = |author: AuthorFilter| NoteListQuery {
+        author,
+        sort: NoteSort::Title,
+        descending: false,
+        ..listing(both(REPO))
+    };
+    let people = |counts: &[(&str, usize)]| -> Vec<(String, usize)> {
+        counts
+            .iter()
+            .map(|(name, count)| ((*name).to_owned(), *count))
+            .collect()
+    };
+    let everyone = [("Ada", 2), ("ada", 1), ("Bob", 1), ("bob", 1), ("Grace", 1)];
+
+    // No filter: everything, and the facet says who added it. Ada and Ada via a client are one.
+    let all = list(store, &with(AuthorFilter::Any));
+    assert_eq!(all.total, 8);
+    assert_eq!(facet_of_page(&all), (people(&everyone), 2));
+
+    // A name keeps the notes it added, whatever client wrote them.
+    let ada = list(store, &with(named("Ada")));
+    assert_eq!(titles(&ada.rows), ["Alpha", "Bravo"]);
+    assert_eq!(ada.total, 2);
+    assert_eq!(count(&ada, NoteKind::Fix), 1);
+    assert_eq!(count(&ada, NoteKind::Decision), 1);
+    assert_eq!(count(&ada, NoteKind::Note), 0, "the counts per kind follow the author");
+    assert_eq!(ada.scopes, [(Scope::Repo, 2), (Scope::Global, 0)]);
+    assert_eq!(facet_of_page(&ada), facet_of_page(&all), "the facet ignores the author");
+
+    // Names are not folded: another case is another person.
+    assert_eq!(titles(&list(store, &with(named("ada"))).rows), ["Charlie"]);
+    assert_eq!(titles(&list(store, &with(named("bob"))).rows), ["Delta"]);
+    assert_eq!(titles(&list(store, &with(named("ADA"))).rows), Vec::<&str>::new());
+
+    // A name nobody has keeps nothing, and the facet still lists the others.
+    let nobody = list(store, &with(named("Nobody")));
+    assert_eq!((nobody.rows.len(), nobody.total), (0, 0));
+    assert_eq!(nobody.kinds.iter().map(|(_, count)| count).sum::<usize>(), 0);
+    assert_eq!(facet_of_page(&nobody), facet_of_page(&all));
+
+    // Unknown keeps the notes nobody known added.
+    let unknown = list(store, &with(AuthorFilter::Unknown));
+    assert_eq!(titles(&unknown.rows), ["Echo", "Foxtrot"]);
+    assert_eq!(unknown.total, 2);
+    assert_eq!(unknown.scopes, [(Scope::Repo, 1), (Scope::Global, 1)]);
+    assert_eq!(facet_of_page(&unknown), facet_of_page(&all));
+
+    // The author combines with the other filters; the facet follows those and not the author.
+    let fixes = NoteListQuery {
+        kind: Some(NoteKind::Fix),
+        ..with(named("Ada"))
+    };
+    let page = list(store, &fixes);
+    assert_eq!(titles(&page.rows), ["Alpha"]);
+    assert_eq!(page.total, 1);
+    assert_eq!(
+        facet_of_page(&page),
+        (people(&[("Ada", 1), ("ada", 1), ("Bob", 1)]), 1),
+        "Alpha, Charlie, Foxtrot and Hotel are the fixes"
+    );
+
+    let global = NoteListQuery {
+        scope: Some(Scope::Global),
+        ..with(AuthorFilter::Any)
+    };
+    assert_eq!(facet_of_page(&list(store, &global)), (people(&[("ada", 1)]), 1));
+
+    let text = NoteListQuery {
+        text: "delta".to_owned(),
+        ..with(named("Ada"))
+    };
+    let page = list(store, &text);
+    assert_eq!((page.rows.len(), page.total), (0, 0));
+    assert_eq!(facet_of_page(&page), (people(&[("bob", 1)]), 0));
+
+    let cache = NoteListQuery {
+        entity: Some("cache".to_owned()),
+        ..with(AuthorFilter::Any)
+    };
+    assert_eq!(
+        facet_of_page(&list(store, &cache)),
+        (people(&[("Ada", 1), ("Grace", 1)]), 0)
+    );
+
+    let left_out = NoteListQuery {
+        exclude: vec![alpha, echo],
+        ..with(AuthorFilter::Any)
+    };
+    let page = list(store, &left_out);
+    assert_eq!(page.total, 6);
+    assert_eq!(
+        facet_of_page(&page),
+        (
+            people(&[("Ada", 1), ("ada", 1), ("Bob", 1), ("bob", 1), ("Grace", 1)]),
+            1
+        )
+    );
+
+    // A list that does not ask who added the notes gets none, and everything else as before.
+    let quiet = list(
+        store,
+        &NoteListQuery {
+            want_authors: false,
+            ..with(named("Ada"))
+        },
+    );
+    assert_eq!(titles(&quiet.rows), ["Alpha", "Bravo"]);
+    assert_eq!(quiet.total, 2);
+    assert_eq!(facet_of_page(&quiet), (Vec::new(), 0));
+
+    // Whatever the other filters are, the facet counts what their rows say.
+    let mut filtered = vec![with(AuthorFilter::Any), fixes, global, text, cache, left_out];
+    filtered.extend(
+        [LangFilter::En, LangFilter::Other, LangFilter::Unknown].map(|lang| NoteListQuery {
+            lang: Some(lang),
+            ..with(AuthorFilter::Any)
+        }),
+    );
+    filtered.extend([UsefulFilter::Ever, UsefulFilter::Never].map(|useful| NoteListQuery {
+        useful: Some(useful),
+        ..with(AuthorFilter::Any)
+    }));
+
+    for query in &filtered {
+        assert_facet_follows_rows(store, query);
+    }
+
+    // Sorted by who added them: folded names, ties by id, the unknown last both ways.
+    let sorted = |descending: bool| NoteListQuery {
+        sort: NoteSort::AddedBy,
+        descending,
+        ..listing(both(REPO))
+    };
+
+    let folded = |rows: &[NoteRow]| -> Vec<Option<String>> {
+        added_by(rows)
+            .iter()
+            .map(|name| name.map(str::to_ascii_lowercase))
+            .collect()
+    };
+    let names = |named: [&str; 6]| -> Vec<Option<String>> {
+        named
+            .iter()
+            .map(|name| Some((*name).to_owned()))
+            .chain([None, None])
+            .collect()
+    };
+
+    let ascending = list(store, &sorted(false));
+    assert_eq!(
+        folded(&ascending.rows),
+        names(["ada", "ada", "ada", "bob", "bob", "grace"])
+    );
+    assert_added_by_order(&ascending.rows, false);
+
+    let descending = list(store, &sorted(true));
+    assert_added_by_order(&descending.rows, true);
+    assert_eq!(
+        folded(&descending.rows),
+        names(["grace", "bob", "bob", "ada", "ada", "ada"])
+    );
+
+    // The sort combines with a filter and with paging.
+    let second = list(
+        store,
+        &NoteListQuery {
+            offset: 3,
+            limit: 3,
+            ..sorted(false)
+        },
+    );
+    assert_eq!(ids(&second.rows), ids(&ascending.rows)[3..6]);
+
+    let fixes_only = list(
+        store,
+        &NoteListQuery {
+            kind: Some(NoteKind::Fix),
+            ..sorted(true)
+        },
+    );
+    assert_added_by_order(&fixes_only.rows, true);
+    assert_eq!(fixes_only.rows.len(), 4);
+
+    let every: Vec<i64> = vec![alpha, bravo, charlie, delta, echo, foxtrot, golf, hotel];
+    let mut listed = ids(&ascending.rows);
+    listed.sort_unstable();
+    let mut wanted = every;
+    wanted.sort_unstable();
+    assert_eq!(listed, wanted, "the other repository's note is not listed");
+}
+
+/// A long list pages through the author sort both ways without a gap or an overlap, the facet
+/// counts every person (its sum is the total) and the cap keeps the name that is asked for.
+pub fn added_by_pages_cover_the_list_and_the_facet_is_capped(store: &mut dyn MemoryStore) {
+    // 250 people: 100 added 6 notes each, 100 added 3, 50 added 1; 250 notes have no author.
+    let mut writers: Vec<Option<usize>> = Vec::new();
+
+    for person in 0..250_usize {
+        let notes = match person {
+            0..100 => 6,
+            100..200 => 3,
+            _ => 1,
+        };
+        writers.extend(std::iter::repeat_n(Some(person), notes));
+    }
+
+    writers.extend(std::iter::repeat_n(None, 250));
+
+    for (index, writer) in writers.iter().enumerate() {
+        let name = writer.map(|person| format!("Person {person:03}"));
+        let note = written_by(
+            draft(&format!("Note {index:04}"), "A body", NoteKind::Note),
+            name.as_deref(),
+            None,
+        );
+        save(store, &repo(REPO), &note);
+    }
+
+    let total = writers.len();
+    assert_eq!(total, 1200);
+
+    for descending in [false, true] {
+        let mut seen: Vec<NoteRow> = Vec::new();
+
+        for page in 0..6 {
+            let rows = list(
+                store,
+                &NoteListQuery {
+                    sort: NoteSort::AddedBy,
+                    descending,
+                    offset: page * 200,
+                    limit: 200,
+                    ..listing(both(REPO))
+                },
+            )
+            .rows;
+            assert_eq!(rows.len(), 200, "page {page}");
+            seen.extend(rows);
+        }
+
+        let mut unique: Vec<i64> = ids(&seen);
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            total,
+            "no row twice and none missing, descending {descending}"
+        );
+        assert_added_by_order(&seen, descending);
+    }
+
+    // The facet lists every person, whatever the author filter, and adds up to the list.
+    let person = |index: usize| format!("Person {index:03}");
+
+    for author in [
+        AuthorFilter::Any,
+        AuthorFilter::Named(person(249)),
+        AuthorFilter::Unknown,
+    ] {
+        let page = list(
+            store,
+            &NoteListQuery {
+                author,
+                limit: 1,
+                ..listing(both(REPO))
+            },
+        );
+        let people = page.authors.people();
+        assert_eq!(people.len(), 250);
+        assert_eq!(
+            people.iter().map(|(_, count)| count).sum::<usize>() + page.authors.unknown(),
+            total
+        );
+        assert_eq!(page.authors.unknown(), 250);
+    }
+
+    // The most notes first, then by name; only 200 of the 250 are kept.
+    let page = list(store, &listing(both(REPO)));
+    let capped = page.authors.clone().capped(None, page.total);
+    let expected: Vec<(String, usize)> = (0..200)
+        .map(|index| (person(index), if index < 100 { 6 } else { 3 }))
+        .collect();
+    assert_eq!(capped, expected);
+
+    // A name beyond the cap is kept, with the notes the list keeps.
+    let picked = list(
+        store,
+        &NoteListQuery {
+            author: AuthorFilter::Named(person(249)),
+            ..listing(both(REPO))
+        },
+    );
+    assert_eq!(picked.total, 1);
+    let capped = picked.authors.clone().capped(Some(&person(249)), picked.total);
+    assert_eq!(capped.len(), 200);
+    assert!(capped.contains(&(person(249), 1)));
+
+    // Even a name nobody has.
+    let missing = list(
+        store,
+        &NoteListQuery {
+            author: AuthorFilter::Named("Nobody".to_owned()),
+            ..listing(both(REPO))
+        },
+    );
+    assert_eq!(missing.total, 0);
+    let capped = missing.authors.clone().capped(Some("Nobody"), missing.total);
+    assert_eq!(capped.len(), 200);
+    assert!(capped.contains(&("Nobody".to_owned(), 0)));
 }

@@ -1,13 +1,15 @@
-//! A page of notes ([`crate::store::listing`]) in PostgreSQL: the counts per kind and scope and
-//! the page, then the entity names of the page's notes. `strpos`, not `LIKE`, so `%` and `_` in
-//! the text are plain characters; titles sort by code point (`COLLATE "C"`), like SQLite. The ids
-//! left out ([`NoteListQuery::exclude`]) go in as one `bigint[]`.
+//! A page of notes ([`crate::store::listing`]) in PostgreSQL: the counts per kind and scope, the
+//! page, then the entity names of the page's notes and who added the notes. `strpos`, not `LIKE`,
+//! so `%` and `_` in the text are plain characters; titles and names sort by code point
+//! (`COLLATE "C"`), like SQLite. The ids left out ([`NoteListQuery::exclude`]) go in as one
+//! `bigint[]`.
 
 use postgres::GenericClient;
 
 use super::notes::{VISIBLE, kind_from_sql, note_from_row, row_columns};
 use super::{KIND_MAX, backend, column, cut, view_params};
-use crate::limits::ENTITY_MAX;
+use crate::limits::{AUTHOR_GROUPS_READ_MAX, ENTITY_MAX, TEAM_DOC_AUTHOR_MAX};
+use crate::store::author_list::AuthorFacet;
 use crate::store::extensions::Columns;
 use crate::store::listing::{
     LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort, UsefulFilter, checked_exclude, direction, page_limit,
@@ -33,14 +35,17 @@ pub(super) fn list(
     let lang = LangFilter::condition(query.lang, "n.lang", columns.lang);
     let useful = UsefulFilter::condition(query.useful, "n.shown", "n.useful", columns.usage);
 
+    let author = query.author.name();
+
     let counts_sql = format!(
         "SELECT {}, n.project_id IS NULL, count(*) FROM notes n WHERE {VISIBLE} AND {KEPT} AND {lang} AND {useful}
-           AND n.id <> ALL($5::bigint[])
+           AND n.id <> ALL($5::bigint[]) AND {author}
          GROUP BY n.kind, n.project_id IS NULL",
-        cut("n.kind", KIND_MAX)
+        cut("n.kind", KIND_MAX),
+        author = query.author.condition("n.added_by_name", "$6::text", columns.authors)
     );
     let counted: Vec<(NoteKind, Scope, usize)> = client
-        .query(&counts_sql, &[&text, &repo, &global, &entity, &exclude])
+        .query(&counts_sql, &[&text, &repo, &global, &entity, &exclude, &author])
         .map_err(backend)?
         .iter()
         .map(|row| {
@@ -63,12 +68,25 @@ pub(super) fn list(
         NoteSort::Useful | NoteSort::LastUseful if !columns.usage => format!("n.id {dir}"),
         NoteSort::Useful => format!("coalesce(n.useful, 0) {dir}, n.id {dir}"),
         NoteSort::LastUseful => format!("coalesce(n.last_useful_at, 0) {dir}, n.id {dir}"),
+        // Without the author columns nobody has a name, so only the id orders them. The notes
+        // without a name come last whichever the direction, and the names sort by ASCII-folded
+        // code point (`lower` would follow the locale).
+        NoteSort::AddedBy if !columns.authors => format!("n.id {dir}"),
+        NoteSort::AddedBy => {
+            let key = "nullif(n.added_by_name, '')";
+            format!(
+                "({key} IS NULL) ASC, {} COLLATE \"C\" {dir}, n.id {dir}",
+                fold_ascii(key)
+            )
+        }
     };
     let sql = format!(
         "SELECT {} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
          WHERE {VISIBLE} AND {KEPT} AND {lang} AND {useful} AND ($5::text IS NULL OR n.kind = $5::text) AND n.id <> ALL($8::bigint[])
+           AND {author}
          ORDER BY {order} LIMIT $6 OFFSET $7",
-        row_columns(columns)
+        row_columns(columns),
+        author = query.author.condition("n.added_by_name", "$9::text", columns.authors)
     );
 
     let limit = i64::try_from(page_limit(query)).unwrap_or(1);
@@ -79,7 +97,9 @@ pub(super) fn list(
     let mut rows: Vec<NoteRow> = client
         .query(
             &sql,
-            &[&text, &repo, &global, &entity, &kind, &limit, &offset, &exclude],
+            &[
+                &text, &repo, &global, &entity, &kind, &limit, &offset, &exclude, &author,
+            ],
         )
         .map_err(backend)?
         .iter()
@@ -87,7 +107,69 @@ pub(super) fn list(
         .collect::<Result<_, StoreError>>()?;
 
     fill_entities(client, &mut rows)?;
-    Ok(NotePage::new(counted, query, rows))
+
+    let authors = if query.want_authors {
+        let facet_sql = sql_facet(columns, &lang, &useful);
+        author_facet(client, &facet_sql, &[&text, &repo, &global, &entity, &kind, &exclude])?
+    } else {
+        AuthorFacet::default()
+    };
+
+    Ok(NotePage::new(counted, query, rows).with_authors(authors))
+}
+
+/// `key` with the ASCII capitals turned to small letters.
+fn fold_ascii(key: &str) -> String {
+    format!("translate({key}, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')")
+}
+
+/// The statement that counts who added the notes every filter but the author keeps (the page's
+/// filters, without its order and its cut), the unknown first and then the most notes first. The
+/// parameters are those of the page up to the kind (`$5`), then the notes left out (`$6`).
+fn sql_facet(columns: Columns, lang: &str, useful: &str) -> String {
+    let filter = format!(
+        "FROM notes n WHERE {VISIBLE} AND {KEPT} AND {lang} AND {useful}
+           AND ($5::text IS NULL OR n.kind = $5::text) AND n.id <> ALL($6::bigint[])"
+    );
+
+    if !columns.authors {
+        return format!("SELECT NULL::text, count(*) {filter}");
+    }
+
+    let key = cut_key("n.added_by_name");
+
+    format!(
+        "SELECT {key}, count(*) {filter}
+         GROUP BY {key} ORDER BY ({key} IS NULL) DESC, count(*) DESC, {key} COLLATE \"C\"
+         LIMIT {AUTHOR_GROUPS_READ_MAX}"
+    )
+}
+
+/// The name of whoever added a note: cut to its limit, `NULL` when none is known (a blank counts
+/// as none).
+fn cut_key(column: &str) -> String {
+    format!("nullif({}, '')", cut(column, TEAM_DOC_AUTHOR_MAX))
+}
+
+/// Who added the notes `sql` ([`sql_facet`]) counts.
+fn author_facet(
+    client: &mut impl GenericClient,
+    sql: &str,
+    params: &[&(dyn postgres::types::ToSql + Sync)],
+) -> Result<AuthorFacet, StoreError> {
+    let groups: Vec<(Option<String>, usize)> = client
+        .query(sql, params)
+        .map_err(backend)?
+        .iter()
+        .map(|row| {
+            let name: Option<String> = column(row, 0)?;
+            let count: i64 = column(row, 1)?;
+
+            Ok((name, usize::try_from(count).unwrap_or(0)))
+        })
+        .collect::<Result<_, StoreError>>()?;
+
+    Ok(AuthorFacet::from_groups(groups))
 }
 
 /// Sets the entity names of `rows` (alphabetically, as a note's), in one statement.

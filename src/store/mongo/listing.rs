@@ -1,6 +1,7 @@
-//! A page of notes ([`crate::store::listing`]) in MongoDB: two aggregations, the counts per kind
-//! and scope and the page (sorted, skipped and cut on the server, the bodies left there), then
-//! the entity names of the page's notes, one query per scope on the page.
+//! A page of notes ([`crate::store::listing`]) in MongoDB: the aggregations of the counts per kind
+//! and scope and of the page (sorted, skipped and cut on the server, the bodies left there), then
+//! the entity names of the page's notes, one query per scope on the page, and the aggregation of
+//! who added the notes.
 
 use mongodb::bson::{Bson, Document, doc};
 
@@ -10,7 +11,8 @@ use super::{
     Ctx, ENTITIES, ENTITY_NORM_MAX, Fail, NOTES, cut, int, lang_is_fresh, note_fields, number, scope_value, text,
     visible,
 };
-use crate::limits::{ENTITY_MAX, TITLE_MAX};
+use crate::limits::{AUTHOR_GROUPS_READ_MAX, ENTITY_MAX, TEAM_DOC_AUTHOR_MAX, TITLE_MAX};
+use crate::store::author_list::{AuthorFacet, AuthorFilter};
 use crate::store::listing::{
     LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort, UsefulFilter, checked_exclude, page_limit, query_entity,
     query_text, scoped,
@@ -52,6 +54,7 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage,
 
     let mut counts_filter = visible(&query.view);
     counts_filter.extend(kept.clone());
+    counts_filter.extend(author_match(&query.author));
 
     let mut counting = vec![doc! { "$match": counts_filter }];
     counting.extend(lang_stages(query.lang));
@@ -87,6 +90,13 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage,
         page_filter.insert("kind", kind.as_str());
     }
 
+    // Who added the notes: everything the page keeps but the author.
+    let mut facet = vec![doc! { "$match": page_filter.clone() }];
+    facet.extend(lang_stages(query.lang));
+    facet.extend(author_groups());
+
+    page_filter.extend(author_match(&query.author));
+
     let way = if query.descending { -1_i32 } else { 1_i32 };
     // A global note's `project` is `null`, which sorts before a repository key.
     let sort = match query.sort {
@@ -96,6 +106,7 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage,
         NoteSort::Scope => doc! { "project": way, "_id": way },
         NoteSort::Place => doc! { "_id": way },
         NoteSort::Useful | NoteSort::LastUseful => doc! { USEFUL_ORDER: way, "_id": way },
+        NoteSort::AddedBy => doc! { AUTHOR_RANK: 1, AUTHOR_ORDER: way, "_id": way },
     };
 
     // The page is sorted again at the end: Amazon DocumentDB keeps the order of a `$sort` only
@@ -114,6 +125,16 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage,
         fields.insert(USEFUL_ORDER, 1);
     }
 
+    // The notes without a name come last whichever the direction: they rank after the others.
+    if query.sort == NoteSort::AddedBy {
+        paging.push(doc! { "$addFields": {
+            AUTHOR_RANK: { "$cond": [unknown_author(), 1, 0] },
+            AUTHOR_ORDER: { "$toLower": cut("$added_by_name", TEAM_DOC_AUTHOR_MAX + 1) },
+        } });
+        fields.insert(AUTHOR_RANK, 1);
+        fields.insert(AUTHOR_ORDER, 1);
+    }
+
     paging.extend([
         doc! { "$sort": sort.clone() },
         doc! { "$skip": i64::try_from(query.offset).unwrap_or(i64::MAX) },
@@ -126,7 +147,59 @@ pub(super) fn list(ctx: &mut Ctx<'_>, query: &NoteListQuery) -> Result<NotePage,
 
     let stored: Vec<Stored> = found.iter().map(stored).collect();
     let rows = with_entities(ctx, stored)?;
-    Ok(NotePage::new(counted, query, rows))
+
+    let mut groups: Vec<(Option<String>, usize)> = Vec::new();
+
+    if query.want_authors {
+        for group in ctx.aggregate(NOTES, facet)? {
+            groups.push((
+                super::text(&group, "_id"),
+                usize::try_from(int(&group, "count")).unwrap_or(0),
+            ));
+        }
+    }
+
+    Ok(NotePage::new(counted, query, rows).with_authors(AuthorFacet::from_groups(groups)))
+}
+
+/// The fields the page is sorted on for the sort by the person who added the notes.
+const AUTHOR_RANK: &str = "author_rank";
+const AUTHOR_ORDER: &str = "author_order";
+
+/// The match that keeps the notes of `filter` (nothing for no filter). `$or` is the text search's
+/// key, so unknown is `$in` of a missing name, `null` and blank, which also matches a missing field.
+fn author_match(filter: &AuthorFilter) -> Document {
+    match filter {
+        AuthorFilter::Any => Document::new(),
+        AuthorFilter::Named(name) => doc! { "added_by_name": name },
+        AuthorFilter::Unknown => doc! { "added_by_name": { "$in": [Bson::Null, Bson::String(String::new())] } },
+    }
+}
+
+/// True (as an aggregation expression) for a note with no name that is a string, or a blank one.
+fn unknown_author() -> Bson {
+    let name = cut("$added_by_name", TEAM_DOC_AUTHOR_MAX + 1);
+
+    Bson::Document(doc! { "$or": [{ "$eq": [name.clone(), Bson::Null] }, { "$eq": [name, ""] }] })
+}
+
+/// The stages that count the notes per name of whoever added them, the unknown first and then the
+/// most notes first, at most [`AUTHOR_GROUPS_READ_MAX`] groups. The name is cut to its limit by
+/// the server and is `null` for a note without a string name.
+fn author_groups() -> Vec<Document> {
+    vec![
+        doc! { "$group": {
+            "_id": cut("$added_by_name", TEAM_DOC_AUTHOR_MAX + 1),
+            "count": { "$sum": 1_i64 },
+        } },
+        doc! { "$addFields": { "unknown_first": { "$cond": [
+            { "$or": [{ "$eq": ["$_id", Bson::Null] }, { "$eq": ["$_id", ""] }] },
+            1,
+            0,
+        ] } } },
+        doc! { "$sort": { "unknown_first": -1, "count": -1, "_id": 1 } },
+        doc! { "$limit": i64::try_from(AUTHOR_GROUPS_READ_MAX).unwrap_or(i64::MAX) },
+    ]
 }
 
 /// The field the page is sorted on for the sorts by usefulness.

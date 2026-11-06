@@ -16,6 +16,7 @@
 //! types of [`MemoryStore::list_notes`].
 
 pub mod author;
+pub mod author_list;
 pub mod clean;
 pub(crate) mod extensions;
 pub(crate) mod fuse;
@@ -43,6 +44,7 @@ use std::path::PathBuf;
 use crate::support::lang::Lang;
 
 pub use author::{Author, Authors};
+pub use author_list::{AuthorFacet, AuthorFilter};
 pub use hidden::{HiddenEntry, HiddenNote, HiddenNotes, HiddenScripts};
 pub use hooks::{HookDelete, HookDraft, HookPage, HookPut, HookStore, TeamHook, checked_hook, hook_sha256};
 pub use lazy::Lazy;

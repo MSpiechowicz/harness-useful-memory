@@ -14,7 +14,8 @@ use crate::limits::GET_IDS_MAX;
 use crate::store::listing::{compare, page_limit};
 use crate::store::split::is_local_id;
 use crate::store::{
-    HiddenNote, LangFilter, MemoryStore, Note, NoteListQuery, NotePage, NoteRow, Scope, StoreError, UsefulFilter, clean,
+    AuthorFacet, HiddenNote, LangFilter, MemoryStore, Note, NoteListQuery, NotePage, NoteRow, Scope, StoreError,
+    UsefulFilter, clean,
 };
 
 /// `notes hide <id>`.
@@ -178,17 +179,32 @@ pub(super) fn page(opened: &mut Opened, query: &NoteListQuery) -> Result<NotePag
         })
         .collect();
 
-    let counted: Vec<_> = kept.iter().map(|note| (note.kind, note.scope, 1)).collect();
-    let mut rows: Vec<NoteRow> = kept
+    // The counts follow the author, the facet of who added the notes every filter but the author.
+    let counted: Vec<_> = kept
+        .iter()
+        .filter(|note| query.author.keeps(&note.authors))
+        .map(|note| (note.kind, note.scope, 1))
+        .collect();
+    let listed: Vec<Note> = kept
         .into_iter()
         .filter(|note| query.kind.is_none_or(|kind| kind == note.kind))
         .filter(|note| query.scope.is_none_or(|scope| scope == note.scope))
+        .collect();
+    let authors = if query.want_authors {
+        AuthorFacet::of_records(listed.iter().map(|note| note.authors.added_by.as_ref()))
+    } else {
+        AuthorFacet::default()
+    };
+
+    let mut rows: Vec<NoteRow> = listed
+        .into_iter()
+        .filter(|note| query.author.keeps(&note.authors))
         .map(NoteRow::from)
         .collect();
 
     rows.sort_by(|a, b| compare(query, a, b));
     let rows = rows.into_iter().skip(query.offset).take(page_limit(query)).collect();
-    Ok(NotePage::new(counted, query, rows))
+    Ok(NotePage::new(counted, query, rows).with_authors(authors))
 }
 
 /// True when the title, the body or a tag of `note` contains the lowercase `text`.

@@ -13,6 +13,7 @@ use std::sync::{LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
 
+use crate::limits::TEAM_DOC_AUTHOR_MAX;
 use crate::store::Provenance;
 use crate::store::clean;
 use crate::store::team_docs::check_author;
@@ -62,7 +63,15 @@ impl Author {
     /// The author the stored `name` and `via` say; `None` without a usable name. A team database
     /// is shared, so what it holds is cleaned again.
     pub fn stored(name: Option<String>, via: Option<String>) -> Option<Self> {
-        let name = check_author(&name?).ok()?;
+        let name = name?;
+
+        // A name longer than the limit is refused whole: trimming first could make a database's
+        // cut of a longer value (a name, a space, more text) read as a valid one.
+        if name.chars().count() > TEAM_DOC_AUTHOR_MAX {
+            return None;
+        }
+
+        let name = check_author(&name).ok()?;
         let via = clean::source(via.as_deref());
 
         Some(Self { name, via })

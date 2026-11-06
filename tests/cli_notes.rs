@@ -216,7 +216,7 @@ fn lists_gets_and_deletes(folders: &Folders, repo_place: &str, global_place: &st
     let keys: Vec<&String> = listing.as_object().expect("object").keys().collect();
 
     if folders.team.is_empty() {
-        assert_eq!(keys, ["total", "kinds", "scopes", "places", "notes"]);
+        assert_eq!(keys, ["total", "kinds", "scopes", "places", "authors", "notes"]);
     } else {
         assert_eq!(
             keys,
@@ -225,6 +225,7 @@ fn lists_gets_and_deletes(folders: &Folders, repo_place: &str, global_place: &st
                 "kinds",
                 "scopes",
                 "places",
+                "authors",
                 "notes",
                 "hiddenCount",
                 "localCounts"
@@ -1061,6 +1062,37 @@ fn reads_both_hides_and_keeps(url: &str) {
         json!({ "local": 0, "team": 1 }),
         "hidden notes are team notes"
     );
+
+    // The hidden list filters by who added the note and counts them, whoever that is here.
+    let added_by = row(&only_hidden, "Team deploy")["addedBy"]["name"].as_str();
+    let (same, other) = match added_by {
+        Some(name) => (vec!["--author", name], vec!["--author-unknown"]),
+        None => (vec!["--author-unknown"], vec!["--author", "Nobody At All"]),
+    };
+    let expected_people = match added_by {
+        Some(name) => json!([{ "name": name, "count": 1 }]),
+        None => json!([]),
+    };
+
+    let kept = folders.widget_list(&[&["--hidden"][..], &same].concat());
+    assert_eq!((titles(&kept), kept["total"].clone()), (vec!["Team deploy"], json!(1)));
+    assert_eq!(kept["authors"]["people"], expected_people);
+    assert_eq!(kept["authors"]["unknown"], json!(u8::from(added_by.is_none())));
+
+    let left = folders.widget_list(&[&["--hidden"][..], &other].concat());
+    assert_eq!((titles(&left).len(), left["total"].clone()), (0, json!(0)));
+    assert_eq!(
+        left["places"],
+        json!({ "local": 0, "team": 0 }),
+        "the places follow the author"
+    );
+    assert_eq!(
+        left["authors"]["unknown"], kept["authors"]["unknown"],
+        "the facet ignores the author"
+    );
+
+    let sorted = folders.widget_list(&["--hidden", "--sort", "addedBy", "--order", "desc"]);
+    assert_eq!(titles(&sorted), ["Team deploy"]);
 
     let hidden_here = folders.widget_list(&["--hidden", "--place", "local"]);
     assert_eq!(

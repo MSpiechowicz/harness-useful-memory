@@ -110,7 +110,10 @@ fn listing(data: &Path, cwd: &Path, extra: &[&str]) -> Value {
 
     let parsed: Value = serde_json::from_str(&stdout(&output)).expect("JSON");
     let keys: Vec<&String> = parsed.as_object().expect("object").keys().collect();
-    assert_eq!(keys, ["total", "groups", "scopes", "review", "places", "scripts"]);
+    assert_eq!(
+        keys,
+        ["total", "groups", "scopes", "review", "places", "authors", "scripts"]
+    );
     parsed
 }
 
@@ -1011,7 +1014,10 @@ fn remote_script_commands_need_a_team_database() {
         .keys()
         .cloned()
         .collect();
-    assert_eq!(keys, ["total", "groups", "scopes", "review", "places", "scripts"]);
+    assert_eq!(
+        keys,
+        ["total", "groups", "scopes", "review", "places", "authors", "scripts"]
+    );
 
     let hide = cli(&data, &work, &["scripts", "hide", &id]);
     assert_eq!(hide.status.code(), Some(1));

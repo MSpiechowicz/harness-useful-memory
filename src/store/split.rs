@@ -40,7 +40,8 @@
 //! the other store too, taking turns. A list of notes merges the two stores' sorted pages: a page at
 //! offset N reads the first N rows of both stores (in pages of [`LIST_PAGE_MAX`]) to find where it
 //! starts. A list of the notes kept in one place reads the page from that place's store alone; the
-//! other store only counts its notes (the list's counts per place).
+//! other store only counts its notes (the list's counts per place). The list's author facet is the
+//! sum of the facets of the stores listed.
 //!
 //! Each store only sees the scopes it is read for: notes of another scope left in it (written
 //! before the routing changed) are not shown.
@@ -57,9 +58,9 @@ use crate::store::listing::{compare, directed, page_limit, per_place};
 use crate::store::pending::{Entry, Kind, Pending};
 use crate::store::rank::Terms;
 use crate::store::{
-    Countable, Edge, Forget, Forgotten, HiddenNotes, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft,
-    NoteListQuery, NoteOrigin, NotePage, NotePatch, NoteRow, NoteSort, Saved, Scope, SearchQuery, StoreError, Target,
-    VectorTarget, View, clean,
+    AuthorFacet, Countable, Edge, Forget, Forgotten, HiddenNotes, Hit, Link, MemoryStore, Neighborhood, Note,
+    NoteDraft, NoteListQuery, NoteOrigin, NotePage, NotePatch, NoteRow, NoteSort, Saved, Scope, SearchQuery,
+    StoreError, Target, VectorTarget, View, clean,
 };
 
 /// How long a copy of the notes saved offline that failed is not tried again.
@@ -902,6 +903,8 @@ struct Cursor {
     read: usize,
     /// True once the store has no more rows.
     done: bool,
+    /// True once the first batch was read: only that one asks the store who added the notes.
+    started: bool,
 }
 
 impl Cursor {
@@ -913,6 +916,7 @@ impl Cursor {
             rows: VecDeque::new(),
             read: 0,
             done: false,
+            started: false,
         }
     }
 
@@ -924,9 +928,12 @@ impl Cursor {
             limit: LIST_PAGE_MAX,
             place: None,
             exclude: self.exclude.clone(),
+            // The facet counts the whole list, so one batch is enough.
+            want_authors: query.want_authors && !self.started,
             ..query.clone()
         })?;
 
+        self.started = true;
         self.read += part.rows.len();
         self.done = part.rows.len() < LIST_PAGE_MAX;
 
@@ -1029,6 +1036,7 @@ impl MemoryStore for SplitStore {
                 let counted = NoteListQuery {
                     offset: 0,
                     limit: 1,
+                    want_authors: false,
                     ..query.clone()
                 };
                 let total = self.page_of(side, &counted, view, exclude)?.total;
@@ -1056,14 +1064,17 @@ impl MemoryStore for SplitStore {
         }
 
         let mut page = NotePage::new([], query, Vec::new());
+        let mut authors = AuthorFacet::default();
 
         for cursor in &mut cursors {
             let part = cursor.fetch(self.store(cursor.side), query)?;
             places.push((cursor.side.place(), part.total));
+            authors.merge(part.authors);
             page = NotePage::new(page.counted.into_iter().chain(part.counted), query, Vec::new());
         }
 
         page.places = per_place(places);
+        page.authors = authors;
 
         let limit = page_limit(query);
         let mut skipped = 0;

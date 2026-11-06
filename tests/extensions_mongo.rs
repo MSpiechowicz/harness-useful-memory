@@ -416,3 +416,26 @@ fn notes_without_counter_fields_count_as_zero() {
         (Ok(2), Ok(1), Ok(0))
     );
 }
+
+#[test]
+fn odd_author_names_read_as_nobody() {
+    let Some((db, mut store)) = store() else { return };
+
+    // BSON text holds a NUL but no invalid UTF-8.
+    let odd = ["Odd nul", "Odd spaced", "Odd 81", "Odd huge"];
+    common::authors::seed_odd_names(&mut store, &odd, &[]);
+
+    for (title, name) in [
+        ("Odd nul", "Ada\0tail".to_owned()),
+        ("Odd spaced", format!("{} {}", "b".repeat(80), "y".repeat(1000))),
+        ("Odd 81", "a".repeat(81)),
+        ("Odd huge", "x".repeat(5000)),
+    ] {
+        notes(&db)
+            .update_one(doc! { "title": title }, doc! { "$set": { "added_by_name": name } })
+            .run()
+            .expect("a name by hand");
+    }
+
+    common::authors::assert_odd_names_are_unknown(&mut store, &odd, &[]);
+}

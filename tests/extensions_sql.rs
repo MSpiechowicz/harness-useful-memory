@@ -9,7 +9,9 @@ mod libsql_support;
 use common::listing::listing;
 use common::{both, draft, query, repo};
 use harness_memory::store::sqlite::schema::{SCHEMA_VERSION, V1, V2, V3, V4, V5};
-use harness_memory::store::{Author, Authors, NoteKind, NotePatch, NoteUsage, Provenance, StoreError};
+use harness_memory::store::{
+    Author, AuthorFilter, Authors, NoteKind, NoteListQuery, NotePatch, NoteSort, NoteUsage, Provenance, StoreError,
+};
 use libsql_support::Database;
 use pretty_assertions::assert_eq;
 
@@ -36,6 +38,8 @@ store_cases!(
     an_older_server_keeps_working_on_a_database_with_counters,
     a_database_without_authors_gets_them_and_keeps_its_rows,
     an_older_server_keeps_working_on_a_database_with_authors,
+    values_written_by_hand_in_the_author_columns_never_fail_or_flood_a_list,
+    odd_author_names_read_as_nobody,
 );
 
 /// The extension objects the database has, out of the six there are.
@@ -575,4 +579,132 @@ fn an_older_server_keeps_working_on_a_database_with_authors(db: &Database) {
 
     assert_eq!(page.total, 1);
     assert_eq!(page.rows[0].authors, Authors::default());
+}
+
+/// A blob in an author column, on or off the page, never fails a list or a read, and a name of
+/// two million characters is never printed: such a row has no author and counts as unknown.
+fn values_written_by_hand_in_the_author_columns_never_fail_or_flood_a_list(db: &Database) {
+    let mut store = db.open();
+
+    for title in ["Aaa fine", "Bbb blob via", "Ccc blob", "Ddd huge one", "Eee huge two"] {
+        let mut note = draft(title, ENGLISH, NoteKind::Note);
+        note.provenance = Provenance {
+            author: Some(Author {
+                name: "Ada Lovelace".to_owned(),
+                via: None,
+            }),
+            ..note.provenance
+        };
+        store.remember(&repo(REPO), &note).expect("remember");
+    }
+
+    db.batch(
+        "UPDATE notes SET updated_by_via = X'FF00' WHERE title = 'Bbb blob via';
+         UPDATE notes SET added_by_name = X'0102' WHERE title = 'Ccc blob';
+         UPDATE notes SET added_by_name = replace(hex(zeroblob(1000000)), '0', 'x') WHERE title LIKE 'Ddd%';
+         UPDATE notes SET added_by_name = replace(hex(zeroblob(1000000)), '0', 'y'),
+                          updated_by_name = replace(hex(zeroblob(1000000)), '0', 'z') WHERE title LIKE 'Eee%';",
+    );
+
+    let by_title = |offset: usize, limit: usize| NoteListQuery {
+        sort: NoteSort::Title,
+        descending: false,
+        offset,
+        limit,
+        ..listing(both(REPO))
+    };
+
+    // A page off the odd rows still counts them, and reads nothing but its own.
+    let first = store.list_notes(&by_title(0, 1)).expect("a page off the blob");
+    assert_eq!(first.rows.len(), 1);
+    assert_eq!(first.total, 5);
+    assert_eq!(first.authors.people(), vec![("Ada Lovelace".to_owned(), 2)]);
+    assert_eq!(first.authors.unknown(), 3);
+
+    // The page that holds them shows them without an author.
+    let rest = store.list_notes(&by_title(1, 4)).expect("a page with the odd rows");
+    let added: Vec<Option<&str>> = rest
+        .rows
+        .iter()
+        .map(|row| row.authors.added_by.as_ref().map(|author| author.name.as_str()))
+        .collect();
+    assert_eq!(added, [Some("Ada Lovelace"), None, None, None]);
+    assert_eq!(
+        rest.rows[0]
+            .authors
+            .updated_by
+            .as_ref()
+            .map(|author| author.via.clone()),
+        Some(None)
+    );
+    assert_eq!(
+        rest.rows[3].authors.updated_by, None,
+        "a name that long is no author either"
+    );
+
+    // Filters and the sort treat them as nobody, and the other reads do not fail.
+    let ada = store
+        .list_notes(&NoteListQuery {
+            author: AuthorFilter::Named("Ada Lovelace".to_owned()),
+            ..by_title(0, 50)
+        })
+        .expect("by name");
+    assert_eq!(ada.total, 2);
+
+    let sorted = store
+        .list_notes(&NoteListQuery {
+            sort: NoteSort::AddedBy,
+            descending: true,
+            ..by_title(0, 50)
+        })
+        .expect("sorted");
+    let last_names: Vec<bool> = sorted.rows.iter().map(|row| row.authors.added_by.is_some()).collect();
+    assert_eq!(last_names, [true, true, false, false, false]);
+
+    let ids: Vec<i64> = sorted.rows.iter().map(|row| row.id).collect();
+    assert_eq!(store.peek(&both(REPO), &ids).expect("peek").len(), 5);
+}
+
+/// `bytes` as the text SQLite reads them as, whatever they are.
+fn text_of(bytes: &[u8]) -> String {
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02X}")).collect();
+    format!("CAST(X'{hex}' AS TEXT)")
+}
+
+/// Names that are not names (a NUL, a lead byte and continuation bytes that SQLite counts as one
+/// character, invalid UTF-8, 80 letters then a space then more, 81 letters, thousands of letters)
+/// read as no author in the rows and in the facet, and none is printed; 80 four-byte characters
+/// stay valid.
+fn odd_author_names_read_as_nobody(db: &Database) {
+    let mut store = db.open();
+
+    let mut lead_and_continuations = b"n42\xC0".to_vec();
+    lead_and_continuations.extend(std::iter::repeat_n(0x80_u8, 1000));
+    let mut spaced = b"b".repeat(80);
+    spaced.push(b' ');
+    spaced.extend(b"y".repeat(1000));
+
+    // Text that is not UTF-8 is counted as unknown, and stays off the page: a libSQL server cannot send it, and SQLite reads it with the replacement character a git name can hold too.
+    let bad = "Zzz bad utf8";
+    let odd = ["Odd nul", "Odd lead", "Odd spaced", "Odd 81", "Odd huge"];
+    let offpage = [bad];
+    common::authors::seed_odd_names(store.as_mut(), &odd, &offpage);
+
+    let by_hand: [(&str, Vec<u8>); 6] = [
+        ("Odd nul", b"Ada\0tail".to_vec()),
+        ("Odd lead", lead_and_continuations),
+        ("Odd spaced", spaced),
+        ("Odd 81", b"a".repeat(81)),
+        ("Odd huge", b"x".repeat(5000)),
+        (bad, vec![0xEE, 0xFF, b'A']),
+    ];
+
+    for (title, name) in by_hand {
+        db.batch(&format!(
+            "UPDATE notes SET added_by_name = {} WHERE title = '{title}';",
+            text_of(&name)
+        ));
+    }
+
+    common::authors::assert_odd_names_are_unknown(store.as_mut(), &odd, &offpage);
 }

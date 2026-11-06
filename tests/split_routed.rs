@@ -10,16 +10,16 @@ mod mongo_support;
 mod postgres_support;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use common::{both, draft, global_only, query, repo, repo_only};
 use harness_memory::backend::{NotesPlace, Place};
 use harness_memory::store::split::LOCAL_ID_OFFSET;
 use harness_memory::store::{
-    Edge, Forget, Forgotten, HiddenNotes, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NoteKind,
-    NoteListQuery, NoteOrigin, NotePage, NotePatch, NoteSort, NoteUsage, Saved, Scope, SearchQuery, SplitStore,
-    SqliteStore, StoreError, Target, View,
+    Author, AuthorFilter, Edge, Forget, Forgotten, HiddenNotes, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft,
+    NoteKind, NoteListQuery, NoteOrigin, NotePage, NotePatch, NoteSort, NoteUsage, Saved, Scope, SearchQuery,
+    SplitStore, SqliteStore, StoreError, Target, View,
 };
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -99,7 +99,7 @@ impl Fixture {
 
 type Case = fn(&Fixture);
 
-const CASES: [Case; 12] = [
+const CASES: [Case; 13] = [
     remote_local_reads_both_and_saves_here,
     pages_merge_both_stores_in_order,
     a_place_lists_its_store_and_counts_both,
@@ -112,6 +112,7 @@ const CASES: [Case; 12] = [
     saving_under_a_hidden_title_is_refused,
     deleting_every_note_leaves_the_hidden_team_notes,
     counters_reach_the_store_of_each_note_also_when_it_is_read_only,
+    who_added_the_notes_is_listed_and_counted_across_both_stores,
 ];
 
 fn run(fresh: Fresh) {
@@ -157,6 +158,8 @@ fn listing(view: View) -> NoteListQuery {
         entity: None,
         lang: None,
         useful: None,
+        author: AuthorFilter::Any,
+        want_authors: true,
         sort: NoteSort::Updated,
         descending: true,
         offset: 0,
@@ -1061,6 +1064,8 @@ fn counters_reach_the_store_of_each_note_also_when_it_is_read_only(fixture: &Fix
 struct Reads {
     inner: SqliteStore,
     reads: Arc<AtomicUsize>,
+    /// Whether each list it was asked for wanted the author facet.
+    asked: Arc<Mutex<Vec<bool>>>,
 }
 
 impl Reads {
@@ -1090,6 +1095,7 @@ impl MemoryStore for Reads {
 
     fn list_notes(&mut self, query: &NoteListQuery) -> Result<NotePage, StoreError> {
         self.read();
+        self.asked.lock().expect("log").push(query.want_authors);
         self.inner.list_notes(query)
     }
 
@@ -1166,6 +1172,7 @@ fn a_counter_does_not_prune_the_hidden_list() {
     let counting = Reads {
         inner: SqliteStore::open(&team_file).expect("team file"),
         reads: Arc::clone(&reads),
+        asked: Arc::default(),
     };
     let mut split = SplitStore::routed(
         Box::new(counting),
@@ -1197,4 +1204,260 @@ fn a_counter_does_not_prune_the_hidden_list() {
         .query_row("SELECT pruned_at FROM hidden_team_notes_meta", [], |row| row.get(0))
         .expect("pruned_at");
     assert!(pruned_at > 1, "the prune was recorded");
+}
+
+/// A note `title` written by `name` (nobody for `None`).
+fn written_by(title: &str, name: Option<&str>) -> NoteDraft {
+    let mut note = draft(title, "A body", NoteKind::Note);
+    note.provenance.author = name.map(|name| Author {
+        name: name.to_owned(),
+        via: None,
+    });
+
+    note
+}
+
+fn facet(page: &NotePage) -> (Vec<(String, usize)>, usize) {
+    (page.authors.people(), page.authors.unknown())
+}
+
+fn people(counts: &[(&str, usize)]) -> Vec<(String, usize)> {
+    counts
+        .iter()
+        .map(|(name, count)| ((*name).to_owned(), *count))
+        .collect()
+}
+
+/// The pages of the author sort follow on across the two stores, and the filter, the counts and
+/// the facet add up their notes (only the store of the place asked for, the hidden team notes left
+/// out).
+fn who_added_the_notes_is_listed_and_counted_across_both_stores(fixture: &Fixture) {
+    let mut team = fixture.team.open();
+
+    for (title, name) in [
+        ("Team ada one", Some("Ada")),
+        ("Team ada two", Some("Ada")),
+        ("Team grace", Some("Grace")),
+        ("Team nobody", None),
+    ] {
+        team.remember(&repo(REPO), &written_by(title, name)).expect("team note");
+    }
+
+    let hidden = team
+        .remember(&repo(REPO), &written_by("Team hidden", Some("Hidden Hank")))
+        .expect("hidden team note");
+    fixture.hide(&repo_only(REPO), hidden.id);
+
+    let mut split = fixture.routed(NotesPlace::RemoteLocal, NotesPlace::Remote);
+
+    for (title, name) in [
+        ("Local ada", Some("Ada")),
+        ("Local bob one", Some("bob")),
+        ("Local bob two", Some("Bob")),
+        ("Local nobody", None),
+    ] {
+        split
+            .remember(&repo(REPO), &written_by(title, name))
+            .expect("local note");
+    }
+
+    let sorted = |descending: bool| NoteListQuery {
+        sort: NoteSort::AddedBy,
+        descending,
+        ..listing(repo_only(REPO))
+    };
+    let everyone = people(&[("Ada", 3), ("Bob", 1), ("bob", 1), ("Grace", 1)]);
+
+    for descending in [false, true] {
+        let whole = split.list_notes(&sorted(descending)).expect("whole list");
+        assert_eq!(whole.total, 8);
+        assert_eq!(facet(&whole), (everyone.clone(), 2), "the hidden note is not counted");
+
+        let names: Vec<Option<String>> = whole
+            .rows
+            .iter()
+            .map(|row| {
+                row.authors
+                    .added_by
+                    .as_ref()
+                    .map(|author| author.name.to_ascii_lowercase())
+            })
+            .collect();
+        let named: Vec<&str> = if descending {
+            vec!["grace", "bob", "bob", "ada", "ada", "ada"]
+        } else {
+            vec!["ada", "ada", "ada", "bob", "bob", "grace"]
+        };
+        let wanted: Vec<Option<String>> = named
+            .iter()
+            .map(|name| Some((*name).to_owned()))
+            .chain([None, None])
+            .collect();
+        assert_eq!(names, wanted, "descending {descending}");
+
+        // Ties go by id the way the sort goes, also across the two stores.
+        for pair in whole.rows.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+
+            if a.authors
+                .added_by
+                .as_ref()
+                .map(|author| author.name.to_ascii_lowercase())
+                == b.authors
+                    .added_by
+                    .as_ref()
+                    .map(|author| author.name.to_ascii_lowercase())
+            {
+                assert_eq!(a.id < b.id, !descending, "{} before {}", a.title, b.title);
+            }
+        }
+
+        let mut paged: Vec<i64> = Vec::new();
+
+        for offset in (0..8).step_by(3) {
+            let page = split
+                .list_notes(&NoteListQuery {
+                    offset,
+                    limit: 3,
+                    ..sorted(descending)
+                })
+                .expect("page");
+            assert_eq!(
+                (page.total, facet(&page)),
+                (8, (everyone.clone(), 2)),
+                "offset {offset}"
+            );
+            paged.extend(page.rows.iter().map(|row| row.id));
+        }
+
+        let all: Vec<i64> = whole.rows.iter().map(|row| row.id).collect();
+        assert_eq!(paged, all, "the pages follow on without gaps or repeats");
+    }
+
+    // A name keeps the notes of both stores; the facet ignores it.
+    let ada = split
+        .list_notes(&NoteListQuery {
+            author: AuthorFilter::Named("Ada".to_owned()),
+            sort: NoteSort::Title,
+            descending: false,
+            ..listing(repo_only(REPO))
+        })
+        .expect("ada");
+    let titles: Vec<&str> = ada.rows.iter().map(|row| row.title.as_str()).collect();
+    assert_eq!(titles, ["Local ada", "Team ada one", "Team ada two"]);
+    assert_eq!((ada.total, facet(&ada)), (3, (everyone.clone(), 2)));
+    assert_eq!(
+        ada.places,
+        [(Place::Local, 1), (Place::Remote, 2)],
+        "places follow the author"
+    );
+
+    let unknown = split
+        .list_notes(&NoteListQuery {
+            author: AuthorFilter::Unknown,
+            ..listing(repo_only(REPO))
+        })
+        .expect("unknown");
+    assert_eq!((unknown.total, unknown.rows.len()), (2, 2));
+    assert_eq!(facet(&unknown), (everyone.clone(), 2));
+
+    // Only the store of the place asked for adds to the facet.
+    for (place, counts, unknown_count) in [
+        (Place::Remote, people(&[("Ada", 2), ("Grace", 1)]), 1),
+        (Place::Local, people(&[("Bob", 1), ("bob", 1), ("Ada", 1)]), 1),
+    ] {
+        let page = split
+            .list_notes(&NoteListQuery {
+                place: Some(place),
+                author: AuthorFilter::Named("Ada".to_owned()),
+                ..listing(repo_only(REPO))
+            })
+            .expect("place");
+        let mut got = page.authors.people();
+        got.sort();
+        let mut want = counts;
+        want.sort();
+        assert_eq!((got, page.authors.unknown()), (want, unknown_count), "{place:?}");
+    }
+}
+
+/// A merged list asks one store batch for who added the notes, however deep the page is, and the
+/// facet adds up both stores; a list that does not ask gets no facet and no store is asked for one.
+#[test]
+fn a_merged_list_asks_who_added_the_notes_once_and_adds_them_up_on_deep_pages() {
+    let team_dir = TempDir::new().expect("temp dir");
+    let local_dir = TempDir::new().expect("temp dir");
+    let team_file = team_dir.path().join("team.sqlite3");
+
+    let mut team = SqliteStore::open(&team_file).expect("team file");
+
+    for index in 0..450 {
+        let name = [Some("Ada"), Some("Bob"), None][index % 3];
+        team.remember(&repo(REPO), &written_by(&format!("Team {index:03}"), name))
+            .expect("team note");
+    }
+
+    let asked: Arc<Mutex<Vec<bool>>> = Arc::default();
+    let counting = Reads {
+        inner: SqliteStore::open(&team_file).expect("team file"),
+        reads: Arc::default(),
+        asked: Arc::clone(&asked),
+    };
+    let mut split = SplitStore::routed(
+        Box::new(counting),
+        Box::new(SqliteStore::open(&local_dir.path().join("memory.sqlite3")).expect("local file")),
+        NotesPlace::RemoteLocal,
+        NotesPlace::RemoteLocal,
+        None,
+    );
+
+    for index in 0..450 {
+        let name = [Some("Ada"), None][index % 2];
+        split
+            .remember(&repo(REPO), &written_by(&format!("Local {index:03}"), name))
+            .expect("local note");
+    }
+
+    // Ada: 150 team notes and 225 local ones, Bob 150, nobody 150 and 225.
+    let everyone = (people(&[("Ada", 375), ("Bob", 150)]), 375);
+
+    for offset in [0, 150, 600, 800] {
+        asked.lock().expect("log").clear();
+
+        let page = split
+            .list_notes(&NoteListQuery {
+                sort: NoteSort::Title,
+                descending: false,
+                offset,
+                limit: 100,
+                ..listing(repo_only(REPO))
+            })
+            .expect("page");
+        assert_eq!(page.total, 900, "offset {offset}");
+        assert_eq!(facet(&page), everyone, "offset {offset}");
+
+        let log = asked.lock().expect("log").clone();
+        assert_eq!(log.first(), Some(&true), "offset {offset}");
+        assert!(log.iter().skip(1).all(|asked| !asked), "{log:?} at offset {offset}");
+    }
+
+    // A deep page needs more than one batch of the team store, and still asked once.
+    assert!(asked.lock().expect("log").len() >= 2);
+
+    // Not asked: no facet, and no store is asked for one.
+    asked.lock().expect("log").clear();
+    let quiet = split
+        .list_notes(&NoteListQuery {
+            want_authors: false,
+            sort: NoteSort::Title,
+            descending: false,
+            offset: 600,
+            limit: 100,
+            ..listing(repo_only(REPO))
+        })
+        .expect("page");
+    assert_eq!((quiet.total, quiet.rows.len()), (900, 100));
+    assert_eq!(facet(&quiet), (Vec::new(), 0));
+    assert!(!asked.lock().expect("log").is_empty());
+    assert!(asked.lock().expect("log").iter().all(|asked| !asked));
 }

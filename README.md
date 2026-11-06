@@ -275,10 +275,12 @@ A script a teammate saved in the team database, or one whose body or language ch
   that line.
 
   `scripts list --json` prints one page, `{"total", "groups": {"needsReview", "repo", "global"}, "scopes": {"repo",
-  "global"}, "review": {"needed", "trusted"}, "places": {"local", "team"}, "scripts"}`, and takes `--group
+  "global"}, "review": {"needed", "trusted"}, "places": {"local", "team"}, "authors": {"people": [{"name",
+  "count"}], "unknown"}, "scripts"}`, and takes `--group
   needsReview|repo|global` (`--untrusted` is `--group needsReview`), `--scope repo|global`, `--place local|team` (kept
-  on this computer or in the team database), `--review needed|trusted`, `--query TEXT` (name or description,
-  ignoring case), `--sort name|language|scope|place|runs|lastRun|updated`, `--order asc|desc`, `--offset N` and
+  on this computer or in the team database), `--review needed|trusted`, `--author NAME` or `--author-unknown`
+  (the scripts one person added, or nobody known, as for `notes list`), `--query TEXT` (name or description,
+  ignoring case), `--sort name|language|scope|place|runs|lastRun|updated|addedBy`, `--order asc|desc`, `--offset N` and
   `--limit N` (1 to 200, 50 by default). Each script has `place` (`team` or `local`: where it is kept), `readOnly` (a
   team script while `scripts = "remote+local"`) and `hidden` (hidden on this computer). With a team database the object
   also has `hiddenCount` (the team scripts of the view hidden on this computer) and `localCounts` (`{"repo", "global"}`:
@@ -288,12 +290,14 @@ A script a teammate saved in the team database, or one whose body or language ch
   The groups do not overlap: `needsReview` holds every script that needs approval, `repo` and `global` the other
   scripts of that scope. `--scope` keeps the scripts of one scope, `--review needed` the ones that need approval (the
   `needsReview` group) and `--review trusted` every other one. `--scope` and `--review` combine with each other but not
-  with `--group` (that is a usage error). `--place` combines with every filter. The group counts follow `--query` and
-  `--place`, the `scopes` counts follow `--query`, `--review` and `--place`, the `review` counts follow `--query`,
-  `--scope` and `--place`, the `places` counts follow every filter but `--place`, and `total` follows every filter. By name (A to Z,
+  with `--group` (that is a usage error). `--place` and `--author` combine with every filter. The group counts follow
+  `--query`, `--author` and `--place`, the `scopes` counts follow `--query`, `--review`, `--author` and `--place`, the
+  `review` counts follow `--query`, `--scope`, `--author` and `--place`, the `places` counts follow every filter but
+  `--place`, `total` follows every filter, and `authors` every filter but `--author`. By name (A to Z,
   repository scripts first on a tie) unless `--sort updated` (newest first), `language`, `scope` (global scripts
-  first), `place` (this computer's first, then by id), `runs` (the run count) or `lastRun` (a script
-  never run comes last whichever the order), all ascending. `--order` turns any round, and ties go by id. Approval is
+  first), `place` (this computer's first, then by id), `runs` (the run count), `lastRun` (a script
+  never run comes last whichever the order) or `addedBy` (the git name of who added it, ASCII letters folded, a script
+  with no known author last whichever the order), all ascending. `--order` turns any round, and ties go by id. Approval is
   decided on this computer, so every visible script is read and the page is cut there. Usage errors exit with 2.
 
   `scripts delete <id>` deletes a visible script as `script_delete` does (a version waiting for approval is
@@ -356,7 +360,7 @@ repository's notes and the global ones; `delete --all` refuses it). Each note ha
 repositories that have entries, by label, and how many global ones there are.
 
 - `notes list --json` prints one page, `{"total", "kinds": [{"kind", "count"}], "scopes": {"repo", "global"},
-  "places": {"local", "team"}, "notes"}`. `--query TEXT` keeps the notes whose title, body or tags contain it,
+  "places": {"local", "team"}, "authors": {"people": [{"name", "count"}], "unknown"}, "notes"}`. `--query TEXT` keeps the notes whose title, body or tags contain it,
   ignoring case (on SQLite and libSQL only ASCII letters are folded), `--kind KIND` one kind, `--scope repo|global`
   one scope, `--place local|team` the notes kept on this computer or in the team database, and they combine. `kinds`
   counts every kind under the other filters, `scopes` both scopes under the other filters, `places` both places
@@ -365,7 +369,15 @@ repositories that have entries, by label, and how many global ones there are.
   this computer first), all ascending, or `--sort useful` (the notes found useful most often first) and `lastUseful`
   (the notes found useful most recently first, never useful ones last), both descending. `--useful ever|never` keeps
   the notes found useful at least once, or those shown at least 3 times and never found useful (`any` keeps every
-  note), and narrows the counts like `--lang` does. `--order asc|desc` turns any round and ties go by id, `--offset N` and
+  note), and narrows the counts like `--lang` does. `--author NAME` keeps the notes one person added (the git
+  `user.name`, matched exactly and case-sensitive, whatever client the write went through) and `--author-unknown`
+  the notes with no known author (a blank or invalid name, and both together, are usage errors). Both narrow the
+  page, `total` and the counts per kind, scope and place. `authors` counts who added the notes every filter but the
+  author keeps, so a picker can show what each name would leave: the people with the most notes first (then by name
+  with ASCII letters folded), at most 200, the `--author` one always among them (with the `total` when it is not among
+  the most), and `unknown` for the notes with no known author or in a database without the author columns.
+  `--sort addedBy` orders by that name (ASCII letters folded, A to Z), the notes with no known author last whichever
+  the order. `--order asc|desc` turns any round and ties go by id, `--offset N` and
   `--limit N` (1 to 200, 50 by default) pick the page. The database filters, sorts and cuts the page, and leaves the bodies there. A note
   object has `id`, `kind`, `title`, `scope` (`repo` or `global`), `repo` (`host/owner/repo`, a `path:` key whole, or
   `null` for a global note), `place` (`team` or `local`, where it is kept), `tags`, `entities`, `author` (`source` and
@@ -1131,10 +1143,12 @@ object has `scripts` totals instead of `notes`, no `relations` or `entitiesCut`,
 ```
 
 `harness-memory features` lists what this build supports, one per line (`push-json`, `scripts-remote-local`,
-`scripts-hide`, `scripts-push-json`, `settings`, `notes-lang`, `notes-useful` and `embedder` among them), so a tool can
+`scripts-hide`, `scripts-push-json`, `settings`, `notes-lang`, `notes-useful`, `notes-author-filter` and `embedder`
+among them), so a tool can
 check before it asks for them. `settings` is the `settings` command, `notes-lang` the `lang` of a note and the `--lang`
-filter, `notes-useful` the usefulness counters of a note with `--useful` and `--sort useful|lastUseful`, `embedder`
-the `embedder` command.
+filter, `notes-useful` the usefulness counters of a note with `--useful` and `--sort useful|lastUseful`,
+`notes-author-filter` the `--author` and `--author-unknown` filters, `--sort addedBy` and the `authors` of the answer of
+`notes list` and `scripts list`, `embedder` the `embedder` command.
 
 ### Security and backups
 

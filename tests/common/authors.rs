@@ -3,7 +3,8 @@
 //! name) never changes who added it.
 
 use harness_memory::store::{
-    Author, Authors, MemoryStore, NoteKind, NotePatch, Provenance, ScriptDraft, ScriptRef, ScriptStore, Target,
+    Author, Authors, MemoryStore, NoteKind, NoteListQuery, NotePatch, NoteSort, Provenance, ScriptDraft, ScriptRef,
+    ScriptStore, Target,
 };
 use pretty_assertions::assert_eq;
 
@@ -121,4 +122,73 @@ pub fn scripts(store: &mut dyn ScriptStore) {
         .save_script(&repo(REPO), &script("lint", "Lints", "just lint\n"))
         .expect("create");
     assert_eq!(nameless.script.summary.authors, Authors::default());
+}
+
+/// The names a backend test seeds beside the odd ones, which are valid at the limit: 80 letters, 80
+/// four-byte characters and a plain name.
+fn good_names() -> [(&'static str, String); 3] {
+    [
+        ("Good a80", "a".repeat(80)),
+        ("Good emoji80", "\u{1F600}".repeat(80)),
+        ("Good plain", "Ada".to_owned()),
+    ]
+}
+
+/// Saves the notes a backend test then writes odd author names into by hand: the good ones (with
+/// their names) and one note per title of `odd` and of `offpage` (all added by Ada).
+pub fn seed_odd_names(store: &mut dyn MemoryStore, odd: &[&str], offpage: &[&str]) {
+    let named = |title: &str, name: &str| {
+        let mut note = draft(title, "A body", NoteKind::Note);
+        note.provenance = by(Some(Author {
+            name: name.to_owned(),
+            via: None,
+        }));
+        note
+    };
+
+    for (title, name) in good_names() {
+        store.remember(&repo(REPO), &named(title, &name)).expect("good note");
+    }
+
+    for title in odd.iter().chain(offpage) {
+        store.remember(&repo(REPO), &named(title, "Ada")).expect("odd note");
+    }
+}
+
+/// After a backend test wrote odd names (a NUL, a lead byte with continuation bytes, invalid UTF-8,
+/// a name of 80 characters, a space and more, one of 81, an enormous one) into the notes of `odd`
+/// and `offpage` by hand: every such note reads as having no author, in its row and in the facet,
+/// no name of theirs is ever printed, and the names at the limit stay valid. The notes of
+/// `offpage` sort last and stay off the listed page (a libSQL server cannot send text that is not
+/// UTF-8, but counts it).
+pub fn assert_odd_names_are_unknown(store: &mut dyn MemoryStore, odd: &[&str], offpage: &[&str]) {
+    let listed = good_names().len() + odd.len();
+    let query = |limit: usize| NoteListQuery {
+        sort: NoteSort::Title,
+        descending: false,
+        limit,
+        ..super::listing::listing(both(REPO))
+    };
+
+    let page = store.list_notes(&query(listed)).expect("list");
+    assert_eq!(page.total, listed + offpage.len());
+    assert_eq!(page.rows.len(), listed);
+
+    for row in &page.rows {
+        let name = row.authors.added_by.as_ref().map(|author| author.name.as_str());
+
+        match good_names().iter().find(|(title, _)| *title == row.title) {
+            Some((_, wanted)) => assert_eq!(name, Some(wanted.as_str()), "{}", row.title),
+            None => assert_eq!(name, None, "{} reads as nobody", row.title),
+        }
+    }
+
+    // The facet counts the same, also from a page that holds none of the odd notes.
+    for page in [page, store.list_notes(&query(1)).expect("a page off the odd notes")] {
+        let mut wanted: Vec<(String, usize)> = good_names().into_iter().map(|(_, name)| (name, 1)).collect();
+        wanted.sort_by_key(|(name, _)| name.to_ascii_lowercase());
+
+        assert_eq!(page.authors.people(), wanted);
+        assert_eq!(page.authors.unknown(), odd.len() + offpage.len());
+    }
 }

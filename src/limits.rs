@@ -124,6 +124,13 @@ pub const SCRIPT_STDERR_MAX: usize = 8 * 1024;
 /// Size of one team document body (a Harness Desktop hook or routine file), in bytes.
 pub const TEAM_DOC_BODY_MAX: usize = 16 * 1024;
 
+/// The most people a list answers with in its author facet ([`crate::store::AuthorFacet`]).
+pub const AUTHOR_FACET_MAX: usize = 200;
+
+/// The most author groups one place (the local file or the team database) is asked for when a list
+/// counts who added its records.
+pub const AUTHOR_GROUPS_READ_MAX: usize = 1000;
+
 /// Length of a team document's author label, in characters.
 pub const TEAM_DOC_AUTHOR_MAX: usize = 80;
 

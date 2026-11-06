@@ -98,7 +98,8 @@ pub(super) fn author_fields(prefix: &str, author: &(Option<String>, Option<Strin
 /// The author fields a read asks for, each bounded. A document an older server wrote has none, and
 /// reads as no author.
 pub(super) fn author_projection() -> Document {
-    let limit = crate::limits::TEAM_DOC_AUTHOR_MAX;
+    // One character over the limit, so a longer name still reads as too long.
+    let limit = crate::limits::TEAM_DOC_AUTHOR_MAX + 1;
 
     doc! {
         "added_by_name": cut("$added_by_name", limit),

@@ -1,11 +1,14 @@
-//! A page of notes ([`crate::store::listing`]) in the SQLite dialect: two statements, the counts
-//! per kind and scope and the page, then the entity names of the page's notes. `instr`, not
-//! `LIKE`, so `%` and `_` in the text are plain characters. The ids left out
+//! A page of notes ([`crate::store::listing`]) in the SQLite dialect: the counts per kind and
+//! scope, the page, then the entity names of the page's notes and who added the notes. `instr`,
+//! not `LIKE`, so `%` and `_` in the text are plain characters. The ids left out
 //! ([`NoteListQuery::exclude`]) go in as one JSON array read with `json_each`.
 
+use super::authors::added_by_key;
 use super::notes::{VISIBLE, kind_from_sql, note_from_row, row_columns};
 use super::sql::{Sql, Value, args};
 use super::view_params;
+use crate::limits::AUTHOR_GROUPS_READ_MAX;
+use crate::store::author_list::AuthorFacet;
 use crate::store::extensions::Columns;
 use crate::store::listing::{
     LangFilter, NoteListQuery, NotePage, NoteRow, NoteSort, UsefulFilter, direction, excluded_json, page_limit,
@@ -35,11 +38,12 @@ pub(super) fn list(db: &mut dyn Sql, query: &NoteListQuery, columns: Columns) ->
     let counted: Vec<(NoteKind, Scope, usize)> = db
         .query(
             &format!(
-                "SELECT n.kind, n.project_id IS NULL, count(*) FROM notes n WHERE {VISIBLE} AND {KEPT} AND {lang} AND {useful} AND {}
+                "SELECT n.kind, n.project_id IS NULL, count(*) FROM notes n WHERE {VISIBLE} AND {KEPT} AND {lang} AND {useful} AND {} AND {}
                  GROUP BY n.kind, n.project_id IS NULL",
-                not_excluded(5)
+                not_excluded(5),
+                query.author.condition(&added_by_key("n"), "?6", columns.authors)
             ),
-            args![text, repo, global, entity.as_deref(), exclude.as_str()],
+            args![text, repo, global, entity.as_deref(), exclude.as_str(), query.author.name()],
         )?
         .iter()
         .map(|row| {
@@ -52,6 +56,7 @@ pub(super) fn list(db: &mut dyn Sql, query: &NoteListQuery, columns: Columns) ->
         .collect::<Result<_, StoreError>>()?;
 
     let dir = direction(query);
+    let added_by = added_by_key("n");
     let order = match query.sort {
         NoteSort::Updated => format!("n.updated_at {dir}, n.id {dir}"),
         NoteSort::Title => format!("n.title_norm {dir}, n.id {dir}"),
@@ -62,13 +67,18 @@ pub(super) fn list(db: &mut dyn Sql, query: &NoteListQuery, columns: Columns) ->
         NoteSort::Useful | NoteSort::LastUseful if !columns.usage => format!("n.id {dir}"),
         NoteSort::Useful => format!("coalesce(n.useful, 0) {dir}, n.id {dir}"),
         NoteSort::LastUseful => format!("coalesce(n.last_useful_at, 0) {dir}, n.id {dir}"),
+        // Without the author columns nobody has a name, so only the id orders them. The notes
+        // without a name come last whichever the direction.
+        NoteSort::AddedBy if !columns.authors => format!("n.id {dir}"),
+        NoteSort::AddedBy => format!("({added_by} IS NULL) ASC, lower({added_by}) {dir}, n.id {dir}"),
     };
     let sql = format!(
         "SELECT {} FROM notes n LEFT JOIN projects p ON p.id = n.project_id
-         WHERE {VISIBLE} AND {KEPT} AND {lang} AND {useful} AND (?5 IS NULL OR n.kind = ?5) AND {}
+         WHERE {VISIBLE} AND {KEPT} AND {lang} AND {useful} AND (?5 IS NULL OR n.kind = ?5) AND {} AND {}
          ORDER BY {order} LIMIT ?6 OFFSET ?7",
         row_columns(columns),
-        not_excluded(8)
+        not_excluded(8),
+        query.author.condition(&added_by_key("n"), "?9", columns.authors)
     );
 
     let limit = i64::try_from(page_limit(query)).unwrap_or(1);
@@ -87,7 +97,8 @@ pub(super) fn list(db: &mut dyn Sql, query: &NoteListQuery, columns: Columns) ->
                 kind,
                 limit,
                 offset,
-                exclude.as_str()
+                exclude.as_str(),
+                query.author.name()
             ],
         )?
         .iter()
@@ -95,7 +106,77 @@ pub(super) fn list(db: &mut dyn Sql, query: &NoteListQuery, columns: Columns) ->
         .collect::<Result<_, StoreError>>()?;
 
     fill_entities(db, &mut rows)?;
-    Ok(NotePage::new(counted, query, rows))
+    let authors = if query.want_authors {
+        author_facet(
+            db,
+            &sql_facet(columns, &lang, &useful),
+            args![text, repo, global, entity.as_deref(), kind, exclude.as_str()],
+        )?
+    } else {
+        AuthorFacet::default()
+    };
+
+    Ok(NotePage::new(counted, query, rows).with_authors(authors))
+}
+
+/// The statement that counts who added the notes every filter but the author keeps (the page's
+/// filters, without its order and its cut), the unknown first and then the most notes first. The
+/// parameters are those of the page up to the kind (`?5`), then the notes left out (`?6`).
+///
+/// The name is computed in a subquery that SQLite cannot fold into the outer one (`LIMIT -1`), so
+/// the grouping sorts only the name, never the whole column, and it comes back as hex: whatever a
+/// database written by hand holds, the reply is plain ASCII, and [`author_facet`] decodes it.
+fn sql_facet(columns: Columns, lang: &str, useful: &str) -> String {
+    let key = if columns.authors {
+        added_by_key("n")
+    } else {
+        "NULL".to_owned()
+    };
+
+    format!(
+        "SELECT hex(CAST(k AS BLOB)), count(*) FROM (
+             SELECT {key} AS k FROM notes n
+             WHERE {VISIBLE} AND {KEPT} AND {lang} AND {useful} AND (?5 IS NULL OR n.kind = ?5) AND {}
+             LIMIT -1)
+         GROUP BY k ORDER BY (k IS NULL) DESC, count(*) DESC, k LIMIT {AUTHOR_GROUPS_READ_MAX}",
+        not_excluded(6)
+    )
+}
+
+/// Who added the notes `sql` ([`sql_facet`]) counts. A name that is not valid UTF-8 counts as
+/// unknown.
+fn author_facet(db: &mut dyn Sql, sql: &str, args: &[Value]) -> Result<AuthorFacet, StoreError> {
+    let groups: Vec<(Option<String>, usize)> = db
+        .query(sql, args)?
+        .iter()
+        .map(|row| {
+            let hex: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+
+            Ok((from_hex(&hex), usize::try_from(count).unwrap_or(0)))
+        })
+        .collect::<Result<_, StoreError>>()?;
+
+    Ok(AuthorFacet::from_groups(groups))
+}
+
+/// The text the hex digits `hex` spell; `None` for none, an odd or bad hex, or bytes that are not
+/// UTF-8.
+fn from_hex(hex: &str) -> Option<String> {
+    if hex.is_empty() || !hex.len().is_multiple_of(2) {
+        return None;
+    }
+
+    let bytes: Option<Vec<u8>> = hex
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let digits = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(digits, 16).ok()
+        })
+        .collect();
+
+    String::from_utf8(bytes?).ok()
 }
 
 /// Sets the entity names of `rows` (alphabetically, as a note's), in one statement.

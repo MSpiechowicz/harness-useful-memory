@@ -1,19 +1,24 @@
 //! Notes page by page, for a person browsing them ([`MemoryStore::list_notes`]): filtered by a
-//! substring, a kind, a scope, a place and a linked entity, sorted by the time of the latest
-//! write, title, kind, scope or place ([`NoteSort`]), counted per kind, per scope and per place.
+//! substring, a kind, a scope, a place, a linked entity and the person who added them
+//! ([`AuthorFilter`]), sorted by the time of the latest write, title, kind, scope, place or that
+//! person ([`NoteSort`]), counted per kind, per scope and per place.
 //!
 //! The backends filter, sort, count and cut the page in the database and leave the bodies there.
-//! They count the notes the text and the entity keep per kind and scope ([`NotePage::new`] makes
-//! the counts of the page from those), and list the page of the view narrowed to the scope asked
-//! for ([`scoped`]). A backend keeps every note in one place and does not know which: the place is
-//! filtered and counted above it, by [`crate::store::SplitStore`] (which reads only the store of
-//! the place asked for) or by the caller of a lone store ([`NotePage::kept_in`]).
+//! They count the notes the text, the entity and the author keep per kind and scope
+//! ([`NotePage::new`] makes the counts of the page from those), count who added the notes every
+//! filter but the author keeps ([`NotePage::authors`]), and list the page of the view narrowed to
+//! the scope asked for ([`scoped`]). A backend keeps every note in one place and does not know
+//! which: the place is filtered and counted above it, by [`crate::store::SplitStore`] (which reads
+//! only the store of the place asked for) or by the caller of a lone store
+//! ([`NotePage::kept_in`]).
 //! The text matches the title, the body or the tags as a substring, ignoring case as the database
 //! folds it: the SQLite-dialect stores fold ASCII letters only (SQLite's `lower()`), PostgreSQL
 //! and MongoDB fold every letter. A sort by title compares the normalized titles
 //! ([`clean::normalize`]) byte by byte, a sort by kind the stored kind names (`decision` before
 //! `fix`), a sort by usefulness the number of times agents found the note useful (a note without
-//! counters counts as 0); every sort breaks ties by note id in the same direction.
+//! counters counts as 0), a sort by the person who added the note their git names with ASCII
+//! letters folded, notes without a known name last in both directions; every sort breaks ties by
+//! note id in the same direction.
 //!
 //! [`MemoryStore::list_notes`]: crate::store::MemoryStore::list_notes
 
@@ -21,6 +26,7 @@ use std::cmp::Ordering;
 
 use crate::backend::Place;
 use crate::limits::{HIDDEN_MAX, LIST_PAGE_MAX, QUERY_MAX};
+use crate::store::author_list::{AuthorFacet, AuthorFilter, fold, name_of};
 use crate::store::{Authors, Note, NoteKind, NoteUsage, Provenance, Scope, StoreError, View, clean};
 use crate::support::lang::Lang;
 
@@ -152,6 +158,12 @@ pub struct NoteListQuery {
     /// Keeps the notes agents found useful, or never useful (see [`UsefulFilter`]); `None` keeps
     /// every note. It narrows the page and every count.
     pub useful: Option<UsefulFilter>,
+    /// Keeps the notes added by one person, or by nobody known (see [`AuthorFilter`]). It narrows
+    /// the page and the counts, but not [`NotePage::authors`].
+    pub author: AuthorFilter,
+    /// Asks for [`NotePage::authors`]. It costs a query over every note the filters keep, so only
+    /// a list a person browses asks; without it the facet is empty.
+    pub want_authors: bool,
     pub sort: NoteSort,
     pub descending: bool,
     /// Rows skipped before the page.
@@ -182,6 +194,9 @@ pub enum NoteSort {
     Useful,
     /// By the time an agent last found the note useful.
     LastUseful,
+    /// By the git name of the person who added the note, the notes without a known name last
+    /// whichever the direction.
+    AddedBy,
 }
 
 /// A listed note: a [`Note`] without its body.
@@ -247,6 +262,10 @@ pub struct NotePage {
     /// database), whatever the place asked for; empty from a store over one database, which does
     /// not know where it is kept (see [`Self::kept_in`]).
     pub places: Vec<(Place, usize)>,
+    /// Who added the notes every filter but the author keeps. A backend reads at most
+    /// [`crate::limits::AUTHOR_GROUPS_READ_MAX`] people, the most notes first, and the caller caps
+    /// them ([`AuthorFacet::capped`]).
+    pub authors: AuthorFacet,
     pub rows: Vec<NoteRow>,
     /// The notes the text keeps, per kind and scope: what the counts above come from (a
     /// [`crate::store::SplitStore`] adds those of its two stores).
@@ -297,9 +316,15 @@ impl NotePage {
             kinds,
             scopes,
             places: Vec::new(),
+            authors: AuthorFacet::default(),
             rows,
             counted: cells,
         }
+    }
+
+    /// This page with who added its notes `authors`.
+    pub(crate) fn with_authors(self, authors: AuthorFacet) -> Self {
+        Self { authors, ..self }
     }
 
     /// This page of a store that keeps every note in `place`, for `query`: what it counts is kept
@@ -406,6 +431,15 @@ pub(crate) fn compare(query: &NoteListQuery, a: &NoteRow, b: &NoteRow) -> Orderi
         NoteSort::Place => Ordering::Equal,
         NoteSort::Useful => useful_of(a).cmp(&useful_of(b)),
         NoteSort::LastUseful => last_useful_of(a).cmp(&last_useful_of(b)),
+        NoteSort::AddedBy => match (
+            name_of(a.authors.added_by.as_ref()),
+            name_of(b.authors.added_by.as_ref()),
+        ) {
+            (Some(a_name), Some(b_name)) => fold(a_name).cmp(&fold(b_name)),
+            (Some(_), None) => return Ordering::Less,
+            (None, Some(_)) => return Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        },
     }
     .then(a.id.cmp(&b.id));
 

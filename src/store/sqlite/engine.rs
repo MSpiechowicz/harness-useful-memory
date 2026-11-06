@@ -319,7 +319,7 @@ mod tests {
     use super::super::schema::{V1, V2, V3, V4, V5};
     use super::*;
     use crate::store::recheck::AUTHORS_RECHECK;
-    use crate::store::{Author, Authors, NoteKind, NoteSort, Provenance, UsefulFilter};
+    use crate::store::{Author, AuthorFilter, Authors, NoteKind, NoteSort, Provenance, UsefulFilter};
     use crate::support::lang::Lang;
 
     /// A database a role without the right to change the schema reads: the write fails.
@@ -572,12 +572,141 @@ mod tests {
             entity: None,
             lang: None,
             useful: None,
+            author: AuthorFilter::Any,
+            want_authors: true,
             sort: NoteSort::Updated,
             descending: true,
             offset: 0,
             limit: 50,
             exclude: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_role_without_the_author_columns_knows_no_author() {
+        let mut role = without_authors();
+        role.installed = install(&mut role, Patience::Wait);
+        role.conn
+            .execute_batch(
+                "INSERT INTO notes (kind, title, title_norm, body, created_at, updated_at, lang)
+                 VALUES ('note', 'Second', 'second', 'The second note', 2, 2, 'en');",
+            )
+            .expect("another note");
+
+        let ids = |page: &NotePage| page.rows.iter().map(|row| row.id).collect::<Vec<_>>();
+
+        // A name keeps nothing, unknown keeps everything.
+        let named = list_notes(
+            &mut role,
+            &NoteListQuery {
+                author: AuthorFilter::Named("Ada".to_owned()),
+                ..everything()
+            },
+        )
+        .expect("list");
+        assert_eq!((named.total, named.rows.len()), (0, 0));
+        assert_eq!(named.kinds.iter().map(|(_, count)| count).sum::<usize>(), 0);
+
+        let unknown = list_notes(
+            &mut role,
+            &NoteListQuery {
+                author: AuthorFilter::Unknown,
+                ..everything()
+            },
+        )
+        .expect("list");
+        assert_eq!((unknown.total, unknown.rows.len()), (2, 2));
+
+        // The facet is all unknown, and the sort falls back to ids both ways.
+        assert_eq!((unknown.authors.people(), unknown.authors.unknown()), (Vec::new(), 2));
+
+        for (descending, expected) in [(false, vec![1, 2]), (true, vec![2, 1])] {
+            let sorted = list_notes(
+                &mut role,
+                &NoteListQuery {
+                    sort: NoteSort::AddedBy,
+                    descending,
+                    ..everything()
+                },
+            )
+            .expect("list");
+            assert_eq!(ids(&sorted), expected, "descending {descending}");
+        }
+    }
+
+    #[test]
+    fn a_name_nobody_could_have_written_is_counted_as_unknown_and_never_listed() {
+        let conn = Connection::open_in_memory().expect("memory database");
+
+        for sql in [V1, V2, V3, V4, V5] {
+            conn.execute_batch(sql).expect("schema");
+        }
+
+        schema::ensure_extensions(&mut Local(&conn)).expect("extensions");
+
+        // A database written by hand: a name with a control character, one with hidden
+        // characters, a blank, one too long, one with spaces around it and no name at all.
+        let names: [Option<String>; 7] = [
+            Some("Ada".to_owned()),
+            Some("Bad\u{7}name".to_owned()),
+            Some("Zero\u{200b}width".to_owned()),
+            Some(String::new()),
+            Some("x".repeat(500)),
+            Some(" padded ".to_owned()),
+            None,
+        ];
+
+        for (index, name) in names.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO notes (kind, title, title_norm, body, created_at, updated_at, lang, added_by_name)
+                 VALUES ('note', ?1, ?1, 'A body', 1, 1, 'en', ?2)",
+                rusqlite::params![format!("Note {index}"), name],
+            )
+            .expect("note");
+        }
+
+        let mut role = ReadOnlyRole {
+            conn,
+            installed: Installed {
+                extensions: true,
+                usage: true,
+                authors: true,
+            },
+            recheck: Recheck::every(AUTHORS_RECHECK),
+        };
+
+        let page = list_notes(&mut role, &everything()).expect("list");
+        assert_eq!(page.total, 7);
+        assert_eq!(page.authors.people(), vec![("Ada".to_owned(), 1)]);
+        assert_eq!(page.authors.unknown(), 6, "only a valid name is listed");
+
+        // A row reads back with no author when its name is not usable, and with Ada's when it is.
+        let shown: Vec<&str> = page
+            .rows
+            .iter()
+            .filter(|row| row.authors.added_by.is_some())
+            .map(|row| row.title.as_str())
+            .collect();
+        assert_eq!(
+            shown,
+            ["Note 5", "Note 0"],
+            "a name with spaces around it is trimmed when read"
+        );
+
+        let sorted = list_notes(
+            &mut role,
+            &NoteListQuery {
+                sort: NoteSort::AddedBy,
+                descending: false,
+                ..everything()
+            },
+        )
+        .expect("list");
+        assert_eq!(
+            sorted.rows.last().map(|row| row.title.as_str()),
+            Some("Note 6"),
+            "nobody last"
+        );
     }
 
     #[test]

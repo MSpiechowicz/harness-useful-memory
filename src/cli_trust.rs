@@ -6,25 +6,34 @@
 //! team script hidden on this computer (see [`crate::store::SplitScripts`]).
 //!
 //! - `harness-memory scripts list --json [--project PATH | --repo KEY | --all-repos] [--group needsReview|repo|global]
-//!   [--scope repo|global] [--place local|team] [--review needed|trusted] [--query TEXT]
-//!   [--sort name|language|scope|place|runs|lastRun|updated] [--order asc|desc] [--offset N]
+//!   [--scope repo|global] [--place local|team] [--review needed|trusted] [--author NAME |
+//!   --author-unknown] [--query TEXT]
+//!   [--sort name|language|scope|place|runs|lastRun|updated|addedBy] [--order asc|desc] [--offset N]
 //!   [--limit N] [--hidden]` prints `{"total": N, "groups": {"needsReview": N, "repo": N,
 //!   "global": N}, "scopes": {"repo": N, "global": N}, "review": {"needed": N, "trusted": N},
-//!   "places": {"local": N, "team": N}, "scripts": [...]}`: one page of the visible scripts as the
+//!   "places": {"local": N, "team": N}, "authors": {"people": [{"name", "count"}], "unknown": N},
+//!   "scripts": [...]}`: one page of the visible scripts as the
 //!   objects `script_list` returns (`place` per script, `team` or `local`; `readOnly` for a team
 //!   script while scripts are `remote+local`; `hidden`). The groups do not overlap: `needsReview` holds every script that
 //!   needs approval, `repo` and `global` the others of their scope. `--scope` keeps the scripts of
 //!   one scope, `--review needed` those that need approval (the `needsReview` group),
 //!   `--review trusted` every other one; the two combine, and neither combines with `--group`.
 //!   `--place` keeps the scripts kept in one place (`local`: this computer's file, `team`: the
-//!   team database) and combines with every other filter. `--query` keeps the scripts whose name
+//!   team database) and combines with every other filter. `--author` keeps the scripts one person
+//!   added (the git `user.name`, matched exactly, case-sensitive, whatever client the write went
+//!   through), `--author-unknown` those with no known author (not together, a blank or invalid
+//!   name is a usage error). `--query` keeps the scripts whose name
 //!   or description contains it, ignoring case (as `script_list` does). The group counts follow
-//!   `--query` and `--place`, the scope counts `--query`, `--review` and `--place`, the review
-//!   counts `--query`, `--scope` and `--place`, the place counts every filter but `--place`, the
-//!   total every filter. By name (ties: repository scripts first, then this computer's) ascending
+//!   `--query`, `--author` and `--place`, the scope counts `--query`, `--review`, `--author` and
+//!   `--place`, the review counts `--query`, `--scope`, `--author` and `--place`, the place counts
+//!   every filter but `--place`, the total every filter. `authors` counts who added the scripts
+//!   every filter but the author keeps: the people with the most scripts first (then by name, ASCII
+//!   letters folded), at most 200, the `--author` one always among them (with the `total` when it
+//!   is not among the most), and `unknown` for the scripts with no known author. By name (ties: repository scripts first, then this computer's) ascending
 //!   unless `--sort updated` (newest first), `language`, `scope` (global scripts first), `place`
-//!   (this computer's first, then by id), `runs` (the run count) or `lastRun` (the latest run; a
-//!   script never run comes last either way), all ascending; `--order` turns any round, ties go by id. `--limit` is 1 to 200, 50 when
+//!   (this computer's first, then by id), `runs` (the run count), `lastRun` (the latest run; a
+//!   script never run comes last either way) or `addedBy` (the git name of who added it, ASCII
+//!   letters folded; a script with no known author comes last either way), all ascending; `--order` turns any round, ties go by id. `--limit` is 1 to 200, 50 when
 //!   not given; `--untrusted` is `--group needsReview`. Approval is decided on this machine, so
 //!   every visible script is read and the page is cut here, not in the database. With a team
 //!   database the object also has `hiddenCount` (the team scripts of the view hidden on this
@@ -81,8 +90,8 @@ use crate::store::{foreign_encoding, foreign_encoding_error, hidden_character, h
 
 /// The usage of these commands, for the executable's usage line.
 pub const USAGE: &str = "scripts list --json [--project PATH | --repo KEY | --all-repos] [--group needsReview|repo|global] [--scope \
-                         repo|global] [--place local|team] [--review needed|trusted] [--query TEXT] [--sort \
-                         name|language|scope|place|runs|lastRun|updated] [--order asc|desc] [--offset N] [--limit N] \
+                         repo|global] [--place local|team] [--review needed|trusted] [--author NAME | --author-unknown] [--query TEXT] [--sort \
+                         name|language|scope|place|runs|lastRun|updated|addedBy] [--order asc|desc] [--offset N] [--limit N] \
                          [--hidden] | scripts repos --json | scripts get <id> --json [--project PATH | --repo KEY | --all-repos] [--hidden] | scripts hide <id> \
                          [--project PATH | --repo KEY | --all-repos] [--json] | scripts unhide <id> [--project PATH | --repo KEY | --all-repos] [--json] | scripts delete \
                          <id> [--project PATH | --repo KEY | --all-repos] | scripts delete --all --yes [--project PATH | --repo KEY] [--json] | scripts \

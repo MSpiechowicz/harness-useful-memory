@@ -793,3 +793,27 @@ fn a_skipping_store_that_missed_the_author_columns_names_its_writer_once_they_ca
         Some("Alice".to_owned())
     );
 }
+
+#[test]
+fn odd_author_names_read_as_nobody() {
+    let _serial = serial();
+    let Some(db) = database() else { return };
+    let mut store = open(&db);
+
+    // PostgreSQL text holds no NUL and no invalid UTF-8: the names too long to be valid remain.
+    let odd = ["Odd spaced", "Odd 81", "Odd huge"];
+    common::authors::seed_odd_names(&mut store, &odd, &[]);
+
+    let mut admin = db.admin();
+    for (title, name) in [
+        ("Odd spaced", format!("{} {}", "b".repeat(80), "y".repeat(1000))),
+        ("Odd 81", "a".repeat(81)),
+        ("Odd huge", "x".repeat(5000)),
+    ] {
+        admin
+            .execute("UPDATE notes SET added_by_name = $1 WHERE title = $2", &[&name, &title])
+            .expect("a name by hand");
+    }
+
+    common::authors::assert_odd_names_are_unknown(&mut store, &odd, &[]);
+}

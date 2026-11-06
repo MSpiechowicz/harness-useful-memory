@@ -7,11 +7,12 @@ use serde_json::{Value, json};
 
 use super::{Opened, hidden};
 use crate::backend::Place;
-use crate::cli::{Args, PAGE_OPTIONS, PICK_VALUED, Page, Repos};
+use crate::cli::{self, AUTHOR_FLAG, AUTHOR_VALUED, Args, PAGE_OPTIONS, PICK_VALUED, Page, Repos};
 use crate::cli_trust::usage;
 use crate::limits::QUERY_MAX;
 use crate::mcp::{Approval, place_label};
-use crate::store::{Scope, ScriptSummary};
+use crate::store::author_list::{fold, name_of};
+use crate::store::{AuthorFacet, AuthorFilter, Scope, ScriptSummary};
 
 /// `scripts list`.
 pub(crate) fn list(args: &[Option<&str>]) -> ExitCode {
@@ -50,14 +51,25 @@ pub(crate) fn list(args: &[Option<&str>]) -> ExitCode {
             .filter(|(summary, approval)| keeps(summary, *approval))
             .count()
     };
-    let in_group =
-        |group: Group| count(&|summary, approval| Group::of(summary, approval) == group && place_keeps(summary));
+    let in_group = |group: Group| {
+        count(&|summary, approval| {
+            Group::of(summary, approval) == group && options.author_keeps(summary) && place_keeps(summary)
+        })
+    };
     let in_scope = |scope: Scope| {
-        count(&|summary, approval| summary.scope == scope && options.review_keeps(approval) && place_keeps(summary))
+        count(&|summary, approval| {
+            summary.scope == scope
+                && options.review_keeps(approval)
+                && options.author_keeps(summary)
+                && place_keeps(summary)
+        })
     };
     let in_review = |review: Review| {
         count(&|summary, approval| {
-            Review::of(approval) == review && options.scope_keeps(summary) && place_keeps(summary)
+            Review::of(approval) == review
+                && options.scope_keeps(summary)
+                && options.author_keeps(summary)
+                && place_keeps(summary)
         })
     };
     let in_place =
@@ -81,6 +93,14 @@ pub(crate) fn list(args: &[Option<&str>]) -> ExitCode {
         place_label(Place::Remote): in_place(Place::Remote),
     });
 
+    // Who added the scripts every filter but the author keeps.
+    let facet = AuthorFacet::of_records(
+        listed
+            .iter()
+            .filter(|(summary, approval)| options.keeps_but_author(summary, *approval) && place_keeps(summary))
+            .map(|(summary, _)| summary.authors.added_by.as_ref()),
+    );
+
     listed.retain(|(summary, approval)| options.keeps(summary, *approval) && place_keeps(summary));
     listed.sort_by(|(a, _), (b, _)| options.compare(a, b, |summary| place_of(summary) == Place::Local));
 
@@ -97,6 +117,7 @@ pub(crate) fn list(args: &[Option<&str>]) -> ExitCode {
         "scopes": scopes,
         "review": review,
         "places": places,
+        "authors": cli::authors_json(&facet, options.author.name(), listed.len()),
         "scripts": objects,
     });
 
@@ -140,6 +161,8 @@ pub(crate) struct ListOptions {
     review: Option<Review>,
     /// `--place`: the scripts kept on this computer or in the team database.
     place: Option<Place>,
+    /// `--author` or `--author-unknown`: the scripts added by one person, or by nobody known.
+    author: AuthorFilter,
     /// `--hidden`: the hidden team scripts instead of the visible ones.
     hidden: bool,
     repos: Repos,
@@ -149,11 +172,21 @@ pub(crate) struct ListOptions {
 }
 
 impl ListOptions {
-    /// True when the group, the scope and the review asked for keep the script.
+    /// True when the group, the scope, the review and the author asked for keep the script.
     fn keeps(&self, summary: &ScriptSummary, approval: Approval) -> bool {
+        self.keeps_but_author(summary, approval) && self.author_keeps(summary)
+    }
+
+    /// True when the group, the scope and the review asked for keep the script.
+    fn keeps_but_author(&self, summary: &ScriptSummary, approval: Approval) -> bool {
         let in_group = self.group.is_none_or(|group| Group::of(summary, approval) == group);
 
         in_group && self.scope_keeps(summary) && self.review_keeps(approval)
+    }
+
+    /// True when the author asked for (if any) keeps the script.
+    fn author_keeps(&self, summary: &ScriptSummary) -> bool {
+        self.author.keeps(&summary.authors)
     }
 
     /// True when the scope asked for (if any) keeps the script.
@@ -167,8 +200,9 @@ impl ListOptions {
     }
 
     /// The order of the list: by [`Self::sort`], then by id, turned round when descending; a
-    /// script never run comes after the others by `lastRun` either way. `local` says whether a
-    /// listed script is kept on this computer.
+    /// script never run comes after the others by `lastRun` either way, and one without a known
+    /// author after the others by `addedBy`. `local` says whether a listed script is kept on this
+    /// computer.
     fn compare(&self, a: &ScriptSummary, b: &ScriptSummary, local: impl Fn(&ScriptSummary) -> bool) -> Ordering {
         let is_repo = |summary: &ScriptSummary| summary.scope == Scope::Repo;
 
@@ -189,6 +223,15 @@ impl ListOptions {
                 (None, None) => Ordering::Equal,
             },
             ScriptSort::Updated => a.updated_at.cmp(&b.updated_at),
+            ScriptSort::AddedBy => match (
+                name_of(a.authors.added_by.as_ref()),
+                name_of(b.authors.added_by.as_ref()),
+            ) {
+                (Some(a_name), Some(b_name)) => fold(a_name).cmp(&fold(b_name)),
+                (Some(_), None) => return Ordering::Less,
+                (None, Some(_)) => return Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
         }
         .then(a.id.cmp(&b.id));
 
@@ -210,6 +253,7 @@ enum ScriptSort {
     Runs,
     LastRun,
     Updated,
+    AddedBy,
 }
 
 impl ScriptSort {
@@ -222,6 +266,7 @@ impl ScriptSort {
             "runs" => Some(Self::Runs),
             "lastRun" => Some(Self::LastRun),
             "updated" => Some(Self::Updated),
+            "addedBy" => Some(Self::AddedBy),
             _ => None,
         }
     }
@@ -289,10 +334,14 @@ fn parse_list(args: &[Option<&str>]) -> Option<ListOptions> {
     let valued = [
         &PAGE_OPTIONS[..],
         &PICK_VALUED[..],
-        &["--group", "--scope", "--place", "--review", "--sort"],
+        &["--group", "--scope", "--place", "--review", "--sort", AUTHOR_VALUED],
     ]
     .concat();
-    let parsed = Args::parse(args, &["--json", "--untrusted", "--hidden", "--all-repos"], &valued)?;
+    let parsed = Args::parse(
+        args,
+        &["--json", "--untrusted", "--hidden", "--all-repos", AUTHOR_FLAG],
+        &valued,
+    )?;
 
     if parsed.positional != ["list"] || !parsed.flag("--json") {
         return None;
@@ -327,6 +376,7 @@ fn parse_list(args: &[Option<&str>]) -> Option<ListOptions> {
         scope,
         review,
         place: parsed.place().ok()?,
+        author: parsed.author().ok()?,
         hidden: parsed.flag("--hidden"),
         repos: parsed.repos().ok()?,
         sort,
@@ -356,6 +406,7 @@ mod tests {
             ("place", ScriptSort::Place),
             ("runs", ScriptSort::Runs),
             ("lastRun", ScriptSort::LastRun),
+            ("addedBy", ScriptSort::AddedBy),
         ] {
             let parsed = parse_list(&args(&["list", "--json", "--sort", raw])).expect("valid");
             assert_eq!((parsed.sort, parsed.descending), (sort, false), "{raw}");
@@ -381,6 +432,18 @@ mod tests {
             (Some(Group::NeedsReview), Some(Place::Remote), true),
             "a place combines with a group"
         );
+
+        assert_eq!(filtered.author, AuthorFilter::Any);
+
+        let named = parse_list(&args(&["list", "--json", "--author", " Ada ", "--untrusted"])).expect("valid");
+        assert_eq!(
+            (named.author, named.group),
+            (AuthorFilter::Named("Ada".to_owned()), Some(Group::NeedsReview)),
+            "an author combines with a group"
+        );
+
+        let nobody = parse_list(&args(&["list", "--json", "--author-unknown", "--scope", "repo"])).expect("valid");
+        assert_eq!(nobody.author, AuthorFilter::Unknown);
 
         let updated = parse_list(&args(&["list", "--json", "--group", "repo", "--sort", "updated"])).expect("valid");
         assert_eq!(
@@ -430,6 +493,14 @@ mod tests {
             &["list", "--json", "--place", ""],
             &["list", "--json", "--place"],
             &["list", "--json", "--place", "local", "--place", "team"],
+            &["list", "--json", "--author", ""],
+            &["list", "--json", "--author", "   "],
+            &["list", "--json", "--author", "Ada\tLovelace"],
+            &["list", "--json", "--author"],
+            &["list", "--json", "--author", "Ada", "--author", "Grace"],
+            &["list", "--json", "--author", "Ada", "--author-unknown"],
+            &["list", "--json", "--author-unknown", "--author-unknown"],
+            &["list", "--json", "--sort", "added"],
         ] {
             assert!(parse_list(&args(bad)).is_none(), "{bad:?}");
         }
