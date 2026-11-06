@@ -55,7 +55,7 @@ fn resolve(server: &mut Server, project_path: Option<&str>) -> Result<Option<Pro
     server.projects.resolve(project_path).map_err(|reason| {
         format!(
             "{reason} (got {:?}). Pass project_path as the absolute path of the repository you are working in \
-             (its git root, e.g. \"/Users/me/work/repo\"), or use scope \"global\"",
+             (its git root, e.g. \"/Users/me/work/repo\"), or use scope \"global\", and call the tool again.",
             project_path.unwrap_or_default()
         )
     })

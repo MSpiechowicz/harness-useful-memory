@@ -31,7 +31,7 @@ lists, prefer script_run. Save a repeated deterministic action with script_save 
 script_delete stale ones. You cannot approve scripts: if script_run refuses, ask the user to approve it in \
 Harness Desktop → Memory, retry once approved, never re-save its code.
 - Reads say if the user turned saving off, paused it or reviews saves. A write held or refused by a \
-user setting is final: never retry.";
+user setting is final: never retry. A call refused for its arguments is not: fix them and call the tool again.";
 
 /// Added to `note_save` and `note_update` while the English notes setting is on (see
 /// [`crate::store::MemoryStore::english_notes`]).

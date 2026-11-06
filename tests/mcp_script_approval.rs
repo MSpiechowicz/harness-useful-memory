@@ -74,6 +74,7 @@ fn no_sequence_of_agent_calls_runs_an_unapproved_script() {
             "{}",
             text(&reply)
         );
+        assert!(text(&reply).contains("call the tool again"), "{}", text(&reply));
     }
 
     for (name, arguments) in [
