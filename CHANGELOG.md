@@ -1,3 +1,10 @@
+## [3.3.1](https://github.com/MSpiechowicz/harness-useful-memory/compare/v3.3.0...v3.3.1) (2026-11-06)
+
+
+### Bug Fixes
+
+* **mcp:** say in the note_get description that it takes a list of ids ([5827f20](https://github.com/MSpiechowicz/harness-useful-memory/commit/5827f2090e4f80bd5ed1bdebe1f044835a69dd7d))
+
 # [3.3.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v3.2.3...v3.3.0) (2026-11-06)
 
 
