@@ -179,7 +179,7 @@ fn note_search() -> Value {
 fn note_get() -> Value {
     tool(
         "note_get",
-        "Read whole notes by id.",
+        "Read whole notes by a list of ids: ids: [12, 15], a list even for one note.",
         json!({
             "ids": {
                 "type": "array",

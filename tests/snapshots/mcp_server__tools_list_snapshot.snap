@@ -197,7 +197,7 @@ expression: "replies[0][\"result\"]"
     },
     {
       "name": "note_get",
-      "description": "Read whole notes by id.",
+      "description": "Read whole notes by a list of ids: ids: [12, 15], a list even for one note.",
       "inputSchema": {
         "type": "object",
         "properties": {
