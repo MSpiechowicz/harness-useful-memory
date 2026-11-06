@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "harness_memory"
-version = "3.2.3"
+version = "3.3.0"
 dependencies = [
  "ctrlc",
  "dunce",

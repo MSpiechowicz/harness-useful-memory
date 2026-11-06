@@ -1,3 +1,10 @@
+# [3.3.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v3.2.3...v3.3.0) (2026-11-06)
+
+
+### Features
+
+* **notes:** filter and sort notes and scripts by who added them ([b6e4031](https://github.com/MSpiechowicz/harness-useful-memory/commit/b6e403163aa2519d8e496b112bba00a12eac100b))
+
 ## [3.2.3](https://github.com/MSpiechowicz/harness-useful-memory/compare/v3.2.2...v3.2.3) (2026-11-06)
 
 
