@@ -199,7 +199,7 @@ fn reads_say_when_saving_their_kind_is_off_for_the_repository_and_writes_are_ref
         guarded.global(&kind.global(false, std::slice::from_ref(&root)));
         let words = kind.word();
         let line = format!(
-            "Saving {words} is off for this project (the user's setting). Reading works. Do not try to save {words}."
+            "Saving {words} is off for this project. The user can turn it on in Harness Desktop. Reading works. Do not try to save {words}."
         );
 
         // The server started in the repository, and the repository named as the chat's root from

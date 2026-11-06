@@ -96,10 +96,19 @@ pub struct HeldItem {
     pub client: String,
     pub kind: HeldKind,
     pub tool: HeldTool,
-    /// The folder the call was about: its `project_path`, else the server's working folder.
+    /// The folder the call was about, canonical: its `project_path` when that resolved, else the
+    /// server's working folder (the root the guard checked). `held save` saves from this folder.
     pub project_path: Option<String>,
     /// The chat's repository (a canonical git root), when there is one.
     pub repo_root: Option<String>,
+    /// The canonical root of the project the guard checked when the call was held, `Some(None)`
+    /// for a folder that is no project (the home folder), which `held save` compares nothing for.
+    /// `held save` refuses with `changed` when `project_path` leads somewhere else by then (a
+    /// folder replaced by a link). Items held before this field existed have none (`None`) and are
+    /// checked against [`Self::repo_root`]. It is no part of the [`Self::digest`], like
+    /// [`Self::author`].
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<Option<String>>,
     /// Who the save is for (the git name of the person and the client), when it was held: saving it
     /// records this author, not the one of whoever saves it. Items held before this field existed
     /// have none and a missing one is left out of the file. It is no part of the [`Self::digest`]
@@ -129,6 +138,7 @@ impl HeldItem {
             tool,
             project_path: None,
             repo_root: None,
+            project_root: None,
             author: None,
             arguments,
             current,
@@ -137,13 +147,14 @@ impl HeldItem {
     }
 
     /// The lowercase hex SHA-256 of the item's canonical JSON (keys sorted, no blanks) without
-    /// its `revision` and its `author`, which older versions did not know.
+    /// its `revision`, its `author` and its `projectRoot`, which older versions did not know.
     pub fn digest(&self) -> String {
         let mut value = serde_json::to_value(self).unwrap_or(Value::Null);
 
         if let Value::Object(fields) = &mut value {
             fields.remove("revision");
             fields.remove("author");
+            fields.remove("projectRoot");
         }
 
         let text = serde_json::to_vec(&sorted(value)).unwrap_or_default();
@@ -165,6 +176,11 @@ impl HeldItem {
             HeldTool::ScriptSave => field("name")?.as_str().map(|name| name.trim().to_owned()),
         }
     }
+}
+
+/// A field that is present, `null` or not, as `Some`; an absent one is `None` (by `default`).
+fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 /// `bytes` as lowercase hex.

@@ -25,6 +25,8 @@
 //!   setting.
 //! - [`held`] and [`cli_held`]: what agents asked to save while the user reviews saves first, and
 //!   the user-only commands that save it, skip it, or save notes and scripts past the save guards.
+//! - [`cli_project_key`]: the `project-key` command, through which Harness Desktop asks which
+//!   project a folder is.
 //! - [`location`]: where the database lives, and the one-time move from Harness Desktop's folder.
 //! - [`support`]: the environment, git runner, secret masking and text checks the rest uses.
 //!
@@ -37,6 +39,7 @@ mod cli_discard;
 pub mod cli_embedder;
 pub mod cli_held;
 pub mod cli_notes;
+pub mod cli_project_key;
 pub mod cli_push;
 pub mod cli_recall;
 mod cli_scripts;

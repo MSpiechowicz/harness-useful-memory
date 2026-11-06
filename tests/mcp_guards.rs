@@ -148,8 +148,8 @@ fn a_repository_turned_off_refuses_its_chats_writes_global_ones_included() {
     assert_eq!(reason(&refused), "repo-off");
     assert_eq!(
         text(&refused),
-        "The user turned off saving notes for this project. Nothing was saved. Do not retry. Continue without \
-         saving."
+        "Saving notes is off for this project. The user can turn it on in Harness Desktop. Nothing was saved. Do not \
+         retry. Continue without saving."
     );
 
     let mut global = note("Global note");

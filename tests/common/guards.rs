@@ -89,7 +89,7 @@ impl Guarded {
         self.data().join("team.sqlite3")
     }
 
-    fn env(&self, session: Option<&str>) -> Env {
+    pub fn env(&self, session: Option<&str>) -> Env {
         let mut env = env(&self.dir.path().join("home")).with_var("HARNESS_MEMORY_DIR", self.data().to_string_lossy());
 
         if let Some(session) = session {

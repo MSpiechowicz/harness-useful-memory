@@ -257,6 +257,37 @@ fn the_users_own_saves_ignore_every_guard() {
 }
 
 #[test]
+fn the_users_own_saves_work_when_saving_is_off_by_default() {
+    let guarded = Guarded::new();
+    let root = guarded.repo.to_string_lossy().into_owned();
+    guarded.global(
+        &json!({ "version": 2,
+                 "notes": { "paused": false, "everyProject": false, "onRepos": [] },
+                 "scripts": { "paused": true, "everyProject": false, "onRepos": [] } })
+        .to_string(),
+    );
+
+    let saved = ok(
+        &guarded,
+        &["notes", "save", "--json", "--project", &root],
+        r#"{ "title": "User note", "body": "Written by the user", "kind": "decision", "tags": ["ux"] }"#,
+    );
+    assert_eq!(saved["scope"], "repo");
+
+    let script = ok(
+        &guarded,
+        &["scripts", "save", "--json", "--project", &root],
+        r#"{ "name": "greet", "description": "Greets", "language": "sh", "body": "echo hi" }"#,
+    );
+    assert_eq!(script["created"], true);
+
+    // The agent's own write is refused.
+    let mut agent = guarded.server(None, &guarded.repo);
+    let reply = tool(&mut agent, "note_save", note("Agent note"));
+    assert_eq!(structured(&reply)["reason"], "repo-off");
+}
+
+#[test]
 fn the_users_own_saves_show_the_client_they_name() {
     let guarded = Guarded::new();
     let root = guarded.repo.to_string_lossy().into_owned();
@@ -765,4 +796,476 @@ fn the_list_shows_a_cleaned_author_and_never_a_hand_edited_one() {
     let listed = ok(&guarded, &["held", "list", "--json"], "");
     assert!(listed["held"][0].get("author").is_none(), "{listed}");
     assert!(!listed.to_string().contains("Eve"), "{listed}");
+}
+
+/// The title of every note `project` can see.
+fn titles_in(guarded: &Guarded, project: &Path) -> String {
+    let mut server = guarded.server(None, project);
+    text(&tool(
+        &mut server,
+        "note_search",
+        json!({ "query": "Body of the note" }),
+    ))
+    .to_owned()
+}
+
+/// Rewrites the one held file with `change`; the revision stays valid for the fields it leaves out of the digest.
+fn change_held(guarded: &Guarded, change: impl FnOnce(&mut Value)) {
+    let chat = std::fs::read_dir(guarded.held())
+        .expect("held folder")
+        .map(|entry| entry.expect("entry").path())
+        .find(|path| path.is_dir())
+        .expect("a chat folder");
+    let file = std::fs::read_dir(chat)
+        .expect("chat folder")
+        .map(|entry| entry.expect("entry").path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "json"))
+        .expect("a held file");
+
+    let mut item: Value = serde_json::from_str(&std::fs::read_to_string(&file).expect("read")).expect("JSON");
+    change(&mut item);
+    std::fs::write(file, item.to_string()).expect("write");
+}
+
+/// A held note naming `project_path` and, for the global scope, `scope`.
+fn held_via(guarded: &Guarded, link: &Path, title: &str, scope: &str) -> String {
+    let mut chat = guarded.server(Some(CHAT), &guarded.repo);
+    let mut arguments = note(title);
+    arguments["project_path"] = json!(link.to_string_lossy());
+    arguments["scope"] = json!(scope);
+    held_id(&tool(&mut chat, "note_save", arguments))
+}
+
+#[cfg(unix)]
+fn point(link: &Path, target: &Path) {
+    let _ = std::fs::remove_file(link);
+    std::os::unix::fs::symlink(target, link).expect("link");
+}
+
+/// Puts a link to `target` where `folder` is: a real folder is moved aside first.
+#[cfg(unix)]
+fn link_over(folder: &Path, target: &Path) {
+    if !std::fs::symlink_metadata(folder).expect("folder").is_symlink() {
+        std::fs::rename(folder, folder.with_extension("real")).expect("move aside");
+    }
+
+    point(folder, target);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_held_save_whose_project_folder_moved_is_changed_and_writes_nothing() {
+    use common::opt_in::{commit, worktree};
+
+    let guarded = asking();
+    let other = common::mcp::canonical(&common::mcp::repo_with_remote(
+        guarded.dir.path(),
+        "other",
+        "https://github.com/acme/other.git",
+    ));
+    commit(&guarded.repo);
+    let sibling = worktree(&guarded.repo, "widget-sibling");
+    let folder = guarded.repo.join("src").join("deep");
+
+    let id = held_via(&guarded, &folder, "Through a link", "repo");
+    let item = waiting(&guarded, &id);
+    assert_eq!(item["projectRoot"], json!(guarded.repo.to_string_lossy()));
+    assert_eq!(item["projectPath"], json!(folder.to_string_lossy()), "kept canonical");
+
+    // The folder is replaced by a link before the user approves: nothing is written, the item waits.
+    link_over(&folder, &other);
+    let moved = refused(&guarded, &["held", "save", &id, "--json"], "");
+    assert_eq!(moved["error"], "changed", "{moved}");
+    assert_eq!(moved["reason"], "project", "{moved}");
+    assert_eq!(listed(&guarded).len(), 1);
+    assert!(!titles_in(&guarded, &other).contains("Through a link"));
+    assert!(!titles_in(&guarded, &guarded.repo).contains("Through a link"));
+
+    // The folder gone is changed too, and is not saved from the folder the command runs in.
+    std::fs::remove_file(&folder).expect("remove");
+    let gone = refused(&guarded, &["held", "save", &id, "--json"], "");
+    assert_eq!(gone["error"], "changed", "{gone}");
+    assert_eq!(listed(&guarded).len(), 1);
+
+    // A worktree of the same repository is the same project, so it still saves.
+    point(&folder, &sibling);
+    assert_eq!(
+        ok(&guarded, &["held", "save", &id, "--json"], "")["saved"]["kind"],
+        "note"
+    );
+    assert!(titles_in(&guarded, &guarded.repo).contains("Through a link"));
+    assert_eq!(listed(&guarded), Vec::<Value>::new());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_held_item_without_a_project_root_is_checked_against_its_repo_root_and_a_global_one_is_not() {
+    let guarded = asking();
+    let other = common::mcp::canonical(&common::mcp::repo_with_remote(
+        guarded.dir.path(),
+        "other",
+        "https://github.com/acme/other.git",
+    ));
+    let folder = guarded.repo.join("src").join("deep");
+
+    // An item held before `projectRoot` existed.
+    let id = held_via(&guarded, &folder, "Older item", "repo");
+    change_held(&guarded, |item| {
+        item.as_object_mut().expect("object").remove("projectRoot");
+    });
+    link_over(&folder, &other);
+    assert_eq!(
+        refused(&guarded, &["held", "save", &id, "--json"], "")["error"],
+        "changed"
+    );
+    assert_eq!(listed(&guarded).len(), 1);
+    assert!(!titles_in(&guarded, &other).contains("Older item"));
+
+    // A global note does not depend on the project, so the retargeted link changes nothing.
+    ok(&guarded, &["held", "skip", &id, "--json"], "");
+    let id = held_via(&guarded, &folder, "Everywhere", "global");
+    point(&folder, &guarded.repo);
+    point(&folder, &other);
+    assert_eq!(
+        ok(&guarded, &["held", "save", &id, "--json"], "")["saved"]["kind"],
+        "note"
+    );
+}
+
+/// `harness-memory <args>` with the home folder the in-process servers have (where `~/` leads).
+fn cli_home(guarded: &Guarded, args: &[&str], input: &str) -> Output {
+    cli_at(guarded, Some(&guarded.dir.path().join("home")), args, input)
+}
+
+/// The refusal of `harness-memory <args>` run in the guarded home folder.
+fn refused_home(guarded: &Guarded, args: &[&str], input: &str) -> Value {
+    let output = cli_home(guarded, args, input);
+    assert_eq!(output.status.code(), Some(1), "{args:?}");
+    serde_json::from_slice(&output.stdout).expect("JSON")
+}
+
+/// A held global script named `name` for `project_path`.
+fn held_script_via(guarded: &Guarded, project_path: &str, name: &str) -> String {
+    let mut chat = guarded.server(Some(CHAT), &guarded.repo);
+    let script = json!({ "name": name, "description": "Says hi", "language": "sh", "body": "echo hi",
+                         "scope": "global", "project_path": project_path });
+    held_id(&tool(&mut chat, "script_save", script))
+}
+
+/// The names of the scripts every project can see in `project`.
+fn scripts_in(guarded: &Guarded, project: &Path) -> String {
+    let mut server = guarded.server(None, project);
+    text(&tool(&mut server, "script_list", json!({}))).to_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_draft_that_turns_a_global_item_into_a_repository_one_is_checked_against_the_project() {
+    let guarded = asking();
+    let home = guarded.dir.path().join("home");
+    let off = common::mcp::canonical(&common::mcp::repo_with_remote(
+        &home,
+        "off",
+        "https://github.com/acme/off.git",
+    ));
+    let draft = r#"{ "scope": "repo" }"#;
+
+    // `~/off` is no absolute path for the guard, which checked the working folder: nothing of it
+    // is kept, so the edit cannot reach `off` once `held save` expands the `~`.
+    let note_id = held_via(&guarded, Path::new("~/off"), "Tilde note", "global");
+    let script_id = held_script_via(&guarded, "~/off", "tilde-script");
+    assert_eq!(waiting(&guarded, &note_id)["projectPath"], Value::Null);
+    assert_eq!(
+        waiting(&guarded, &note_id)["projectRoot"],
+        json!(guarded.repo.to_string_lossy())
+    );
+
+    for (id, what) in [(&note_id, "note"), (&script_id, "script")] {
+        let moved = refused_home(&guarded, &["held", "save", id, "--json"], draft);
+        assert_eq!(moved["error"], "changed", "{what}: {moved}");
+        assert_eq!(moved["reason"], "project", "{what}: {moved}");
+    }
+
+    assert_eq!(listed(&guarded).len(), 2, "both wait");
+
+    for project in [&off, &guarded.repo] {
+        assert!(!titles_in(&guarded, project).contains("Tilde note"));
+        assert!(!scripts_in(&guarded, project).contains("tilde-script"));
+    }
+
+    // Saved as the agent asked, to the global scope, it needs no project.
+    for id in [&note_id, &script_id] {
+        let saved = cli_home(&guarded, &["held", "save", id, "--json"], "");
+        assert!(saved.status.success(), "{}", String::from_utf8_lossy(&saved.stderr));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_draft_that_turns_a_global_item_into_a_repository_one_is_checked_after_a_link_moved() {
+    let guarded = asking();
+    let other = common::mcp::canonical(&common::mcp::repo_with_remote(
+        guarded.dir.path(),
+        "other",
+        "https://github.com/acme/other.git",
+    ));
+    let folder = guarded.repo.join("src").join("deep");
+    let note_id = held_via(&guarded, &folder, "Moved note", "global");
+    let script_id = held_script_via(&guarded, &folder.to_string_lossy(), "moved-script");
+
+    link_over(&folder, &other);
+
+    for (id, what) in [(&note_id, "note"), (&script_id, "script")] {
+        let moved = refused(&guarded, &["held", "save", id, "--json"], r#"{ "scope": "repo" }"#);
+        assert_eq!(moved["error"], "changed", "{what}: {moved}");
+        assert_eq!(moved["reason"], "project", "{what}: {moved}");
+    }
+
+    assert_eq!(listed(&guarded).len(), 2);
+    assert!(!titles_in(&guarded, &other).contains("Moved note"));
+    assert!(!scripts_in(&guarded, &other).contains("moved-script"));
+    assert!(!titles_in(&guarded, &guarded.repo).contains("Moved note"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_held_repository_save_without_a_draft_in_an_unchanged_project_still_saves() {
+    let guarded = asking();
+    let folder = guarded.repo.join("src").join("deep");
+    let id = held_via(&guarded, &folder, "Unchanged", "repo");
+
+    assert_eq!(
+        ok(&guarded, &["held", "save", &id, "--json"], "")["saved"]["kind"],
+        "note"
+    );
+    assert!(titles_in(&guarded, &guarded.repo).contains("Unchanged"));
+
+    // An edit that keeps the repository scope in an unchanged project saves too.
+    let id = held_via(&guarded, &folder, "Edited", "repo");
+    let saved = ok(
+        &guarded,
+        &["held", "save", &id, "--json"],
+        r#"{ "scope": "repo", "body": "Body of the note" }"#,
+    );
+    assert_eq!(saved["saved"]["kind"], "note");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_held_item_for_a_folder_that_is_no_project_compares_nothing_and_saves() {
+    let guarded = Guarded::new();
+    let mut chat = guarded.chat_server();
+    assert!(!is_error(&tool(
+        &mut chat,
+        "note_save",
+        json!({
+            "title": "Everywhere", "body": "Body of the note", "kind": "decision", "scope": "global"
+        })
+    )));
+
+    guarded.rules(false, (true, true), (true, false));
+    guarded.desktop_alive();
+    let home = guarded.dir.path().join("home");
+    let id = held_id(&tool(
+        &mut chat,
+        "note_update",
+        json!({ "id": 1, "body": "Newer body", "project_path": home.to_string_lossy() }),
+    ));
+
+    let item = waiting(&guarded, &id);
+    assert_eq!(item["projectRoot"], Value::Null, "{item}");
+    assert!(item.as_object().expect("object").contains_key("projectRoot"), "{item}");
+
+    let saved = ok(&guarded, &["held", "save", &id, "--json"], "");
+    assert_eq!(saved["saved"]["kind"], "note", "{saved}");
+}
+
+/// A held repository-scope note or script for each way a call can name the project, as `(what,
+/// held id, the folder the item is tied to, a draft that edits it)`.
+#[cfg(unix)]
+fn held_for_root(guarded: &Guarded, what: &str, sibling: &Path) -> (String, std::path::PathBuf, &'static str) {
+    let mut chat = guarded.server(Some(CHAT), &guarded.repo);
+    let script = |extra: Value| {
+        let mut script = json!({ "name": "root-script", "description": "Says hi", "language": "sh",
+                                 "body": "echo hi", "scope": "repo" });
+        script
+            .as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        script
+    };
+    let root = json!(guarded.repo.to_string_lossy());
+
+    match what {
+        "note at the root" => {
+            let id = held_id(&tool(
+                &mut chat,
+                "note_save",
+                json!({ "title": what, "body": "Body of the note",
+                "kind": "decision", "project_path": root }),
+            ));
+            (id, guarded.repo.clone(), r#"{ "body": "Body of the note, edited" }"#)
+        }
+        "note of the working folder" => {
+            let id = held_id(&tool(&mut chat, "note_save", note(what)));
+            (id, guarded.repo.clone(), r#"{ "body": "Body of the note, edited" }"#)
+        }
+        "note of a worktree" => {
+            let id = held_via(guarded, sibling, what, "repo");
+            (id, sibling.to_path_buf(), r#"{ "body": "Body of the note, edited" }"#)
+        }
+        "script at the root" => {
+            let id = held_id(&tool(&mut chat, "script_save", script(json!({ "project_path": root }))));
+            (id, guarded.repo.clone(), r#"{ "description": "Edited" }"#)
+        }
+        _ => {
+            let id = held_id(&tool(&mut chat, "script_save", script(json!({}))));
+            (id, guarded.repo.clone(), r#"{ "description": "Edited" }"#)
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_held_save_whose_project_root_became_a_link_is_changed_and_kept_with_or_without_a_draft() {
+    use common::opt_in::{commit, worktree};
+
+    let cases = [
+        "note at the root",
+        "note of the working folder",
+        "note of a worktree",
+        "script at the root",
+        "script of the working folder",
+    ];
+
+    for what in cases {
+        let guarded = asking();
+        let other = common::mcp::canonical(&common::mcp::repo_with_remote(
+            guarded.dir.path(),
+            "other",
+            "https://github.com/acme/other.git",
+        ));
+        commit(&guarded.repo);
+        let sibling = worktree(&guarded.repo, "widget-sibling");
+        let (id, tied_to, draft) = held_for_root(&guarded, what, &sibling);
+
+        // The folder the item is tied to is itself replaced by a link to another repository.
+        link_over(&tied_to, &other);
+
+        for input in ["", draft] {
+            let moved = refused(&guarded, &["held", "save", &id, "--json"], input);
+            assert_eq!(moved["error"], "changed", "{what} {input}: {moved}");
+            assert_eq!(moved["reason"], "project", "{what} {input}: {moved}");
+        }
+
+        assert_eq!(listed(&guarded).len(), 1, "{what}: kept");
+        assert!(!titles_in(&guarded, &other).contains(what), "{what}");
+        assert!(!scripts_in(&guarded, &other).contains("root-script"), "{what}");
+    }
+}
+
+/// A held repository-scope note or script for the subfolder `folder` of the repository: named in
+/// `project_path`, or not named, then the chat's server works in `folder`.
+#[cfg(unix)]
+fn held_for_subfolder(guarded: &Guarded, what: &str, named: bool, folder: &Path) -> String {
+    let mut chat = guarded.server(Some(CHAT), if named { &guarded.repo } else { folder });
+    let path = json!(folder.to_string_lossy());
+
+    if what == "note" {
+        let mut arguments = note("Subfolder note");
+        if named {
+            arguments["project_path"] = path;
+        }
+
+        return held_id(&tool(&mut chat, "note_save", arguments));
+    }
+
+    let mut arguments = json!({ "name": "root-script", "description": "Says hi", "language": "sh",
+                                "body": "echo hi", "scope": "repo" });
+    if named {
+        arguments["project_path"] = path;
+    }
+
+    held_id(&tool(&mut chat, "script_save", arguments))
+}
+
+/// The root is compared without following a link at it, so a root swapped for a link to a worktree
+/// of another repository that holds the same subfolder does not read as the same project.
+#[cfg(unix)]
+#[test]
+fn a_held_save_for_a_subfolder_is_changed_when_the_root_became_a_link_to_another_repositorys_worktree() {
+    use common::opt_in::{commit, worktree};
+
+    for (what, named, draft) in [
+        ("note", true, r#"{ "body": "Body of the note, edited" }"#),
+        ("note", false, r#"{ "body": "Body of the note, edited" }"#),
+        ("script", true, r#"{ "description": "Edited" }"#),
+        ("script", false, r#"{ "description": "Edited" }"#),
+    ] {
+        let guarded = asking();
+        let other = common::mcp::canonical(&common::mcp::repo_with_remote(
+            guarded.dir.path(),
+            "other",
+            "https://github.com/acme/other.git",
+        ));
+        commit(&other);
+        let foreign = worktree(&other, "other-worktree");
+        let folder = guarded.repo.join("src").join("deep");
+        std::fs::create_dir_all(foreign.join("src").join("deep")).expect("mkdir");
+
+        let id = held_for_subfolder(&guarded, what, named, &folder);
+        let held = waiting(&guarded, &id);
+        assert_eq!(
+            held["projectRoot"],
+            json!(guarded.repo.to_string_lossy()),
+            "{what} {named}"
+        );
+        assert_eq!(held["projectPath"], json!(folder.to_string_lossy()), "{what} {named}");
+
+        // The root itself is replaced by a link to the worktree of another repository, which has
+        // the same subfolder.
+        link_over(&guarded.repo, &foreign);
+
+        for input in ["", draft] {
+            let moved = refused(&guarded, &["held", "save", &id, "--json"], input);
+            assert_eq!(moved["error"], "changed", "{what} {named} {input}: {moved}");
+            assert_eq!(moved["reason"], "project", "{what} {named} {input}: {moved}");
+        }
+
+        assert_eq!(listed(&guarded).len(), 1, "{what} {named}: kept");
+        assert!(
+            !titles_in(&guarded, &other).contains("Subfolder note"),
+            "{what} {named}"
+        );
+        assert!(!scripts_in(&guarded, &other).contains("root-script"), "{what} {named}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_held_update_of_a_global_note_saves_after_its_folder_is_gone() {
+    let guarded = Guarded::new();
+    let mut chat = guarded.chat_server();
+    assert!(!is_error(&tool(
+        &mut chat,
+        "note_save",
+        json!({ "title": "Everywhere", "body": "Body of the note", "kind": "decision", "scope": "global" })
+    )));
+
+    guarded.rules(false, (true, true), (true, true));
+    guarded.desktop_alive();
+
+    // The update names no scope: only the note it changes says it is global.
+    let folder = guarded.repo.join("src").join("deep");
+    let id = held_id(&tool(
+        &mut chat,
+        "note_update",
+        json!({ "id": 1, "body": "Newer body", "project_path": folder.to_string_lossy() }),
+    ));
+    assert_eq!(waiting(&guarded, &id)["current"]["scope"], "global");
+
+    std::fs::remove_dir(&folder).expect("remove the empty folder");
+
+    let saved = ok(&guarded, &["held", "save", &id, "--json"], "");
+    assert_eq!(saved["saved"]["kind"], "note", "{saved}");
 }

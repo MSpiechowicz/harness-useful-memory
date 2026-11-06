@@ -95,7 +95,7 @@ fn refused_line(reason: Reason, kind: Kind) -> Option<String> {
             "Saving is paused for this chat (the user's setting). Reading works. Do not try to save.".to_owned()
         }
         Reason::RepoOff => format!(
-            "Saving {words} is off for this project (the user's setting). Reading works. Do not try to save {words}."
+            "Saving {words} is off for this project. The user can turn it on in Harness Desktop. Reading works. Do not try to save {words}."
         ),
         Reason::GlobalPaused => format!(
             "Saving {words} is paused everywhere (the user's setting). Reading works. Do not try to save {words}."

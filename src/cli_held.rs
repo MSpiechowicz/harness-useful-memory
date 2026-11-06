@@ -33,7 +33,10 @@
 //! A refusal prints `{"error": CODE, "message": "..."}` on stdout and the message as the last line
 //! of stderr, exit 1: `notFound` (no such held item or note, or another save took it), `gone`
 //! (the note a held update changes was deleted), `changed` (the held item is not of the expected
-//! revision), `invalid` (standard input is not a draft) or `refused` (the save failed, the message
+//! revision, or a save whose project folder is gone or leads to another repository than the one
+//! the guard checked when the call was held, judged by the scope the save will have once the draft
+//! is merged, and again right before the write: the item is kept and the answer adds `"reason":
+//! "project"`), `invalid` (standard input is not a draft) or `refused` (the save failed, the message
 //! says why). Other failures and usage errors as in [`crate::cli`].
 
 use std::io::{IsTerminal, Read};
@@ -191,6 +194,16 @@ pub(crate) fn client_of(given: Option<&str>) -> Result<Option<String>, ExitCode>
 /// Prints `{"error": code, "message"}` and the message on stderr; exit 1.
 pub(crate) fn refused(code: Code, message: &str) -> ExitCode {
     println!("{}", json!({ "error": code.as_str(), "message": message }));
+    eprintln!("harness-memory: {message}");
+    ExitCode::FAILURE
+}
+
+/// [`refused`], with `"reason"` telling why when the code alone does not.
+fn refused_because(code: Code, message: &str, reason: &str) -> ExitCode {
+    println!(
+        "{}",
+        json!({ "error": code.as_str(), "message": message, "reason": reason })
+    );
     eprintln!("harness-memory: {message}");
     ExitCode::FAILURE
 }
@@ -368,7 +381,15 @@ fn save(args: &[Option<&str>]) -> ExitCode {
         Err(exit) => return exit,
     };
 
-    // Saved from the folder the agent's call was about, as if from there.
+    // The folder must still lead to the project the guard checked, else nothing is written. The
+    // scope is the one the save will have, so a draft that turns a global item into a
+    // repository one is checked too.
+    if let Some(message) = moved::moved(&env, &claim.item, edited.as_ref()) {
+        let restored = claim.restore();
+        return refused_because(Code::Changed, &with_restore(&message, restored), "project");
+    }
+
+    // Saved from the folder the guard checked (canonical since it was held), as if from there.
     let cwd = claim
         .item
         .project_path
@@ -403,6 +424,13 @@ fn save(args: &[Option<&str>]) -> ExitCode {
             let restored = claim.restore();
             return saver.refused(code, &with_restore(&message, restored));
         }
+    }
+
+    // Once more right before the write: opening the store took time, and the folder may have been
+    // replaced by a link since the first check.
+    if let Some(message) = moved::moved(&env, &claim.item, edited.as_ref()) {
+        let restored = claim.restore();
+        return refused_because(Code::Changed, &with_restore(&message, restored), "project");
     }
 
     let saved = match saved_item(&mut saver, &claim.item, edited) {
@@ -519,6 +547,7 @@ fn held_store() -> Option<HeldStore> {
     store
 }
 
+mod moved;
 mod stale;
 
 #[cfg(test)]

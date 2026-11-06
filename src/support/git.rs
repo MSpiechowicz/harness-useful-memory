@@ -8,8 +8,11 @@
 //! Each command line starts with options that switch off what a repository's own configuration
 //! could otherwise execute or redirect: the fsmonitor hook, the untracked cache, external diff
 //! programs, pagers, colors and path quoting. Pathspecs are literal. The environment disables
-//! prompts and optional locks and fixes the locale. `HOME` and `XDG_CONFIG_HOME` come from the
-//! injected [`Env`], so the global configuration read is the one of that home.
+//! prompts and optional locks and fixes the locale. `safe.bareRepository=explicit` makes git refuse
+//! a bare repository it finds by itself: a tracked folder holding `HEAD`, `objects/`, `refs/` and
+//! `config` is one, with a `core.worktree` and a remote its author chose. `HOME` and
+//! `XDG_CONFIG_HOME` come from the injected [`Env`], so the global configuration read is the one
+//! of that home.
 //!
 //! Every `GIT_*` variable inherited from the server's own environment is dropped (only the ones
 //! set here reach git): `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
@@ -43,7 +46,7 @@ pub const GIT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const GIT_OUTPUT_CAP: usize = 16 * 1024 * 1024;
 
 /// Options placed before every git subcommand.
-const HARDENING: [&str; 15] = [
+const HARDENING: [&str; 17] = [
     "--no-pager",
     "--literal-pathspecs",
     "-c",
@@ -58,6 +61,8 @@ const HARDENING: [&str; 15] = [
     "color.ui=false",
     "-c",
     "core.quotepath=off",
+    "-c",
+    "safe.bareRepository=explicit",
     "--no-optional-locks",
 ];
 
@@ -353,6 +358,9 @@ mod tests {
 
         let pager = git.run(&["config", "--get", "core.pager"]).expect("git runs");
         assert_eq!(pager.stdout.trim(), "cat");
+
+        let bare = git.run(&["config", "--get", "safe.bareRepository"]).expect("git runs");
+        assert_eq!(bare.stdout.trim(), "explicit");
 
         let missing = git.run(&["config", "--get", "remote.origin.url"]).expect("git runs");
         assert!(!missing.success());

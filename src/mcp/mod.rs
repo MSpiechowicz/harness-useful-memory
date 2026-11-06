@@ -32,6 +32,7 @@ mod tools_scripts;
 mod trusting;
 pub(crate) mod user;
 mod vectors;
+pub(crate) mod worktree;
 
 pub(crate) use approval::approval_of;
 pub use approval::{ALIVE_FILE, APPROVAL_WAIT_VAR, REQUESTS_FOLDER, SCRIPT_APPROVAL_WAIT};
@@ -357,7 +358,14 @@ impl Server {
             return protocol::error(id, INVALID_PARAMS, "tools/call needs a tool name");
         };
 
-        let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        // Missing or null arguments are an empty object. Anything else that is no object is refused
+        // here: a derived struct also parses a JSON array as positional fields, which a guard that
+        // reads `project_path` by name would not see.
+        let arguments = match params.get("arguments") {
+            None | Some(Value::Null) => json!({}),
+            Some(object @ Value::Object(_)) => object.clone(),
+            Some(_) => return protocol::error(id, INVALID_PARAMS, "tools/call arguments must be an object"),
+        };
 
         match calls::call(self, name, arguments) {
             Some(reply) => protocol::result(id, tool_result(reply)),

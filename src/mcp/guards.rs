@@ -7,12 +7,20 @@
 //! `entity_link`, `entity_delete`) and the script writes (`script_save`, `script_delete`). Before
 //! any of their bodies runs ([`gate`]), in this order:
 //!
-//! 1. `guards/global.json` next to the database: the kind paused everywhere, then the kind turned
-//!    off for the chat's repository (`offRepos`, canonical git roots). The chat's repository is
-//!    the git root of the resolved `project_path` (that of the server's working folder when the
-//!    call names none), and the `repoRoot` of the chat's file (below): any one turned off, by its root or by its project
-//!    key ([`super::guard_repos`]), refuses, so global-scope writes from that repository, and
-//!    writes from another clone or worktree of it, are refused too.
+//! 1. `guards/global.json` next to the database, which has no rules when it is missing and
+//!    `guards/opt-in` (the marker Harness Desktop writes first) does not exist. The kind
+//!    paused everywhere refuses, then its repository rule ([`super::guard_repos`]) over the
+//!    call's repositories: the git root of the resolved `project_path` (that of the server's
+//!    working folder when the call names none), and the `repoRoot` of the chat's file (below).
+//!    Version 2 (what Harness Desktop writes now) is an allow list: the kind is refused unless
+//!    `everyProject` is on or every repository of the call is in `onRepos` (a worktree counts as
+//!    its main repository, another clone must be listed itself) and still has the project key its
+//!    entry was pinned with in `repoKeys`, so a call with no repository, and
+//!    a global-scope write from a repository that is not on, are refused. With no chat root the
+//!    server's working folder also counts, so naming an enabled project does not replace a
+//!    working folder that is off. Version 1 is the older
+//!    deny list: the kind is refused when any repository of the call is in `offRepos`, by its root
+//!    or its project key, so writes from another clone or worktree of it are refused too.
 //! 2. Without [`SESSION_VAR`] nothing more applies. A value that is not a lowercase UUID refuses.
 //! 3. `guards/chats/<chatKey>.json`: a missing file refuses (Harness Desktop writes it before it
 //!    starts the chat). Its optional `repoRoot` (the chat's project root, absolute) counts as the
@@ -26,13 +34,15 @@
 //! ([`super::saving`]).
 //!
 //! A guard file that cannot be read (a symbolic link, another user's, another version, not the
-//! shape below) refuses: the guards fail closed. A missing global file applies no rule. Every reply is a
-//! normal tool result (not an error, so the agent does not retry), with `structuredContent`
+//! shape below) refuses: the guards fail closed. A missing global file applies no rule, unless the
+//! `opt-in` marker exists: then the file was there once and is gone, so it refuses. Every
+//! reply is a normal tool result (not an error, so the agent does not retry), with `structuredContent`
 //! `{"held": true, "heldId"}` or `{"saved": false, "reason"}`.
 //!
 //! The guards stop agents that use these tools. They are no sandbox: an agent with a shell can
 //! change files under the user's home or run the user-only commands.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -41,7 +51,7 @@ use serde_json::{Value, json};
 
 use super::Server;
 use super::calls::Reply;
-use super::guard_repos::Repos;
+use super::guard_repos::{RepoRule, Repos};
 use crate::backend::SESSION_VAR;
 use crate::held::HeldTool;
 use crate::support::private::{check_folders, data_folder, desktop_alive, is_lowercase_uuid, read_private};
@@ -49,11 +59,15 @@ use crate::support::private::{check_folders, data_folder, desktop_alive, is_lowe
 /// The folder next to the database that holds the guard files Harness Desktop writes.
 pub const GUARDS_FOLDER: &str = "guards";
 
+/// The file in [`GUARDS_FOLDER`] that Harness Desktop writes before `global.json` once saving is
+/// opt-in: while it exists, a missing `global.json` is unreadable, not "no rules".
+const OPT_IN_MARKER: &str = "opt-in";
+
 /// The folder in [`GUARDS_FOLDER`] that holds one file per chat.
 const CHATS_FOLDER: &str = "chats";
 
 /// The largest guard file read, in bytes.
-const GUARD_FILE_MAX: usize = 512 * 1024;
+const GUARD_FILE_MAX: usize = 256 * 1024;
 
 /// The reply to a held call.
 pub const HELD_TEXT: &str = "Waiting for the user's review in Harness Desktop. Nothing is saved yet. Do not save it \
@@ -110,18 +124,70 @@ impl Reason {
     }
 }
 
-/// `guards/global.json`.
-#[derive(Deserialize)]
+/// `guards/global.json`, of either version.
 struct GlobalFile {
     notes: GlobalKind,
     scripts: GlobalKind,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct GlobalKind {
     paused: bool,
+    repos: RepoRule,
+}
+
+/// `guards/global.json` of version 1: a deny list.
+#[derive(Deserialize)]
+struct GlobalV1 {
+    notes: KindV1,
+    scripts: KindV1,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KindV1 {
+    paused: bool,
     off_repos: Vec<String>,
+}
+
+/// `guards/global.json` of version 2: an allow list.
+#[derive(Deserialize)]
+struct GlobalV2 {
+    notes: KindV2,
+    scripts: KindV2,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct KindV2 {
+    paused: bool,
+    every_project: bool,
+    on_repos: Vec<String>,
+    /// The project key each entry had when it was turned on. A file from before the pins has
+    /// none, which names no entry: nothing is on until the user turns it on again.
+    #[serde(default)]
+    repo_keys: HashMap<String, Option<String>>,
+}
+
+impl From<KindV1> for GlobalKind {
+    fn from(kind: KindV1) -> Self {
+        Self {
+            paused: kind.paused,
+            repos: RepoRule::Off(kind.off_repos),
+        }
+    }
+}
+
+impl From<KindV2> for GlobalKind {
+    fn from(kind: KindV2) -> Self {
+        Self {
+            paused: kind.paused,
+            repos: RepoRule::On {
+                every_project: kind.every_project,
+                repos: kind.on_repos,
+                pins: kind.repo_keys,
+            },
+        }
+    }
 }
 
 /// `guards/chats/<chatKey>.json`.
@@ -204,7 +270,7 @@ pub(super) fn gate(server: &mut Server, name: &str, arguments: &Value) -> Option
 }
 
 /// True when a guard applies to the call with `arguments`: a guard file cannot be read, notes or
-/// scripts are paused everywhere or turned off for the call's repository, or the call's chat is
+/// scripts are paused everywhere or not on for the call's repository, or the call's chat is
 /// paused, has notes or scripts off, or asks before saving them. `script_save` then trusts
 /// nothing it saves.
 pub(super) fn applies(server: &mut Server, arguments: &Value) -> bool {
@@ -219,7 +285,7 @@ pub(super) fn applies(server: &mut Server, arguments: &Value) -> bool {
         let mut repos = Repos::new(arguments, rules.chat.repo_root());
 
         for guard in [&global.notes, &global.scripts] {
-            if guard.paused || repos.any_off(server, &guard.off_repos) {
+            if guard.paused || repos.refused_by(server, &guard.repos) {
                 return true;
             }
         }
@@ -288,7 +354,7 @@ pub(super) fn verdict(server: &mut Server, kind: Kind, arguments: &Value) -> Ver
                 return Verdict::Refuse(Reason::GlobalPaused);
             }
 
-            if Repos::new(arguments, rules.chat.repo_root()).any_off(server, &guard.off_repos) {
+            if Repos::new(arguments, rules.chat.repo_root()).refused_by(server, &guard.repos) {
                 return Verdict::Refuse(Reason::RepoOff);
             }
         }
@@ -350,13 +416,40 @@ fn rules(server: &Server) -> Rules {
     Rules { data, global, chat }
 }
 
-/// `guards/global.json` in `data`: `None` when there is none, `Err` when it cannot be read.
+/// `guards/global.json` in `data`, of version 1 or 2: `None` when there is none, `Err` when it
+/// cannot be read.
 fn read_global(data: &Path) -> Result<Option<GlobalFile>, ()> {
     let guards = data.join(GUARDS_FOLDER);
-    read_guard(
-        &guards.join("global.json"),
-        &[(data, "data folder"), (&guards, "guards folder")],
-    )
+    let folders = [(data, "data folder"), (&guards, "guards folder")];
+
+    let Some(value) = read_json(&guards.join("global.json"), &folders)? else {
+        // Harness Desktop writes the marker before the file, so a file that went missing after
+        // that is not "no rules". A marker of any kind (a folder, a link) counts: it is not ours.
+        return match std::fs::symlink_metadata(guards.join(OPT_IN_MARKER)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            _ => Err(()),
+        };
+    };
+
+    let file = match value.get("version") {
+        Some(version) if version == &json!(1) => {
+            let file: GlobalV1 = serde_json::from_value(value).map_err(|_| ())?;
+            GlobalFile {
+                notes: file.notes.into(),
+                scripts: file.scripts.into(),
+            }
+        }
+        Some(version) if version == &json!(2) => {
+            let file: GlobalV2 = serde_json::from_value(value).map_err(|_| ())?;
+            GlobalFile {
+                notes: file.notes.into(),
+                scripts: file.scripts.into(),
+            }
+        }
+        _ => return Err(()),
+    };
+
+    Ok(Some(file))
 }
 
 /// The file of chat `key` in `data`: `None` when there is none, `Err` when it cannot be read or
@@ -387,19 +480,26 @@ fn read_chat(data: &Path, key: &str) -> Result<Option<ChatFile>, ()> {
 
 /// The guard file `path` of version 1 in the private `folders`: `None` when there is none.
 fn read_guard<T: DeserializeOwned>(path: &Path, folders: &[(&Path, &str)]) -> Result<Option<T>, ()> {
-    let Some(bytes) = read_private(path, GUARD_FILE_MAX).map_err(|_| ())? else {
+    let Some(value) = read_json(path, folders)? else {
         return Ok(None);
     };
-
-    check_folders(folders).map_err(|_| ())?;
-
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| ())?;
 
     if value.get("version") != Some(&json!(1)) {
         return Err(());
     }
 
     serde_json::from_value(value).map(Some).map_err(|_| ())
+}
+
+/// The JSON of the guard file `path` in the private `folders`: `None` when there is none.
+fn read_json(path: &Path, folders: &[(&Path, &str)]) -> Result<Option<Value>, ()> {
+    let Some(bytes) = read_private(path, GUARD_FILE_MAX).map_err(|_| ())? else {
+        return Ok(None);
+    };
+
+    check_folders(folders).map_err(|_| ())?;
+
+    serde_json::from_slice(&bytes).map(Some).map_err(|_| ())
 }
 
 /// The reply to a held call: `heldId` names the held item.
@@ -417,7 +517,9 @@ pub(super) fn refused(reason: Reason, kind: Kind, name: &str) -> Reply {
     let why = match reason {
         Reason::ChatOff => format!("The user turned off saving {words} for this chat."),
         Reason::ChatPaused => "The user paused saving to Harness Memory for this chat.".to_owned(),
-        Reason::RepoOff => format!("The user turned off saving {words} for this project."),
+        Reason::RepoOff => {
+            format!("Saving {words} is off for this project. The user can turn it on in Harness Desktop.")
+        }
         Reason::GlobalPaused => format!("The user paused saving {words} everywhere."),
         Reason::NoDesktop => {
             format!("The user reviews {words} before they are saved, and Harness Desktop is not running.")

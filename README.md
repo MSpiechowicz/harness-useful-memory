@@ -71,6 +71,14 @@ On Windows delete `%LOCALAPPDATA%\Programs\harness-memory`, remove that folder f
 About, Advanced system settings, Environment Variables), and delete `%LOCALAPPDATA%\harness-memory` to remove the notes.
 The installer's `PATH` line in your shell profile is marked `# Added by the Harness Memory installer`.
 
+If Harness Desktop was used, uninstalling it leaves `guards/opt-in` (the marker) and `guards/global.json` (version 2) in
+the data folder, so saving stays off and no screen turns it on until you remove the `guards` folder there. An older
+Harness Desktop treats the version 2 file as unreadable and refuses saves.
+
+Known limit, not fixed: another local user with write access to a data folder that is not private can remove both
+files. The server does not check the folders before accepting "no rules", because a standalone user's existing folder
+could break.
+
 ## Register with your harness
 
 `harness-memory mcp` (or just `harness-memory`) serves MCP over stdio, and the harness starts it. Each harness keeps its
@@ -400,15 +408,43 @@ errors exit with 2, other failures with 1 and the reason on the last line of std
 ### Save guards
 
 Harness Desktop lets you decide what agents may save, per chat, per project and everywhere, and can ask you before a
-save. Reading, recall and `script_run` are never guarded. The desktop writes `guards/global.json` (notes and scripts:
-`paused`, `offRepos`) and `guards/chats/<chatKey>.json` (`paused`, notes and scripts `on` and `ask`, and `repoRoot`, the
+save. Reading, recall and `script_run` are never guarded. The desktop writes `guards/global.json` (version 2, notes and
+scripts: `paused`, `everyProject`, `onRepos`, `repoKeys`) and `guards/chats/<chatKey>.json` (`paused`, notes and scripts `on` and `ask`, and `repoRoot`, the
 chat's project root or `null`) next to the local database, and starts each chat's harness with
 `HARNESS_MEMORY_SESSION=<chatKey>`. Before `note_save`, `note_update`, `note_delete`, `entity_link`, `entity_delete`,
 `script_save` or `script_delete` runs, the server checks the global pause of that kind, then the repository (the git
-root of `project_path`, that of its working folder and the chat's `repoRoot`: any one turned off refuses, global-scope
-writes included). A repository counts as turned off when its canonical path is an `offRepos` entry or its repository
-key (`git:host/owner/repo`, see [Which repository](#which-repository)) is that of an entry, so other clones and git
-worktrees of it are covered. Then the chat: paused or off refuses. With `HARNESS_MEMORY_SESSION` set, a missing chat
+root of `project_path`, else that of its working folder, and the chat's `repoRoot`). Saving is off by default: unless
+`everyProject` is on, every one of those repositories must be in `onRepos`, or the call is refused (global-scope writes
+and calls with no repository included). With no `repoRoot` the working folder counts besides `project_path`, so naming
+an enabled project does not replace a working folder that is off (version 2 only). A working folder with no project (the home folder, or one that is gone) gives the server nothing to check, so there `project_path` alone decides. Only canonical paths match, never a repository key, so a separate clone is on
+only when it is listed itself. An entry names something only when it is its own canonical form: one with a link in it (a listed submodule that a `git pull` replaced by a tracked link, say) or whose folder is gone names nothing, so it never turns on the repository the link leads to. A linked git worktree counts as its main repository (its `.git` file must name an
+administrative folder inside `<common>/worktrees` that points back to it, which stops a folder's own files from claiming
+another repository but not someone who can already write inside a repository's own git folder). A common folder named
+`.git` leads to its checkout. Any other one (`git init --separate-git-dir`, `git clone --bare`) leads to no checkout and
+counts only when it is shaped like a git folder (`HEAD` a regular file, `objects` and `refs` folders, no `.git` inside):
+its worktrees then map to that git folder, and a work tree that merely holds a forged `worktrees/<name>` folder is no git
+folder, so its forged worktrees stay their own root and off. A git folder `X` is turned on only by an entry that is `X`,
+or by a listed checkout (a `.git` file `gitdir: X`, `X` shaped like a git folder with no `commondir`), and only for a
+call root that is a worktree of `X`, never for one that is its own root or a checkout, so a listed folder cannot turn on
+another repository by naming it in its own `.git` file. A listed checkout whose `.git` file names the git folder of
+another repository still turns on that repository's worktrees: it is your own folder. A listed worktree turns on its main
+checkout and itself. Adding a worktree stores the git folder, which turns on the repository's worktrees but not the
+checkout. Each entry of `onRepos` is also pinned in `repoKeys` to the project key the repository had when you turned it on
+(`git:host/owner/repo`, or `path:` plus the root for a repository with no remote, `null` for a folder that has no
+project, the home folder). A repository is on only while its key is still the pinned one: a remote that changed since
+(`git remote set-url`, a fresh clone at the same path, an edit of `.git/config`) would send the writes to the notes of
+another project, so the call is refused (`repo-off`) until you turn the project on again, which pins the key it has then.
+A legitimate change of the remote stops saving the same way. Two keys made from a path match each other, since a linked
+worktree of a repository with no remote has a path key of its own. An entry with no pin names nothing, and a version 2
+file with no `repoKeys` object (written before the pins) reads as having none, so nothing is on until it is turned on
+again. `everyProject` needs no pin. The notice Harness Desktop puts in a chat can still say that saving is on after a key
+changed, since the app cannot compute keys: the refusal tells the agent, and Settings tells you. A missing `guards/global.json` applies no
+rule while `guards/opt-in` does not exist (the desktop writes that marker first, then the file, before any chat starts,
+and treats a missing file as off). Once the marker exists, in any form, a missing `guards/global.json` refuses
+(`guard-unreadable`), so a deleted file does not turn saving back on. An older desktop, or none, writes no marker, and a
+version 1 file
+(`paused`, `offRepos`, a deny list that also matches by repository key, `git:host/owner/repo`, see
+[Which repository](#which-repository)) is still read. Then the chat: paused or off refuses. With `HARNESS_MEMORY_SESSION` set, a missing chat
 file refuses too (the desktop writes it before it starts the chat). With Ask on, `note_save`, `note_update` and
 `script_save` are held in `held/<chatKey>/<heldId>.json` (one private folder per chat) for your review while Harness
 Desktop runs (refused when it does not), at most 50 items and 4 MiB per chat, kept 30 days. Files of the older flat
@@ -417,11 +453,11 @@ and language as the tool reads them, note text, tags, entities and script descri
 changes whenever the agent holds it again. Nothing held is saved or searchable. The agent gets a normal result saying
 it was held or refused, with `structuredContent` `{"held": true, "heldId"}` or `{"saved": false, "reason"}`. Reads
 (`note_search`, `note_get`, `entity_neighbors` for notes, `script_list`, `script_get` for scripts) end with one line when
-the same checks would not plainly let that kind save, such as "Saving notes is off for this project (the user's
-setting). Reading works. Do not try to save notes.", and script reads add `structuredContent.saving` (`{"allowed":
+the same checks would not plainly let that kind save, such as "Saving notes is off for this project. The user can
+turn it on in Harness Desktop. Reading works. Do not try to save notes.", and script reads add `structuredContent.saving` (`{"allowed":
 false, "reason"}` or `{"ask": true}`). A guard
 file that cannot be read, or a `HARNESS_MEMORY_SESSION` that is not a lowercase UUID, refuses. While any guard applies
-to a call (a pause, a kind off or on Ask in its chat, a repository opt-out or a global pause of either kind), an
+to a call (a pause, a kind off or on Ask in its chat, a repository that is not on or a global pause of either kind), an
 agent's `script_save` trusts nothing and holds the version back on this computer (in a table of the local database,
 never in a team database, never pruned), so `script_run` asks you first with the code, also with `trust_team_scripts`
 on. Only your approval (`harness-memory trust`, or Allow in Harness Desktop) releases it. Scripts never see
@@ -437,7 +473,15 @@ harness-memory held skip <heldId> --json [--expect REVISION] # {"skipped": "<hel
 harness-memory notes save --json --project ~/src/widget < note.json          # {"id", "title", "scope"}
 harness-memory notes update 12 --json --project ~/src/widget < patch.json    # {"id", "title"}
 harness-memory scripts save --json --project ~/src/widget < script.json      # {"name", "scope", "id", "created", "approval"}
+harness-memory project-key --json < folders.json             # [{"path", "root", "key"}], key null for no project
 ```
+
+`project-key` reads a JSON array of absolute folder paths on standard input (at most 512 paths, 4096 bytes each, 4 MiB in
+all) and prints, in order, the project each folder is for the server: its `root` and its `key` (`git:host/owner/repo` or
+`path:<root>`), with `key` `null` for a folder that has no project, such as the home folder. A path it cannot use (not
+absolute, not an existing folder, a filesystem root, too long) gives `{"path", "error"}` and the others still answer. More
+than 512 paths, input that is not an array of strings or one past the size exits 1 with `{"error": "invalid",
+"message"}`. Harness Desktop asks it when you turn a project on, to pin the key (see above).
 
 `held save` and `held skip` claim the item first, so two saves of one item save it once (the other gets `notFound`), and
 an item the agent holds again meanwhile waits as a new one. With `--expect` they save or skip only the revision you saw.
@@ -451,15 +495,41 @@ you review it again against that note and can save it. A held script is saved un
 
 A refusal prints `{"error": "notFound" | "gone" | "changed" | "invalid" | "refused", "message"}` and exits with 1.
 `gone`: the note a held `note_update` changes was deleted since. `changed`: the held item is not of the `--expect`
-revision, or the note a held `note_update` changes was changed since (the item now shows that note). A refused `held save` or `held skip` keeps the
+revision, the note a held `note_update` changes was changed since (the item now shows that note), or the folder the agent
+named is gone or leads to another repository than the one the guard checked when the call was held (a folder replaced by a
+link before you approved, the project root itself included, which is compared without following a link at it): nothing is written and the answer adds `"reason": "project"`. The held item stores the folder
+as a canonical `projectPath` (a `project_path` that did not resolve, such as a `~/` path, is dropped: the item belongs to
+the working folder the guard checked) and that repository as `projectRoot` (`null` for a folder that is no project, the
+home folder, where nothing is compared; older items are checked against `repoRoot`). A linked worktree counts as its main
+repository. The check uses the scope the save will have, so a draft that turns a global item into a repository one is
+checked too, and it runs again right before the write. A global-scope save is not checked. A refused `held save` or `held skip` keeps the
 item.
 
 ### Which repository
 
-The server asks git (`git rev-parse --show-toplevel` and `git config --get remote.origin.url`) in its working directory,
+The server asks git (`git rev-parse --show-toplevel` and `git config --local --get remote.origin.url`) in its working directory,
 or in `project_path`. The repository key is the normalized `origin` remote (`host/owner/repo`, credentials dropped), so
 every clone of a repository shares its notes, and the repository path when there is no remote (so a path key matches only on one machine). A home or filesystem-root
 directory is no project. The `global` scope is shared by all repositories.
+
+A work tree that is a submodule is keyed by its path (`path:<root>`) and its remote is never read: its `origin` is whatever the
+superproject's `.gitmodules` said, and an upstream change of that file, brought in by `git submodule sync` or a fresh
+`git clone --recurse-submodules`, would otherwise give the folder the key of another repository, with that repository's
+notes. It is a submodule when `git rev-parse --show-superproject-working-tree` prints a superproject, or when it is a
+linked worktree of a submodule (git finds none from there, so the module's main work tree is asked). A submodule of a
+submodule is one too, and a clone that the repository above does not track as a submodule keeps its `git:` key. Notes saved
+for a submodule before this stay under its old `git:` key and are no longer read from that folder: nothing is migrated, and
+the notes of a submodule are no longer shared with teammates through a team database: a `path:` key matches only on one machine.
+
+The work tree git reports counts only when it holds the directory and has a `.git` of its own (a folder, or the file of a
+linked worktree, a submodule or a `--separate-git-dir` checkout), and git finds the same repository again from that
+work tree. The remote is read from that repository's own configuration only, never from a file it includes (`include.path`),
+and a remote URL with a `?`, `#` or `\` in its host part gives no remote, since git and a parser can read another host
+there. Anything else is the folder itself, keyed by its path with no remote
+read: a tracked folder shaped like a bare repository (`HEAD`, `objects/`, `refs/`, `config`) names a work tree and a
+remote of its author's choosing, and git is told `safe.bareRepository=explicit`, so it does not use such a folder at
+all. A genuine bare repository has no work tree, so a chat started inside one is a project by its path, never by its
+remote, and the repository's linked worktrees keep the key of the remote.
 
 ### Search
 
@@ -1143,11 +1213,11 @@ object has `scripts` totals instead of `notes`, no `relations` or `entitiesCut`,
 ```
 
 `harness-memory features` lists what this build supports, one per line (`push-json`, `scripts-remote-local`,
-`scripts-hide`, `scripts-push-json`, `settings`, `notes-lang`, `notes-useful`, `notes-author-filter` and `embedder`
+`scripts-hide`, `scripts-push-json`, `settings`, `notes-lang`, `notes-useful`, `notes-author-filter`, `save-opt-in` and `embedder`
 among them), so a tool can
 check before it asks for them. `settings` is the `settings` command, `notes-lang` the `lang` of a note and the `--lang`
 filter, `notes-useful` the usefulness counters of a note with `--useful` and `--sort useful|lastUseful`,
-`notes-author-filter` the `--author` and `--author-unknown` filters, `--sort addedBy` and the `authors` of the answer of
+`save-opt-in` the version 2 `guards/global.json`, `notes-author-filter` the `--author` and `--author-unknown` filters, `--sort addedBy` and the `authors` of the answer of
 `notes list` and `scripts list`, `embedder` the `embedder` command.
 
 ### Security and backups

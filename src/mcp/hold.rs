@@ -14,7 +14,6 @@ use serde_json::{Map, Value, json};
 use super::Server;
 use super::calls::{RememberArgs, Reply, UpdateArgs, parse};
 use super::calls_scripts::{SaveArgs, draft_of};
-use super::guard_repos::chat_repos;
 use super::guards::{Reason, held, kind_of, refused};
 use super::scope::{kind, provenance, scope_arg, target, view};
 use super::script_blocks::shown_text;
@@ -54,15 +53,13 @@ pub(super) fn hold(
         .client
         .as_deref()
         .map_or_else(|| "unknown".to_owned(), |client| shown_text(client, CLIENT_MAX));
-    let project_path = project_path(server, arguments);
-    let repo_root = chat_repos(server, arguments)
-        .first()
-        .map(|project| project.root.to_string_lossy().into_owned())
-        .or(chat_root);
+    let (project_path, project_root) = call_folder(server, arguments);
+    let repo_root = project_root.clone().or(chat_root);
 
     let mut item = HeldItem::new(chat, &client, tool, Value::Object(normal), current);
     item.project_path = project_path;
     item.repo_root = repo_root;
+    item.project_root = Some(project_root);
     item.author = provenance(server, arguments.get("project_path").and_then(Value::as_str)).author;
 
     match HeldStore::in_folder(data).hold(item) {
@@ -238,20 +235,34 @@ fn insert_project_path(normal: &mut Map<String, Value>, project_path: Option<&st
     }
 }
 
-/// The folder the call is about: its `project_path`, else the server's working folder (made
-/// absolute).
-fn project_path(server: &Server, arguments: &Value) -> Option<String> {
+/// The folder the call is about (canonical) and the root of its project, as the guard checked
+/// them: the call's `project_path` when it resolves, else the server's working folder.
+///
+/// A `project_path` that does not resolve (a `~/` path, a folder that is gone) was passed over by
+/// the guard, which checked the working folder. It is dropped: no folder is kept for a later save
+/// to resolve differently (`held save` expands a `~/` the guard did not), and the item stays tied
+/// to the root the guard checked. The root is `None` for a folder that is no project (the home
+/// folder).
+fn call_folder(server: &mut Server, arguments: &Value) -> (Option<String>, Option<String>) {
     let given = arguments
         .get("project_path")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|raw| !raw.is_empty());
 
-    if let Some(given) = given {
-        return Some(given.to_owned());
-    }
+    let usable = given.filter(|raw| server.projects.resolve(Some(raw)).is_ok());
 
-    let cwd = server.projects.cwd()?;
-    let absolute = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    Some(absolute.to_string_lossy().into_owned())
+    let folder = match given {
+        Some(_) if usable.is_none() => None,
+        _ => server.projects.folder(usable).ok().flatten(),
+    };
+    let root = server
+        .projects
+        .resolve(usable)
+        .ok()
+        .flatten()
+        .map(|project| project.root);
+    let text = |path: PathBuf| path.to_string_lossy().into_owned();
+
+    (folder.map(text), root.map(text))
 }

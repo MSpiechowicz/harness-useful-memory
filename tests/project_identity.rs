@@ -104,9 +104,45 @@ fn remotes_normalize_to_host_owner_repo() {
         ("file:///srv/git/r.git", None),
         ("https://host", None),
         ("", None),
+        ("https://example.invalid:8443/o/r.git", Some("example.invalid/o/r")),
+        ("https://bob@example.invalid/o/r", Some("example.invalid/o/r")),
+        ("ssh://git@example.invalid/o/r.git", Some("example.invalid/o/r")),
+        ("ssh://git@example.invalid:2222/o/r.git", Some("example.invalid/o/r")),
+        ("git@example.invalid:o/r.git", Some("example.invalid/o/r")),
+        ("example.invalid:o/r", Some("example.invalid/o/r")),
+        ("https://example.invalid/o/r.git/", Some("example.invalid/o/r")),
     ];
 
     for (raw, expected) in cases {
         assert_eq!(normalize_remote(raw).as_deref(), expected, "{raw}");
     }
+}
+
+#[test]
+fn a_url_whose_authority_git_and_this_parser_could_read_differently_gives_no_remote() {
+    // Git connects to 127.0.0.1 here, a parser that looks for the last `@` to `example.invalid`.
+    let cases = [
+        "http://127.0.0.1:9?@example.invalid/acme/off",
+        "http://127.0.0.1:9#@example.invalid/acme/off",
+        "http://127.0.0.1:9\\@example.invalid/acme/off",
+        "ssh://git@127.0.0.1?@example.invalid/acme/off",
+        "git@127.0.0.1#@example.invalid:acme/off",
+    ];
+
+    for raw in cases {
+        assert_eq!(normalize_remote(raw), None, "{raw}");
+    }
+}
+
+#[test]
+fn such_a_remote_keys_the_folder_by_its_path() {
+    let home = TempDir::new().expect("home");
+    let work = TempDir::new().expect("work");
+    let dir = repo_with_remote(work.path(), "odd", "http://127.0.0.1:9?@example.invalid/acme/off");
+
+    let mut resolver = ProjectResolver::new(env(home.path()), Some(dir.clone()));
+    let project = resolver.resolve(None).expect("resolves").expect("a project");
+
+    assert_eq!(project.key, format!("path:{}", canonical(&dir).display()));
+    assert_eq!(project.remote, None);
 }
