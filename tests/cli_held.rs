@@ -798,6 +798,7 @@ fn the_list_shows_a_cleaned_author_and_never_a_hand_edited_one() {
     assert!(!listed.to_string().contains("Eve"), "{listed}");
 }
 
+#[cfg(unix)]
 /// The title of every note `project` can see.
 fn titles_in(guarded: &Guarded, project: &Path) -> String {
     let mut server = guarded.server(None, project);
@@ -809,6 +810,7 @@ fn titles_in(guarded: &Guarded, project: &Path) -> String {
     .to_owned()
 }
 
+#[cfg(unix)]
 /// Rewrites the one held file with `change`; the revision stays valid for the fields it leaves out of the digest.
 fn change_held(guarded: &Guarded, change: impl FnOnce(&mut Value)) {
     let chat = std::fs::read_dir(guarded.held())
@@ -827,6 +829,7 @@ fn change_held(guarded: &Guarded, change: impl FnOnce(&mut Value)) {
     std::fs::write(file, item.to_string()).expect("write");
 }
 
+#[cfg(unix)]
 /// A held note naming `project_path` and, for the global scope, `scope`.
 fn held_via(guarded: &Guarded, link: &Path, title: &str, scope: &str) -> String {
     let mut chat = guarded.server(Some(CHAT), &guarded.repo);
@@ -932,11 +935,13 @@ fn a_held_item_without_a_project_root_is_checked_against_its_repo_root_and_a_glo
     );
 }
 
+#[cfg(unix)]
 /// `harness-memory <args>` with the home folder the in-process servers have (where `~/` leads).
 fn cli_home(guarded: &Guarded, args: &[&str], input: &str) -> Output {
     cli_at(guarded, Some(&guarded.dir.path().join("home")), args, input)
 }
 
+#[cfg(unix)]
 /// The refusal of `harness-memory <args>` run in the guarded home folder.
 fn refused_home(guarded: &Guarded, args: &[&str], input: &str) -> Value {
     let output = cli_home(guarded, args, input);
@@ -944,6 +949,7 @@ fn refused_home(guarded: &Guarded, args: &[&str], input: &str) -> Value {
     serde_json::from_slice(&output.stdout).expect("JSON")
 }
 
+#[cfg(unix)]
 /// A held global script named `name` for `project_path`.
 fn held_script_via(guarded: &Guarded, project_path: &str, name: &str) -> String {
     let mut chat = guarded.server(Some(CHAT), &guarded.repo);
@@ -952,6 +958,7 @@ fn held_script_via(guarded: &Guarded, project_path: &str, name: &str) -> String 
     held_id(&tool(&mut chat, "script_save", script))
 }
 
+#[cfg(unix)]
 /// The names of the scripts every project can see in `project`.
 fn scripts_in(guarded: &Guarded, project: &Path) -> String {
     let mut server = guarded.server(None, project);
