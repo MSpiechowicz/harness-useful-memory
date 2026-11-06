@@ -22,6 +22,7 @@ fn project_key(guarded: &Guarded, args: &[&str], input: &str) -> Output {
         .args(args)
         .current_dir(guarded.work())
         .env("HOME", guarded.dir.path().join("home"))
+        .env("USERPROFILE", guarded.dir.path().join("home"))
         .env("HARNESS_MEMORY_DIR", guarded.data())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
