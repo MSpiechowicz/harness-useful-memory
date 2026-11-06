@@ -1,3 +1,10 @@
+## [3.2.3](https://github.com/MSpiechowicz/harness-useful-memory/compare/v3.2.2...v3.2.3) (2026-11-06)
+
+
+### Bug Fixes
+
+* **mcp:** tell the agent to call a tool again after refused arguments ([9d559bb](https://github.com/MSpiechowicz/harness-useful-memory/commit/9d559bb5fe4c37bb5429cff50e4639470d6010b5))
+
 ## [3.2.2](https://github.com/MSpiechowicz/harness-useful-memory/compare/v3.2.1...v3.2.2) (2026-11-05)
 
 
