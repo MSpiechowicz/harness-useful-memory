@@ -1,3 +1,10 @@
+# [3.4.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v3.3.1...v3.4.0) (2026-11-06)
+
+
+### Features
+
+* **guards:** make saving notes and scripts opt-in per project ([b27247e](https://github.com/MSpiechowicz/harness-useful-memory/commit/b27247ed9aff5ef154ab2ddf7201c4f6a01606be)), closes [MSpiechowicz/harness-useful-desktop#55](https://github.com/MSpiechowicz/harness-useful-desktop/issues/55)
+
 ## [3.3.1](https://github.com/MSpiechowicz/harness-useful-memory/compare/v3.3.0...v3.3.1) (2026-11-06)
 
 
