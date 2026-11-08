@@ -38,7 +38,7 @@ fn a_held_script_waits_for_approval_while_every_team_script_is_trusted() {
         arguments,
         Value::Null,
     );
-    let saved = saved_item(&mut saver, &item, None).expect("saved");
+    let saved = saved_item(&mut saver, &item, None, None).expect("saved");
     assert_eq!(saved, json!({ "kind": "script", "name": "held" }));
 
     let teammate = ScriptDraft {

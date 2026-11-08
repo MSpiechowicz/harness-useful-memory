@@ -424,6 +424,10 @@ fn a_held_update_of_a_note_changed_since_is_shown_again_against_the_note_as_it_i
     ));
     let shown = waiting(&guarded, &held);
     assert_eq!(shown["current"]["body"], "Body of the note");
+    assert_eq!(
+        shown["current"]["revision"], 1,
+        "what the update is judged against once the note cannot be read"
+    );
     let first = shown["revision"].as_str().expect("revision").to_owned();
 
     // The user changes the note before reviewing the update, which shows the note as it was.
@@ -480,6 +484,137 @@ fn a_held_update_of_a_note_changed_since_is_shown_again_against_the_note_as_it_i
     assert_eq!(waiting(&guarded, &tagged)["current"]["tags"], json!(["retagged"]));
     ok(&guarded, &["held", "save", &tagged, "--json"], "");
     assert_eq!(listed(&guarded), Vec::<Value>::new());
+}
+
+/// An update held while the team database could not be read has no `current`. Saved once the note
+/// can be read, it is shown against the note as it is, like an update of a note that changed since.
+#[test]
+fn a_held_update_without_a_current_note_is_shown_against_the_note_as_it_is() {
+    use harness_memory::held::{HeldItem, HeldStore, HeldTool};
+
+    let guarded = Guarded::new();
+    let mut chat = guarded.chat_server();
+    let mut unread = note("Unread note");
+    unread["scope"] = json!("global");
+    assert!(!is_error(&tool(&mut chat, "note_save", unread)));
+
+    let item = HeldItem::new(
+        CHAT,
+        "omp",
+        HeldTool::NoteUpdate,
+        json!({ "id": 1, "append": "Appended by the agent", "scope": "global" }),
+        Value::Null,
+    );
+    let held = HeldStore::in_folder(guarded.data()).hold(item).expect("held");
+
+    let changed = refused(&guarded, &["held", "save", &held, "--json"], "");
+    assert_eq!(changed["error"], "changed");
+
+    let again = waiting(&guarded, &held);
+    assert_eq!(again["current"]["body"], "Body of the note", "the live note is shown");
+    assert_eq!(again["current"]["revision"], 1);
+    assert_eq!(listed(&guarded).len(), 1, "nothing was saved");
+
+    // Reviewed against the real note, it saves.
+    assert_eq!(
+        ok(&guarded, &["held", "save", &held, "--json"], ""),
+        json!({ "saved": { "kind": "note", "id": 1 } })
+    );
+}
+
+/// An edited draft for an update held with no `current` is judged against the note once it can be
+/// read: refused as `changed`, never saved over it unseen.
+#[test]
+fn an_edited_held_update_without_a_current_note_is_changed_when_the_note_can_be_read() {
+    use harness_memory::held::{HeldItem, HeldStore, HeldTool};
+
+    let guarded = Guarded::new();
+    let mut chat = guarded.chat_server();
+    let mut unread = note("Unread note");
+    unread["scope"] = json!("global");
+    assert!(!is_error(&tool(&mut chat, "note_save", unread)));
+
+    let item = HeldItem::new(
+        CHAT,
+        "omp",
+        HeldTool::NoteUpdate,
+        json!({ "id": 1, "append": "Appended by the agent", "scope": "global" }),
+        Value::Null,
+    );
+    let held = HeldStore::in_folder(guarded.data()).hold(item).expect("held");
+
+    let draft = json!({ "title": "Edited", "body": "Edited body" }).to_string();
+    let changed = refused(&guarded, &["held", "save", &held, "--json"], &draft);
+    assert_eq!(changed["error"], "changed");
+
+    let again = waiting(&guarded, &held);
+    assert_eq!(again["current"]["body"], "Body of the note", "the live note is shown");
+    assert_eq!(listed(&guarded).len(), 1, "nothing was saved");
+}
+
+#[test]
+fn a_note_edited_expecting_a_revision_is_changed_only_when_it_is_still_at_it() {
+    let guarded = Guarded::new();
+    let root = guarded.repo.to_string_lossy().into_owned();
+    let saved = ok(
+        &guarded,
+        &["notes", "save", "--json", "--project", &root],
+        r#"{ "title": "Edited note", "body": "first text", "kind": "decision" }"#,
+    );
+    let note_id = saved["id"].as_i64().expect("id");
+    let id = note_id.to_string();
+    let edit = |expect: &str, body: &str| {
+        let patch = json!({ "body": body }).to_string();
+        cli(
+            &guarded,
+            &[
+                "notes",
+                "update",
+                &id,
+                "--json",
+                "--project",
+                &root,
+                "--expect-revision",
+                expect,
+            ],
+            &patch,
+        )
+    };
+
+    // The editor read revision 1, and the note is still at it.
+    let output = edit("1", "second text");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    // Another editor, which still holds revision 1, does not overwrite the second text.
+    let output = edit("1", "overwritten text");
+    assert_eq!(output.status.code(), Some(1));
+    let answer: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(answer["error"], "changed");
+    assert_eq!(answer["revision"], 2, "the revision the note is at now");
+    assert!(
+        answer["message"]
+            .as_str()
+            .expect("message")
+            .contains("nothing was changed")
+    );
+
+    let mut reader = guarded.server(None, &guarded.repo);
+    let reply = tool(&mut reader, "note_get", json!({ "ids": [note_id] }));
+    let read = text(&reply);
+    assert!(
+        read.contains("second text") && !read.contains("overwritten text"),
+        "{read}"
+    );
+
+    // A revision that is not a positive number is a usage error, and `notes save` takes none.
+    assert_eq!(edit("0", "x").status.code(), Some(2));
+    assert_eq!(edit("two", "x").status.code(), Some(2));
+    let output = cli(
+        &guarded,
+        &["notes", "save", "--json", "--expect-revision", "1"],
+        r#"{ "title": "x", "body": "y", "kind": "decision" }"#,
+    );
+    assert_eq!(output.status.code(), Some(2));
 }
 
 #[test]
@@ -1275,4 +1410,46 @@ fn a_held_update_of_a_global_note_saves_after_its_folder_is_gone() {
 
     let saved = ok(&guarded, &["held", "save", &id, "--json"], "");
     assert_eq!(saved["saved"]["kind"], "note", "{saved}");
+}
+
+#[test]
+fn a_place_is_refused_for_a_held_item_when_nothing_is_routed_remote_and_local_and_the_item_stays() {
+    // A note to change, saved before the chat asks to review.
+    let guarded = Guarded::new();
+    let mut chat = guarded.chat_server();
+    assert!(!is_error(&tool(&mut chat, "note_save", note("Existing note"))));
+    guarded.rules(false, (true, true), (true, true));
+    guarded.desktop_alive();
+
+    let saved = held_id(&tool(&mut chat, "note_save", note("Held note")));
+    let script = held_id(&tool(
+        &mut chat,
+        "script_save",
+        json!({ "name": "hello", "description": "d", "language": "sh", "body": "echo hi" }),
+    ));
+    let update = held_id(&tool(&mut chat, "note_update", json!({ "id": 1, "append": "more" })));
+
+    // No team database is set, so everything is on this computer and there is no place to pick.
+    for id in [&saved, &script, &update] {
+        for place in ["remote", "local"] {
+            let said = refused(&guarded, &["held", "save", id, "--json", "--place", place], "");
+            assert_eq!(said["error"], "invalid", "{id} {place}: {said}");
+        }
+    }
+
+    let bad = refused(&guarded, &["held", "save", &saved, "--json", "--place", "nowhere"], "");
+    assert_eq!(bad["error"], "invalid", "{bad}");
+    assert!(bad["message"].as_str().expect("message").contains("--place"), "{bad}");
+
+    let listed = ok(&guarded, &["held", "list", "--json"], "");
+    assert_eq!(
+        listed["held"].as_array().map(Vec::len),
+        Some(3),
+        "every refused item is kept: {listed}"
+    );
+
+    // Without a place they save as before.
+    let done = ok(&guarded, &["held", "save", &saved, "--json"], "");
+    assert_eq!(done["saved"]["kind"], "note");
+    assert!(done["saved"].get("place").is_none(), "{done}");
 }

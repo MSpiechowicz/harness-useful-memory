@@ -27,12 +27,15 @@
 //! [`Routing`] can keep one scope on this computer instead: `repository_notes` and `global_notes`
 //! in the config file (or [`REPOSITORY_NOTES_VAR`] and [`GLOBAL_NOTES_VAR`]) are `"remote"` (the
 //! default), `"local"` or `"remote+local"` ([`NotesPlace`]): the last reads the team database and
-//! this computer and saves new notes here, the team notes of the scope being read-only. When notes
-//! are read from both the server reads and writes through a [`crate::store::SplitStore`]; with both
-//! `"local"` the team database is not used for notes. Scripts follow `scripts` (or [`SCRIPTS_VAR`])
-//! the same way ([`Selection::scripts_place`]): `"remote+local"` reads the team's scripts and this
-//! computer's, saves new ones here and leaves the team's read-only, through a
-//! [`crate::store::SplitScripts`].
+//! this computer, and where it saves new notes `remote_local_saves` (or [`REMOTE_LOCAL_SAVES_VAR`])
+//! says: `"remote"` (the default) saves them to the team database and leaves the team's notes of the
+//! scope editable, `"local"` saves them on this computer and leaves the team's notes of the scope
+//! read-only ([`Routing::remote_local_saves`]). When notes are read from both the server reads and
+//! writes through a [`crate::store::SplitStore`]; with both `"local"` the team database is not used
+//! for notes. Scripts follow `scripts` (or [`SCRIPTS_VAR`]) the same way
+//! ([`Selection::scripts_place`]): `"remote+local"` reads the team's scripts and this computer's,
+//! saves new ones where `remote_local_saves` says and leaves the team's read-only when it says
+//! `"local"`, through a [`crate::store::SplitScripts`].
 //! `trust_team_scripts = true` (or [`TRUST_TEAM_SCRIPTS_VAR`] `1`) lets every script read from the
 //! team database run without a person approving it on this computer first.
 //!
@@ -89,6 +92,12 @@ pub const GLOBAL_NOTES_VAR: &str = "HARNESS_MEMORY_GLOBAL_NOTES";
 /// config file; empty = unset.
 pub const SCRIPTS_VAR: &str = "HARNESS_MEMORY_SCRIPTS";
 
+/// Environment variable saying where new notes and scripts of a scope routed `remote+local` are
+/// saved: in the team database (`remote`, the default) or on this computer (`local`). Wins over
+/// `remote_local_saves` in the config file; empty = unset. It changes nothing for a scope routed
+/// `remote` or `local`.
+pub const REMOTE_LOCAL_SAVES_VAR: &str = "HARNESS_MEMORY_REMOTE_LOCAL_SAVES";
+
 /// Environment variable trusting every script read from the team database (`1`) or not (`0`, the
 /// default). Wins over `trust_team_scripts` in the config file; empty = unset.
 pub const TRUST_TEAM_SCRIPTS_VAR: &str = "HARNESS_MEMORY_TRUST_TEAM_SCRIPTS";
@@ -113,7 +122,8 @@ pub const TRUST_TEAM_ROUTINES_VAR: &str = "HARNESS_MEMORY_TRUST_TEAM_ROUTINES";
 /// Environment variable turning the offline fallback on (`1`, the default) or off (`0`): while the
 /// team database cannot be reached, scopes set to `remote` are served like `remote+local` (read
 /// this computer's notes and scripts, save here) and what was saved is copied to the team database
-/// when it is back. Wins over `offline_fallback` in the config file; empty = unset.
+/// when it is back, and a change to a team note is queued and applied then. Wins over
+/// `offline_fallback` in the config file; empty = unset.
 pub const OFFLINE_FALLBACK_VAR: &str = "HARNESS_MEMORY_OFFLINE_FALLBACK";
 
 /// Environment variable naming the Harness Desktop chat this server's harness runs for (its
@@ -138,6 +148,7 @@ struct ConfigFile {
     repository_notes: Option<String>,
     global_notes: Option<String>,
     scripts: Option<String>,
+    remote_local_saves: Option<String>,
     trust_team_scripts: Option<bool>,
     hooks: Option<String>,
     trust_team_hooks: Option<bool>,
@@ -257,7 +268,8 @@ impl Place {
 
 /// Where one note scope is read and saved when a team database is set: [`Place`] plus
 /// [`NotesPlace::RemoteLocal`], which reads the team database and this computer and saves new notes
-/// here (the team notes of the scope are read-only then).
+/// where [`Routing::remote_local_saves`] says (the team notes of the scope are read-only when that
+/// is this computer).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum NotesPlace {
     /// In the team database (`remote`).
@@ -265,7 +277,8 @@ pub enum NotesPlace {
     Remote,
     /// In the local SQLite file of this computer (`local`).
     Local,
-    /// Read from the team database and this computer, saved on this computer (`remote+local`).
+    /// Read from the team database and this computer, saved where `remote_local_saves` says
+    /// (`remote+local`).
     RemoteLocal,
 }
 
@@ -308,12 +321,26 @@ impl NotesPlace {
         matches!(self, Self::Local | Self::RemoteLocal)
     }
 
-    /// Where the scope's new notes are saved: the team database only for `remote`.
-    pub fn writes(self) -> Place {
+    /// Where the scope's new entries are saved: the team database for `remote`, this computer for
+    /// `local`, and for `remote+local` the place `saves` names (`remote_local_saves`).
+    pub fn writes(self, saves: Place) -> Place {
         match self {
             Self::Remote => Place::Remote,
-            Self::Local | Self::RemoteLocal => Place::Local,
+            Self::Local => Place::Local,
+            Self::RemoteLocal => saves,
         }
+    }
+
+    /// True when the team's entries of the scope can be changed from here and new ones go to the team
+    /// database: `remote`, and `remote+local` while `saves` (`remote_local_saves`) is `remote`.
+    pub fn writes_team(self, saves: Place) -> bool {
+        self.writes(saves) == Place::Remote
+    }
+
+    /// True when the scope reads the team's entries but cannot change them: `remote+local` while
+    /// `saves` (`remote_local_saves`) is `local`.
+    pub fn team_read_only(self, saves: Place) -> bool {
+        self == Self::RemoteLocal && saves == Place::Local
     }
 }
 
@@ -333,9 +360,17 @@ pub struct Routing {
     pub repository: NotesPlace,
     pub global: NotesPlace,
     pub scripts: NotesPlace,
+    /// Where new entries of a scope (or the scripts) routed `remote+local` are saved: the team
+    /// database by default (`remote_local_saves`). Nothing changes for any other place.
+    pub remote_local_saves: Place,
 }
 
 impl Routing {
+    /// Where new entries of `place` are saved under this routing, see [`NotesPlace::writes`].
+    pub fn writes(self, place: NotesPlace) -> Place {
+        place.writes(self.remote_local_saves)
+    }
+
     /// True when notes are read from both the team database and this computer: one scope in each,
     /// or a scope in `remote+local` (the server then reads and writes through a
     /// [`crate::store::SplitStore`]).
@@ -631,6 +666,13 @@ pub fn select(env: &Env) -> Result<Selection, BackendError> {
         )?,
         global: notes_place(env, GLOBAL_NOTES_VAR, config.global_notes.as_deref(), "global_notes")?,
         scripts: notes_place(env, SCRIPTS_VAR, config.scripts.as_deref(), "scripts")?,
+        remote_local_saves: place(
+            env,
+            REMOTE_LOCAL_SAVES_VAR,
+            config.remote_local_saves.as_deref(),
+            "remote_local_saves",
+            Place::Remote,
+        )?,
     };
 
     if backend != Backend::Local && routing.is_all_local() {
@@ -1571,17 +1613,33 @@ mod tests {
             assert_eq!(NotesPlace::parse(raw), None, "{raw}");
         }
 
+        // Where new entries go: only `remote+local` follows `remote_local_saves`.
         let rows = [
-            (NotesPlace::Remote, true, false, Place::Remote),
-            (NotesPlace::Local, false, true, Place::Local),
-            (NotesPlace::RemoteLocal, true, true, Place::Local),
+            (NotesPlace::Remote, true, false, Place::Remote, Place::Remote),
+            (NotesPlace::Local, false, true, Place::Local, Place::Local),
+            (NotesPlace::RemoteLocal, true, true, Place::Remote, Place::Local),
         ];
-        for (place, team, local, writes) in rows {
-            assert_eq!(
-                (place.reads_team(), place.reads_local(), place.writes()),
-                (team, local, writes)
-            );
+        for (place, team, local, writes_remote_saves, writes_local_saves) in rows {
+            assert_eq!((place.reads_team(), place.reads_local()), (team, local));
+
+            let saves = |saves| place.writes(saves);
+            assert_eq!(saves(Place::Remote), writes_remote_saves, "{place:?}");
+            assert_eq!(saves(Place::Local), writes_local_saves, "{place:?}");
         }
+
+        // The team's entries can be changed where new ones go to the team database, and are
+        // read-only only in `remote+local` saving here.
+        for saves in [Place::Remote, Place::Local] {
+            assert!(NotesPlace::Remote.writes_team(saves));
+            assert!(!NotesPlace::Local.writes_team(saves));
+            assert!(!NotesPlace::Remote.team_read_only(saves));
+            assert!(!NotesPlace::Local.team_read_only(saves));
+        }
+
+        assert!(NotesPlace::RemoteLocal.writes_team(Place::Remote));
+        assert!(!NotesPlace::RemoteLocal.team_read_only(Place::Remote));
+        assert!(!NotesPlace::RemoteLocal.writes_team(Place::Local));
+        assert!(NotesPlace::RemoteLocal.team_read_only(Place::Local));
 
         assert_eq!(NotesPlace::RemoteLocal.describe(), "team database and this computer");
     }
@@ -1594,6 +1652,7 @@ mod tests {
             repository,
             global,
             scripts: Remote,
+            ..Routing::default()
         };
 
         for (repository, global, both, all_local) in [
@@ -1644,6 +1703,7 @@ mod tests {
                 repository: NotesPlace::Remote,
                 global: NotesPlace::Local,
                 scripts: NotesPlace::Remote,
+                remote_local_saves: Place::Remote,
             }
         );
         assert!(routing.needs_both_stores());
@@ -1657,6 +1717,7 @@ mod tests {
                 repository: NotesPlace::Local,
                 global: NotesPlace::Remote,
                 scripts: NotesPlace::Remote,
+                remote_local_saves: Place::Remote,
             }
         );
 
@@ -1667,6 +1728,57 @@ mod tests {
         let routing = select(&env).expect("remote+local").routing;
         assert_eq!(routing.global, NotesPlace::RemoteLocal);
         assert!(routing.needs_both_stores());
+    }
+
+    #[test]
+    fn remote_local_saves_go_to_the_team_database_unless_the_settings_say_local() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        let env = Env::for_tests("/home/u").with_var(CONFIG_VAR, path.to_string_lossy());
+
+        std::fs::write(&path, "database_url = \"postgres://file/m\"\n").expect("write");
+        assert_eq!(select(&env).expect("absent").routing.remote_local_saves, Place::Remote);
+
+        std::fs::write(
+            &path,
+            "database_url = \"postgres://file/m\"\nremote_local_saves = \" Local \"\n",
+        )
+        .expect("write");
+        let routing = select(&env).expect("file").routing;
+        assert_eq!(routing.remote_local_saves, Place::Local);
+        assert_eq!(routing.writes(NotesPlace::RemoteLocal), Place::Local);
+        assert_eq!(routing.writes(NotesPlace::Remote), Place::Remote);
+
+        let remote = env.clone().with_var(REMOTE_LOCAL_SAVES_VAR, "remote");
+        assert_eq!(
+            select(&remote).expect("env wins").routing.remote_local_saves,
+            Place::Remote
+        );
+
+        let blank = env.clone().with_var(REMOTE_LOCAL_SAVES_VAR, "");
+        assert_eq!(
+            select(&blank).expect("empty is unset").routing.remote_local_saves,
+            Place::Local
+        );
+
+        let wrong = env.with_var(REMOTE_LOCAL_SAVES_VAR, "remote+local");
+        let error = select(&wrong).expect_err("not a place").to_string();
+        assert_eq!(
+            error,
+            "HARNESS_MEMORY_REMOTE_LOCAL_SAVES must be \"remote\" or \"local\""
+        );
+
+        std::fs::write(
+            &path,
+            "database_url = \"postgres://file/m\"\nremote_local_saves = \"both\"\n",
+        )
+        .expect("write");
+        let env = Env::for_tests("/home/u").with_var(CONFIG_VAR, path.to_string_lossy());
+        let error = select(&env).expect_err("not a place in the file").to_string();
+        assert_eq!(
+            error,
+            "remote_local_saves in the config file must be \"remote\" or \"local\""
+        );
     }
 
     #[test]

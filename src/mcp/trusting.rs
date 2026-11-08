@@ -6,6 +6,7 @@
 //! trust unrecorded, and by its id once saved.
 
 use super::Server;
+use crate::backend::Place;
 use crate::store::{Script, ScriptDraft, script_sha256};
 
 /// Why `script_save` trusts nothing while a save guard applies to its chat or repository.
@@ -33,9 +34,9 @@ impl Trusting {
     }
 }
 
-/// Holds `draft` back by name in the place the server saves scripts to, before it is saved.
-pub(super) fn hold_back_draft(server: &mut Server, draft: &ScriptDraft) -> Result<(), String> {
-    let place = server.place_key(server.scripts_place.writes());
+/// Holds `draft` back by name in `place`, the place the save writes to, before it is saved.
+pub(super) fn hold_back_draft(server: &mut Server, draft: &ScriptDraft, place: Place) -> Result<(), String> {
+    let place = server.place_key(place);
     let sha256 = script_sha256(draft.language, &draft.body);
 
     server

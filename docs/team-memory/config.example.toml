@@ -36,6 +36,11 @@ database_url = "postgres://harness_memory:CHANGE-ME@db.example.com:5432/harness_
 # repository_notes = "remote"
 # global_notes = "local"
 
+# With a scope (or `scripts`) set to "remote+local", where new notes and scripts are saved: "remote" (the default, the
+# team database) or "local" (this computer, leaving the team's entries read-only). Nothing changes for other values of
+# those keys. HARNESS_MEMORY_REMOTE_LOCAL_SAVES overrides it.
+# remote_local_saves = "remote"
+
 # Whether a scope set to "remote" (and "remote+local") is read and saved on this computer while the team database
 # cannot be reached, and what was saved there is copied to the team database when it is back. On by default; set
 # false to never keep notes or scripts on this computer. HARNESS_MEMORY_OFFLINE_FALLBACK overrides it.
