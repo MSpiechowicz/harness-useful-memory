@@ -1,3 +1,19 @@
+# [3.5.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v3.4.0...v3.5.0) (2026-11-08)
+
+
+### Bug Fixes
+
+* **offline:** keep notes and scripts when the remote connection drops ([a21ec24](https://github.com/MSpiechowicz/harness-useful-memory/commit/a21ec24fc27a2bbaf667d9fbc607b8f695f2fc4e))
+
+
+### Features
+
+* **memory:** choose where new notes and scripts are saved ([cd7f9c6](https://github.com/MSpiechowicz/harness-useful-memory/commit/cd7f9c6b00d6bdd032248989a02c3cfd2efa113e))
+* **notes:** refuse a save from an editor that opened an older version ([e77cdb5](https://github.com/MSpiechowicz/harness-useful-memory/commit/e77cdb5a6cfe96da8ce081c86051128ba5522d20))
+* **offline:** queue changes to existing remote notes during an outage ([781a1d8](https://github.com/MSpiechowicz/harness-useful-memory/commit/781a1d87849ddf41aabaf9cc6fd2173290870311))
+* **sync:** add a sync command that sends waiting work to the remote ([7e8b3fd](https://github.com/MSpiechowicz/harness-useful-memory/commit/7e8b3fdcc90f8dc21a6bb8a2b68124bf82d80f59))
+* **sync:** copy chosen notes and scripts between the remote and this computer ([035bfe3](https://github.com/MSpiechowicz/harness-useful-memory/commit/035bfe339e6c0611bd94c800bccde377badcb18b))
+
 # [3.4.0](https://github.com/MSpiechowicz/harness-useful-memory/compare/v3.3.1...v3.4.0) (2026-11-06)
 
 
