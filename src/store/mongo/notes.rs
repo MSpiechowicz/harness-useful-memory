@@ -37,6 +37,18 @@ pub(super) struct CleanPatch {
     kind: Option<NoteKind>,
     tags: Option<Vec<String>>,
     writer: Writer,
+    /// The revision the note must be at ([`NotePatch::expected_revision`]).
+    expected_revision: Option<i64>,
+}
+
+impl CleanPatch {
+    /// Fails with [`StoreError::Stale`] when the patch expects another revision than `revision`.
+    fn expects(&self, revision: i64) -> Result<(), StoreError> {
+        match self.expected_revision {
+            Some(expected) if expected != revision => Err(StoreError::Stale(revision)),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// A [`Provenance`] as stored; an unknown writer is stored as such (`null` root and source).
@@ -159,6 +171,7 @@ pub(super) fn prepare_patch(patch: &NotePatch) -> Result<CleanPatch, StoreError>
         kind: patch.kind,
         tags: patch.tags.as_deref().map(clean::tags).transpose()?,
         writer: Writer::new(&patch.provenance),
+        expected_revision: patch.expected_revision,
     })
 }
 
@@ -293,6 +306,8 @@ pub(super) fn remember(
         revision,
         scope: scope_of(project.as_deref()),
         project,
+        queued: false,
+        not_listed: false,
     })
 }
 
@@ -308,6 +323,8 @@ pub(super) fn update(
     let Some(Stored { note, .. }) = load(ctx, view, id)? else {
         return Err(Fail::Store(not_found(id)));
     };
+
+    patch.expects(note.revision).map_err(Fail::Store)?;
 
     let title = patch.title.clone().unwrap_or_else(|| note.title.clone());
     let title_norm = clean::normalize(&title);
@@ -361,6 +378,8 @@ pub(super) fn update(
         revision: note.revision + 1,
         scope: note.scope,
         project: note.project,
+        queued: false,
+        not_listed: false,
     })
 }
 

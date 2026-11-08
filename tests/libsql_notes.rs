@@ -16,6 +16,7 @@ store_cases!(
     same_title_updates_and_counts_revisions,
     titles_are_unique_per_scope,
     update_patches_and_refuses_conflicts,
+    a_patch_expecting_a_revision_changes_only_a_note_still_at_it,
     get_counts_hits_and_caps_ids,
     forgetting_cascades,
     forgetting_a_relation_keeps_the_rest,
@@ -53,6 +54,10 @@ fn same_title_updates_and_counts_revisions(db: &Database) {
     assert_eq!(notes[0].body, "Moved to .cache/");
     assert_eq!(notes[0].kind, NoteKind::Decision);
     assert_eq!(notes[0].title, "build CACHE");
+}
+
+fn a_patch_expecting_a_revision_changes_only_a_note_still_at_it(db: &Database) {
+    common::revision::a_patch_expecting_a_revision_changes_only_a_note_still_at_it(db.open().as_mut());
 }
 
 fn titles_are_unique_per_scope(db: &Database) {

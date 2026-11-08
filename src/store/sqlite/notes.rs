@@ -151,6 +151,8 @@ pub(super) fn update(
         return Err(not_found(id));
     };
 
+    patch.expects(note.revision)?;
+
     let title = patch.title.clone().unwrap_or_else(|| note.title.clone());
     let title_norm = clean::normalize(&title);
     ensure_title_free(db, &note, &title_norm)?;
@@ -492,6 +494,8 @@ fn saved(db: &mut dyn Sql, id: i64, created: bool) -> Result<Saved, StoreError> 
                 revision: row.get(0)?,
                 scope: scope_of(row.get(1)?),
                 project: row.get(2)?,
+                queued: false,
+                not_listed: false,
             })
         },
     )?;

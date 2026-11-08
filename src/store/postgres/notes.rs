@@ -175,6 +175,8 @@ pub(super) fn update(
         return Err(not_found(id));
     };
 
+    patch.expects(note.revision)?;
+
     let title = patch.title.clone().unwrap_or_else(|| note.title.clone());
     let title_norm = clean::normalize(&title);
     ensure_title_free(tx, &note, &title_norm)?;
@@ -550,6 +552,8 @@ fn saved(tx: &mut Transaction<'_>, id: i64, created: bool) -> Result<Saved, Stor
         revision: column(&row, 0)?,
         scope: scope_of(column(&row, 1)?),
         project: column(&row, 2)?,
+        queued: false,
+        not_listed: false,
     })
 }
 

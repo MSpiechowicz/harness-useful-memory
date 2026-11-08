@@ -138,6 +138,14 @@ fn mongo_titles_are_unique_per_scope_not_across_scopes() {
 }
 
 #[test]
+fn mongo_a_patch_expecting_a_revision_changes_only_a_note_still_at_it() {
+    let Some((_db, mut store)) = mongo_support::store() else {
+        return;
+    };
+    common::revision::a_patch_expecting_a_revision_changes_only_a_note_still_at_it(&mut store);
+}
+
+#[test]
 fn mongo_update_patches_fields_and_refuses_conflicts() {
     let Some((_db, mut store)) = mongo_support::store() else {
         return;

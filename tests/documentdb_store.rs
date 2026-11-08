@@ -150,6 +150,14 @@ fn documentdb_similar_notes_share_words_and_leave_out_the_note_itself() {
 }
 
 #[test]
+fn documentdb_a_patch_expecting_a_revision_changes_only_a_note_still_at_it() {
+    let Some((_db, mut store)) = mongo_support::documentdb_store() else {
+        return;
+    };
+    common::revision::a_patch_expecting_a_revision_changes_only_a_note_still_at_it(&mut store);
+}
+
+#[test]
 fn documentdb_notes_are_saved_updated_and_forgotten() {
     let Some((_db, mut store)) = mongo_support::documentdb_store() else {
         return;

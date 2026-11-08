@@ -25,7 +25,7 @@
 
 use std::io::Write;
 
-use mongodb::error::{Error, ErrorKind};
+use mongodb::error::Error;
 use mongodb::options::{AuthMechanism, ClientOptions, ReadPreference, SelectionCriteria};
 use tempfile::NamedTempFile;
 
@@ -181,12 +181,11 @@ pub(super) fn backend(error: &Error) -> StoreError {
         return StoreError::Backend(message);
     }
 
-    match error.kind.as_ref() {
-        ErrorKind::ServerSelection { .. } | ErrorKind::Io(_) | ErrorKind::DnsResolve { .. } => {
-            StoreError::Unreachable(format!("{message}. {VPN_HINT}"))
-        }
-        _ => StoreError::Backend(message),
+    if super::connection::unreachable(error) {
+        return StoreError::Unreachable(format!("{message}. {VPN_HINT}"));
     }
+
+    StoreError::Backend(message)
 }
 
 #[cfg(test)]

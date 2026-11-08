@@ -115,6 +115,12 @@ fn update_patches_fields_and_refuses_conflicts() {
 }
 
 #[test]
+fn a_patch_expecting_a_revision_changes_only_a_note_still_at_it() {
+    let (_dir, mut store) = temp_store();
+    common::revision::a_patch_expecting_a_revision_changes_only_a_note_still_at_it(&mut store);
+}
+
+#[test]
 fn get_counts_hits_skips_unknown_ids_and_caps_the_id_list() {
     let (_dir, mut store) = temp_store();
     let saved = store

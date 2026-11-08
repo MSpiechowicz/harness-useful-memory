@@ -45,6 +45,19 @@ pub struct CleanPatch {
     pub kind: Option<NoteKind>,
     pub tags: Option<Vec<String>>,
     pub writer: Writer,
+    /// The revision the note must be at ([`NotePatch::expected_revision`]).
+    pub expected_revision: Option<i64>,
+}
+
+impl CleanPatch {
+    /// Fails with [`StoreError::Stale`] when the patch expects a revision and the note `revision`
+    /// is another. Each backend asks it for the note it just read inside its write.
+    pub fn expects(&self, revision: i64) -> Result<(), StoreError> {
+        match self.expected_revision {
+            Some(expected) if expected != revision => Err(StoreError::Stale(revision)),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// A [`Provenance`] as stored. An unknown writer is stored as such (no root and no source), so a
@@ -110,6 +123,7 @@ pub fn patch(patch: &NotePatch) -> Result<CleanPatch, StoreError> {
         kind: patch.kind,
         tags: patch.tags.as_deref().map(tags).transpose()?,
         writer: Writer::new(&patch.provenance),
+        expected_revision: patch.expected_revision,
     })
 }
 
