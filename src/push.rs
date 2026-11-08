@@ -30,11 +30,18 @@
 //! reported as a failure; the relation of a failed note does not count, as its note stays. A note
 //! that changed (or went) after the push read it stays as well, marked [`Change::changed_since`].
 //!
+//! [`push_selected`] takes only the local notes the caller names (`--selection -`): what the user
+//! reviewed, each as the id, title and update time the dry run printed ([`Seen`]). A note is taken
+//! only while all three still match its row. Any other note of the scope is neither pushed nor
+//! deleted, however it got there meanwhile (a new note may even reuse the id of a deleted one), and
+//! a named note that changed since it was reviewed, or is no longer saved, is a [`Failure`] of its
+//! id, not of the rest.
+//!
 //! What the trait cannot carry stays behind: the team store stamps its own creation and update
 //! times, revisions and hit counts start fresh, and an updated note keeps the entities it had
 //! (only added notes get the local ones; at most [`ENTITIES_PER_NOTE`] of them).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::store::pending::Entry;
 use std::path::{Path, PathBuf};
@@ -45,6 +52,7 @@ use crate::limits::{ENTITIES_PER_NOTE, NEIGHBORS_LIMIT_MAX};
 use crate::store::split::hidden_title_error;
 use crate::store::{Authors, Forget, Link, MemoryStore, Note, NoteDraft, NoteKind, NotePatch, ProjectKey, Provenance};
 use crate::store::{SqliteStore, StoreError, Target, View, clean};
+use crate::support::time::rfc3339;
 
 /// The label of the global scope in [`Change::scope`] and [`Summary::projects`].
 pub const GLOBAL: &str = "global";
@@ -71,6 +79,91 @@ impl Overwrite {
             Self::None => false,
             Self::Ids(ids) => ids.contains(&local_id),
         }
+    }
+}
+
+/// A local note (or script) as the user reviewed it: the title (or name) and update time the dry
+/// run printed for its id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seen {
+    /// The note's title, or the script's name.
+    pub name: String,
+    /// `localUpdatedAt` as the dry run printed it (`YYYY-MM-DDTHH:MM:SSZ`), compared as text.
+    pub updated_at: String,
+}
+
+impl Seen {
+    /// True when a row named `name`, last changed at `updated_at` (unix seconds), is what was seen.
+    fn matches(&self, name: &str, updated_at: i64) -> bool {
+        self.name == name && self.updated_at == rfc3339(updated_at)
+    }
+}
+
+/// The local notes (or scripts) a push is limited to.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Only<'a> {
+    /// What the offline fallback saved: the id, scope and title or name all have to match.
+    Entries(&'a [Entry]),
+    /// What the user reviewed, by local id: the id, title or name and update time all have to match
+    /// the row, whatever else the scope holds.
+    Reviewed(&'a BTreeMap<i64, Seen>),
+}
+
+impl Only<'_> {
+    /// True when the local row `id` in `scope` with `name`, last changed at `updated_at` (unix
+    /// seconds), is one of them.
+    pub(crate) fn takes(&self, id: i64, name: &str, scope: &str, updated_at: i64) -> bool {
+        match self {
+            Self::Entries(entries) => entries
+                .iter()
+                .any(|entry| entry.id == id && entry.name == name && entry.scope == scope),
+            Self::Reviewed(seen) => seen.get(&id).is_some_and(|seen| seen.matches(name, updated_at)),
+        }
+    }
+
+    /// The ids named by [`Only::Reviewed`] whose row is gone or is not what was seen, as failures of
+    /// those ids (they are neither pushed nor deleted); `rows` maps every local id to its name and
+    /// update time, and `noun` is `note` or `script`.
+    pub(crate) fn unmatched(&self, rows: &HashMap<i64, (&str, i64)>, noun: &str) -> Vec<Failure> {
+        let Self::Reviewed(reviewed) = self else {
+            return Vec::new();
+        };
+
+        let mut failures = Vec::new();
+
+        for (id, seen) in *reviewed {
+            let message = match rows.get(id) {
+                None => format!("{noun} {id} is no longer saved on this computer, so it was not pushed"),
+                Some((name, updated_at)) if !seen.matches(name, *updated_at) => {
+                    format!("{noun} {id} changed since it was reviewed, so it was not pushed")
+                }
+                Some(_) => continue,
+            };
+
+            failures.push(Failure {
+                local_id: Some(*id),
+                message,
+                deleting: false,
+            });
+        }
+
+        failures
+    }
+
+    /// A failure of the local row `id` when [`Only::Reviewed`] names it and it still matches, but
+    /// the push no longer takes its `scope` (the routing changed after the review): the row is
+    /// neither pushed nor deleted. `noun` is `note` or `script`. The offline fallback's entries
+    /// stay listed instead: they wait for their scope to come back.
+    pub(crate) fn untaken(&self, id: i64, name: &str, scope: &str, updated_at: i64, noun: &str) -> Option<Failure> {
+        if !matches!(self, Self::Reviewed(_)) || !self.takes(id, name, scope, updated_at) {
+            return None;
+        }
+
+        Some(Failure {
+            local_id: Some(id),
+            message: format!("{noun} {id}: its scope \"{scope}\" is no longer part of this copy, so it was not pushed"),
+            deleting: false,
+        })
     }
 }
 
@@ -266,6 +359,21 @@ pub fn push(
     push_ids(local, remote, hidden, options, None)
 }
 
+/// Like [`push`], but only the local notes in `reviewed` (by local id), with their relations: what
+/// the user reviewed. A note is taken only while its id, title and update time still match what
+/// was seen. Notes saved or changed since stay as they are (and are not deleted by
+/// [`Options::delete_copied`]); a named note that changed, or is no longer a local note, fails on
+/// its own.
+pub fn push_selected(
+    local: &Path,
+    remote: &mut dyn MemoryStore,
+    hidden: &[i64],
+    options: &Options,
+    reviewed: &BTreeMap<i64, Seen>,
+) -> Result<Summary, StoreError> {
+    push_ids(local, remote, hidden, options, Some(Only::Reviewed(reviewed)))
+}
+
 /// Like [`push`], but only the local notes `only` names (an id, scope and title that all match), with
 /// their relations: the offline fallback copies what it saved while the team database was
 /// unreachable (see [`crate::store::pending`]).
@@ -276,7 +384,7 @@ pub fn push_only(
     options: &Options,
     only: &[Entry],
 ) -> Result<Summary, StoreError> {
-    push_ids(local, remote, hidden, options, Some(only))
+    push_ids(local, remote, hidden, options, Some(Only::Entries(only)))
 }
 
 fn push_ids(
@@ -284,23 +392,44 @@ fn push_ids(
     remote: &mut dyn MemoryStore,
     hidden: &[i64],
     options: &Options,
-    only: Option<&[Entry]>,
+    only: Option<Only>,
 ) -> Result<Summary, StoreError> {
     let (notes, links) = read_local(local)?;
     let mut summary = Summary::default();
+
+    if let Some(only) = &only {
+        let rows: HashMap<i64, (&str, i64)> = notes
+            .iter()
+            .map(|note| (note.id, (note.title.as_str(), note.updated_at)))
+            .collect();
+        summary.failed.extend(only.unmatched(&rows, "note"));
+    }
+
     let mut remote_ids: HashMap<i64, i64> = HashMap::new();
     let mut lacking: HashSet<i64> = HashSet::new();
     let mut failed_notes: HashSet<i64> = HashSet::new();
     let mut left_hidden: HashSet<i64> = HashSet::new();
 
     let chosen = |note: &LocalNote| {
-        only.is_none_or(|entries| {
-            entries.iter().any(|entry| {
-                entry.id == note.id && entry.name == note.title && entry.scope == scope_label(&note.target)
-            })
-        })
+        only.is_none_or(|only| only.takes(note.id, &note.title, &scope_label(&note.target), note.updated_at))
     };
     let chosen_ids: HashSet<i64> = notes.iter().filter(|note| chosen(note)).map(|note| note.id).collect();
+
+    if let Some(only) = &only {
+        let untaken = notes
+            .iter()
+            .filter(|note| !options.takes(&note.target))
+            .filter_map(|note| {
+                only.untaken(
+                    note.id,
+                    &note.title,
+                    &scope_label(&note.target),
+                    note.updated_at,
+                    "note",
+                )
+            });
+        summary.failed.extend(untaken);
+    }
 
     for note in notes.iter().filter(|note| options.takes(&note.target) && chosen(note)) {
         summary.projects.insert(scope_label(&note.target));
@@ -491,6 +620,7 @@ fn push_note(
         kind: Some(note.kind),
         tags: Some(note.tags.clone()),
         provenance: note.provenance.clone(),
+        expected_revision: None,
     };
 
     remote.update(&View::around(&note.target), existing.id, &patch)?;
@@ -674,7 +804,7 @@ fn forget_unchanged(store: &mut SqliteStore, read: &LocalNote) -> Result<bool, S
 /// it: the same entities and label, and its note (a relation without a note keeps the one it has).
 /// Only the relations [`MemoryStore::neighbors`] lists for the first entity are looked at, so one
 /// past [`NEIGHBORS_LIMIT_MAX`] counts as missing and is written again.
-fn link_exists(remote: &mut dyn MemoryStore, target: &Target, link: &Link) -> Result<bool, StoreError> {
+pub(crate) fn link_exists(remote: &mut dyn MemoryStore, target: &Target, link: &Link) -> Result<bool, StoreError> {
     // An invalid relation is left to `link`, which reports why.
     let Ok(wanted) = clean::link(link) else {
         return Ok(false);

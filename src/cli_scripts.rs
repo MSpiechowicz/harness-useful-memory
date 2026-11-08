@@ -1,12 +1,13 @@
 //! What the script commands share ([`Opened`]: the stores, the trust and the view, opened like
 //! the server), `scripts list` ([`list`]), and the commands for scripts read from the team
 //! database: `scripts hide` and `scripts unhide` ([`hidden`]), `scripts discard-local`
-//! ([`discard`]) and `scripts push` ([`push`]). [`crate::cli_trust`] dispatches them and documents
+//! ([`discard`]), `scripts push` ([`push`]) and `scripts pull` ([`pull`]). [`crate::cli_trust`] dispatches them and documents
 //! every script command.
 
 pub(crate) mod discard;
 pub(crate) mod hidden;
 pub(crate) mod list;
+pub(crate) mod pull;
 pub(crate) mod push;
 pub(crate) mod save;
 
@@ -54,7 +55,7 @@ impl Opened {
 
     /// Where the script the store shows as `id` is kept, and its id there.
     pub fn spot(&self, id: i64) -> (Place, i64) {
-        let single = self.selection.scripts_place().writes();
+        let single = self.selection.routing.writes(self.selection.scripts_place());
         self.scripts.origin(id).spot(id, single)
     }
 

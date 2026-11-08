@@ -27,11 +27,11 @@
 //! or they changed since they were read (their update time or version; such a script is marked
 //! [`ScriptChange::changed_since`]). Any failure that names no script deletes nothing.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use crate::backend::LOCAL_KEY;
-use crate::push::{Action, Failure, Options, Overwrite};
+use crate::push::{Action, Failure, Only, Options, Overwrite, Seen};
 use crate::store::hidden::view_of;
 use crate::store::pending::Entry;
 use crate::store::split::narrow_by;
@@ -116,6 +116,21 @@ pub fn push_scripts(
     push_ids(local, team, trust, options, None)
 }
 
+/// Like [`push_scripts`], but only the local scripts in `reviewed` (by local id): what the user
+/// reviewed. A script is taken only while its id, name and update time still match what was seen.
+/// Scripts saved or changed since stay as they are (and are not deleted by
+/// [`Options::delete_copied`]); a named script that changed, or is no longer a local script, fails
+/// on its own.
+pub fn push_scripts_selected(
+    local: &Path,
+    team: &mut TeamScripts,
+    trust: &mut dyn TrustStore,
+    options: &Options,
+    reviewed: &BTreeMap<i64, Seen>,
+) -> Result<ScriptPush, StoreError> {
+    push_ids(local, team, trust, options, Some(Only::Reviewed(reviewed)))
+}
+
 /// Like [`push_scripts`], but only the local scripts `only` names (the offline fallback copies
 /// what it saved while the team database was unreachable; see [`crate::store::pending`]).
 pub fn push_scripts_only(
@@ -125,7 +140,7 @@ pub fn push_scripts_only(
     options: &Options,
     only: &[Entry],
 ) -> Result<ScriptPush, StoreError> {
-    push_ids(local, team, trust, options, Some(only))
+    push_ids(local, team, trust, options, Some(Only::Entries(only)))
 }
 
 fn push_ids(
@@ -133,10 +148,21 @@ fn push_ids(
     team: &mut TeamScripts,
     trust: &mut dyn TrustStore,
     options: &Options,
-    only: Option<&[Entry]>,
+    only: Option<Only>,
 ) -> Result<ScriptPush, StoreError> {
     let scripts = read_local(local)?;
     let mut summary = ScriptPush::default();
+
+    if let Some(only) = &only {
+        let rows: HashMap<i64, (&str, i64)> = scripts
+            .iter()
+            .map(|(script, _)| {
+                let summary = &script.summary;
+                (summary.id, (summary.name.as_str(), summary.updated_at))
+            })
+            .collect();
+        summary.failed.extend(only.unmatched(&rows, "script"));
+    }
 
     for (script, project) in &scripts {
         let target = match project {
@@ -144,15 +170,32 @@ fn push_ids(
             None => Target::Global,
         };
 
-        let skipped = only.is_some_and(|entries| {
-            !entries.iter().any(|entry| {
-                entry.id == script.summary.id
-                    && entry.name == script.summary.name
-                    && entry.scope == crate::push::scope_label(&target)
-            })
+        let skipped = only.is_some_and(|only| {
+            !only.takes(
+                script.summary.id,
+                &script.summary.name,
+                &crate::push::scope_label(&target),
+                script.summary.updated_at,
+            )
         });
 
-        if !options.takes(&target) || skipped {
+        // A script picked for this copy whose scope it no longer takes fails, instead of vanishing.
+        if !options.takes(&target) {
+            let untaken = only.and_then(|only| {
+                only.untaken(
+                    script.summary.id,
+                    &script.summary.name,
+                    &crate::push::scope_label(&target),
+                    script.summary.updated_at,
+                    "script",
+                )
+            });
+            summary.failed.extend(untaken);
+
+            continue;
+        }
+
+        if skipped {
             continue;
         }
 
@@ -306,7 +349,7 @@ fn carry_trust(
 }
 
 /// `local` as a draft to save in the team database.
-fn draft_of(local: &Script) -> ScriptDraft {
+pub(crate) fn draft_of(local: &Script) -> ScriptDraft {
     let summary = &local.summary;
 
     ScriptDraft {

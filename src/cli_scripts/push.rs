@@ -1,10 +1,16 @@
 //! `scripts push [--dry-run] [--json] [--overwrite none|all|ID[,ID…]|-] [--delete-copied]
-//! [--scope repo|global] [--repo <key|.>] [--no-global]`: copies the scripts saved on this
+//! [--scope repo|global | --remote-local] [--repo <key|.>] [--no-global] [--selection -]`: copies the scripts saved on this
 //! computer into the team database ([`crate::push_scripts`]), with the options of `push`
-//! ([`crate::cli_push`]).
+//! ([`crate::cli_push`]). `--selection -` limits it to the scripts a JSON object on stdin names
+//! (`{"only": [{"id": N, "name": "<script name>", "updatedAt": "<localUpdatedAt>"}, ...],
+//! "overwrite": [N, ...]}`, as the dry run printed them): a script is taken only while its id, name and
+//! update time still match, any other script is neither pushed nor deleted, and a named one that
+//! changed since it was reviewed or is no script any more is listed in `failed` (exit 1) without
+//! stopping the rest.
 //!
 //! It pushes while scripts are `remote`; with `remote+local` only when `--scope` names the scope
-//! to push, and never with `local`. `--json` prints one object, the same for a dry run and a real
+//! to push, and never with `local`. `--remote-local` takes scripts set to `remote+local` (and only
+//! those, so never `remote` or `local`) without naming a scope. `--json` prints one object, the same for a dry run and a real
 //! one:
 //!
 //! ```json
@@ -30,11 +36,11 @@ use serde_json::{Value, json};
 
 use crate::backend::{self, Backend, CONFIG_VAR, NotesPlace, Place, Secrets, URL_VAR};
 use crate::cli;
-use crate::cli_push::{PushArgs, overwrite, repo_key};
+use crate::cli_push::{PushArgs, chosen, repo_key};
 use crate::mcp::repo_label;
 use crate::open::{open_hidden_scripts, open_trust};
-use crate::push::{Action, Options};
-use crate::push_scripts::{ScriptPush, TeamScripts, push_scripts};
+use crate::push::{Action, Failure, Options};
+use crate::push_scripts::{ScriptPush, TeamScripts, push_scripts, push_scripts_selected};
 use crate::store::Scope;
 use crate::support::time::rfc3339;
 
@@ -68,8 +74,15 @@ pub(crate) fn push(args: &[Option<&str>]) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    if let Some(reason) = left_out(selection.scripts_place(), args.scope) {
-        return report_nothing(&args, reason);
+    // Read first: a selection that lists ids must hear why they were not pushed, whatever else
+    // leaves nothing to push.
+    let Some(chosen) = chosen(&args) else {
+        return ExitCode::from(2);
+    };
+    let listed: Vec<i64> = chosen.only.iter().flat_map(|only| only.keys().copied()).collect();
+
+    if let Some(reason) = left_out(selection.scripts_place(), &args) {
+        return report_nothing(&args, reason, &listed);
     }
 
     let Some(local) = crate::database_path(&env) else {
@@ -78,12 +91,8 @@ pub(crate) fn push(args: &[Option<&str>]) -> ExitCode {
     };
 
     if !local.is_file() {
-        return report_nothing(&args, "no scripts are saved on this computer");
+        return report_nothing(&args, "no scripts are saved on this computer", &listed);
     }
-
-    let Some(overwrite) = overwrite(&args) else {
-        return ExitCode::from(2);
-    };
 
     let repo = match &args.repo {
         Some(raw) => match repo_key(&env, raw) {
@@ -117,7 +126,7 @@ pub(crate) fn push(args: &[Option<&str>]) -> ExitCode {
         repo,
         skip_global: args.no_global || args.scope == Some(Scope::Repo),
         skip_repositories: args.scope == Some(Scope::Global),
-        overwrite,
+        overwrite: chosen.overwrite,
         delete_copied: args.delete_copied,
     };
 
@@ -129,7 +138,12 @@ pub(crate) fn push(args: &[Option<&str>]) -> ExitCode {
     };
     let mut trust = open_trust(&env);
 
-    let summary = match push_scripts(&local, &mut target, trust.as_mut(), &options) {
+    let pushed = match &chosen.only {
+        Some(ids) => push_scripts_selected(&local, &mut target, trust.as_mut(), &options, ids),
+        None => push_scripts(&local, &mut target, trust.as_mut(), &options),
+    };
+
+    let summary = match pushed {
         Ok(summary) => summary,
         Err(error) => return failed(&format!("scripts push failed: {error}")),
     };
@@ -147,10 +161,14 @@ pub(crate) fn push(args: &[Option<&str>]) -> ExitCode {
     }
 }
 
-/// Why scripts kept in `place` are not pushed with `--scope` `scope`, if so.
-fn left_out(place: NotesPlace, scope: Option<Scope>) -> Option<&'static str> {
-    match (place, scope) {
+/// Why scripts kept in `place` are not pushed with these options, if so.
+fn left_out(place: NotesPlace, args: &PushArgs) -> Option<&'static str> {
+    match (place, args.scope) {
         (NotesPlace::Local, _) => Some("scripts stay on this computer (scripts = \"local\")"),
+        (NotesPlace::Remote, _) if args.remote_local => {
+            Some("--remote-local takes scripts set to \"remote+local\", and scripts are \"remote\"")
+        }
+        (NotesPlace::RemoteLocal, None) if args.remote_local => None,
         (NotesPlace::RemoteLocal, None) => Some(
             "scripts are \"remote+local\", so only --scope repo or --scope global pushes the ones saved on this \
              computer",
@@ -160,8 +178,33 @@ fn left_out(place: NotesPlace, scope: Option<Scope>) -> Option<&'static str> {
 }
 
 /// Says there is nothing to push and why: in the JSON object (exit 0) with `--json`, else on
-/// stderr (exit 2).
-fn report_nothing(args: &PushArgs, reason: &str) -> ExitCode {
+/// stderr (exit 2). Scripts a `--selection -` listed (`listed`, by local id) are not "nothing":
+/// each is reported as failed with the reason, and the exit is 1.
+fn report_nothing(args: &PushArgs, reason: &str, listed: &[i64]) -> ExitCode {
+    if !listed.is_empty() {
+        let summary = ScriptPush {
+            failed: listed
+                .iter()
+                .map(|id| Failure {
+                    local_id: Some(*id),
+                    message: format!("script {id} was not pushed: nothing to push, {reason}"),
+                    deleting: false,
+                })
+                .collect(),
+            ..ScriptPush::default()
+        };
+
+        if args.json {
+            println!("{}", push_json(args.dry_run, None, &summary, &Secrets::default()));
+        } else {
+            for failure in &summary.failed {
+                eprintln!("harness-memory: not pushed: {}", failure.message);
+            }
+        }
+
+        return ExitCode::FAILURE;
+    }
+
     if args.json {
         let empty = ScriptPush::default();
         println!("{}", push_json(args.dry_run, Some(reason), &empty, &Secrets::default()));

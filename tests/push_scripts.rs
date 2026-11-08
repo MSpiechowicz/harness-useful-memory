@@ -11,18 +11,19 @@ mod mongo_support;
 mod postgres_support;
 mod script_teams;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use common::scripts::{REPO, script};
 use common::{both, global_only, repo, repo_only};
 use harness_memory::backend::LOCAL_KEY;
-use harness_memory::push::{Action, Options, Overwrite};
-use harness_memory::push_scripts::{ScriptChange, ScriptPush, TeamScripts, push_scripts};
+use harness_memory::push::{Action, Options, Overwrite, Seen};
+use harness_memory::push_scripts::{ScriptChange, ScriptPush, TeamScripts, push_scripts, push_scripts_selected};
 use harness_memory::store::{
     Author, Authors, PreviousVersion, Scope, Script, ScriptRef, ScriptStore, SqliteStore, StoreError, Target,
     TrustOrigin, TrustRecord, TrustStore, TrustedVersion, View,
 };
+use harness_memory::support::time::rfc3339;
 use pretty_assertions::assert_eq;
 use script_teams::{Fresh, Team};
 use tempfile::TempDir;
@@ -155,13 +156,14 @@ impl Fixture {
 
 type Case = fn(&Fixture);
 
-const CASES: [Case; 6] = [
+const CASES: [Case; 7] = [
     a_dry_run_classifies_every_script_and_writes_nothing,
     a_dry_run_fails_hidden_matches_as_the_push_does,
     overwrite_ids_pick_the_conflicts_and_trust_goes_with_trusted_versions,
     delete_copied_deletes_only_unchanged_copies,
     failed_scripts_are_uncounted_and_stay,
     a_push_keeps_who_added_and_who_changed_a_script,
+    a_selected_script_whose_scope_is_no_longer_taken_fails_and_the_rest_is_copied,
 ];
 
 fn run(fresh: Fresh) {
@@ -452,6 +454,62 @@ fn failed_scripts_are_uncounted_and_stay(fixture: &Fixture) {
 
     // The copies that went through are deleted, the failed ones stay.
     assert_eq!(fixture.local_names(), ["added", "same", "team-newer"]);
+}
+
+/// A selected script whose scope the copy no longer takes (the routing changed after the review) is
+/// a failure of its own: nothing is copied or deleted for it, and the rest goes on.
+fn a_selected_script_whose_scope_is_no_longer_taken_fails_and_the_rest_is_copied(fixture: &Fixture) {
+    let ids = fixture.scenario();
+
+    // The review saw a repository script and a global one, with both scopes taken.
+    let preview = fixture.push(&dry_run(), &mut fixture.local_store(), &[]);
+    let seen = |id: i64| {
+        let change = change(&preview, id);
+        let seen = Seen {
+            name: change.name.clone(),
+            updated_at: rfc3339(change.local_updated_at),
+        };
+
+        (id, seen)
+    };
+    let reviewed = BTreeMap::from([seen(ids.added), seen(ids.second)]);
+
+    // Global scripts are no longer copied when the review is applied.
+    let options = Options {
+        skip_global: true,
+        delete_copied: true,
+        ..Options::default()
+    };
+    let mut team = fixture.team.open();
+    let mut target = TeamScripts {
+        scripts: team.as_mut(),
+        key: TEAM_KEY,
+        hidden: &[],
+    };
+    let pushed = push_scripts_selected(
+        &fixture.path(),
+        &mut target,
+        &mut fixture.local_store(),
+        &options,
+        &reviewed,
+    )
+    .expect("push");
+
+    let copied: Vec<i64> = pushed.changes.iter().map(|change| change.local_id).collect();
+    assert_eq!(copied, [ids.added]);
+
+    let failed: Vec<Option<i64>> = pushed.failed.iter().map(|failure| failure.local_id).collect();
+    assert_eq!(failed, [Some(ids.second)]);
+    assert!(
+        pushed.failed[0].message.contains("no longer part of this copy"),
+        "{}",
+        pushed.failed[0].message
+    );
+
+    // The script that failed stays here, and the team never got it.
+    assert!(fixture.local_names().contains(&"second".to_owned()));
+    assert!(!fixture.local_names().contains(&"added".to_owned()));
+    assert_eq!(fixture.team_script(&global_only(), "second").body, "echo theirs\n");
 }
 
 /// This machine's trust, rewriting local script `rewrite` (as a server would) when a version of it

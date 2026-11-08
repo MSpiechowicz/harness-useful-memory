@@ -6,15 +6,16 @@ mod libsql_support;
 mod mongo_support;
 mod push_support;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use common::{both, draft, global_only, query, repo, repo_only};
-use harness_memory::push::{Action, Options, Overwrite, push};
+use harness_memory::push::{Action, Options, Overwrite, Seen, push, push_selected};
 use harness_memory::store::{
     Edge, Forget, Forgotten, Hit, Link, MemoryStore, Neighborhood, Note, NoteDraft, NoteKind, NoteListQuery, NotePage,
     NotePatch, Saved, SearchQuery, SqliteStore, StoreError, Target, View,
 };
-use push_support::{all, change_of, counts, local_memory};
+use harness_memory::support::time::rfc3339;
+use push_support::{all, change_of, counts, dry, local_memory};
 use tempfile::TempDir;
 
 #[test]
@@ -657,4 +658,56 @@ impl MemoryStore for Racing {
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
         self.inner.find_by_title(target, title)
     }
+}
+
+/// A selected note whose scope the copy no longer takes (the routing changed after the review) is
+/// a failure of its own: nothing is copied or deleted for it, and the rest goes on.
+#[test]
+fn a_selected_note_whose_scope_is_no_longer_taken_fails_and_the_rest_is_copied() {
+    let dir = TempDir::new().expect("temp dir");
+    let mut remote = SqliteStore::open(&dir.path().join("team.sqlite3")).expect("team store");
+    let local = local_memory();
+
+    // The review saw one repository note and one global note, with global notes taken.
+    let preview = push(&local.path, &mut remote, &[], &dry()).expect("preview");
+    let seen = |title: &str| {
+        let change = change_of(&preview, title);
+        let seen = Seen {
+            name: title.to_owned(),
+            updated_at: rfc3339(change.local_updated_at),
+        };
+
+        (change.local_id, seen)
+    };
+    let (cache, tabs) = (seen("Build cache"), seen("Editor tabs"));
+    let reviewed = BTreeMap::from([cache.clone(), tabs.clone()]);
+
+    // Global notes are no longer copied when the review is applied.
+    let options = Options {
+        skip_global: true,
+        delete_copied: true,
+        ..Options::default()
+    };
+    let pushed = push_selected(&local.path, &mut remote, &[], &options, &reviewed).expect("pushed");
+
+    let copied: Vec<&str> = pushed.changes.iter().map(|change| change.title.as_str()).collect();
+    assert_eq!(copied, ["Build cache"]);
+
+    let failed: Vec<Option<i64>> = pushed.failed.iter().map(|failure| failure.local_id).collect();
+    assert_eq!(failed, [Some(tabs.0)]);
+    assert!(
+        pushed.failed[0].message.contains("no longer part of this copy"),
+        "{}",
+        pushed.failed[0].message
+    );
+
+    assert_eq!(local_titles(&local.path), ["Deploy steps", "Editor tabs"]);
+    assert!(remote.search(&query("", global_only())).expect("global").is_empty());
+    assert_eq!(
+        remote
+            .search(&query("", repo_only(push_support::REPO)))
+            .expect("repository")
+            .len(),
+        1
+    );
 }
