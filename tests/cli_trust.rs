@@ -1076,7 +1076,9 @@ fn on_team(data: &Path, cwd: &Path, url: &str, scripts: &str, args: &[&str]) -> 
         .current_dir(cwd)
         .env("HARNESS_MEMORY_DIR", data)
         .env("HARNESS_MEMORY_DATABASE_URL", url)
-        .env("HARNESS_MEMORY_SCRIPTS", scripts);
+        .env("HARNESS_MEMORY_SCRIPTS", scripts)
+        // What these cases test is `remote+local` scripts that save on this computer.
+        .env("HARNESS_MEMORY_REMOTE_LOCAL_SAVES", "local");
     without_team_settings(&mut command);
     command.output().expect("the executable runs")
 }
@@ -1340,7 +1342,7 @@ fn push_and_discard(url: &str) {
         "remote",
         &["scripts", "discard-local", &second.to_string(), "--yes", "--json"],
     );
-    assert_eq!(discarded, json!({ "deleted": 1 }));
+    assert_eq!(discarded, json!({ "deleted": 1, "waiting": 0 }));
     assert_eq!(
         json("remote", &["scripts", "list", "--json"])["localCounts"],
         json!({ "repo": 0, "global": 0 })

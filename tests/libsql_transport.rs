@@ -207,7 +207,9 @@ fn a_commit_whose_reply_is_lost_may_have_applied_and_is_not_repeated() {
         .expect_err("the reply is lost");
     let message = error.to_string();
 
-    assert!(matches!(error, StoreError::Backend(_)), "{error:?}");
+    // The server could not be reached for the answer: with the offline fallback the save is kept
+    // here and copied later, where the note the commit made is found by its title, not added twice.
+    assert!(matches!(error, StoreError::Unreachable(_)), "{error:?}");
     assert!(message.contains("may have been applied"), "{message}");
     assert_eq!(db.integer("SELECT count(*) FROM notes"), 1);
     assert_eq!(db.integer("SELECT revision FROM notes"), 1);

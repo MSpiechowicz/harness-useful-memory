@@ -468,11 +468,11 @@ Your own saves go past every guard, through commands no agent reaches through MC
 
 ```sh
 harness-memory held list --json [--chat KEY]                 # {"held": [...]}, newest first
-harness-memory held save <heldId> --json [--expect REVISION] [< edited.json]   # {"saved": {"kind": "note", "id": 12}}
+harness-memory held save <heldId> --json [--expect REVISION] [--place remote|local] [< edited.json]   # {"saved": {"kind": "note", "id": 12}}
 harness-memory held skip <heldId> --json [--expect REVISION] # {"skipped": "<heldId>"}
-harness-memory notes save --json --project ~/src/widget < note.json          # {"id", "title", "scope"}
-harness-memory notes update 12 --json --project ~/src/widget < patch.json    # {"id", "title"}
-harness-memory scripts save --json --project ~/src/widget < script.json      # {"name", "scope", "id", "created", "approval"}
+harness-memory notes save --json --project ~/src/widget [--place remote|local] < note.json   # {"id", "title", "scope"[, "place"]}
+harness-memory notes update 12 --json --project ~/src/widget [--expect-revision N] < patch.json  # {"id", "title"}
+harness-memory scripts save --json --project ~/src/widget [--place remote|local] < script.json   # {"name", "scope", "id", "created", "approval"[, "place"]}
 harness-memory project-key --json < folders.json             # [{"path", "root", "key"}], key null for no project
 ```
 
@@ -492,6 +492,26 @@ you review it again against that note and can save it. A held script is saved un
 
 `notes save`, `notes update` and `scripts save` take `--client NAME` to name the author (Harness Desktop passes
 `harness-desktop`): 1 to 64 visible characters on one line. Without it the author is unknown.
+
+`notes save` and `scripts save` take `--place remote|local` to pick where the entry goes when the notes of its scope (or
+the scripts) are set to `"remote+local"`, where a save goes where `remote_local_saves` says without it (the team
+database unless you set `"local"`), except that a title or name already kept on this computer is changed there. `--place local` saves to this computer whatever that setting says, and the entry is
+never listed to be copied to the team database, also while it cannot be reached: one that was listed already (saved by
+an agent while the team database was down) is taken off the list. `--place remote` saves straight to the team database with the rules of a save to a `"remote"` scope: the
+same masking and limits, a title or name hidden on this computer is refused, a same-title conflict is answered as there,
+and the author and provenance are recorded. A script saved this way is trusted on this machine as any script you save to
+the team database. When the team database cannot be reached, the save fails (exit 1, the message without credentials)
+and nothing is saved: it does not fall back to this computer and is not listed to be copied later, as you chose the
+team database. For any other routing, `--place` is refused with `{"error": "invalid", "message"}` and nothing is saved.
+The answer then adds `"place": "remote"` or `"local"`. No MCP tool has a place argument. The feature is `save-place`.
+
+`held save` takes the same `--place remote|local` for a held `note_save` or `script_save`: the entry goes to that place
+instead of where `remote_local_saves` says, and the answer's `saved` adds `"place"`. It is allowed only when the scope the
+entry will have (after an edited draft) is set to `"remote+local"`, or the scripts are for a script, else it is refused
+with `{"error": "invalid", "message"}` and the item stays. A held `note_update` has no place to pick and is refused the
+same way. With `--place remote` and the team database unreachable the save fails with `refused`, nothing is saved (not
+even on this computer) and the item stays, where a save without `--place` falls back to this computer as usual. The
+feature is `held-save-place`.
 
 A refusal prints `{"error": "notFound" | "gone" | "changed" | "invalid" | "refused", "message"}` and exits with 1.
 `gone`: the note a held `note_update` changes was deleted since. `changed`: the held item is not of the `--expect`
@@ -907,18 +927,19 @@ message). A connection lost later in a session comes back as a tool error. The c
 
 ### Which notes are shared
 
-By default both kinds of notes go to the team database. Two optional keys keep one kind on this computer, in the local
+By default both kinds of notes go to the team database. Two optional keys (and `remote_local_saves` below) keep one kind on this computer, in the local
 SQLite file, while the other is shared, or read the team's notes of a kind while saving your own on this computer:
 
 | Key | Environment variable | Values | Default |
 | --- | --- | --- | --- |
-| `repository_notes` | `HARNESS_MEMORY_REPOSITORY_NOTES` | `"remote"` (team database), `"local"` (this computer) or `"remote+local"` (read both, save here) | `"remote"` |
-| `global_notes` | `HARNESS_MEMORY_GLOBAL_NOTES` | `"remote"` (team database), `"local"` (this computer) or `"remote+local"` (read both, save here) | `"remote"` |
+| `repository_notes` | `HARNESS_MEMORY_REPOSITORY_NOTES` | `"remote"` (team database), `"local"` (this computer) or `"remote+local"` (read both, save where `remote_local_saves` says) | `"remote"` |
+| `global_notes` | `HARNESS_MEMORY_GLOBAL_NOTES` | `"remote"` (team database), `"local"` (this computer) or `"remote+local"` (read both, save where `remote_local_saves` says) | `"remote"` |
+| `remote_local_saves` | `HARNESS_MEMORY_REMOTE_LOCAL_SAVES` | `"remote"` (save to the team database) or `"local"` (save on this computer), for the scopes and scripts set to `"remote+local"` only | `"remote"` |
 
 ```toml
 database_url = "postgres://..."
 global_notes = "local"   # share repository notes with the team, keep personal global notes here
-# repository_notes = "remote+local"   # see the team's repository notes, save new ones on this computer only
+# repository_notes = "remote+local"   # see the team's repository notes, and save new ones where remote_local_saves says
 ```
 
 The environment variable wins over the key, and any other value is an error that stops the server (`hooks` and
@@ -935,10 +956,32 @@ before you changed the keys are not shown; `push` copies local notes of a shared
 local database at …`).
 
 With a kind set to `"remote+local"` the tools read the team's notes of that kind and this computer's, and every note
-they save goes to this computer. The team's notes of that kind are read-only there: `note_update`, `note_delete` and
-`entity_link` with a team note's id are refused, and similar notes listed after `note_save` are marked `(team,
-read-only)`. Searches take turns between the two places, and similar notes are looked for in both. `notes delete --all`
-deletes only this computer's notes of that kind and counts the team's that stay (`kept`).
+they save goes where `remote_local_saves` (or `HARNESS_MEMORY_REMOTE_LOCAL_SAVES`) says: `"remote"`, the default,
+saves to the team database (what you get when the key is absent), `"local"` saves to this computer. The key applies to
+every scope and to the scripts set to `"remote+local"`, and to nothing else. Any other value is an error that stops the
+server, as for the other routing keys. Reads stay merged from both places either way, and searches take turns between
+them, and similar notes are looked for in both.
+
+The key decides where a **new** entry goes. In a scope (or for the scripts) set to `"remote+local"`, a save without a
+place whose title or name already exists on this computer, in that scope, changes that entry where it is, with the team
+database reachable or not, and never lists it as waiting to be copied: editing your own script, or an agent saving
+over a note you kept here, does not publish it. The store's usual rules apply to it, such as the conflict of a
+same-title save from another checkout. With `"remote"` only a title or name the team does not hold is new, and only
+what such a save creates while the team database is unreachable is listed to be copied. `--place remote` over a title
+or name kept here saves to the team database as asked, and leaves this computer's entry as it is. A `"remote"` scope
+keeps the behavior it always had: a row left on this computer under the title or name is listed and copied.
+
+- With `"remote"` the team's notes of that kind are editable, as in a scope set to `"remote"`: an agent can
+  `note_update` a note it saved. A note saved there while the team database is unreachable is kept on this computer and
+  copied back as the offline fallback describes, a change to a team note is queued, and a note you keep on this
+  computer on purpose (`--place local`) stays there. `notes delete --all` deletes the team notes of that kind and
+  leaves this computer's.
+- With `"local"` the team's notes of that kind are read-only: `note_update`, `note_delete` and `entity_link` with a team
+  note's id are refused, and similar notes listed after `note_save` are marked `(team, read-only)`. `notes delete
+  --all` deletes only this computer's notes of that kind and counts the team's that stay (`kept`).
+
+`harness-memory features` lists `remote-local-saves` for this key. `--place` of `notes save`, `scripts save` and `held
+save` overrides it either way.
 
 ### Offline fallback
 
@@ -950,21 +993,38 @@ the team's notes and scripts are not shown, and every reply of an MCP tool, and 
 database again for a minute, and `harness-memory check` ends that minute as soon as it can connect. Only a database
 that cannot be reached counts: one that answers with a failure (a refused login, a migration that fails) is not served
 from this computer, and the call that needs it fails with the reason.
-The notes and scripts saved this way for a `"remote"` scope are listed in `pending-sync.json` next to the
+A connection that was open and is lost since (the VPN drops, the server stops) is told apart the same way: the call that
+met it is made again from this computer at once, so nothing is lost and no later call waits for the dead connection (the
+first call after a drop is the only one that waits for the connection to time out).
+The notes and scripts saved this way for a `"remote"` scope (or a `"remote+local"` scope while `remote_local_saves` is
+`"remote"`) are listed in `pending-sync.json` next to the
 local database (by id, scope, title or name and the team database they were meant for; the file is private to you);
 when that team database opens again (at the next call, or when a later server starts) they are copied to it as
-`harness-memory push` copies them (a note with the title of a teammate's newer note stays as it is) and leave the list;
-a copy that fails is tried again after a minute. Nothing is deleted from this computer, and notes you keep on this
-computer on purpose, or whose scope you have since set to `"local"`, are never copied. Only new notes and scripts are
-copied: a change you make offline to a note or script that already has a team copy, and relations between entities
-made without a note, stay on this computer. The ids differ too: a note saved offline gets its team id when it is
-copied. Hooks and routines have no local copy: `hooks list` and `routines list` print
-`{"error": "failed", "message": ...}` while the team database is down.
+`harness-memory push --delete-copied` copies them (a note with the title of a teammate's newer note stays as it is) and
+leave the list, and the copy on this computer is deleted once the team database holds it as it is. A note or script the
+team database holds differently (a teammate's newer text, a conflict the team kept) stays on this computer, where
+`notes list` counts it in `localCounts` for you to decide, and a copy that fails is tried again after a minute. Notes you
+keep on this computer on purpose, or whose scope you have since set to `"local"` (or to `"remote+local"` saving to this
+computer), are never copied. In a `"remote+local"` scope that includes one an agent saves over while the team database
+is unreachable: a save without a place over a title or name kept here changes it where it is and lists nothing. Relations between
+entities made without a note stay on this computer. The ids differ too: a note saved offline gets its team id when it is
+copied. When the list cannot be changed (it cannot be read, or holds as much as it may, 3 MB), the note or script is still saved on this computer, and `note_save`, `script_save`, `notes save`, `scripts save` and `held save` say so (`"notListed": true` and the message "saved on this computer, but could not be listed to sync automatically"). It is not copied by itself then, and `harness-memory push` copies it. A change to a team note (one the team database already holds) cannot be made on a copy: it is kept in
+`pending-updates.json` next to the local database (private to you, in the order it was made, refused with a message
+when it is full) and `note_update`, `notes update` and a held update say so (`queued`: "saved on this computer, applied
+when the remote database is back"). When the team database is back one process applies the queue in order (at most 100 changes per call, the rest at the next): text added
+with `append` is always applied (unless an earlier attempt already sent it, which the queue file records, and the note now ends with it), a change that replaces the title, body, kind or
+tags only to a note that was not changed since (not at another revision than the one you read, or not updated after your
+change), with who made the change kept. A change that cannot be applied (the note changed or was deleted meanwhile, or
+the write is refused) is saved as a note on this computer instead (`<title> (offline change)`, or `Offline change to note
+<id>` when the note is gone), so no text is lost, and leaves the queue. Deleting a team note, or linking one, while the
+team database is down is refused with a message that says nothing was changed. `harness-memory sync --json` does all of it
+at once and prints `{"online": true, "waiting": {"notes": 0, "scripts": 0, "updates": 0}}` (what still waits after one
+try); with nothing waiting it makes no connection. Hooks and routines have no local copy: `hooks list` and `routines
+list` print `{"error": "failed", "message": ...}` while the team database is down.
 
 Set `offline_fallback = false` (or `HARNESS_MEMORY_OFFLINE_FALLBACK=0`) to turn it off, for example when notes must
 never be kept on this computer: the calls that need the team database then fail with the reason and how to change the
-settings. The fallback decides when the team database is opened; a connection that breaks after it was opened is not
-covered, and its calls fail with the database's error.
+settings, a connection that was lost included (the next call connects again once the cooldown has passed).
 
 A team note you do not want to see can be hidden on this computer, with `harness-memory notes hide <id>` (or Hide on
 this computer in Harness Desktop), whatever the kind is set to: the team database is not changed, but the note is left
@@ -976,16 +1036,19 @@ database in the local SQLite file (at most 500 notes).
 
 Scripts go to the team database too, unless `scripts` (or `HARNESS_MEMORY_SCRIPTS`) says otherwise: `"remote"` (the
 default), `"local"` (this computer) or `"remote+local"` (read the team's scripts and this computer's, save new ones
-here). Like the note keys it only matters with a team database.
+where `remote_local_saves` says, the team database unless it is `"local"`). Like the note keys it only matters with a
+team database.
 
 ```toml
-scripts = "remote+local"   # run the team's scripts, keep the ones your agents save on this computer
+scripts = "remote+local"
+remote_local_saves = "local"   # run the team's scripts, keep the ones your agents save on this computer
 ```
 
 With `"remote+local"` both are listed (this computer's first on the same name), and a name is looked up on this
 computer first: its repository scripts, the team's, its global ones, the team's. Local scripts are numbered from
-1000000001, like local notes. The team's scripts are read-only there (`script_delete` with a team script is refused,
-naming `harness-memory scripts hide`), and `scripts delete --all` deletes only this computer's. Each script keeps its
+1000000001, like local notes. With `remote_local_saves = "local"` the team's scripts are read-only there
+(`script_delete` with a team script is refused, naming `harness-memory scripts hide`), and `scripts delete --all`
+deletes only this computer's; with `"remote"` they can be changed and deleted, as with `scripts = "remote"`. Each script keeps its
 own approval: a team script is approved under the team database (and `trust_team_scripts` trusts the team's only), a
 local one on this computer, by the id it has there.
 
@@ -1001,7 +1064,13 @@ changed either.
 With `"remote"` the scripts left in the local file are not read. `harness-memory scripts push` copies them into the
 team database (see [Seed it from existing notes](#seed-it-from-existing-notes)), and `harness-memory scripts
 discard-local (--all | ID[,ID...] | -) [--scope repo|global] --yes [--json]` deletes them by their local ids (`localId`
-in `scripts push --json`, `-` reads them from stdin), only while `scripts = "remote"`.
+in `scripts push --json`, `-` reads them from stdin), only while `scripts = "remote"`. A script saved while the team
+database was unreachable that still waits to be copied to it is never deleted, by `--all` or by id: it is counted in
+`waiting` of the answer (`{"deleted": N, "waiting": M}`) and can be discarded once a sync has copied it.
+`notes discard-local` leaves waiting notes the same way. The list of waiting entries is what tells them apart, so when
+`pending-sync.json` exists but cannot be read (a link, another owner or mode, over 4 MiB, or not a list) both commands
+delete nothing, say why and exit 1, rather than take it for an empty list. `--all` deletes the notes (or scripts) it
+found when it read the local file, so one saved a moment later stays.
 
 ### Sharing hooks
 
@@ -1141,7 +1210,9 @@ It reads the local file (`HARNESS_MEMORY_DIR` applies) and writes to the databas
 push their own notes. By default `push` takes everything: every repository's notes and the global ones. A kind kept on
 this computer (`repository_notes` or `global_notes` set to `"local"`) is left out, and `push` says so. A kind set to
 `"remote+local"` is left out too unless `--scope repo` or `--scope global` names it: its new notes are meant to stay on
-this computer. `--scope repo|global` pushes only that kind.
+this computer. `--scope repo|global` pushes only that kind. `--remote-local` takes every kind set to `"remote+local"`
+in one run, and only those (never `"remote"` or `"local"`), with all the options below; it does not go with `--scope`,
+and when no kind is `"remote+local"` its `--json` answer says so in `nothing`.
 
 - **Review first.** Everything you push becomes visible to the whole team. `--dry-run` lists, under each repository key
   (and `global`), the titles of the notes it would add or change. Repositories without a remote are keyed by their
@@ -1156,6 +1227,21 @@ this computer. `--scope repo|global` pushes only that kind.
   names every such note (`"Title" (key): overwrote the team's version`) and counts them as overwritten, apart from
   updates that only changed the kind or tags. `--overwrite none` keeps the team's text of every conflict, `--overwrite
   all` replaces it, and `--overwrite 12,40` (local note ids, or `-` to read them from stdin) replaces only those.
+- **Push only what you reviewed.** `--selection -` reads
+  `{"only": [{"id": 12, "name": "Build cache", "updatedAt": "2026-10-19T08:00:00Z"}], "overwrite": [12]}` from stdin
+  (both lists are required, no other key, not in an entry either, at most 100000 entries or positive ids each and
+  2 MiB). Each entry of `only` is a note as `--dry-run` listed it: its `localId` as `id`, its `title` as `name` (a
+  script's `name`), and its `localUpdatedAt` as `updatedAt`, compared as the exact text the dry run printed. A note is
+  pushed (and, with `--delete-copied`, deleted) only while its id, title and update time all still match its row.
+  Local ids are reused, so a note that was edited, renamed or replaced by a new note with the same id after the
+  review is neither pushed nor deleted: it is listed in `failed` (exit 1) with its `localId` and the message that it
+  changed since it was reviewed, and the rest goes on. A note saved after the review, or any other note of the scope,
+  stays exactly as it is, on this computer and out of the team database, and so does an id that is no local note any
+  more (listed in `failed` too). An id may appear once in `only`. `overwrite` is a list of ids that names which
+  conflicts among `only` may replace the team's text, so it does not go with `--overwrite` (exit 2). It works with
+  `--remote-local` and on its own, and with `scripts push` the same way. Without it nothing changes. When there is
+  nothing to push from (no local database, or no scope taken), every id of a non-empty `only` is listed in `failed`
+  (exit 1) and nothing is copied or deleted, and only an empty `only` answers `nothing`.
 - **Move instead of copy.** `--delete-copied` deletes from this computer the notes the team database now holds as they
   are here (added, updated, overwritten or identical) once the push is done. Conflicts it kept, notes the team changed
   later and notes that failed to push stay. So does a note the team already had (updated, overwritten or identical)
@@ -1196,7 +1282,7 @@ after the push read it. A relation whose note failed is not pushed either and is
 matches the team's of the same scope, repository and name, and is `identical` (same code, description and timeout),
 `teamNewer` (the team's changed at or after yours), `update` (same code, another description or timeout), or a
 conflict (`overwrite` or `keep`, as `--overwrite` says, with local script ids). It pushes while `scripts = "remote"`,
-with `"remote+local"` only when `--scope` names the scope, never with `"local"`. A script this computer trusts stays
+with `"remote+local"` only when `--scope` names the scope or `--remote-local` is given, never with `"local"`. A script this computer trusts stays
 trusted once copied (one waiting for approval never becomes trusted), a team script hidden on this computer is never
 written over (it fails, in a dry run too), and `--delete-copied` deletes a local script only when it did not change since it was read. Its `--json`
 object has `scripts` totals instead of `notes`, no `relations` or `entitiesCut`, and each change a `name` and
@@ -1212,13 +1298,58 @@ object has `scripts` totals instead of `notes`, no `relations` or `entitiesCut`,
  "failed": []}
 ```
 
-`harness-memory features` lists what this build supports, one per line (`push-json`, `scripts-remote-local`,
-`scripts-hide`, `scripts-push-json`, `settings`, `notes-lang`, `notes-useful`, `notes-author-filter`, `save-opt-in` and `embedder`
-among them), so a tool can
+### Copy team notes and scripts to this computer
+
+With `"remote+local"` and `remote_local_saves = "local"` the team's notes and scripts are read-only here and new ones stay on this computer. `pull` copies the
+team entries you pick to this computer's file, and never writes to the team database. Nothing is copied by default: a dry
+run lists the candidates, and `--ids` names the ones to copy (team ids, or `-` to read them from stdin).
+
+```sh
+harness-memory pull --dry-run --json                  # what the team holds in the "remote+local" scopes, and what each would do
+harness-memory pull --json --ids 12,40                # copy those two notes
+harness-memory pull --json --ids - --repo . < ids.txt # copy the ids in the file, this checkout's repository only
+harness-memory scripts pull --dry-run --json          # the same for scripts
+harness-memory scripts pull --json --ids 9            # copy that script
+```
+
+`--json` is required. Only scopes set to `"remote+local"` are taken, `--repo` narrows the repository notes to one
+repository (a key, a remote or `.`) and `--no-global` leaves the global ones out. An entry of the same title (name, for
+scripts) in the same repository or scope that this computer already has is never written: it is `identical` when the text is
+the same (a script: the same code) and `localDiffers` when it is not. A copy is its own local row, and the team's entry
+stays where it is. A team entry you hid on this computer is never listed or copied, even by id, and an id that names nothing,
+a hidden entry or one outside the scopes taken fails and copies nothing. A copy keeps the kind, tags, linked entities, who
+added and last changed it and the writer's provenance, and takes along the relations the team holds for the note that touch
+its entities (at most 50 per entity, and one this computer already has is left as it is). The text is masked and limited as in
+any local save. A pulled script is never trusted, whatever the team's trust setting says: it needs approval on this computer
+before it runs. A pulled entry is not queued for the team database (`pending-sync.json`).
+
+```json
+{"dryRun": true, "nothing": null,
+ "notes": {"added": 1, "identical": 0, "localDiffers": 1, "failed": 0},
+ "changes": [{"teamId": 34, "localId": null, "scope": "repo", "repo": "github.com/acme/widget", "title": "Deploy steps",
+   "action": "add", "teamUpdatedAt": "2026-10-18T17:30:00Z", "localUpdatedAt": null, "failed": false}],
+ "failed": [{"teamId": 35, "message": "…"}]}
+```
+
+`nothing` says why there was nothing to pull (no scope is `"remote+local"`, or no ids on stdin). A change whose copy
+failed has `failed: true` and is not counted in the totals (`notes.failed` counts it, and the ids that name nothing that can
+be copied). `scripts pull --json` has `scripts` totals and a `name` instead of `title`. Exit 0 when nothing failed, 1 when
+something did, 2 for bad usage (a copy without `--ids` too). The team database is read before anything is written here, so
+one that cannot be reached exits 1 with `{"error": "failed", "message": ...}` (without credentials) and nothing copied.
+The list is read a page at a time and the text of an entry only where it is needed, so it works on thousands of entries.
+
+`harness-memory features` lists what this build supports, one per line (`push-json`, `push-remote-local`, `pull-json`,
+`scripts-pull-json`, `push-selection`, `save-place`, `remote-local-saves`, `held-save-place`, `scripts-remote-local`,
+`scripts-hide`, `scripts-push-json`, `settings`, `notes-lang`, `notes-useful`, `notes-author-filter`, `save-opt-in`,
+`offline-update-queue`, `note-expect-revision`, `sync-command` and `embedder` among them), so a tool can
 check before it asks for them. `settings` is the `settings` command, `notes-lang` the `lang` of a note and the `--lang`
 filter, `notes-useful` the usefulness counters of a note with `--useful` and `--sort useful|lastUseful`,
-`save-opt-in` the version 2 `guards/global.json`, `notes-author-filter` the `--author` and `--author-unknown` filters, `--sort addedBy` and the `authors` of the answer of
-`notes list` and `scripts list`, `embedder` the `embedder` command.
+`save-opt-in` the version 2 `guards/global.json`, `offline-update-queue` the queue of changes to team notes made while
+the team database is down, `note-expect-revision` `notes update --expect-revision N` (the note is changed only if it is
+still at revision `N`, else `{"error": "changed", "message": ..., "revision": M}` with the revision it is at now),
+`sync-command` the `sync` command, `notes-author-filter` the `--author` and `--author-unknown` filters, `--sort addedBy` and the `authors` of the answer of
+`notes list` and `scripts list`, `embedder` the `embedder` command, `push-selection` `push --selection -` and `scripts
+push --selection -`, `save-place` `--place` of `notes save` and `scripts save`, `held-save-place` `--place` of `held save`.
 
 ### Security and backups
 

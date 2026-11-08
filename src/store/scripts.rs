@@ -118,6 +118,10 @@ pub struct SavedScript {
     pub script: Script,
     /// True when the script was created, false when one with the same name was replaced.
     pub created: bool,
+    /// True when the script was saved on this computer while the team database was unreachable but
+    /// could not be put on the list of what waits to be copied ([`crate::store::pending`]): it
+    /// stays here and is not copied automatically.
+    pub not_listed: bool,
 }
 
 /// How a call names a script.
@@ -214,6 +218,51 @@ pub trait ScriptStore: Send {
     /// offline fallback of a [`super::SplitScripts`]). The default is `false`.
     fn offline(&self) -> bool {
         false
+    }
+
+    /// The connection to the database dropped while a call ran: as
+    /// [`MemoryStore::connection_lost`](super::MemoryStore::connection_lost). The default has no
+    /// connection to drop.
+    fn connection_lost(&mut self, reason: &str, cooldown: bool) -> String {
+        let _ = cooldown;
+        reason.to_owned()
+    }
+
+    /// The place [`Self::save_script`] of the script `name` in the scope of `target` is meant for, when
+    /// the store can tell: `Some(Place::Local)` when a script of that name is kept on this computer
+    /// and is updated where it is (scripts routed `remote+local`), else the place new scripts go to.
+    /// `None` for a store of one place, which the routing settings describe.
+    fn save_place(&mut self, target: &Target, name: &str) -> Result<Option<Place>, StoreError> {
+        let _ = (target, name);
+        Ok(None)
+    }
+
+    /// Takes the script `name` that this computer keeps in the scope of `target` off the list of what
+    /// waits for the team database, ahead of a save into this computer that replaces it: the save
+    /// lets the person keep it here. A caller that reads scripts before such a save (any read may
+    /// copy what waits to the team database and delete the row here) calls this first. A store with
+    /// no list has nothing to take off, which is the default.
+    fn keep_here(&mut self, target: &Target, name: &str) -> Result<(), StoreError> {
+        let _ = (target, name);
+        Ok(())
+    }
+
+    /// [`Self::save_script`] into the store `place` names, for scripts routed `remote+local`: new
+    /// scripts go where `remote_local_saves` says unless the user picks a place. Saving to the team
+    /// database that cannot be reached fails with [`StoreError::Unreachable`]: the script is neither
+    /// kept on this computer nor recorded as waiting, and a script saved to this computer is not
+    /// recorded as waiting either. A store of one place has none to pick, so the
+    /// default refuses.
+    fn save_script_to(
+        &mut self,
+        place: Place,
+        target: &Target,
+        draft: &ScriptDraft,
+    ) -> Result<SavedScript, StoreError> {
+        let _ = (place, target, draft);
+        Err(StoreError::Invalid(
+            "this store keeps its scripts in one place".to_owned(),
+        ))
     }
 }
 

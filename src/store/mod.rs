@@ -28,6 +28,7 @@ pub mod listing;
 pub mod mongo;
 pub mod patience;
 pub mod pending;
+pub mod pending_updates;
 pub mod postgres;
 pub(crate) mod rank;
 pub mod reach;
@@ -258,6 +259,10 @@ pub struct NotePatch {
     pub tags: Option<Vec<String>>,
     /// The writer, recorded on the note (an unknown one too: the note then names no writer).
     pub provenance: Provenance,
+    /// When given, the change is made only if the note is still at this revision, checked in the
+    /// same step as the write; any other revision fails with [`StoreError::Stale`] and nothing is
+    /// changed.
+    pub expected_revision: Option<i64>,
 }
 
 /// A stored note.
@@ -320,6 +325,14 @@ pub struct Saved {
     pub revision: i64,
     pub scope: Scope,
     pub project: Option<String>,
+    /// True when the change to a team note was not made yet: the team database is unreachable, so it
+    /// is kept on this computer and applied when the database is back (see
+    /// [`pending_updates`]). `id` is the note asked for, and `revision` is 0 (not known).
+    pub queued: bool,
+    /// True when the note was saved on this computer while the team database was unreachable but
+    /// could not be put on the list of what waits to be copied ([`pending`]): it stays here and
+    /// is not copied automatically.
+    pub not_listed: bool,
 }
 
 /// A search.
@@ -536,6 +549,11 @@ pub enum StoreError {
     /// failed migration is reachable, and is a [`StoreError::Backend`].
     #[error("memory database error: {0}")]
     Unreachable(String),
+    /// The note is not at the revision the change expected ([`NotePatch::expected_revision`]), so it
+    /// was changed by someone else since it was read: nothing was changed (the revision it is at
+    /// now).
+    #[error("the note changed since it was read (it is at revision {0} now), so nothing was changed")]
+    Stale(i64),
 }
 
 impl StoreError {
@@ -753,5 +771,35 @@ pub trait MemoryStore: Send {
     /// offline fallback of a [`SplitStore`]). The default is `false`.
     fn offline(&self) -> bool {
         false
+    }
+
+    /// The connection to the database dropped while a call ran (`reason` is safe to show): a
+    /// [`Lazy`] store closes it, so the next call connects again. With `cooldown`, because the
+    /// caller serves from elsewhere meanwhile, it also starts the cooldown of its [`Reach`], so
+    /// the calls until it ends fail at once instead of each waiting for a connection timeout.
+    /// Without it the next call opens the database at once (the server may be up, and a failed open
+    /// starts the cooldown anyway). Returns the message the call fails with: `reason`, with what to
+    /// do about it when the store knows. The default has no connection to drop.
+    fn connection_lost(&mut self, reason: &str, cooldown: bool) -> String {
+        let _ = cooldown;
+        reason.to_owned()
+    }
+
+    /// [`Self::remember`] into the store `place` names, for a scope routed `remote+local`: new
+    /// notes go where `remote_local_saves` says unless the user picks a place. Saving to the team
+    /// database that cannot be reached fails with [`StoreError::Unreachable`]: the note is neither
+    /// kept on this computer nor recorded as waiting, and a note saved to this computer is not
+    /// recorded as waiting either. A store of one place has none to pick, so the
+    /// default refuses.
+    fn remember_to(
+        &mut self,
+        place: crate::backend::Place,
+        target: &Target,
+        draft: &NoteDraft,
+    ) -> Result<Saved, StoreError> {
+        let _ = (place, target, draft);
+        Err(StoreError::Invalid(
+            "this store keeps its notes in one place".to_owned(),
+        ))
     }
 }

@@ -5,18 +5,25 @@
 //! comma-separated argument or, with `-`, read from stdin (separated by commas or blanks, at most
 //! [`crate::limits::STDIN_IDS_BYTES_MAX`] bytes and [`crate::limits::IDS_MAX`] ids, exit 2 beyond);
 //! an id of another scope, or of no note, is left alone. `--scope` takes one scope, which has to be
-//! routed `remote`; without it every scope that is. Each note goes as `note_delete` deletes one.
+//! routed `remote`; without it every scope that is. Each note goes as `note_delete` deletes one, by
+//! its id as read (also for `--all`), so a note saved after the list was read is never deleted.
 //!
-//! Without `--yes` nothing is deleted and it exits 2; a scope not routed `remote` exits 1.
+//! A note saved while the team database was unreachable that still waits to be copied to it is
+//! left (see [`crate::cli_discard`]), and counted in the `waiting` of the answer
+//! (`{"deleted": N, "waiting": M}`).
+//!
+//! Without `--yes` nothing is deleted and it exits 2; a scope not routed `remote` exits 1, and so
+//! does a list of waiting notes that exists but cannot be read (nothing is deleted).
 
 use std::process::ExitCode;
 
 use crate::backend::{Backend, NotesPlace, Selection};
 use crate::cli;
-use crate::cli_discard::{self, Discard, Wanted};
+use crate::cli_discard::{self, Discard, Discarded, Waiting, Wanted};
 use crate::open::notes_place;
 use crate::store::hidden::view_of;
-use crate::store::{Forget, Forgotten, MemoryStore, Scope, SqliteStore, StoreError, Target};
+use crate::store::pending::Kind;
+use crate::store::{Forget, MemoryStore, Scope, SqliteStore, StoreError, Target};
 
 /// `notes discard-local`.
 pub(super) fn discard_local(args: &[Option<&str>]) -> ExitCode {
@@ -45,15 +52,20 @@ pub(super) fn discard_local(args: &[Option<&str>]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let deleted = if path.is_file() {
-        SqliteStore::open(&path).and_then(|mut store| discard(&mut store, &scopes, &options.wanted))
-    } else {
-        Ok(0)
+    let waiting = match Waiting::of(Kind::Notes, &path, &selection) {
+        Ok(waiting) => waiting,
+        Err(reason) => return cli_discard::unreadable(&reason),
     };
 
-    match deleted {
-        Ok(deleted) => {
-            cli_discard::report("note", deleted, options.json);
+    let discarded = if path.is_file() {
+        SqliteStore::open(&path).and_then(|mut store| discard(&mut store, &scopes, &options.wanted, &waiting))
+    } else {
+        Ok(Discarded::default())
+    };
+
+    match discarded {
+        Ok(discarded) => {
+            cli_discard::report("note", discarded, options.json);
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -109,37 +121,95 @@ fn names(scope: Scope) -> (&'static str, &'static str) {
     }
 }
 
-/// Deletes the notes of `scopes` in `store` that `wanted` names; how many went.
-fn discard(store: &mut SqliteStore, scopes: &[Scope], wanted: &Wanted) -> Result<usize, StoreError> {
-    let notes: Vec<(i64, Scope, Option<String>)> = store
+/// The notes a discard is about to delete, read from the local file: by id, with their repository
+/// key (`None`: global), and how many were left because they still wait for the team database.
+struct Plan {
+    notes: Vec<(i64, Option<String>)>,
+    waiting: usize,
+}
+
+/// Reads the notes of `scopes` in `store` that `wanted` names, apart from those still `waiting` for
+/// the team database.
+fn plan(store: &mut SqliteStore, scopes: &[Scope], wanted: &Wanted, waiting: &Waiting) -> Result<Plan, StoreError> {
+    let named: Vec<(i64, Scope, Option<String>)> = store
         .note_scopes()?
         .into_iter()
         .filter(|(id, scope, _)| scopes.contains(scope) && wanted.takes(*id))
         .collect();
 
-    if *wanted == Wanted::All {
-        let mut places: Vec<Option<String>> = Vec::new();
+    let (kept, notes): (Vec<_>, Vec<_>) = named
+        .into_iter()
+        .partition(|(id, _, project)| waiting.holds(*id, project.as_deref()));
 
-        for (_, _, project) in &notes {
-            if !places.contains(project) {
-                places.push(project.clone());
-            }
-        }
+    Ok(Plan {
+        notes: notes.into_iter().map(|(id, _, project)| (id, project)).collect(),
+        waiting: kept.len(),
+    })
+}
 
-        let mut forgotten = Forgotten::default();
-
-        for project in places {
-            forgotten = forgotten + store.forget_notes(&view_of(project), &[])?;
-        }
-
-        return Ok(forgotten.total());
-    }
-
+/// Deletes the notes of `plan` by their ids: a note saved after the plan was read is not among them.
+fn apply(store: &mut SqliteStore, plan: Plan) -> Result<Discarded, StoreError> {
     let mut deleted = 0;
 
-    for (id, _, project) in notes {
+    for (id, project) in plan.notes {
         deleted += store.forget(&view_of(project), &Target::Global, &Forget::Note(id))?;
     }
 
-    Ok(deleted)
+    Ok(Discarded {
+        deleted,
+        waiting: plan.waiting,
+    })
+}
+
+/// Deletes the notes of `scopes` in `store` that `wanted` names, except those still `waiting` for
+/// the team database; how many went and how many were left for that.
+fn discard(
+    store: &mut SqliteStore,
+    scopes: &[Scope],
+    wanted: &Wanted,
+    waiting: &Waiting,
+) -> Result<Discarded, StoreError> {
+    let plan = plan(store, scopes, wanted, waiting)?;
+    apply(store, plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{NoteDraft, NoteKind, Provenance};
+
+    fn draft(title: &str) -> NoteDraft {
+        NoteDraft {
+            title: title.to_owned(),
+            body: "Saved here".to_owned(),
+            kind: NoteKind::Note,
+            tags: Vec::new(),
+            entities: Vec::new(),
+            provenance: Provenance::default(),
+        }
+    }
+
+    #[test]
+    fn a_note_saved_after_the_list_was_read_survives_discard_all() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut store = SqliteStore::open(&dir.path().join("memory.sqlite3")).expect("store");
+        store.remember(&Target::Global, &draft("Read")).expect("note");
+
+        let read = plan(&mut store, &[Scope::Global], &Wanted::All, &Waiting::default()).expect("plan");
+        let later = store
+            .remember(&Target::Global, &draft("Saved later"))
+            .expect("later note");
+
+        let discarded = apply(&mut store, read).expect("apply");
+
+        assert_eq!(discarded, Discarded { deleted: 1, waiting: 0 });
+
+        let left: Vec<i64> = store
+            .note_scopes()
+            .expect("scopes")
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(left, [later.id]);
+    }
 }

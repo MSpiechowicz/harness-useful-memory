@@ -13,7 +13,7 @@ use common::mcp::{call, env, repo_with_remote, run, server, text};
 use common::stdio::{BINARY, without_team_settings};
 use common::{draft, global_only};
 use harness_memory::Server;
-use harness_memory::backend::NotesPlace;
+use harness_memory::backend::{NotesPlace, Place};
 use harness_memory::embed::{set_enabled, store_key_local};
 use harness_memory::mcp::Vectors;
 use harness_memory::project::ProjectResolver;
@@ -148,7 +148,7 @@ fn split(dir: &Path, place: NotesPlace) -> SplitStore {
     let team = SqliteStore::open(&dir.join("team.sqlite3")).expect("team file");
     let hidden = HiddenNotes::new(dir.join("memory.sqlite3"), "team");
 
-    SplitStore::routed(Box::new(team), Box::new(store(dir)), place, place, Some(hidden))
+    SplitStore::routed(Box::new(team), Box::new(store(dir)), place, place, Some(hidden)).saving_to(Place::Local)
 }
 
 fn server_over(store: Box<dyn MemoryStore>, dir: &Path, cwd: &Path) -> Server {

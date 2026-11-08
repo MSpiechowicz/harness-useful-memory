@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use harness_memory::backend::NotesPlace;
+use harness_memory::backend::{NotesPlace, Place};
 use harness_memory::store::{HiddenNotes, Lazy, MemoryStore, SplitStore, SqliteStore};
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -14,7 +14,7 @@ fn split(dir: &Path, repo: NotesPlace, global: NotesPlace) -> SplitStore {
     let team = SqliteStore::open(&dir.join("team.sqlite3")).expect("team");
     let local = SqliteStore::open(&dir.join("local.sqlite3")).expect("local");
 
-    SplitStore::routed(Box::new(team), Box::new(local), repo, global, None::<HiddenNotes>)
+    SplitStore::routed(Box::new(team), Box::new(local), repo, global, None::<HiddenNotes>).saving_to(Place::Local)
 }
 
 fn setting(dir: &Path, file: &str) -> bool {

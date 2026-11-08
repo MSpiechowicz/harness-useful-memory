@@ -13,6 +13,8 @@ use super::{
     SavedScript, Script, ScriptDraft, ScriptOrigin, ScriptRef, ScriptStore, ScriptSummary, StoreError, Target,
 };
 
+use crate::backend::Secrets;
+
 /// Opens the store behind it.
 type Opener<S> = Box<dyn FnMut() -> Result<Box<S>, StoreError> + Send>;
 
@@ -28,6 +30,11 @@ pub struct Lazy<S: ?Sized> {
     reach: Option<Reach>,
     /// With a reach: the last open the database answered with a failure, and when.
     refused: Option<(Instant, String)>,
+    /// What to do about a database that cannot be reached, added to the message of a connection
+    /// that dropped ([`Lazy::lost`]).
+    lost_hint: Option<&'static str>,
+    /// Masked out of the reason a connection dropped ([`Lazy::lost`]); an opener masks its own.
+    secrets: Secrets,
 }
 
 impl<S: ?Sized> std::fmt::Debug for Lazy<S> {
@@ -54,6 +61,8 @@ impl<S: ?Sized> Lazy<S> {
             store: None,
             reach: None,
             refused: None,
+            lost_hint: None,
+            secrets: Secrets::default(),
         }
     }
 
@@ -64,8 +73,33 @@ impl<S: ?Sized> Lazy<S> {
         self
     }
 
-    /// The open store, opening it first when needed.
+    /// The store telling `hint` (what to do about a database that cannot be reached) with the
+    /// message of a connection that dropped, as the opener tells it with the message of a failed
+    /// open.
+    pub fn with_lost_hint(mut self, hint: &'static str) -> Self {
+        self.lost_hint = Some(hint);
+        self
+    }
+
+    /// The store masking `secrets` (the database's URL and token) out of the reason of a connection
+    /// that dropped, which a driver words and which is recorded for other processes and shown.
+    pub fn with_secrets(mut self, secrets: Secrets) -> Self {
+        self.secrets = secrets;
+        self
+    }
+
+    /// The open store, opening it first when needed. An open store is not used while the cooldown of
+    /// the reach runs: another connection to the same database was lost (the notes' while this one
+    /// serves scripts, or another process's), so this one is closed too instead of waiting for its
+    /// own timeout.
     fn store(&mut self) -> Result<&mut S, StoreError> {
+        if self.store.is_some()
+            && let Some(message) = self.reach.as_ref().and_then(Reach::cooling)
+        {
+            self.store = None;
+            return Err(StoreError::Unreachable(message));
+        }
+
         let store = match self.store.take() {
             Some(store) => store,
             None => self.open_store()?,
@@ -103,6 +137,32 @@ impl<S: ?Sized> Lazy<S> {
         }
 
         opened
+    }
+
+    /// The open connection dropped (`reason`): the store is closed, so the next call opens it again.
+    /// With `cooldown` the cooldown of the reach starts too, so the calls until it ends fail at once
+    /// with the message this returns. A store that is not open has no connection to drop: the
+    /// failure was an open that failed or is cooling, which is recorded already (and scrubbed), so it
+    /// is only repeated. The reason of a connection that dropped is scrubbed of [`Lazy::with_secrets`].
+    fn lost(&mut self, reason: &str, cooldown: bool) -> String {
+        if self.store.take().is_none() {
+            return reason.to_owned();
+        }
+
+        let reason = self.secrets.scrub(reason);
+
+        let message = match self.lost_hint {
+            Some(hint) => format!("{reason}. {hint}"),
+            None => reason,
+        };
+
+        self.refused = None;
+
+        if let Some(reach) = self.reach.as_ref().filter(|_| cooldown) {
+            reach.failed(&message);
+        }
+
+        message
     }
 
     /// Whether the database can be reached: the call that needs a database that answered with a
@@ -149,6 +209,10 @@ impl ScriptStore for Lazy<dyn ScriptStore> {
 
     fn ready(&mut self) -> bool {
         self.usable()
+    }
+
+    fn connection_lost(&mut self, reason: &str, cooldown: bool) -> String {
+        self.lost(reason, cooldown)
     }
 }
 
@@ -249,6 +313,10 @@ impl MemoryStore for Lazy<dyn MemoryStore> {
 
     fn ready(&mut self) -> bool {
         self.usable()
+    }
+
+    fn connection_lost(&mut self, reason: &str, cooldown: bool) -> String {
+        self.lost(reason, cooldown)
     }
 }
 
@@ -380,6 +448,94 @@ mod tests {
             1,
             "the cooldown holds the next open back"
         );
+    }
+
+    /// A trust store that opens and counts its opens, behind a reach in a folder of its own.
+    fn counted_opens(dir: &tempfile::TempDir) -> (Reach, Lazy<dyn TrustStore>, Arc<AtomicUsize>) {
+        let reach = Reach::beside(&dir.path().join("memory.sqlite3"), "team");
+        let opens = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&opens);
+        let lazy: Lazy<dyn TrustStore> = Lazy::classified(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Open) as Box<dyn TrustStore>)
+        })
+        .with_reach(reach.clone())
+        .with_lost_hint("Turn on the offline fallback");
+
+        (reach, lazy, opens)
+    }
+
+    #[test]
+    fn a_connection_that_dropped_is_closed_and_with_a_cooldown_the_next_calls_fail_at_once() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (reach, mut lazy, opens) = counted_opens(&dir);
+        assert!(lazy.is_trusted("team", 1, "x").expect("opened"));
+
+        let message = lazy.lost("the connection was lost", true);
+        assert_eq!(message, "the connection was lost. Turn on the offline fallback");
+        assert_eq!(reach.cooling().as_deref(), Some(message.as_str()));
+
+        let repeated = lazy.is_trusted("team", 1, "x").expect_err("cooling");
+        assert!(
+            matches!(&repeated, StoreError::Unreachable(text) if *text == message),
+            "{repeated:?}"
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 1, "the cooldown holds the next open back");
+
+        // A failure the cooldown repeats is not a connection to drop: it does not start it again.
+        assert_eq!(lazy.lost("again", true), "again");
+        assert_eq!(reach.cooling().as_deref(), Some(message.as_str()));
+    }
+
+    #[test]
+    fn the_reason_a_connection_dropped_is_scrubbed_of_the_databases_secrets() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (reach, lazy, _) = counted_opens(&dir);
+        let url = "postgres://alice:hunter2secret@db.example.com:5432/memory";
+        let mut lazy = lazy.with_secrets(Secrets::of(url, None));
+        assert!(lazy.is_trusted("team", 1, "x").expect("opened"));
+
+        let message = lazy.lost(&format!("write to {url} failed"), true);
+
+        assert!(!message.contains("hunter2secret"), "{message}");
+        assert!(message.contains("failed"), "{message}");
+        assert!(!reach.cooling().expect("recorded").contains("hunter2secret"));
+    }
+
+    #[test]
+    fn a_connection_lost_by_another_store_closes_this_open_one_too() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (_, mut notes, _) = counted_opens(&dir);
+        let (_, mut scripts, scripts_opens) = counted_opens(&dir);
+        assert!(notes.is_trusted("team", 1, "x").expect("opened"));
+        assert!(scripts.is_trusted("team", 1, "x").expect("opened"));
+
+        // The connection of the first is lost, with its cooldown shared through the folder.
+        notes.lost("the connection was lost", true);
+
+        let error = scripts
+            .is_trusted("team", 1, "x")
+            .expect_err("the cooldown holds for it too");
+        assert!(matches!(error, StoreError::Unreachable(_)), "{error:?}");
+        assert_eq!(
+            scripts_opens.load(Ordering::SeqCst),
+            1,
+            "it did not wait for its own timeout"
+        );
+    }
+
+    #[test]
+    fn a_connection_that_dropped_without_a_cooldown_is_opened_again_by_the_next_call() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (reach, mut lazy, opens) = counted_opens(&dir);
+        assert!(lazy.is_trusted("team", 1, "x").expect("opened"));
+
+        let message = lazy.lost("the connection was lost", false);
+        assert!(message.ends_with("Turn on the offline fallback"), "{message}");
+        assert_eq!(reach.cooling(), None, "nobody serves from elsewhere, so nothing waits");
+
+        assert!(lazy.is_trusted("team", 1, "x").expect("opened again"));
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
     }
 
     #[test]

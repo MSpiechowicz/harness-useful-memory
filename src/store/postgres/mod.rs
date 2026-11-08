@@ -230,18 +230,32 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// `error` as [`StoreError::Unreachable`] when it is a failure of the database that left the
+    /// connection closed (or the server ended the session): the database was lost, not refused.
+    /// Any other error stays as it is.
+    fn lost(&self, error: StoreError) -> StoreError {
+        match error {
+            StoreError::Backend(message) if self.client.is_closed() || ended_by(&message) => {
+                StoreError::Unreachable(message)
+            }
+            other => other,
+        }
+    }
+
     /// Runs the read `operation` on a live client, once more after reconnecting when it failed
-    /// because the connection closed meanwhile.
+    /// because the connection closed meanwhile. A connection lost again is unreachable.
     fn read<T>(&mut self, mut operation: impl FnMut(&mut Client) -> Result<T, StoreError>) -> Result<T, StoreError> {
         self.ready()?;
 
-        match operation(&mut self.client) {
+        let result = match operation(&mut self.client) {
             Err(error) if self.client.is_closed() || ended(&error) => {
                 self.client = open(&self.settings)?;
                 operation(&mut self.client)
             }
             other => other,
-        }
+        };
+
+        result.map_err(|error| self.lost(error))
     }
 
     /// Runs `operation` in a write transaction (see [`transact`]). It runs once more after
@@ -271,7 +285,7 @@ impl PostgresStore {
             self.newer = true;
         }
 
-        Err(error)
+        Err(self.lost(error))
     }
 }
 
@@ -348,10 +362,12 @@ fn transact<T>(
     Ok(result)
 }
 
-/// The error of a `COMMIT` whose connection closed: the server may or may not have saved it.
+/// The error of a `COMMIT` whose connection closed: the server may or may not have saved it. The
+/// database was lost, so it is unreachable: with the offline fallback the change is saved on this
+/// computer and copied later, where the same title or an identical note is found, not added twice.
 fn uncertain(error: StoreError) -> StoreError {
     match error {
-        StoreError::Backend(message) => StoreError::Backend(format!(
+        StoreError::Backend(message) => StoreError::Unreachable(format!(
             "{message}; the connection closed while the write was committed, so it may have been saved: \
              read it back before repeating it"
         )),
@@ -558,18 +574,24 @@ fn takes_no_connections(code: &str) -> bool {
     code.starts_with("08") || code.starts_with("53") || code.starts_with("57P0")
 }
 
-/// A [`StoreError::Backend`] for a client error. A database error becomes its SQLSTATE with a
-/// fixed description (see [`described`]): the server's message, detail and hint can quote stored
-/// values or text a teammate raised, so none of them is kept. Any other error is the error and its
-/// causes, at most 200 characters.
 /// Whether `error` says the server ended this session (an administrator or a restart terminated
 /// it: SQLSTATE 57P01, 57P02, 57P03). The client may not have noticed the closed socket yet, so
 /// this counts as a lost connection like [`Client::is_closed`].
 fn ended(error: &StoreError) -> bool {
-    matches!(error, StoreError::Backend(message)
-        if ["57P01", "57P02", "57P03"].iter().any(|code| message.contains(&format!("SQLSTATE {code}"))))
+    matches!(error, StoreError::Backend(message) if ended_by(message))
 }
 
+/// Whether the message of a failure names the server ending the session (see [`ended`]).
+fn ended_by(message: &str) -> bool {
+    ["57P01", "57P02", "57P03"]
+        .iter()
+        .any(|code| message.contains(&format!("SQLSTATE {code}")))
+}
+
+/// A [`StoreError::Backend`] for a client error. A database error becomes its SQLSTATE with a
+/// fixed description (see [`described`]): the server's message, detail and hint can quote stored
+/// values or text a teammate raised, so none of them is kept. Any other error is the error and its
+/// causes, at most 200 characters.
 fn backend(error: postgres::Error) -> StoreError {
     let message = match error.as_db_error() {
         Some(db) => described(db.code().code()),

@@ -9,6 +9,10 @@
 //! The check is conservative ([`crate::support::lang::detect`]): short, mixed and code-heavy
 //! notes pass. A setting that cannot be read does not block a save: the store may be unreachable
 //! for a moment, and refusing then would lose a note the user may well want.
+//!
+//! A `note_update` of a team note while the team database is unreachable cannot read the note it
+//! changes (the change is queued, see [`crate::store::pending_updates`]): the title, body and text to
+//! append the call gives are checked as they are, so the change is refused like an online one.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -16,6 +20,7 @@ use serde_json::{Value, json};
 use super::Server;
 use super::calls::Reply;
 use super::scope::view;
+use super::user::unverifiable;
 use crate::support::lang::{self, Lang};
 
 /// The reason in `structuredContent`.
@@ -67,7 +72,8 @@ pub(super) fn gate(server: &mut Server, name: &str, arguments: &Value) -> Option
 }
 
 /// The title and body note `id` has after the `note_update` `arguments`; `None` when the call
-/// changes neither (the tool answers it) or the note cannot be read (the tool says why).
+/// changes neither (the tool answers it) or the note cannot be read (the tool says why). A team note
+/// that cannot be read because the team database is down gives the text the call supplies alone.
 fn updated(server: &mut Server, arguments: &Value) -> Option<(String, String)> {
     let args: UpdateText = serde_json::from_value(arguments.clone()).ok()?;
 
@@ -76,7 +82,11 @@ fn updated(server: &mut Server, arguments: &Value) -> Option<(String, String)> {
     }
 
     let view = view(server, args.scope.as_deref(), args.project_path.as_deref()).ok()?;
-    let note = server.store.peek(&view, &[args.id]).ok()?.into_iter().next()?;
+    let note = server.store.peek(&view, &[args.id]).ok()?.into_iter().next();
+
+    let Some(note) = note else {
+        return unverifiable(server, args.id).then(|| supplied(args));
+    };
 
     let title = args.title.unwrap_or(note.title);
     let mut body = args.body.unwrap_or(note.body);
@@ -87,6 +97,18 @@ fn updated(server: &mut Server, arguments: &Value) -> Option<(String, String)> {
     }
 
     Some((title, body))
+}
+
+/// The title and body the call `args` gives, with the text to append after the body.
+fn supplied(args: UpdateText) -> (String, String) {
+    let title = args.title.unwrap_or_default();
+    let body = [args.body, args.append]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    (title, body)
 }
 
 fn refusal(again: &str) -> Reply {

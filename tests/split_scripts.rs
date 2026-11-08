@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use common::scripts::{REPO, script};
 use common::{both, global_only, repo, repo_only};
-use harness_memory::backend::NotesPlace;
+use harness_memory::backend::{NotesPlace, Place};
 use harness_memory::store::split::LOCAL_ID_OFFSET;
 use harness_memory::store::{
     HiddenScripts, Lazy, Script, ScriptOrigin, ScriptRef, ScriptStore, SplitScripts, SqliteStore, StoreError, Target,
@@ -41,8 +41,13 @@ impl Fixture {
 
     /// The scripts as `place` routes them, hiding what the local file hides.
     fn split(&self, place: NotesPlace) -> SplitScripts {
+        self.split_saving(place, Place::Local)
+    }
+
+    /// The scripts as `place` routes them, `remote+local` saving to `saves`.
+    fn split_saving(&self, place: NotesPlace, saves: Place) -> SplitScripts {
         let local = Box::new(SqliteStore::open(&self.path()).expect("local file"));
-        SplitScripts::new(self.team.open(), local, place, Some(self.hidden()))
+        SplitScripts::new(self.team.open(), local, place, Some(self.hidden())).saving_to(saves)
     }
 
     /// The hidden list, as another process sees it.
@@ -70,13 +75,15 @@ impl Fixture {
 
 type Case = fn(&Fixture);
 
-const CASES: [Case; 6] = [
+const CASES: [Case; 8] = [
     remote_local_lists_both_and_finds_this_computers_first,
     team_scripts_are_read_only_with_remote_local,
     hidden_team_scripts_are_left_out_of_every_read,
     saving_under_a_hidden_name_is_refused,
     stale_hidden_rows_stop_hiding_scripts,
     remote_never_opens_the_local_file,
+    remote_local_saving_to_the_team_saves_there_and_changes_the_teams_scripts,
+    a_place_picked_wins_over_where_remote_local_saves_scripts,
 ];
 
 fn run(fresh: Fresh) {
@@ -125,6 +132,70 @@ fn listed(store: &mut dyn ScriptStore, view: &View) -> Vec<(i64, String)> {
         .into_iter()
         .map(|summary| (summary.id, summary.name))
         .collect()
+}
+
+fn remote_local_saving_to_the_team_saves_there_and_changes_the_teams_scripts(fixture: &Fixture) {
+    let teammate = fixture.team_save(&repo(REPO), "lint", "echo team lint\n");
+    let mut split = fixture.split_saving(NotesPlace::RemoteLocal, Place::Remote);
+
+    let saved = split
+        .save_script(&repo(REPO), &script("deploy", "", "echo deploy\n"))
+        .expect("saved");
+    let id = saved.script.summary.id;
+    assert!(id < LOCAL_ID_OFFSET, "saved in the team database: {id}");
+
+    // The same name saved again replaces the team's script, and the team's scripts can be deleted.
+    let again = split
+        .save_script(&repo(REPO), &script("deploy", "", "echo deploy again\n"))
+        .expect("saved again");
+    assert_eq!(again.script.summary.id, id);
+    assert!(!again.created);
+    assert_eq!(
+        named(split.get_script(&both(REPO), &ScriptRef::Id(id)).expect("get")).1,
+        "echo deploy again\n"
+    );
+
+    assert_eq!(
+        split.origin(teammate),
+        ScriptOrigin::Team {
+            raw: teammate,
+            read_only: false
+        }
+    );
+    assert!(
+        split
+            .delete_script(&both(REPO), &ScriptRef::Id(teammate))
+            .expect("deleted")
+    );
+    assert_eq!(split.delete_scripts(&both(REPO), &[id]).expect("deleted many"), 1);
+    assert!(listed(&mut split, &both(REPO)).is_empty());
+}
+
+fn a_place_picked_wins_over_where_remote_local_saves_scripts(fixture: &Fixture) {
+    for (saves, other) in [(Place::Remote, Place::Local), (Place::Local, Place::Remote)] {
+        let mut split = fixture.split_saving(NotesPlace::RemoteLocal, saves);
+
+        for (place, name) in [(saves, "as-set"), (other, "the-other-way")] {
+            let name = format!("{name}-{saves:?}").to_lowercase();
+            let saved = split
+                .save_script_to(place, &repo(REPO), &script(&name, "", "echo hi\n"))
+                .expect("saved");
+
+            assert_eq!(
+                saved.script.summary.id >= LOCAL_ID_OFFSET,
+                place == Place::Local,
+                "{name}: a place picked is where it goes"
+            );
+        }
+
+        let plain = split
+            .save_script(
+                &repo(REPO),
+                &script(&format!("plain-{saves:?}").to_lowercase(), "", "echo hi\n"),
+            )
+            .expect("saved");
+        assert_eq!(plain.script.summary.id >= LOCAL_ID_OFFSET, saves == Place::Local);
+    }
 }
 
 fn remote_local_lists_both_and_finds_this_computers_first(fixture: &Fixture) {

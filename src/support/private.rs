@@ -156,6 +156,56 @@ pub fn write_atomic(folder: &Path, path: &Path, text: &[u8], prefix: &str, what:
     Ok(())
 }
 
+/// An advisory lock on a file next to the data it guards (`<name>.lock`, `0600` on Unix), held until
+/// it is dropped. It serialises the processes that read, change and write a private file back, so
+/// none writes over what another just wrote. It is only ever held for the few steps of one change.
+#[derive(Debug)]
+pub struct FileLock {
+    _file: std::fs::File,
+}
+
+impl FileLock {
+    /// The lock file of the file `guarded`: the same name with `.lock` added.
+    fn path_of(guarded: &Path) -> PathBuf {
+        let mut name = guarded.file_name().map(std::ffi::OsString::from).unwrap_or_default();
+        name.push(".lock");
+        guarded.with_file_name(name)
+    }
+
+    fn open(guarded: &Path, what: &str) -> Result<std::fs::File, String> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+
+        options
+            .open(Self::path_of(guarded))
+            .map_err(|error| format!("locking the {what} failed: {error}"))
+    }
+
+    /// Waits for the lock that guards `guarded` (shown as `what` in errors).
+    pub fn exclusive(guarded: &Path, what: &str) -> Result<Self, String> {
+        let file = Self::open(guarded, what)?;
+        file.lock()
+            .map_err(|error| format!("locking the {what} failed: {error}"))?;
+
+        Ok(Self { _file: file })
+    }
+
+    /// The lock that guards `guarded` when no one holds it; `Ok(None)` when another process (or
+    /// another holder in this one) does.
+    pub fn try_exclusive(guarded: &Path, what: &str) -> Result<Option<Self>, String> {
+        let file = Self::open(guarded, what)?;
+
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(format!("locking the {what} failed: {error}")),
+        }
+    }
+}
+
 /// The bytes of the regular file `path`, at most `max` of them; `Ok(None)` when there is no such
 /// file. Fails for a symbolic link or anything but a regular file, more than `max` bytes, and on
 /// Unix a file of another user or one other users may write to.

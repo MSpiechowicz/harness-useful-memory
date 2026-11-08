@@ -10,12 +10,13 @@ use super::Server;
 use super::blocks::{FRAME, hit_block, note_block, rewrite_line, saved_line, similar_line};
 use super::reply::{Capped, now};
 use super::scope::{kind, own_root, provenance, scope_arg, target, view};
+use crate::backend::Place;
 use crate::limits::{
     DEPTH_MAX, FEEDBACK_REASON_MAX, GET_REPLY_MAX, GLOBAL_SLOT_BYTES_MAX, LIST_REPLY_MAX, NEIGHBORS_LIMIT_DEFAULT,
     SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, SIMILAR_MAX,
 };
 use crate::store::{
-    Forget, Hit, Link, NoteDraft, NoteOrigin, NotePatch, Saved, Scope, SearchQuery, Target, View, clean,
+    Forget, Hit, Link, NoteDraft, NoteOrigin, NotePatch, Saved, Scope, SearchQuery, StoreError, Target, View, clean,
 };
 use crate::support::lang::Lang;
 
@@ -116,6 +117,10 @@ pub(super) struct UpdateArgs {
     pub tags: Option<Vec<String>>,
     pub scope: Option<String>,
     pub project_path: Option<String>,
+    /// Not an argument of the tool: set by the user's own commands (`notes update
+    /// --expect-revision`, `held save`), never read from what an agent sends.
+    #[serde(skip)]
+    pub expect_revision: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -214,6 +219,16 @@ fn remember(server: &mut Server, args: RememberArgs) -> Result<String, String> {
 
 /// Saves the note `args` describe (the body of `note_save`): where it went, and the result.
 pub(super) fn save_note(server: &mut Server, args: RememberArgs) -> Result<(Target, Saved), String> {
+    save_note_to(server, args, None)
+}
+
+/// [`save_note`] into the store `place` names (`None`: where the routing sends new notes). Only the
+/// user's own save asks for a place, never an MCP call.
+pub(super) fn save_note_to(
+    server: &mut Server,
+    args: RememberArgs,
+    place: Option<Place>,
+) -> Result<(Target, Saved), String> {
     let target = target(server, args.scope.as_deref(), args.project_path.as_deref())?;
     let draft = NoteDraft {
         title: args.title,
@@ -224,10 +239,11 @@ pub(super) fn save_note(server: &mut Server, args: RememberArgs) -> Result<(Targ
         provenance: provenance(server, args.project_path.as_deref()),
     };
 
-    let saved = server
-        .store
-        .remember(&target, &draft)
-        .map_err(|error| error.to_string())?;
+    let saved = match place {
+        Some(place) => server.store.remember_to(place, &target, &draft),
+        None => server.store.remember(&target, &draft),
+    }
+    .map_err(|error| error.to_string())?;
 
     super::vectors::refresh(server, saved.id);
 
@@ -238,24 +254,61 @@ fn update(server: &mut Server, args: UpdateArgs) -> Result<String, String> {
     update_note(server, args).map(|saved| saved_line(&saved))
 }
 
+/// Why [`update_note_typed`] changed nothing.
+pub(crate) enum UpdateError {
+    /// The note is not at the revision the caller expected (`revision` is where it is now).
+    Stale { revision: i64, message: String },
+    /// Any other failure, as the message the caller shows.
+    Failed(String),
+}
+
+impl UpdateError {
+    /// The message to show.
+    pub(crate) fn message(self) -> String {
+        match self {
+            Self::Stale { message, .. } | Self::Failed(message) => message,
+        }
+    }
+}
+
 /// Changes the note `args` name (the body of `note_update`).
 pub(super) fn update_note(server: &mut Server, args: UpdateArgs) -> Result<Saved, String> {
-    let view = view(server, args.scope.as_deref(), args.project_path.as_deref())?;
+    update_note_typed(server, args).map_err(UpdateError::message)
+}
+
+/// [`update_note`], telling a note that is not at the expected revision apart from other failures.
+pub(super) fn update_note_typed(server: &mut Server, args: UpdateArgs) -> Result<Saved, UpdateError> {
+    let view = view(server, args.scope.as_deref(), args.project_path.as_deref()).map_err(UpdateError::Failed)?;
     let patch = NotePatch {
         title: args.title,
         body: args.body,
         append: args.append,
-        kind: args.kind.as_deref().map(kind).transpose()?,
+        kind: args
+            .kind
+            .as_deref()
+            .map(kind)
+            .transpose()
+            .map_err(UpdateError::Failed)?,
         tags: args.tags,
         provenance: provenance(server, args.project_path.as_deref()),
+        expected_revision: args.expect_revision,
     };
 
-    let saved = server
-        .store
-        .update(&view, args.id, &patch)
-        .map_err(|error| error.to_string())?;
+    let saved = match server.store.update(&view, args.id, &patch) {
+        Ok(saved) => saved,
+        Err(StoreError::Stale(revision)) => {
+            return Err(UpdateError::Stale {
+                revision,
+                message: StoreError::Stale(revision).to_string(),
+            });
+        }
+        Err(error) => return Err(UpdateError::Failed(error.to_string())),
+    };
 
-    super::vectors::refresh(server, saved.id);
+    // A change that waits for the team database is not in it yet, so there is nothing to index.
+    if !saved.queued {
+        super::vectors::refresh(server, saved.id);
+    }
 
     Ok(saved)
 }

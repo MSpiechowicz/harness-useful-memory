@@ -320,11 +320,35 @@ pub(super) fn backend(error: &Error) -> StoreError {
         return StoreError::Backend(message(error));
     }
 
+    if unreachable(error) {
+        return StoreError::Unreachable(message(error));
+    }
+
+    StoreError::Backend(message(error))
+}
+
+/// The server error codes that say a server that is up cannot take the request now: it is
+/// stopping, stepped down, has no primary, or the network under it failed (`HostUnreachable`,
+/// `HostNotFound`, `NetworkTimeout`, `SocketException`, `ShutdownInProgress`,
+/// `PrimarySteppedDown`, `NotWritablePrimary`, `InterruptedAtShutdown`,
+/// `InterruptedDueToReplStateChange`, `NotPrimaryNoSecondaryOk`, `NotPrimaryOrSecondary`).
+const NOT_NOW_CODES: [i32; 11] = [6, 7, 89, 91, 189, 9001, 10107, 11600, 11602, 13435, 13436];
+
+/// True when `error` says the database could not be reached, at connect or on a connection that
+/// worked and was lost since: no server could be selected, the network failed (an I/O error, a
+/// connection pool the driver cleared after one), a host did not resolve, or the server said it
+/// cannot take the request now ([`NOT_NOW_CODES`]). A server that answered with a refusal (a login,
+/// a permission, a duplicate key, a TLS check) is reachable: the caller has handled TLS first.
+pub(super) fn unreachable(error: &Error) -> bool {
     match error.kind.as_ref() {
-        ErrorKind::ServerSelection { .. } | ErrorKind::Io(_) | ErrorKind::DnsResolve { .. } => {
-            StoreError::Unreachable(message(error))
-        }
-        _ => StoreError::Backend(message(error)),
+        ErrorKind::ServerSelection { .. }
+        | ErrorKind::Io(_)
+        | ErrorKind::DnsResolve { .. }
+        | ErrorKind::ConnectionPoolCleared { .. } => true,
+        ErrorKind::Command(command) => NOT_NOW_CODES.contains(&command.code),
+        ErrorKind::Write(WriteFailure::WriteError(write)) => NOT_NOW_CODES.contains(&write.code),
+        ErrorKind::Write(WriteFailure::WriteConcernError(concern)) => NOT_NOW_CODES.contains(&concern.code),
+        _ => false,
     }
 }
 
@@ -337,6 +361,7 @@ pub(super) fn message(error: &Error) -> String {
         ErrorKind::ServerSelection { .. } => "cannot reach a usable MongoDB server (timed out)".to_owned(),
         ErrorKind::Io(io) => format!("network error ({:?})", io.kind()),
         ErrorKind::DnsResolve { .. } => "cannot resolve the MongoDB host".to_owned(),
+        ErrorKind::ConnectionPoolCleared { .. } => "the MongoDB connection was lost".to_owned(),
         ErrorKind::InvalidTlsConfig { .. } => "invalid TLS settings".to_owned(),
         ErrorKind::InvalidArgument { .. } => "invalid MongoDB settings".to_owned(),
         ErrorKind::Command(command) => coded("MongoDB command failed", Some(&command.code_name), command.code),
@@ -462,6 +487,42 @@ mod tests {
 
         let reset = Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
         assert!(matches!(backend(&reset), StoreError::Unreachable(_)));
+    }
+
+    /// A server error with `code`, as the driver reports one.
+    fn command_error(code: i32, name: &str) -> Error {
+        let command: mongodb::error::CommandError = mongodb::bson::from_document(
+            mongodb::bson::doc! { "code": code, "codeName": name, "errmsg": "stored text" },
+        )
+        .expect("a command error");
+
+        Error::from(ErrorKind::Command(command))
+    }
+
+    #[test]
+    fn a_server_that_cannot_take_the_request_now_is_unreachable_and_an_answered_refusal_is_not() {
+        // A server that is up but cannot take the request now.
+        for (code, name) in [
+            (10107, "NotWritablePrimary"),
+            (91, "ShutdownInProgress"),
+            (189, "PrimarySteppedDown"),
+        ] {
+            assert!(
+                matches!(backend(&command_error(code, name)), StoreError::Unreachable(_)),
+                "{name}"
+            );
+        }
+
+        // A server that answered with a refusal is reachable: it is a failure to fix, not to wait out.
+        for (code, name) in [
+            (13, "Unauthorized"),
+            (11000, "DuplicateKey"),
+            (18, "AuthenticationFailed"),
+        ] {
+            let refused = backend(&command_error(code, name));
+            assert!(matches!(refused, StoreError::Backend(_)), "{name}: {refused:?}");
+            assert!(!refused.to_string().contains("stored text"), "no server text is shown");
+        }
     }
 
     #[test]

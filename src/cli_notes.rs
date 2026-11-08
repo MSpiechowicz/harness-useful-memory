@@ -24,7 +24,7 @@
 //!   object has `id`, `kind`, `title`, `scope` (`repo` or `global`), `repo`
 //!   (`github.com/o/r`, a `path:` key whole, `null` for a global note), `place` (`team` or
 //!   `local`: where this note is kept), `readOnly` (a team note of a scope routed
-//!   `remote+local`, which cannot be changed from here), `hidden` (hidden on this computer),
+//!   `remote+local` while `remote_local_saves` is `local`, which cannot be changed from here), `hidden` (hidden on this computer),
 //!   `tags`, `entities`, `author` (`source` and `root`, shown like a script's writer),
 //!   `addedBy` and `updatedBy` (who added the note and who changed it last: `{"name", "via"}`,
 //!   the git `user.name` and the MCP client of an agent's write, `via` `null` for the user's own
@@ -69,16 +69,18 @@
 //!   `notes list` shows without filters (all pages) in one write per store, as `note_delete`
 //!   deletes one, and prints `deleted N notes` (and how many came from the team database), or
 //!   `{"deleted": N, "team": M}` with `--json` (`team`: how many were kept in the team database).
-//!   In a scope routed `remote+local` only the notes on this computer go: the team notes stay,
-//!   counted as `kept` (`{"deleted": N, "team": M, "kept": K}`). Without `--yes` it deletes
-//!   nothing and exits 2.
+//!   In a scope routed `remote+local` that saves to this computer (`remote_local_saves` `local`)
+//!   only the notes on this computer go: the team notes stay, counted as `kept` (`{"deleted": N,
+//!   "team": M, "kept": K}`). One that saves to the team database deletes the team's notes and
+//!   leaves this computer's. Without `--yes` it deletes nothing and exits 2.
 //! - `harness-memory notes discard-local (--all | ID[,ID...] | -) [--scope repo|global] --yes
 //!   [--json]` deletes notes from the local file in the scopes routed `remote`, where they are not
 //!   read (every repository's, see [`discard`]), and prints `deleted N notes from this computer`,
 //!   or `{"deleted": N}`.
 //!
 //! - `harness-memory notes save --json [--project PATH] [--client NAME]` and `notes update <id>
-//!   --json [--project PATH] [--client NAME]` save the user's own note past the save guards (see [`save`]).
+//!   --json [--project PATH] [--client NAME] [--expect-revision N]` save the user's own note past the save
+//!   guards (see [`save`]).
 //!
 //! A note that is not visible exits 1 with `harness-memory: note <id> not found` as the last line
 //! of stderr. Other exit codes and errors as in [`crate::cli`].
@@ -92,12 +94,13 @@ mod discard;
 mod hidden;
 mod save;
 
-use crate::backend::{Backend, NotesPlace, Place, Secrets, Selection};
+use crate::backend::{Backend, Place, Secrets, Selection};
 use crate::cli::{self, AUTHOR_FLAG, AUTHOR_VALUED, Args, Delete, PAGE_OPTIONS, PICK_VALUED, Page, Repos};
 use crate::limits::{LIST_PAGE_MAX, NEIGHBORS_LIMIT_MAX};
 use crate::mcp::Vectors;
 use crate::mcp::{author_json, person_json, place_label, repo_label};
 use crate::open::{lone_notes_place, notes_place, open_hidden, open_notes};
+use crate::store::split::is_local_id;
 use crate::store::{
     AuthorFilter, Forget, HiddenNotes, LangFilter, MemoryStore, Note, NoteKind, NoteListQuery, NoteOrigin, NoteRow,
     NoteSort, UsefulFilter,
@@ -114,8 +117,8 @@ pub const USAGE: &str = "notes list --json [--project PATH | --repo KEY | --all-
                          [--project PATH | --repo KEY | --all-repos] [--json] | notes unhide <id> [--project PATH | --repo KEY | --all-repos] [--json] | notes delete \
                          <id> [--project PATH | --repo KEY | --all-repos] | notes delete --all --yes [--project PATH | --repo KEY] [--json] | notes \
                          discard-local (--all | ID[,ID...] | -) [--scope repo|global] --yes [--json] | notes save --json \
-                         [--project PATH] [--client NAME] < note.json | notes update <id> --json [--project PATH] \
-                         [--client NAME] < patch.json";
+                         [--project PATH] [--client NAME] [--place remote|local] < note.json | notes update <id> --json [--project PATH] \
+                         [--client NAME] [--expect-revision N] < patch.json";
 
 /// The most linked notes `notes get` lists.
 const LINKS_MAX: usize = 50;
@@ -338,6 +341,14 @@ fn delete_one(id: i64, pick: &Repos) -> ExitCode {
 
     let note = match opened.note(id) {
         Ok(Some(note)) => note,
+        // A team note that cannot be read now is not known to be gone: the store says why it cannot
+        // be deleted either, and changes nothing.
+        Ok(None) if opened.store.offline() && !is_local_id(id) => {
+            return match opened.store.forget(&opened.view, &Target::Global, &Forget::Note(id)) {
+                Err(error) => opened.failed(&error),
+                Ok(_) => not_found(id),
+            };
+        }
         Ok(None) => return not_found(id),
         Err(error) => return opened.failed(&error),
     };
@@ -371,7 +382,10 @@ fn delete_all(pick: &Repos, scope: Option<Scope>, json: bool) -> ExitCode {
 
     let team: usize = [Scope::Repo, Scope::Global]
         .into_iter()
-        .filter(|scope| notes_place(&opened.selection, *scope).writes() == Place::Remote)
+        .filter(|scope| {
+            let place = notes_place(&opened.selection, *scope);
+            opened.selection.routing.writes(place) == Place::Remote
+        })
         .map(|scope| forgotten.of(scope))
         .sum();
 
@@ -556,7 +570,8 @@ impl Opened {
     /// How many team notes of the view stay in the scopes routed `remote+local` (where deleting
     /// every note only deletes those on this computer); `None` when no scope is.
     fn kept_team_notes(&mut self) -> Result<Option<usize>, StoreError> {
-        let shared = |scope| notes_place(&self.selection, scope) == NotesPlace::RemoteLocal;
+        let saves = self.selection.routing.remote_local_saves;
+        let shared = |scope| notes_place(&self.selection, scope).team_read_only(saves);
         let view = View {
             repo: self.view.repo.clone().filter(|_| shared(Scope::Repo)),
             global: self.view.global && shared(Scope::Global),
@@ -595,7 +610,10 @@ impl Opened {
     /// The note object of `row`, hidden on this computer when `hidden` (see the module docs).
     fn summary(&self, row: &NoteRow, hidden: bool) -> Value {
         let (place, read_only) = match self.store.origin(row.id, row.scope) {
-            NoteOrigin::Single => (place_label(notes_place(&self.selection, row.scope).writes()), false),
+            NoteOrigin::Single => {
+                let place = notes_place(&self.selection, row.scope);
+                (place_label(self.selection.routing.writes(place)), false)
+            }
             NoteOrigin::Team { read_only } => (place_label(Place::Remote), read_only),
             NoteOrigin::Local => (place_label(Place::Local), false),
         };

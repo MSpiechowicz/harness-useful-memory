@@ -14,6 +14,7 @@ pub mod hooks;
 pub mod listing;
 pub mod mcp;
 pub mod opt_in;
+pub mod revision;
 pub mod routines;
 pub mod scripts;
 pub mod search_cases;

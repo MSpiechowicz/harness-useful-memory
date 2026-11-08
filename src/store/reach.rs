@@ -9,8 +9,10 @@
 //! The cooldown is also kept in `team-unreachable.json` next to the local database ([`Reach::beside`]),
 //! because `harness-memory notes list` and the other commands Harness Desktop runs are a new process
 //! each: without the file every one of them would wait out the timeout itself. The file names the
-//! team database it is about and the (already scrubbed) reason; it is private to the owner, and one
-//! that cannot be read or does not match counts as no failure.
+//! team database it is about and the reason; it is private to the owner, and one that cannot be read
+//! or does not match counts as no failure. The reason is scrubbed of the database's secrets before it
+//! gets here: an opener masks its own message, and [`crate::store::Lazy::with_secrets`] masks the
+//! reason of a connection that dropped.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -104,7 +106,7 @@ impl Reach {
         }
     }
 
-    /// Records a failed open (`message` must be safe to show).
+    /// Records a failed open (`message` must be scrubbed of the database's secrets by the caller).
     pub fn failed(&self, message: &str) {
         let failure = Failure {
             at: Instant::now(),

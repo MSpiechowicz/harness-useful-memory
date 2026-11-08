@@ -9,7 +9,8 @@
 //! - [`backend`]: which store to use (the local file, or a team database from the environment or
 //!   the config file).
 //! - [`push`] and [`push_scripts`]: copy the local notes and scripts into a team database
-//!   ([`cli_push`] reads their options).
+//!   ([`cli_push`] reads their options). [`pull`] and [`pull_scripts`] copy team notes and scripts
+//!   to this computer for the scopes set to `remote+local` ([`cli_pull`] reads their options).
 //! - [`mcp`]: the stdio JSON-RPC server and its tools.
 //! - [`embed`] and [`cli_embedder`]: the embedder, one process per computer that holds the vector
 //!   search model and answers every server over a local socket.
@@ -40,10 +41,12 @@ pub mod cli_embedder;
 pub mod cli_held;
 pub mod cli_notes;
 pub mod cli_project_key;
+pub mod cli_pull;
 pub mod cli_push;
 pub mod cli_recall;
 mod cli_scripts;
 pub mod cli_settings;
+pub mod cli_sync;
 pub mod cli_team_docs;
 pub mod cli_trust;
 pub mod embed;
@@ -53,6 +56,8 @@ pub mod location;
 pub mod mcp;
 pub mod open;
 pub mod project;
+pub mod pull;
+pub mod pull_scripts;
 pub mod push;
 pub mod push_scripts;
 pub mod store;

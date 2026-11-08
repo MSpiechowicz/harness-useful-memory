@@ -5,7 +5,10 @@
 //! scope, kind and language as the tool reads them, the note text, tags and entities and the
 //! script description masked as the store masks them (a script body is kept as sent). A
 //! `note_update` needs the note it changes, and records it as `current`; a `script_save` that
-//! replaces a script of the same name in its scope records that script.
+//! replaces a script of the same name in its scope records that script. A team note that cannot be
+//! read because the team database is unreachable is held with a null `current` (the note is not
+//! known to be gone): `held save` then reads the note as it is, and shows the item against it when it
+//! can, or queues the change when it still cannot ([`crate::cli_held`]).
 
 use std::path::PathBuf;
 
@@ -132,6 +135,7 @@ fn note_update(server: &mut Server, arguments: &Value) -> Result<(Map<String, Va
         kind: args.kind.as_deref().map(kind).transpose()?,
         tags: args.tags,
         provenance: Provenance::default(),
+        expected_revision: None,
     };
     let cleaned = clean::patch(&patch).map_err(|error| error.to_string())?;
 
@@ -140,10 +144,18 @@ fn note_update(server: &mut Server, arguments: &Value) -> Result<(Map<String, Va
         .peek(&view, &[args.id])
         .map_err(|error| error.to_string())?
         .into_iter()
-        .next()
-        .ok_or_else(|| format!("note {} not found in this repository or the global scope", args.id))?;
+        .next();
 
-    let current = super::user::note_current(&note);
+    let current = match note {
+        Some(note) => super::user::note_current(&note),
+        None if super::user::unverifiable(server, args.id) => Value::Null,
+        None => {
+            return Err(format!(
+                "note {} not found in this repository or the global scope",
+                args.id
+            ));
+        }
+    };
 
     let mut normal = Map::new();
     normal.insert("id".to_owned(), json!(args.id));

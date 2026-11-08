@@ -26,6 +26,7 @@ pub fn open_server(env: &Env, selection: &Selection, cwd: Option<PathBuf>) -> Op
     let projects = ProjectResolver::new(env.clone(), cwd);
     let mut server = Server::new(store, scripts, trust, projects)
         .with_scripts_place(selection.scripts_place())
+        .with_scripts_saves(selection.routing.remote_local_saves)
         .with_team_key(selection.backend.team_key())
         .with_trust_team_scripts(selection.team_scripts_trusted());
 
@@ -70,7 +71,7 @@ pub fn open_scripts(env: &Env, selection: &Selection) -> Box<dyn ScriptStore> {
 
     let team = team_scripts(&selection.backend, reach_of(env, selection), selection.offline_fallback);
     let hidden = open_hidden_scripts(env, selection);
-    let split = SplitScripts::new(team, local, place, hidden);
+    let split = SplitScripts::new(team, local, place, hidden).saving_to(selection.routing.remote_local_saves);
 
     match crate::database_path(env).filter(|_| selection.offline_fallback) {
         Some(database) => {
@@ -130,6 +131,7 @@ fn local_scripts(env: &Env) -> Box<dyn ScriptStore> {
 /// cooldown of `reach`. Without the offline fallback the failure names what to change.
 fn team_scripts(backend: &Backend, reach: Reach, fallback: bool) -> Box<dyn ScriptStore> {
     let team = backend.clone();
+    let secrets = backend.secrets();
 
     let store = Lazy::classified(move || match backend::try_open_scripts(&team) {
         Some(Err(StoreError::Unreachable(message))) if fallback => {
@@ -148,7 +150,14 @@ fn team_scripts(backend: &Backend, reach: Reach, fallback: bool) -> Box<dyn Scri
         None => Err(StoreError::Unreachable("no team database is set".to_owned())),
     });
 
-    Box::new(store.with_reach(reach))
+    let store = store.with_reach(reach).with_secrets(secrets);
+
+    // Without the fallback the first failure of a connection that dropped says what to change too.
+    if fallback {
+        return Box::new(store);
+    }
+
+    Box::new(store.with_lost_hint(SCRIPTS_HINT))
 }
 
 /// The script versions this machine trusts: always the local SQLite file, wherever scripts are.
@@ -199,7 +208,8 @@ pub fn open_notes(env: &Env, selection: &Selection) -> Option<Box<dyn MemoryStor
     };
 
     let hidden = open_hidden(env, selection);
-    let split = SplitStore::routed(team, local, routing.repository, routing.global, hidden);
+    let split = SplitStore::routed(team, local, routing.repository, routing.global, hidden)
+        .saving_to(routing.remote_local_saves);
 
     match crate::database_path(env).filter(|_| selection.offline_fallback) {
         Some(database) => {
@@ -256,6 +266,7 @@ pub fn open_hidden(env: &Env, selection: &Selection) -> Option<HiddenNotes> {
 /// notes meanwhile; without it the calls that need the team database fail with the reason and
 /// what to change, and the next call tries again once `reach`'s cooldown has ended.
 fn open_team_notes(backend: &Backend, reach: Reach, fallback: bool) -> Box<dyn MemoryStore> {
+    let secrets = backend.secrets();
     let backend = backend.clone();
     let mut warned_newer = false;
 
@@ -284,7 +295,14 @@ fn open_team_notes(backend: &Backend, reach: Reach, fallback: bool) -> Box<dyn M
         None => Err(StoreError::Unreachable("no team database is set".to_owned())),
     });
 
-    Box::new(team.with_reach(reach))
+    let team = team.with_reach(reach).with_secrets(secrets);
+
+    // Without the fallback the first failure of a connection that dropped says what to change too.
+    if fallback {
+        return Box::new(team);
+    }
+
+    Box::new(team.with_lost_hint(OFFLINE_HINT))
 }
 
 /// What a user can do when the team database is unreachable (VPN off, server down), the notes are

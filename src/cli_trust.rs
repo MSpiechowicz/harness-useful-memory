@@ -14,7 +14,7 @@
 //!   "places": {"local": N, "team": N}, "authors": {"people": [{"name", "count"}], "unknown": N},
 //!   "scripts": [...]}`: one page of the visible scripts as the
 //!   objects `script_list` returns (`place` per script, `team` or `local`; `readOnly` for a team
-//!   script while scripts are `remote+local`; `hidden`). The groups do not overlap: `needsReview` holds every script that
+//!   script while scripts are `remote+local` and `remote_local_saves` is `local`; `hidden`). The groups do not overlap: `needsReview` holds every script that
 //!   needs approval, `repo` and `global` the others of their scope. `--scope` keeps the scripts of
 //!   one scope, `--review needed` those that need approval (the `needsReview` group),
 //!   `--review trusted` every other one; the two combine, and neither combines with `--group`.
@@ -55,7 +55,7 @@
 //!   script `scripts list` shows without filters (all groups, all pages), deleted in one write per
 //!   store, and prints `deleted N scripts` (and how many came from the team database), or
 //!   `{"deleted": N, "team": M}` with `--json` (`team`: how many were kept in the team database).
-//!   With `remote+local` only the scripts on this computer go: the team scripts stay, counted as
+//!   With `remote+local` saving to this computer only the scripts on this computer go: the team scripts stay, counted as
 //!   `kept` (`{"deleted": N, "team": 0, "kept": K}`). Without `--yes` it deletes nothing and exits
 //!   2.
 //! - `harness-memory scripts discard-local (--all | ID[,ID...] | -) [--scope repo|global] --yes
@@ -63,6 +63,9 @@
 //!   [`crate::cli_scripts::discard`]).
 //! - `harness-memory scripts push [...]` copies the scripts saved on this computer into the team
 //!   database (see [`crate::cli_scripts::push`]).
+//! - `harness-memory scripts pull [--dry-run] --json [--ids -|ID[,ID...]] [--repo <key|.>] [--no-global]`
+//!   copies team scripts to this computer while scripts are `remote+local`, never trusted (see
+//!   [`crate::cli_scripts::pull`]).
 //! - `harness-memory scripts save --json [--project PATH] [--client NAME]` saves the user's own script past the
 //!   save guards (see [`crate::cli_scripts::save`]).
 //! - `harness-memory trust <id>=<sha256>... [--project PATH | --repo KEY | --all-repos]` approves those scripts on this
@@ -84,7 +87,7 @@ use serde_json::{Value, json};
 
 use crate::backend::{NotesPlace, Place, Selection};
 use crate::cli::{self, Args, Delete, PICK_VALUED, Repos};
-use crate::cli_scripts::{Opened, discard, hidden, list, not_found, push, save};
+use crate::cli_scripts::{Opened, discard, hidden, list, not_found, pull, push, save};
 use crate::store::{Scope, Script, ScriptRef, TrustOrigin, TrustedVersion};
 use crate::store::{foreign_encoding, foreign_encoding_error, hidden_character, hidden_character_error};
 
@@ -97,7 +100,8 @@ pub const USAGE: &str = "scripts list --json [--project PATH | --repo KEY | --al
                          <id> [--project PATH | --repo KEY | --all-repos] | scripts delete --all --yes [--project PATH | --repo KEY] [--json] | scripts \
                          discard-local (--all | ID[,ID...] | -) [--scope repo|global] --yes [--json] | scripts push \
                          [--dry-run] [--json] [--overwrite none|all|ID[,ID...]|-] [--delete-copied] [--scope \
-                         repo|global] [--repo <key|.>] [--no-global] | scripts save --json [--project PATH] [--client NAME] < script.json \
+                         repo|global | --remote-local] [--repo <key|.>] [--no-global] [--selection -] | scripts pull [--dry-run] --json \
+                         [--ids -|ID[,ID...]] [--repo <key|.>] [--no-global] | scripts save --json [--project PATH] [--client NAME] [--place remote|local] < script.json \
                          | trust <id>[=<sha256>]... | --all [--project PATH]";
 
 /// The line `harness-memory check` adds when every team script runs without approval.
@@ -117,6 +121,7 @@ pub fn scripts(args: &[Option<&str>]) -> ExitCode {
         [Some("delete"), rest @ ..] => delete(rest),
         [Some("discard-local"), rest @ ..] => discard::discard_local(rest),
         [Some("push"), rest @ ..] => push::push(rest),
+        [Some("pull"), rest @ ..] => pull::pull(rest),
         [Some("save"), rest @ ..] => save::save(rest),
         _ => list::list(args),
     }
@@ -272,11 +277,17 @@ fn delete_all(repos: &Repos, scope: Option<Scope>, json: bool) -> ExitCode {
     };
 
     let place = opened.selection.scripts_place();
-    let team = if place == NotesPlace::Remote { deleted } else { 0 };
+    let saves = opened.selection.routing.remote_local_saves;
+    let on_team = listed.iter().filter(|(_, side)| *side == Place::Remote).count();
 
-    // With `remote+local` the team scripts are read-only, so they stay.
-    let kept =
-        (place == NotesPlace::RemoteLocal).then(|| listed.iter().filter(|(_, side)| *side == Place::Remote).count());
+    let team = match place {
+        NotesPlace::Remote => deleted,
+        NotesPlace::RemoteLocal if place.writes_team(saves) => on_team,
+        NotesPlace::RemoteLocal | NotesPlace::Local => 0,
+    };
+
+    // With `remote+local` saving to this computer the team scripts are read-only, so they stay.
+    let kept = place.team_read_only(saves).then_some(on_team);
 
     cli::deleted_all_keeping("script", (deleted, team), kept, json);
     ExitCode::SUCCESS

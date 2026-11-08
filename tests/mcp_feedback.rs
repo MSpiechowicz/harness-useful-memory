@@ -11,7 +11,7 @@ use common::guards::{Guarded, structured, tool};
 use common::mcp::{call, env, is_error, run, server, text};
 use common::{both, global_only};
 use harness_memory::Server;
-use harness_memory::backend::NotesPlace;
+use harness_memory::backend::{NotesPlace, Place};
 use harness_memory::limits::SEARCH_LIMIT_MAX;
 use harness_memory::project::ProjectResolver;
 use harness_memory::store::{HiddenNotes, MemoryStore, Note, NoteUsage, SplitStore, SqliteStore};
@@ -460,7 +460,8 @@ fn split_server_hiding_in(dir: &TempDir, hidden_file: &Path) -> (Server, PathBuf
         NotesPlace::RemoteLocal,
         NotesPlace::RemoteLocal,
         Some(HiddenNotes::new(hidden_file.to_path_buf(), "team")),
-    );
+    )
+    .saving_to(Place::Local);
 
     let project = dir.path().join("project");
     std::fs::create_dir_all(&project).expect("project");

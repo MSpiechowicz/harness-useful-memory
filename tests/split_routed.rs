@@ -81,8 +81,13 @@ impl Fixture {
 
     /// The store routed `repo` and `global`, hiding what the local file hides.
     fn routed(&self, repo: NotesPlace, global: NotesPlace) -> SplitStore {
+        self.routed_saving(repo, global, Place::Local)
+    }
+
+    /// The same, with `remote+local` scopes saving new notes to `saves`.
+    fn routed_saving(&self, repo: NotesPlace, global: NotesPlace, saves: Place) -> SplitStore {
         let local = Box::new(SqliteStore::open(&self.path()).expect("local file"));
-        SplitStore::routed(self.team.open(), local, repo, global, Some(self.hidden()))
+        SplitStore::routed(self.team.open(), local, repo, global, Some(self.hidden())).saving_to(saves)
     }
 
     /// The hidden list, as another process sees it.
@@ -99,7 +104,7 @@ impl Fixture {
 
 type Case = fn(&Fixture);
 
-const CASES: [Case; 13] = [
+const CASES: [Case; 15] = [
     remote_local_reads_both_and_saves_here,
     pages_merge_both_stores_in_order,
     a_place_lists_its_store_and_counts_both,
@@ -113,6 +118,8 @@ const CASES: [Case; 13] = [
     deleting_every_note_leaves_the_hidden_team_notes,
     counters_reach_the_store_of_each_note_also_when_it_is_read_only,
     who_added_the_notes_is_listed_and_counted_across_both_stores,
+    remote_local_saving_to_the_team_saves_there_and_edits_the_teams_notes,
+    a_place_picked_wins_over_where_remote_local_saves,
 ];
 
 fn run(fresh: Fresh) {
@@ -235,6 +242,114 @@ fn remote_local_reads_both_and_saves_here(fixture: &Fixture) {
     let mut found: Vec<i64> = deploy.iter().map(|hit| hit.id).collect();
     found.sort_unstable();
     assert_eq!(found, [shared.id, mine.id], "the hits of both stores take turns");
+}
+
+fn remote_local_saving_to_the_team_saves_there_and_edits_the_teams_notes(fixture: &Fixture) {
+    let teammate = fixture
+        .team
+        .open()
+        .remember(
+            &repo(REPO),
+            &draft("Team deploy", "deploy with make", NoteKind::Decision),
+        )
+        .expect("team note");
+
+    let mut split = fixture.routed_saving(NotesPlace::RemoteLocal, NotesPlace::RemoteLocal, Place::Remote);
+
+    let mine = split
+        .remember(&repo(REPO), &draft("My deploy", "deploy by hand", NoteKind::Fix))
+        .expect("saved");
+    assert!(mine.id < LOCAL_ID_OFFSET, "saved in the team database: {mine:?}");
+
+    let global = split
+        .remember(&Target::Global, &draft("Global rule", "Shared", NoteKind::Note))
+        .expect("global note");
+    assert!(global.id < LOCAL_ID_OFFSET, "also the global scope: {global:?}");
+
+    let local_before = fixture.path();
+    assert!(
+        SqliteStore::open(&local_before)
+            .expect("local file")
+            .list_notes(&listing(both(REPO)))
+            .expect("list")
+            .rows
+            .is_empty(),
+        "nothing reached this computer"
+    );
+
+    // The team's notes can be changed, an agent's and a teammate's alike.
+    for id in [mine.id, teammate.id] {
+        let patch = NotePatch {
+            append: Some("one more line".to_owned()),
+            ..NotePatch::default()
+        };
+        split.update(&both(REPO), id, &patch).expect("a team note is editable");
+    }
+
+    let body = |split: &mut SplitStore, id: i64| split.peek(&both(REPO), &[id]).expect("peek").remove(0).body;
+    assert_eq!(body(&mut split, mine.id), "deploy by hand\none more line");
+    assert_eq!(body(&mut split, teammate.id), "deploy with make\none more line");
+
+    assert_eq!(
+        split.origin(teammate.id, Scope::Repo),
+        NoteOrigin::Team { read_only: false }
+    );
+
+    // Entities link to a team note, and a note kept here cannot be linked from the team's scope.
+    let kept = split
+        .remember_to(Place::Local, &repo(REPO), &draft("Kept here", "mine", NoteKind::Note))
+        .expect("kept here");
+    assert!(kept.id >= LOCAL_ID_OFFSET);
+
+    let link = Link {
+        from: "Deploy".to_owned(),
+        relation: "located_in".to_owned(),
+        to: "Makefile".to_owned(),
+        note_id: Some(mine.id),
+    };
+    split.link(&repo(REPO), &link).expect("a team note can be linked");
+
+    let refused = split
+        .link(
+            &repo(REPO),
+            &Link {
+                note_id: Some(kept.id),
+                ..link
+            },
+        )
+        .expect_err("a note kept here is not linked from the team's scope");
+    assert!(matches!(refused, StoreError::NotFound(_)), "{refused:?}");
+
+    // Deleting a team note works too.
+    let deleted = split
+        .forget(&both(REPO), &repo(REPO), &Forget::Note(teammate.id))
+        .expect("a team note can be deleted");
+    assert_eq!(deleted, 1);
+}
+
+fn a_place_picked_wins_over_where_remote_local_saves(fixture: &Fixture) {
+    for (saves, other) in [(Place::Remote, Place::Local), (Place::Local, Place::Remote)] {
+        let mut split = fixture.routed_saving(NotesPlace::RemoteLocal, NotesPlace::RemoteLocal, saves);
+
+        for (place, title) in [(saves, "Saved as set"), (other, "Saved the other way")] {
+            let title = format!("{title} {saves:?}");
+            let saved = split
+                .remember_to(place, &repo(REPO), &draft(&title, "body", NoteKind::Note))
+                .expect("saved");
+
+            assert_eq!(
+                saved.id >= LOCAL_ID_OFFSET,
+                place == Place::Local,
+                "{title}: a place picked is where it goes: {saved:?}"
+            );
+        }
+
+        // Without a place it goes where the setting says.
+        let plain = split
+            .remember(&repo(REPO), &draft(&format!("Plain {saves:?}"), "body", NoteKind::Note))
+            .expect("saved");
+        assert_eq!(plain.id >= LOCAL_ID_OFFSET, saves == Place::Local, "{plain:?}");
+    }
 }
 
 fn pages_merge_both_stores_in_order(fixture: &Fixture) {
@@ -1409,7 +1524,8 @@ fn a_merged_list_asks_who_added_the_notes_once_and_adds_them_up_on_deep_pages() 
         NotesPlace::RemoteLocal,
         NotesPlace::RemoteLocal,
         None,
-    );
+    )
+    .saving_to(Place::Local);
 
     for index in 0..450 {
         let name = [Some("Ada"), None][index % 2];

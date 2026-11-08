@@ -53,6 +53,9 @@ impl Folders {
     /// when given.
     fn on_team(mut self, url: &str, routing: Option<(&str, &str)>) -> Self {
         self.team.push(("HARNESS_MEMORY_DATABASE_URL", url.to_owned()));
+        // What these cases test is a `remote+local` scope that saves on this computer.
+        self.team
+            .push(("HARNESS_MEMORY_REMOTE_LOCAL_SAVES", "local".to_owned()));
 
         if let Some((repository, global)) = routing {
             self.team
@@ -1205,7 +1208,11 @@ fn discards_what_nothing_reads(folders: &mut Folders) {
 
     let ids = format!("{global},{gadget}");
     let one = folders.json(&["notes", "discard-local", &ids, "--yes", "--json"]);
-    assert_eq!(one, json!({ "deleted": 1 }), "only the global scope is routed remote");
+    assert_eq!(
+        one,
+        json!({ "deleted": 1, "waiting": 0 }),
+        "only the global scope is routed remote"
+    );
 
     folders.route("remote", "remote");
     let piped = folders.cli_with_input(
@@ -1215,7 +1222,7 @@ fn discards_what_nothing_reads(folders: &mut Folders) {
     assert!(piped.status.success(), "{}", stderr(&piped));
     assert_eq!(
         stdout(&piped),
-        "{\"deleted\":1}\n",
+        "{\"deleted\":1,\"waiting\":0}\n",
         "the global note is not in --scope repo"
     );
 

@@ -21,7 +21,7 @@
 //!
 //! The script inherits the server's environment, `GH_TOKEN`, `PATH` and the rest included, except
 //! the team database settings, the script settings (`HARNESS_MEMORY_SCRIPTS`,
-//! `HARNESS_MEMORY_TRUST_TEAM_SCRIPTS`) and the chat (`HARNESS_MEMORY_SESSION`): a script has no
+//! `HARNESS_MEMORY_REMOTE_LOCAL_SAVES`, `HARNESS_MEMORY_TRUST_TEAM_SCRIPTS`) and the chat (`HARNESS_MEMORY_SESSION`): a script has no
 //! use for them and must not see the database credentials. On Unix it runs in its own process group, so a timeout kills
 //! everything it started. On Windows a timeout kills the interpreter only (a Job Object needs
 //! unsafe code, which this crate forbids): processes it started in the background keep running.
@@ -41,8 +41,9 @@ use super::{Env, OsKind};
 /// The script settings (routing, team trust, the approval wait) and the chat the server runs
 /// for (`HARNESS_MEMORY_SESSION`, so a script's own harness-memory calls are not the chat's),
 /// never passed on.
-const SCRIPT_VARS: [&str; 4] = [
+const SCRIPT_VARS: [&str; 5] = [
     "HARNESS_MEMORY_SCRIPTS",
+    crate::backend::REMOTE_LOCAL_SAVES_VAR,
     "HARNESS_MEMORY_TRUST_TEAM_SCRIPTS",
     "HARNESS_MEMORY_APPROVAL_WAIT_MS",
     crate::backend::SESSION_VAR,

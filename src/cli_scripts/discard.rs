@@ -3,19 +3,23 @@
 //! from before the routing changed, or after `scripts push` copied them). `--all` takes every
 //! script, every repository's, `--scope` those of one scope; ids are the local file's own
 //! (`localId` in `scripts push --json`, see [`crate::cli_discard`]), and an id of another scope,
-//! or of no script, is left alone. It prints `deleted N scripts from this computer`, or
-//! `{"deleted": N}`.
+//! or of no script, is left alone. A script saved while the team database was unreachable that
+//! still waits to be copied to it is left too (see [`crate::cli_discard`]). It prints `deleted N
+//! scripts from this computer`, or `{"deleted": N, "waiting": M}` (`waiting`: the scripts left
+//! because they still wait for the team database).
 //!
 //! Without `--yes` nothing is deleted and it exits 2; without a team database, or with scripts
-//! not `remote`, it exits 1.
+//! not `remote`, or when the list of waiting scripts exists but cannot be read (nothing is
+//! deleted), it exits 1.
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 use crate::backend::{Backend, NotesPlace, Selection};
 use crate::cli;
-use crate::cli_discard::{self, Discard, Wanted};
+use crate::cli_discard::{self, Discard, Discarded, Waiting, Wanted};
 use crate::store::hidden::view_of;
+use crate::store::pending::Kind;
 use crate::store::{Scope, ScriptStore, SqliteStore, StoreError};
 
 /// `scripts discard-local`.
@@ -42,15 +46,20 @@ pub(crate) fn discard_local(args: &[Option<&str>]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let deleted = if path.is_file() {
-        SqliteStore::open(&path).and_then(|mut store| discard(&mut store, options.scope, &options.wanted))
-    } else {
-        Ok(0)
+    let waiting = match Waiting::of(Kind::Scripts, &path, &selection) {
+        Ok(waiting) => waiting,
+        Err(reason) => return cli_discard::unreadable(&reason),
     };
 
-    match deleted {
-        Ok(deleted) => {
-            cli_discard::report("script", deleted, options.json);
+    let discarded = if path.is_file() {
+        SqliteStore::open(&path).and_then(|mut store| discard(&mut store, options.scope, &options.wanted, &waiting))
+    } else {
+        Ok(Discarded::default())
+    };
+
+    match discarded {
+        Ok(discarded) => {
+            cli_discard::report("script", discarded, options.json);
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -81,16 +90,30 @@ fn check_routing(selection: &Selection) -> Result<(), String> {
     Ok(())
 }
 
-/// Deletes the scripts of `store` that `wanted` names (of `scope` when given); how many went.
-fn discard(store: &mut SqliteStore, scope: Option<Scope>, wanted: &Wanted) -> Result<usize, StoreError> {
+/// Deletes the scripts of `store` that `wanted` names (of `scope` when given), except those still
+/// `waiting` for the team database; how many went and how many were left for that.
+fn discard(
+    store: &mut SqliteStore,
+    scope: Option<Scope>,
+    wanted: &Wanted,
+    waiting: &Waiting,
+) -> Result<Discarded, StoreError> {
     let mut by_project: BTreeMap<Option<String>, Vec<i64>> = BTreeMap::new();
+    let mut kept = 0;
 
     for (script, _) in store.every_script()? {
         let summary = script.summary;
 
-        if scope.is_none_or(|scope| summary.scope == scope) && wanted.takes(summary.id) {
-            by_project.entry(summary.project).or_default().push(summary.id);
+        if !scope.is_none_or(|scope| summary.scope == scope) || !wanted.takes(summary.id) {
+            continue;
         }
+
+        if waiting.holds(summary.id, summary.project.as_deref()) {
+            kept += 1;
+            continue;
+        }
+
+        by_project.entry(summary.project).or_default().push(summary.id);
     }
 
     let mut deleted = 0;
@@ -99,5 +122,5 @@ fn discard(store: &mut SqliteStore, scope: Option<Scope>, wanted: &Wanted) -> Re
         deleted += store.delete_scripts(&view_of(project), &ids)?;
     }
 
-    Ok(deleted)
+    Ok(Discarded { deleted, waiting: kept })
 }

@@ -1,10 +1,16 @@
 //! The `harness-memory` executable: `harness-memory [mcp]` serves MCP over stdio,
 //! `harness-memory push [--dry-run] [--json] [--overwrite none|all|ID[,ID…]|-] [--delete-copied]
-//! [--scope repo|global] [--repo <key|.>] [--no-global]` copies the local memory into the team
-//! database, `harness-memory check` opens the configured database and says which it is and where
+//! [--scope repo|global] [--repo <key|.>] [--no-global] [--remote-local] [--selection -]` copies the
+//! local memory into the team database (`--remote-local` takes every scope set to `remote+local`, and
+//! only those, `--selection -` only the notes a JSON object on stdin names (id, title and update time as the dry run printed them), see
+//! [`harness_memory::cli_push`]), `harness-memory pull [--dry-run] --json [--ids -|ID,ID...] [--repo <key|.>] [--no-global]`
+//! copies team notes the user ticked to this computer for the scopes set to `remote+local`
+//! ([`harness_memory::cli_pull`]), `harness-memory check` opens the configured database and says which it is and where
 //! scripts are, `harness-memory kinds` lists the team database kinds this build supports,
 //! `harness-memory features` lists what this build can do for Harness Desktop,
-//! `harness-memory scripts list|get|hide|unhide|delete|discard-local|push` and `harness-memory
+//! `harness-memory sync --json` copies what was saved while the team database was unreachable
+//! ([`harness_memory::cli_sync`]),
+//! `harness-memory scripts list|get|hide|unhide|delete|discard-local|push|pull` and `harness-memory
 //! trust` list, hide, delete, copy and approve scripts ([`harness_memory::cli_trust`]),
 //! `harness-memory notes list|get|hide|unhide|delete|discard-local` browse, hide and delete notes
 //! ([`harness_memory::cli_notes`]), `harness-memory notes save|update`, `scripts save` and
@@ -22,31 +28,34 @@ use std::io::{BufReader, Write};
 use std::process::ExitCode;
 
 use harness_memory::backend::{self, Backend, CONFIG_VAR, NotesPlace, Opened, Routing, Secrets, Selection, URL_VAR};
-use harness_memory::cli_push::{PushArgs, overwrite, repo_key};
+use harness_memory::cli_push::{PushArgs, chosen, repo_key};
 use harness_memory::location::{DIR_VAR, override_is_relative};
 use harness_memory::mcp::stop_on_sigterm;
 use harness_memory::open::{open_hidden, open_server, reach_of};
-use harness_memory::push::{Action, Change, GLOBAL, Options, Summary, push};
+use harness_memory::push::{Action, Change, Failure, GLOBAL, Options, Summary, push, push_selected};
 use harness_memory::store::{Reach, Scope, StoreError};
 use harness_memory::support::Env;
 use harness_memory::support::runner::Stop;
 use harness_memory::support::time::rfc3339;
 use harness_memory::{
-    cli_embedder, cli_held, cli_notes, cli_project_key, cli_recall, cli_settings, cli_team_docs, cli_trust,
+    cli_embedder, cli_held, cli_notes, cli_project_key, cli_pull, cli_recall, cli_settings, cli_sync, cli_team_docs,
+    cli_trust,
 };
 use harness_memory::{database_path, serve};
 use serde_json::{Value, json};
 
 const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--overwrite none|all|ID[,ID...]|-] \
-                     [--delete-copied] [--scope repo|global] [--repo <key|.>] [--no-global] | check | kinds | features \
-                     | scripts list --json [--project PATH | --repo KEY | --all-repos] [--group needsReview|repo|global] [--scope repo|global] \
+                     [--delete-copied] [--scope repo|global | --remote-local] [--repo <key|.>] [--no-global] [--selection -] | pull [--dry-run] --json \
+                     [--ids -|ID[,ID...]] [--repo <key|.>] [--no-global] | check | kinds | features \
+                     | sync --json | scripts list --json [--project PATH | --repo KEY | --all-repos] [--group needsReview|repo|global] [--scope repo|global] \
                      [--place local|team] [--review needed|trusted] [--query TEXT] [--sort name|language|scope|place|runs|lastRun|updated] \
                      [--order asc|desc] [--offset N] [--limit N] [--hidden] | scripts get <id> --json [--project PATH | --repo KEY | --all-repos] \
                      [--hidden] | scripts hide <id> [--project PATH | --repo KEY | --all-repos] [--json] | scripts unhide <id> [--project PATH | --repo KEY | --all-repos] \
                      [--json] | scripts delete <id> [--project PATH | --repo KEY | --all-repos] | scripts delete --all --yes [--project PATH | --repo KEY] \
                      [--json] | scripts discard-local (--all | ID[,ID...] | -) [--scope repo|global] --yes [--json] | \
                      scripts push [--dry-run] [--json] [--overwrite none|all|ID[,ID...]|-] [--delete-copied] [--scope \
-                     repo|global] [--repo <key|.>] [--no-global] | trust <id>[=<sha256>]... [--repo KEY | --all-repos] | --all [--project PATH | --repo KEY] \
+                     repo|global | --remote-local] [--repo <key|.>] [--no-global] [--selection -] | scripts pull [--dry-run] --json \
+                     [--ids -|ID[,ID...]] [--repo <key|.>] [--no-global] | trust <id>[=<sha256>]... [--repo KEY | --all-repos] | --all [--project PATH | --repo KEY] \
                      | notes list --json [--project PATH | --repo KEY | --all-repos] [--kind KIND] [--scope repo|global] \
                      [--place local|team] [--lang en|other|unknown] [--query TEXT] [--sort updated|title|kind|scope|place] [--order asc|desc] [--offset N] [--limit N] [--hidden] | notes \
                      get <id> --json [--project PATH | --repo KEY | --all-repos] [--hidden] | notes hide <id> [--project PATH | --repo KEY | --all-repos] [--json] | notes \
@@ -58,10 +67,10 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--o
                      --json | routines list --json [--project PATH] [--offset N] [--limit N] | routines get <id> \
                      --json | routines put --json [--project PATH] [--expect-sha SHA256] [--author NAME] < \
                      routine.json | routines delete <id> [--expect-sha SHA256] --json | routines delete --mine \
-                     [--author NAME] --json | notes save --json [--project PATH] [--client NAME] < note.json | notes update <id> --json \
-                     [--project PATH] [--client NAME] < patch.json | scripts save --json [--project PATH] [--client NAME] \
-                     < script.json | held list --json \
-                     [--chat KEY] | held save <heldId> --json [< draft.json] | held skip <heldId> --json | settings get --json | \
+                     [--author NAME] --json | notes save --json [--project PATH] [--client NAME] [--place remote|local] < note.json | notes update <id> --json \
+                     [--project PATH] [--client NAME] [--expect-revision N] < patch.json | scripts save --json [--project PATH] [--client NAME] \
+                     [--place remote|local] < script.json | held list --json \
+                     [--chat KEY] | held save <heldId> --json [--place remote|local] [< draft.json] | held skip <heldId> --json | settings get --json | \
                      settings set english_notes=true|false --json | project-key --json < paths.json | recall --hook [--project PATH] [--limit N] | --version]";
 
 /// What this build can do that older ones could not, as `harness-memory features` lists it: the
@@ -77,8 +86,18 @@ const USAGE: &str = "usage: harness-memory [mcp | push [--dry-run] [--json] [--o
 /// the notes and scripts lists by who added them (`--author`, `--author-unknown`, `--sort addedBy`,
 /// the `authors` of the answer), and `recall --hook` (`recall`), and a version 2 `guards/global.json`,
 /// where saving is off until the user turns it on for a repository or every project, with the
-/// project key each listed repository had then, and `project-key --json` (`save-opt-in`).
-const FEATURES: [&str; 17] = [
+/// project key each listed repository had then, and `project-key --json` (`save-opt-in`), and the
+/// changes to team notes made while the team database is unreachable that wait for it
+/// (`offline-update-queue`), and `notes update --expect-revision` (`note-expect-revision`), and
+/// `sync --json` (`sync-command`), and copying between this computer and the team database for the
+/// scopes set to `remote+local` (`push --remote-local`: `push-remote-local`, `pull --json`:
+/// `pull-json`, `scripts pull --json`: `scripts-pull-json`), and limiting a push to the entries the
+/// user reviewed (`push --selection -`, `scripts push --selection -`: `push-selection`), and picking
+/// where a note or script goes in a scope set to `remote+local` (`notes save --place`, `scripts save
+/// --place`: `save-place`), and where new entries of a scope set to `remote+local` go when no place is
+/// picked (`remote_local_saves`: `remote-local-saves`), and the same pick for a held save (`held save
+/// --place`: `held-save-place`).
+const FEATURES: [&str; 27] = [
     "notes-remote-local",
     "notes-hide",
     "push-json",
@@ -96,6 +115,16 @@ const FEATURES: [&str; 17] = [
     "notes-author-filter",
     "recall",
     "save-opt-in",
+    "offline-update-queue",
+    "note-expect-revision",
+    "sync-command",
+    "push-remote-local",
+    "pull-json",
+    "scripts-pull-json",
+    "push-selection",
+    "save-place",
+    "remote-local-saves",
+    "held-save-place",
 ];
 
 /// mimalloc hands freed memory back to the operating system, which the embedder's idle unload of
@@ -133,6 +162,8 @@ fn main() -> ExitCode {
 
             ExitCode::SUCCESS
         }
+        [Some("sync"), rest @ ..] => cli_sync::sync(rest),
+        [Some("pull"), rest @ ..] => cli_pull::pull(rest),
         [Some("scripts"), rest @ ..] => cli_trust::scripts(rest),
         [Some("trust"), rest @ ..] => cli_trust::trust(rest),
         [Some("notes"), rest @ ..] => cli_notes::notes(rest),
@@ -360,8 +391,10 @@ enum Taken {
     NotAsked,
     /// Kept on this computer (`local`), so never pushed.
     Local,
-    /// `remote+local`, which only `--scope` naming it pushes.
+    /// `remote+local`, which only `--scope` naming it (or `--remote-local`) pushes.
     Unnamed,
+    /// Not `remote+local`, so `--remote-local` leaves it out.
+    NotShared,
 }
 
 /// How `push` takes one note scope routed to `place`: `asked` when the options leave it in,
@@ -410,6 +443,10 @@ struct PushScopes {
 
 impl PushScopes {
     fn of(routing: Routing, args: &PushArgs) -> Self {
+        if args.remote_local {
+            return Self::shared(routing, args);
+        }
+
         let repository = taken(
             routing.repository,
             args.scope != Some(Scope::Global),
@@ -422,6 +459,20 @@ impl PushScopes {
         );
 
         Self { repository, global }
+    }
+
+    /// The scopes `--remote-local` takes: those set to `remote+local`, and no others.
+    fn shared(routing: Routing, args: &PushArgs) -> Self {
+        let taken = |place: NotesPlace, asked: bool| match place {
+            _ if !asked => Taken::NotAsked,
+            NotesPlace::RemoteLocal => Taken::Pushed,
+            NotesPlace::Remote | NotesPlace::Local => Taken::NotShared,
+        };
+
+        Self {
+            repository: taken(routing.repository, true),
+            global: taken(routing.global, !args.no_global),
+        }
     }
 
     /// Both scopes with their words.
@@ -460,10 +511,17 @@ fn run_push(args: &PushArgs) -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // Read first: a selection that lists ids must hear why they were not pushed, whatever else
+    // leaves nothing to push.
+    let Some(chosen) = chosen(args) else {
+        return ExitCode::from(2);
+    };
+    let listed: Vec<i64> = chosen.only.iter().flat_map(|only| only.keys().copied()).collect();
+
     let scopes = PushScopes::of(routing, args);
 
     if let Some(reason) = nothing_to_push(routing, args, scopes) {
-        return report_nothing(args, &reason);
+        return report_nothing(args, &reason, &listed);
     }
 
     let Some(local) = database_path(&env) else {
@@ -471,13 +529,9 @@ fn run_push(args: &PushArgs) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    if args.json && !local.is_file() {
-        return report_nothing(args, "no notes are saved on this computer");
+    if (args.json || !listed.is_empty()) && !local.is_file() {
+        return report_nothing(args, "no notes are saved on this computer", &listed);
     }
-
-    let Some(overwrite) = overwrite(args) else {
-        return ExitCode::from(2);
-    };
 
     let repo = match &args.repo {
         Some(raw) => match repo_key(&env, raw) {
@@ -510,7 +564,7 @@ fn run_push(args: &PushArgs) -> ExitCode {
         repo,
         skip_global: scopes.global != Taken::Pushed,
         skip_repositories: scopes.repository != Taken::Pushed,
-        overwrite,
+        overwrite: chosen.overwrite,
         delete_copied: args.delete_copied,
     };
 
@@ -529,7 +583,12 @@ fn run_push(args: &PushArgs) -> ExitCode {
         None => Vec::new(),
     };
 
-    let summary = match push(&local, opened.store.as_mut(), &hidden, &options) {
+    let pushed = match &chosen.only {
+        Some(ids) => push_selected(&local, opened.store.as_mut(), &hidden, &options, ids),
+        None => push(&local, opened.store.as_mut(), &hidden, &options),
+    };
+
+    let summary = match pushed {
         Ok(summary) => summary,
         Err(error) => {
             eprintln!("harness-memory: push failed: {}", secrets.scrub(&error.to_string()));
@@ -553,8 +612,31 @@ fn run_push(args: &PushArgs) -> ExitCode {
 }
 
 /// Says there is nothing to push and why: in the JSON object (exit 0) with `--json`, else on
-/// stderr (exit 2).
-fn report_nothing(args: &PushArgs, reason: &str) -> ExitCode {
+/// stderr (exit 2). Notes a `--selection -` listed (`listed`, by local id) are not "nothing": each
+/// is reported as failed with the reason, and the exit is 1.
+fn report_nothing(args: &PushArgs, reason: &str, listed: &[i64]) -> ExitCode {
+    if !listed.is_empty() {
+        let summary = Summary {
+            failed: listed
+                .iter()
+                .map(|id| Failure {
+                    local_id: Some(*id),
+                    message: format!("note {id} was not pushed: nothing to push, {reason}"),
+                    deleting: false,
+                })
+                .collect(),
+            ..Summary::default()
+        };
+
+        if args.json {
+            println!("{}", push_json(args.dry_run, None, &summary, &Secrets::default()));
+        } else {
+            report_failures(&summary, &Secrets::default());
+        }
+
+        return ExitCode::FAILURE;
+    }
+
     if args.json {
         let empty = Summary::default();
         println!("{}", push_json(args.dry_run, Some(reason), &empty, &Secrets::default()));
@@ -568,6 +650,10 @@ fn report_nothing(args: &PushArgs, reason: &str) -> ExitCode {
 /// Why `push` with `args` has nothing to send under `routing`, taking the scopes as `scopes`
 /// says, if so.
 fn nothing_to_push(routing: Routing, args: &PushArgs, scopes: PushScopes) -> Option<String> {
+    if args.remote_local {
+        return nothing_to_share(args, scopes);
+    }
+
     if routing.is_all_local() {
         return Some(
             "repository_notes and global_notes are both \"local\", so nothing goes to the team database".to_owned(),
@@ -603,7 +689,7 @@ fn nothing_to_push(routing: Routing, args: &PushArgs, scopes: PushScopes) -> Opt
                         .to_owned(),
                 );
             }
-            Taken::Pushed | Taken::NotAsked => {}
+            Taken::Pushed | Taken::NotAsked | Taken::NotShared => {}
         }
     }
 
@@ -618,6 +704,32 @@ fn nothing_to_push(routing: Routing, args: &PushArgs, scopes: PushScopes) -> Opt
         .collect();
 
     Some(reasons.join(" and "))
+}
+
+/// Why `push --remote-local` has nothing to send, taking the scopes as `scopes` says, if so.
+fn nothing_to_share(args: &PushArgs, scopes: PushScopes) -> Option<String> {
+    if args.repo.is_some() && scopes.repository != Taken::Pushed {
+        return Some(
+            "--repo names a repository, but repository notes are not \"remote+local\" (repository_notes), so \
+             --remote-local leaves them out"
+                .to_owned(),
+        );
+    }
+
+    if scopes.repository == Taken::Pushed || scopes.global == Taken::Pushed {
+        return None;
+    }
+
+    let reasons: Vec<String> = scopes
+        .each()
+        .into_iter()
+        .map(|(taken, scope)| left_out_reason(taken, &scope, args))
+        .collect();
+
+    Some(format!(
+        "--remote-local takes the scopes set to \"remote+local\", and none is taken: {}",
+        reasons.join(" and ")
+    ))
 }
 
 /// Why a scope taken as `taken` is not pushed (it is not [`Taken::Pushed`]).
@@ -639,6 +751,10 @@ fn left_out_reason(taken: Taken, scope: &ScopeWords, args: &PushArgs) -> String 
             };
             format!("--scope {other} leaves the {} out", scope.words)
         }
+        Taken::NotShared => format!(
+            "{} are not \"remote+local\" ({}), so --remote-local leaves them out",
+            scope.words, scope.key
+        ),
         Taken::Pushed => format!("{} are pushed", scope.words),
     }
 }
@@ -655,6 +771,10 @@ fn report_left_out(scopes: PushScopes) {
                 "{} are \"remote+local\" ({}) and were left out: push --scope {} copies the ones saved on this \
                  computer",
                 scope.words, scope.key, scope.flag
+            ),
+            Taken::NotShared => println!(
+                "{} are not \"remote+local\" ({}) and were left out by --remote-local",
+                scope.words, scope.key
             ),
             Taken::Pushed | Taken::NotAsked => {}
         }

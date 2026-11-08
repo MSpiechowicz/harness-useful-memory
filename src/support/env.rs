@@ -38,6 +38,9 @@ pub const CAPTURED_VARS: &[&str] = &[
     "HARNESS_MEMORY_GLOBAL_NOTES",
     // Whether scripts stay on this computer with a team database (see `crate::backend::Routing`).
     "HARNESS_MEMORY_SCRIPTS",
+    // Where new notes and scripts of a `remote+local` scope are saved (see
+    // `crate::backend::REMOTE_LOCAL_SAVES_VAR`).
+    "HARNESS_MEMORY_REMOTE_LOCAL_SAVES",
     // Whether team scripts run without approval here (see `crate::backend::TRUST_TEAM_SCRIPTS_VAR`).
     "HARNESS_MEMORY_TRUST_TEAM_SCRIPTS",
     // Whether team hooks are shared, and whether Harness Desktop runs them without approval (see

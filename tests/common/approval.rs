@@ -9,7 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 use harness_memory::Server;
-use harness_memory::backend::NotesPlace;
+use harness_memory::backend::{NotesPlace, Place};
 use harness_memory::mcp::{ALIVE_FILE, APPROVAL_WAIT_VAR, REQUESTS_FOLDER};
 use harness_memory::project::ProjectResolver;
 use harness_memory::store::{
@@ -87,10 +87,12 @@ impl Fixture {
     pub fn split_server(&self, wait_ms: u64, place: NotesPlace, team_key: &str) -> Server {
         let team = SqliteStore::open(&self.data().join("team.sqlite3")).expect("team store");
         let hidden = self.hidden_scripts(team_key);
-        let scripts = SplitScripts::new(Box::new(team), Box::new(self.store()), place, Some(hidden));
+        let scripts =
+            SplitScripts::new(Box::new(team), Box::new(self.store()), place, Some(hidden)).saving_to(Place::Local);
 
         self.server_over(wait_ms, "tests", Box::new(scripts))
             .with_scripts_place(place)
+            .with_scripts_saves(Place::Local)
             .with_team_key(team_key.to_owned())
     }
 

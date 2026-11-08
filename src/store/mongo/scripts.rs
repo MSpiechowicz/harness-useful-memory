@@ -160,7 +160,11 @@ fn saved(document: &Document, created: bool) -> Result<SavedScript, Fail> {
         )));
     };
 
-    Ok(SavedScript { script, created })
+    Ok(SavedScript {
+        script,
+        created,
+        not_listed: false,
+    })
 }
 
 /// A new script id. Taken outside the transaction, like note ids: an id of an attempt that is

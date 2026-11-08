@@ -227,7 +227,11 @@ fn save_in(
         .find_map(script_from_row)
         .ok_or_else(|| StoreError::Backend("the saved script could not be read back".to_owned()))?;
 
-    Ok(SavedScript { script, created })
+    Ok(SavedScript {
+        script,
+        created,
+        not_listed: false,
+    })
 }
 
 /// The script `script` names when it is visible in `view`; a name resolves in the repository

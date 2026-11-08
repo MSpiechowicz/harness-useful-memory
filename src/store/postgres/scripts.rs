@@ -180,7 +180,11 @@ fn save(
     let script =
         load(tx, id, authors)?.ok_or_else(|| StoreError::Backend("the saved script was not found".to_owned()))?;
 
-    Ok(SavedScript { script, created })
+    Ok(SavedScript {
+        script,
+        created,
+        not_listed: false,
+    })
 }
 
 /// The scripts visible in `view`, repository scripts first, then by name (by code point, like

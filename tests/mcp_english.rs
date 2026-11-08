@@ -8,7 +8,7 @@ mod common;
 use common::guards::{Guarded, structured, tool};
 use common::mcp::{call, env, is_error, run, server, text};
 use harness_memory::Server;
-use harness_memory::backend::NotesPlace;
+use harness_memory::backend::{NotesPlace, Place};
 use harness_memory::project::ProjectResolver;
 use harness_memory::store::{
     HiddenNotes, MemoryStore, NoteDraft, NoteKind, Provenance, SplitStore, SqliteStore, Target,
@@ -273,13 +273,10 @@ fn note_get_asks_for_no_rewrite_of_a_team_note_this_computer_cannot_change() {
         let hidden = HiddenNotes::new(dir.path().join("memory.sqlite3"), "team");
 
         let mut server = Server::new(
-            Box::new(SplitStore::routed(
-                Box::new(team),
-                Box::new(local()),
-                place,
-                place,
-                Some(hidden),
-            )),
+            Box::new(
+                SplitStore::routed(Box::new(team), Box::new(local()), place, place, Some(hidden))
+                    .saving_to(Place::Local),
+            ),
             Box::new(local()),
             Box::new(local()),
             ProjectResolver::new(env(dir.path()), Some(dir.path().to_path_buf())),

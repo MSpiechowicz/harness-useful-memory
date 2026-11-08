@@ -4,13 +4,54 @@
 //! `scripts push --json`), given as one comma-separated argument or, with `-`, read from stdin
 //! (separated by commas or blanks, at most [`crate::limits::STDIN_IDS_BYTES_MAX`] bytes and
 //! [`crate::limits::IDS_MAX`] ids, exit 2 beyond).
+//!
+//! An entry saved while the team database was unreachable and still listed as waiting for it
+//! ([`crate::store::pending`]) is never discarded, by `--all` or by id: the team database has not
+//! received it, so deleting it would lose it. It is counted in `waiting` of the answer instead, and
+//! can be discarded once a sync (or a push) has copied it and taken it off the list. A listed entry
+//! is told apart by its id and scope, which is all the local file's rows give before they are read.
+//! A list that exists but cannot be read (a link, another owner or mode, oversized, malformed) is
+//! not taken for an empty one: nothing is deleted, the reason is printed and it exits 1
+//! ([`unreadable`]).
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::process::ExitCode;
 
+use crate::backend::Selection;
 use crate::cli::Args;
+use crate::push::GLOBAL;
 use crate::store::Scope;
+use crate::store::pending::{Entry, Kind, Pending};
 use crate::support::ids;
+
+/// What a discard did: the entries deleted, and those it left because they still wait for the
+/// team database.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Discarded {
+    pub deleted: usize,
+    pub waiting: usize,
+}
+
+/// The entries of one kind that wait to be copied to the team database of a selection.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Waiting(Vec<Entry>);
+
+impl Waiting {
+    /// What the list beside the local `database` holds of `kind` for the team database `selection`
+    /// names; why not when the list exists but cannot be read (see [`Pending::entries_strict`]):
+    /// without it nothing can be told apart as waiting, so nothing may be deleted.
+    pub(crate) fn of(kind: Kind, database: &Path, selection: &Selection) -> Result<Self, String> {
+        let team = selection.backend.team_key();
+        Pending::beside(database).entries_strict(kind, &team).map(Self)
+    }
+
+    /// True when the local row `id` of the repository `project` (`None`: global) is listed.
+    pub(crate) fn holds(&self, id: i64, project: Option<&str>) -> bool {
+        let scope = project.unwrap_or(GLOBAL);
+        self.0.iter().any(|entry| entry.id == id && entry.scope == scope)
+    }
+}
 
 /// The entries asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,15 +96,35 @@ pub(crate) fn unconfirmed(noun: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-/// Prints how many `noun`s were deleted: `{"deleted": N}` with `json`, else a line.
-pub(crate) fn report(noun: &str, deleted: usize, json: bool) {
+/// Says that the list of entries waiting for the team database cannot be read, so nothing was
+/// deleted; exit 1.
+pub(crate) fn unreadable(reason: &str) -> ExitCode {
+    eprintln!(
+        "harness-memory: nothing was deleted: {reason}. Entries that still wait for the team database could not be \
+         told apart, so nothing is discarded until the list is readable (fix pending-sync.json)"
+    );
+    ExitCode::FAILURE
+}
+
+/// Prints how many `noun`s were deleted and how many were left because they still wait for the
+/// team database: `{"deleted": N, "waiting": M}` with `json`, else a line (the second half only
+/// when some waited).
+pub(crate) fn report(noun: &str, discarded: Discarded, json: bool) {
+    let Discarded { deleted, waiting } = discarded;
+
     if json {
-        println!("{}", serde_json::json!({ "deleted": deleted }));
+        println!("{}", serde_json::json!({ "deleted": deleted, "waiting": waiting }));
         return;
     }
 
     let plural = if deleted == 1 { "" } else { "s" };
-    println!("deleted {deleted} {noun}{plural} from this computer");
+    let left = if waiting == 0 {
+        String::new()
+    } else {
+        format!(", kept {waiting} that still wait for the team database")
+    };
+
+    println!("deleted {deleted} {noun}{plural} from this computer{left}");
 }
 
 /// [`Discard::parse`] with `stdin` giving the ids for `-`.

@@ -129,7 +129,8 @@ fn note_update() -> Value {
     tool(
         "note_update",
         "Correct or extend a note by id. Give only the fields to change; append adds text to the body. A \
-         team note of a scope set to remote+local is read-only (refused): save a new note instead.",
+         team note of a scope set to remote+local is read-only (refused) when remote_local_saves is local: \
+         save a new note instead.",
         json!({
             "id": { "type": "integer", "description": "Note id" },
             "title": text(&format!("New title (1-{TITLE_MAX} characters)")),
@@ -226,7 +227,7 @@ fn entity_link() -> Value {
         "entity_link",
         "Relate two entities: `from relation to`, for example `GitCli located_in business/src/git/cli.rs` \
          or `retry-fix resolves flaky-test`. Missing entities are created. note_id cannot be a read-only team \
-         note (scope set to remote+local).",
+         note (scope set to remote+local with remote_local_saves local).",
         json!({
             "from": text(&format!("Entity name (at most {ENTITY_MAX} characters)")),
             "relation": text(&format!("Relation such as located_in, resolves, depends_on (at most {RELATION_MAX} characters)")),
@@ -258,7 +259,7 @@ fn note_delete() -> Value {
     tool(
         "note_delete",
         "Delete an outdated or wrong note by id, looked up in this repository and the global scope unless \
-         scope is given. A team note of a scope set to remote+local is read-only (refused).",
+         scope is given. A team note of a scope set to remote+local is read-only (refused) when remote_local_saves is local.",
         json!({
             "id": { "type": "integer", "description": "Note id" },
             "scope": scope(true, "both"),

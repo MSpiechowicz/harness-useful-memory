@@ -31,6 +31,7 @@ use crate::limits::{
     QUERY_MAX, SCRIPT_ARG_MAX, SCRIPT_ARGS_MAX, SCRIPT_STDERR_MAX, SCRIPT_STDIN_MAX, SCRIPT_STDOUT_MAX,
     SCRIPT_TIMEOUT_DEFAULT,
 };
+use crate::store::pending::{NOT_LISTED_MESSAGE, mark_not_listed};
 use crate::store::{Language, Scope, Script, ScriptDraft, ScriptRef, ScriptSummary, StoreError, Target, View};
 use crate::store::{TrustOrigin, TrustedVersion, checked_draft, declares_encoding, script_sha256};
 use crate::store::{foreign_encoding, foreign_encoding_error, hidden_character, hidden_character_error};
@@ -129,11 +130,33 @@ pub(super) fn draft_of(server: &mut Server, args: SaveArgs) -> Result<(Target, S
 
 /// Saves the script `args` describe (the body of `script_save`), trusting it as `trusting` says.
 pub(super) fn save(server: &mut Server, args: SaveArgs, trusting: Trusting) -> Result<Reply, String> {
+    save_to(server, args, trusting, None)
+}
+
+/// [`save`] into the store `place` names (`None`: where the routing sends new scripts). Only the
+/// user's own save asks for a place, never an MCP call. The script is trusted as for any save: by
+/// where it ended up (a team script under the team database's name).
+pub(super) fn save_to(
+    server: &mut Server,
+    args: SaveArgs,
+    trusting: Trusting,
+    place: Option<Place>,
+) -> Result<Reply, String> {
     let project_path = args.project_path.clone();
     let (target, draft) = draft_of(server, args)?;
 
+    // A script kept on this computer on purpose waits for nothing: off the list before the reads
+    // below, which may copy what waits to the team database and delete the row here.
+    if place == Some(Place::Local) {
+        server
+            .scripts
+            .keep_here(&target, &draft.name)
+            .map_err(|error| error.to_string())?;
+    }
+
     if trusting.held_back().is_some() {
-        hold_back_draft(server, &draft)?;
+        let held_in = saved_in(server, &target, &draft, place)?;
+        hold_back_draft(server, &draft, held_in)?;
     }
 
     // Looked up before the save, which may replace the script waiting for approval.
@@ -144,10 +167,11 @@ pub(super) fn save(server: &mut Server, args: SaveArgs, trusting: Trusting) -> R
         .was_unapproved(&every_language_sha256(&draft.body))
         .map_err(|error| error.to_string());
 
-    let saved = server
-        .scripts
-        .save_script(&target, &draft)
-        .map_err(|error| error.to_string())?;
+    let saved = match place {
+        Some(place) => server.scripts.save_script_to(place, &target, &draft),
+        None => server.scripts.save_script(&target, &draft),
+    }
+    .map_err(|error| error.to_string())?;
     let script = &saved.script;
 
     // What the agent sent is what is trusted, never what the store gives back.
@@ -186,11 +210,35 @@ pub(super) fn save(server: &mut Server, args: SaveArgs, trusting: Trusting) -> R
 
     let approval = approval_for(server, &script.summary, &sha256)?;
     let shown = shown(server, &script.summary, &sha256, approval);
+
+    let mut structured = json!({ "script": shown.json(), "created": saved.created });
+
+    if saved.not_listed {
+        note.push_str(&format!("\nnot listed: {NOT_LISTED_MESSAGE}"));
+        mark_not_listed(&mut structured);
+    }
+
     Ok(Reply {
         text: format!("{}{note}", saved_line(&shown, saved.created)),
         is_error: false,
-        structured: Some(json!({ "script": shown.json(), "created": saved.created })),
+        structured: Some(structured),
     })
+}
+
+/// The place the save of `draft` into `target` writes to: the one picked, else where the store says
+/// the script is meant for (this computer when it keeps it already), else where the routing sends new
+/// scripts.
+fn saved_in(server: &mut Server, target: &Target, draft: &ScriptDraft, picked: Option<Place>) -> Result<Place, String> {
+    if let Some(place) = picked {
+        return Ok(place);
+    }
+
+    let meant = server
+        .scripts
+        .save_place(target, &draft.name)
+        .map_err(|error| error.to_string())?;
+
+    Ok(meant.unwrap_or_else(|| server.scripts_place.writes(server.scripts_saves)))
 }
 
 /// True when the store gave back `draft` as saved into `target`: the same name, scope,

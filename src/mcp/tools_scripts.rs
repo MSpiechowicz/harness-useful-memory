@@ -19,7 +19,9 @@ pub(super) fn script_save() -> Value {
          Arguments arrive as $1, $2 (sys.argv, process.argv), never through a shell. What you save runs here \
          without approval, since you wrote it: never save the code of a script that waits for approval, edited \
          or not, to run it (an unedited copy waits for approval too). When scripts are set to remote+local, \
-         new scripts are saved on this computer, next to the team's.",
+         the user's remote_local_saves setting says where new scripts are saved: the team database (the \
+         default) or this computer, next to the team's, but one with that name already on this computer is replaced \
+         there.",
         json!({
             "scope": scope(false, "repo"),
             "name": {
@@ -55,7 +57,7 @@ pub(super) fn script_list() -> Value {
         "List saved scripts, repository scripts first: check here before working out a repeated action \
          again. Without a query every visible script is listed. `place` says where a script is kept (team or \
          local); `readOnly` marks a team script that cannot be changed from here (scripts set to \
-         remote+local).",
+         remote+local with remote_local_saves local).",
         json!({
             "scope": scope(true, "all"),
             "query": text(&format!(
@@ -110,7 +112,7 @@ pub(super) fn script_delete() -> Value {
     let definition = tool(
         "script_delete",
         "Delete a stale or wrong script by id or name. A team script is read-only when scripts are set to \
-         remote+local (refused): save a script of your own instead.",
+         remote+local with remote_local_saves local (refused): save a script of your own instead.",
         with_ref(json!({ "scope": scope(true, "all"), "project_path": project_path() })),
         &[],
     );

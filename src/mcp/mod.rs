@@ -67,6 +67,7 @@ pub struct Server {
     store: Box<dyn MemoryStore>,
     scripts: Box<dyn ScriptStore>,
     scripts_place: NotesPlace,
+    scripts_saves: Place,
     /// The trust name of the team database ([`crate::backend::Backend::team_key`]).
     team_key: String,
     other_scripts: Option<Box<dyn ScriptStore>>,
@@ -138,6 +139,7 @@ impl Server {
             store,
             scripts,
             scripts_place: NotesPlace::Local,
+            scripts_saves: Place::default(),
             team_key: "team".to_owned(),
             other_scripts: None,
             trust,
@@ -237,6 +239,14 @@ impl Server {
         self
     }
 
+    /// The server whose scripts routed `remote+local` are saved to `saves` (`remote_local_saves`, see
+    /// [`crate::backend::Routing::remote_local_saves`]; the team database without this), which is
+    /// where `script_save` holds a script back from team trust before it is saved.
+    pub fn with_scripts_saves(mut self, saves: Place) -> Self {
+        self.scripts_saves = saves;
+        self
+    }
+
     /// The server writing as client `client` (as if `initialize` named it), for the user-only
     /// commands that save through the tool bodies.
     pub fn with_client(mut self, client: Option<String>) -> Self {
@@ -300,7 +310,9 @@ impl Server {
     /// Where the script the script store shows as `id` is kept, and its id there (the id this
     /// machine's trust names it by).
     fn spot(&self, id: i64) -> (Place, i64) {
-        self.scripts.origin(id).spot(id, self.scripts_place.writes())
+        self.scripts
+            .origin(id)
+            .spot(id, self.scripts_place.writes(self.scripts_saves))
     }
 
     /// Answers one parsed message; `None` for notifications and client answers.

@@ -584,14 +584,16 @@ fn remote_local_lists_both_runs_this_computers_by_name_and_hides_hidden_ones() {
         Box::new(SqliteStore::open(&path("local.sqlite3")).expect("local")),
         NotesPlace::RemoteLocal,
         Some(HiddenScripts::new(path("local.sqlite3"), key)),
-    );
+    )
+    .saving_to(Place::Local);
     let mut server = Server::new(
         Box::new(SqliteStore::open(&path("notes.sqlite3")).expect("notes")),
         Box::new(scripts),
         Box::new(SqliteStore::open(&path("trust.sqlite3")).expect("trust")),
         ProjectResolver::new(env(&dir.path().join("home")), Some(dir.path().to_path_buf())),
     )
-    .with_scripts_place(NotesPlace::RemoteLocal);
+    .with_scripts_place(NotesPlace::RemoteLocal)
+    .with_scripts_saves(Place::Local);
 
     // A name runs this computer's script, so the team's is run by its id; the hidden one is left out.
     let lines = listed(&search(&mut server, "deploy"));

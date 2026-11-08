@@ -16,7 +16,10 @@ use std::process::{Command, Output, Stdio};
 use common::mcp::repo_with_remote;
 use common::stdio::{BINARY, Client, without_team_settings};
 use harness_memory::backend::Backend;
-use harness_memory::store::{Language, Provenance, Reach, ScriptDraft, ScriptStore, SqliteStore, Target};
+use harness_memory::store::pending::{Entry, Kind, Pending};
+use harness_memory::store::{
+    Language, MemoryStore, NoteKind, Provenance, Reach, ScriptDraft, ScriptStore, SqliteStore, Target,
+};
 use postgres_support::database;
 use serde_json::json;
 use tempfile::TempDir;
@@ -158,6 +161,48 @@ fn an_unreachable_team_database_is_served_from_this_computer_by_default() {
 }
 
 #[test]
+fn an_agents_update_of_a_team_note_while_the_team_database_is_down_is_a_queued_success() {
+    let machine = machine();
+    let call = |id: u32, name: &str, arguments: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{name}","arguments":{arguments}}}}}"#
+        )
+    };
+    let input = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#.to_owned(),
+        call(2, "note_update", r#"{"id":5,"append":"found while the team database was down","scope":"global"}"#),
+        call(3, "note_delete", r#"{"id":5,"scope":"global"}"#),
+    ]
+    .join("\n")
+        + "\n";
+
+    let output = run_with_input(binary(&machine, &["mcp"], Some(NOBODY)), &input);
+    let replies = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut lines = replies.lines();
+    let (_initialize, update, delete) = (
+        lines.next(),
+        lines.next().expect("update"),
+        lines.next().expect("delete"),
+    );
+
+    assert!(
+        update.contains("note 5 queued: saved on this computer, applied when the remote database is back"),
+        "{update}"
+    );
+    assert!(!update.contains(r#""isError":true"#), "a normal success: {update}");
+
+    // A delete stays refused, and says why instead of "not found".
+    assert!(delete.contains(r#""isError":true"#), "{delete}");
+    assert!(
+        delete.contains("unreachable") && delete.contains("nothing was changed"),
+        "{delete}"
+    );
+    assert!(!delete.contains("not found"), "{delete}");
+    assert!(machine.memory.join("pending-updates.json").is_file());
+    assert!(!replies.contains("hunter2secret"), "{replies}");
+}
+
+#[test]
 fn bad_team_settings_stop_the_server() {
     let machine = machine();
 
@@ -285,7 +330,7 @@ fn features_lists_what_this_build_can_do() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(
         stdout(&output),
-        "notes-remote-local\nnotes-hide\npush-json\nscripts-remote-local\nscripts-hide\nscripts-push-json\nall-repos\nsave-guards\nsettings\nnotes-lang\nembedder\noffline-fallback\nnotes-useful\nnotes-authors\nnotes-author-filter\nrecall\nsave-opt-in\n"
+        "notes-remote-local\nnotes-hide\npush-json\nscripts-remote-local\nscripts-hide\nscripts-push-json\nall-repos\nsave-guards\nsettings\nnotes-lang\nembedder\noffline-fallback\nnotes-useful\nnotes-authors\nnotes-author-filter\nrecall\nsave-opt-in\noffline-update-queue\nnote-expect-revision\nsync-command\npush-remote-local\npull-json\nscripts-pull-json\npush-selection\nsave-place\nremote-local-saves\nheld-save-place\n"
     );
 }
 
@@ -582,7 +627,9 @@ fn routed(machine: &Machine, args: &[&str], url: Option<&str>, routing: (&str, &
     let mut command = binary(machine, args, url);
     command
         .env("HARNESS_MEMORY_REPOSITORY_NOTES", routing.0)
-        .env("HARNESS_MEMORY_GLOBAL_NOTES", routing.1);
+        .env("HARNESS_MEMORY_GLOBAL_NOTES", routing.1)
+        // The `remote+local` cases here save on this computer.
+        .env("HARNESS_MEMORY_REMOTE_LOCAL_SAVES", "local");
     command
 }
 
@@ -1066,7 +1113,9 @@ fn copy_into(from: &Path, memory: &Path) {
 /// [`binary`] with `scripts` routed as given.
 fn scripts_routed(machine: &Machine, args: &[&str], url: Option<&str>, scripts: &str) -> Command {
     let mut command = binary(machine, args, url);
-    command.env("HARNESS_MEMORY_SCRIPTS", scripts);
+    command
+        .env("HARNESS_MEMORY_SCRIPTS", scripts)
+        .env("HARNESS_MEMORY_REMOTE_LOCAL_SAVES", "local");
     command
 }
 
@@ -1265,4 +1314,830 @@ fn a_green_check_ends_the_cooldown_for_the_lists_at_once() {
     let after = list(&machine);
     assert!(after.get("offline").is_none(), "{after}");
     assert!(after.get("offlineReason").is_none(), "{after}");
+}
+
+/// A team database nobody listens to, for the commands that must not wait for one.
+const NOBODY: &str = "postgres://alice:hunter2secret@127.0.0.1:1/memory?connect_timeout=2";
+
+/// `harness-memory <args>` on `machine` with the team database unreachable and every note scope in it.
+fn offline(machine: &Machine, args: &[&str], input: &str) -> Output {
+    let command = routed(machine, args, Some(NOBODY), ("remote", "remote"));
+    run_with_input(command, input)
+}
+
+fn sync_answer(machine: &Machine) -> serde_json::Value {
+    let output = offline(machine, &["sync", "--json"], "");
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    serde_json::from_slice(&output.stdout).expect("one JSON object")
+}
+
+#[test]
+fn sync_with_nothing_waiting_makes_no_connection() {
+    let machine = machine();
+
+    let answer = sync_answer(&machine);
+
+    assert_eq!(
+        answer,
+        json!({ "online": true, "waiting": { "notes": 0, "scripts": 0, "updates": 0 } })
+    );
+    assert!(
+        !machine.memory.join("team-unreachable.json").exists(),
+        "the team database was not asked"
+    );
+    assert!(
+        !machine.memory.join("memory.sqlite3").exists(),
+        "no local database was made either"
+    );
+
+    let usage = run(binary(&machine, &["sync"], None));
+    assert_eq!(usage.status.code(), Some(2), "--json is required");
+}
+
+#[test]
+fn a_change_to_a_team_note_while_the_team_database_is_down_is_queued_and_sync_counts_it() {
+    let machine = machine();
+
+    let output = offline(
+        &machine,
+        &["notes", "update", "5", "--json"],
+        r#"{ "title": "A new title" }"#,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let answer: serde_json::Value = serde_json::from_slice(&output.stdout).expect("one JSON object");
+    assert_eq!(
+        answer,
+        json!({
+            "id": 5,
+            "title": "A new title",
+            "queued": true,
+            "message": "saved on this computer, applied when the remote database is back",
+        })
+    );
+    assert!(!stderr(&output).contains("hunter2secret"), "{}", stderr(&output));
+
+    let queue = machine.memory.join("pending-updates.json");
+    assert!(queue.is_file(), "the change waits in a file next to the database");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(
+            std::fs::metadata(&queue).expect("metadata").permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    // The team database is still unreachable: nothing was applied, and sync says what waits.
+    let answer = sync_answer(&machine);
+    assert_eq!(answer["online"], false);
+    assert_eq!(answer["waiting"], json!({ "notes": 0, "scripts": 0, "updates": 1 }));
+}
+
+#[test]
+fn a_held_update_of_a_team_note_is_queued_against_the_revision_the_user_was_shown() {
+    use harness_memory::held::{HeldItem, HeldStore, HeldTool};
+
+    let machine = machine();
+    let chat = "0b7a9b3e-3d57-4a63-9a2c-7b1d3b6f0c11";
+    let item = HeldItem::new(
+        chat,
+        "omp",
+        HeldTool::NoteUpdate,
+        json!({ "id": 5, "append": "Appended by the agent", "scope": "global" }),
+        json!({ "id": 5, "title": "Shown", "body": "Body", "kind": "note", "tags": [], "entities": [],
+                "scope": "global", "revision": 3 }),
+    );
+    let store = HeldStore::in_folder(machine.memory.clone());
+    let held = store.hold(item).expect("held");
+
+    let output = offline(&machine, &["held", "save", &held, "--json"], "");
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let answer: serde_json::Value = serde_json::from_slice(&output.stdout).expect("one JSON object");
+    assert_eq!(
+        answer,
+        json!({ "saved": { "kind": "note", "id": 5, "queued": true,
+                           "message": "saved on this computer, applied when the remote database is back" } })
+    );
+    assert!(store.list(None).expect("list").is_empty(), "the held item is done with");
+
+    // Not `gone`: the note cannot be read, so it is not known to be deleted. The revision shown
+    // is what the change is judged against when it is applied.
+    let queue = std::fs::read_to_string(machine.memory.join("pending-updates.json")).expect("queue");
+    let queue: serde_json::Value = serde_json::from_str(&queue).expect("JSON");
+    assert_eq!(queue["updates"][0]["base_revision"], 3);
+    assert_eq!(queue["updates"][0]["patch"]["append"], "Appended by the agent");
+}
+
+#[test]
+fn a_held_update_without_a_current_note_is_queued_with_no_revision_while_the_team_database_is_down() {
+    use harness_memory::held::{HeldItem, HeldStore, HeldTool};
+
+    let machine = machine();
+    let chat = "0b7a9b3e-3d57-4a63-9a2c-7b1d3b6f0c12";
+    let item = HeldItem::new(
+        chat,
+        "omp",
+        HeldTool::NoteUpdate,
+        json!({ "id": 5, "append": "Appended by the agent", "scope": "global" }),
+        serde_json::Value::Null,
+    );
+    let store = HeldStore::in_folder(machine.memory.clone());
+    let held = store.hold(item).expect("held");
+
+    let output = offline(&machine, &["held", "save", &held, "--json"], "");
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let answer: serde_json::Value = serde_json::from_slice(&output.stdout).expect("one JSON object");
+    assert_eq!(answer["saved"]["queued"], true, "{answer}");
+
+    // No note was shown, so nothing is judged against a revision when it is applied.
+    let queue = std::fs::read_to_string(machine.memory.join("pending-updates.json")).expect("queue");
+    let queue: serde_json::Value = serde_json::from_str(&queue).expect("JSON");
+    assert!(queue["updates"][0].get("base_revision").is_none(), "{queue}");
+}
+
+#[test]
+fn an_edited_held_update_without_a_current_note_is_refused_while_the_team_database_is_down() {
+    use harness_memory::held::{HeldItem, HeldStore, HeldTool};
+
+    let machine = machine();
+    let chat = "0b7a9b3e-3d57-4a63-9a2c-7b1d3b6f0c13";
+    let item = HeldItem::new(
+        chat,
+        "omp",
+        HeldTool::NoteUpdate,
+        json!({ "id": 5, "append": "Appended by the agent", "scope": "global" }),
+        serde_json::Value::Null,
+    );
+    let store = HeldStore::in_folder(machine.memory.clone());
+    let held = store.hold(item).expect("held");
+
+    // Queued with no revision, an edited draft would replace the title, body, kind and tags of the
+    // shared note: it is refused and the item keeps waiting.
+    let draft = r#"{ "title": "Edited", "body": "Edited body", "kind": "decision", "tags": ["x"] }"#;
+    let output = offline(&machine, &["held", "save", &held, "--json"], draft);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let answer: serde_json::Value = serde_json::from_slice(&output.stdout).expect("one JSON object");
+    assert_eq!(answer["error"], "refused", "{answer}");
+    let message = answer["message"].as_str().expect("message");
+    assert!(
+        message.contains("Save it unedited") && message.contains("remote database is back"),
+        "{message}"
+    );
+    assert!(!stdout(&output).contains("hunter2secret"), "{}", stdout(&output));
+    assert!(!stderr(&output).contains("hunter2secret"), "{}", stderr(&output));
+    assert!(
+        !machine.memory.join("pending-updates.json").exists(),
+        "nothing was queued"
+    );
+    assert_eq!(store.list(None).expect("list").len(), 1, "the held item is kept");
+
+    // Unedited it still queues, and an empty draft is no edit.
+    let output = offline(&machine, &["held", "save", &held, "--json"], "{}");
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let answer: serde_json::Value = serde_json::from_slice(&output.stdout).expect("one JSON object");
+    assert_eq!(answer["saved"]["queued"], true, "{answer}");
+    assert!(store.list(None).expect("list").is_empty(), "the held item is done with");
+}
+
+/// An item held by an earlier version has a `current` with no `revision`: nothing the edited draft
+/// could be judged against at replay, so it is refused like an item with no `current` at all.
+#[test]
+fn an_edited_held_update_whose_current_note_has_no_revision_is_refused_while_the_team_database_is_down() {
+    use harness_memory::held::{HeldItem, HeldStore, HeldTool};
+
+    let machine = machine();
+    let chat = "0b7a9b3e-3d57-4a63-9a2c-7b1d3b6f0c15";
+    let item = HeldItem::new(
+        chat,
+        "omp",
+        HeldTool::NoteUpdate,
+        json!({ "id": 5, "append": "Appended by the agent", "scope": "global" }),
+        json!({ "id": 5, "title": "Shown", "body": "Body", "kind": "note", "tags": [], "entities": [],
+                "scope": "global" }),
+    );
+    let store = HeldStore::in_folder(machine.memory.clone());
+    let held = store.hold(item).expect("held");
+
+    let output = offline(
+        &machine,
+        &["held", "save", &held, "--json"],
+        r#"{ "body": "Edited body" }"#,
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let answer: serde_json::Value = serde_json::from_slice(&output.stdout).expect("one JSON object");
+    assert_eq!(answer["error"], "refused", "{answer}");
+    assert!(
+        !machine.memory.join("pending-updates.json").exists(),
+        "nothing was queued"
+    );
+    assert_eq!(store.list(None).expect("list").len(), 1, "the held item is kept");
+
+    // Unedited it still queues, with no revision to judge it against.
+    let output = offline(&machine, &["held", "save", &held, "--json"], "{}");
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(store.list(None).expect("list").is_empty(), "the held item is done with");
+}
+
+#[test]
+fn an_edited_held_update_with_a_current_note_is_still_queued_while_the_team_database_is_down() {
+    use harness_memory::held::{HeldItem, HeldStore, HeldTool};
+
+    let machine = machine();
+    let chat = "0b7a9b3e-3d57-4a63-9a2c-7b1d3b6f0c14";
+    let item = HeldItem::new(
+        chat,
+        "omp",
+        HeldTool::NoteUpdate,
+        json!({ "id": 5, "append": "Appended by the agent", "scope": "global" }),
+        json!({ "id": 5, "title": "Shown", "body": "Body", "kind": "note", "tags": [], "entities": [],
+                "scope": "global", "revision": 3 }),
+    );
+    let held = HeldStore::in_folder(machine.memory.clone()).hold(item).expect("held");
+
+    let output = offline(
+        &machine,
+        &["held", "save", &held, "--json"],
+        r#"{ "body": "Edited body" }"#,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let queue = std::fs::read_to_string(machine.memory.join("pending-updates.json")).expect("queue");
+    let queue: serde_json::Value = serde_json::from_str(&queue).expect("JSON");
+    assert_eq!(queue["updates"][0]["base_revision"], 3);
+}
+
+/// The waiting list of the offline saves cannot be read: what is saved here stays here, and the
+/// answer says it was not listed to sync automatically.
+#[test]
+fn an_offline_save_says_when_it_could_not_be_listed_to_sync() {
+    use harness_memory::held::{HeldItem, HeldStore, HeldTool};
+
+    let machine = machine();
+    std::fs::create_dir_all(&machine.memory).expect("data folder");
+    let list = machine.memory.join("pending-sync.json");
+    std::fs::write(&list, "not json").expect("a damaged list");
+
+    let saved = |args: &[&str], input: &str| -> serde_json::Value {
+        let mut command = routed(&machine, args, Some(NOBODY), ("remote", "remote"));
+        command.env("HARNESS_MEMORY_SCRIPTS", "remote");
+        let output = run_with_input(command, input);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {}", stderr(&output));
+
+        serde_json::from_slice(&output.stdout).expect("one JSON object")
+    };
+    let message = "saved on this computer, but could not be listed to sync automatically";
+
+    let note = saved(
+        &["notes", "save", "--json"],
+        r#"{ "title": "Saved offline", "body": "Kept here", "kind": "note", "scope": "global" }"#,
+    );
+    assert_eq!(
+        (&note["notListed"], &note["message"]),
+        (&json!(true), &json!(message)),
+        "{note}"
+    );
+
+    let script = saved(
+        &["scripts", "save", "--json"],
+        r#"{ "name": "offline", "description": "d", "language": "sh", "body": "echo hi", "scope": "global" }"#,
+    );
+    assert_eq!(
+        (&script["notListed"], &script["message"]),
+        (&json!(true), &json!(message)),
+        "{script}"
+    );
+
+    let item = HeldItem::new(
+        "0b7a9b3e-3d57-4a63-9a2c-7b1d3b6f0c16",
+        "omp",
+        HeldTool::NoteSave,
+        json!({ "title": "Held offline", "body": "Kept here", "kind": "note", "scope": "global" }),
+        serde_json::Value::Null,
+    );
+    let held = HeldStore::in_folder(machine.memory.clone()).hold(item).expect("held");
+    let answer = saved(&["held", "save", &held, "--json"], "");
+    assert_eq!(answer["saved"]["notListed"], true, "{answer}");
+    assert_eq!(answer["saved"]["message"], message, "{answer}");
+
+    // Everything is saved on this computer, and the damaged list was not replaced.
+    assert_eq!(local_titles(&machine), ["Held offline", "Saved offline"]);
+    assert_eq!(std::fs::read_to_string(&list).expect("list"), "not json");
+
+    // With a list that can be read, nothing is said.
+    std::fs::remove_file(&list).expect("remove");
+    let listed = saved(
+        &["notes", "save", "--json"],
+        r#"{ "title": "Listed offline", "body": "Kept here", "kind": "note", "scope": "global" }"#,
+    );
+    assert!(listed.get("notListed").is_none(), "{listed}");
+    assert!(list.is_file(), "the note waits on the list");
+}
+
+#[test]
+fn deleting_a_team_note_while_the_team_database_is_down_says_so() {
+    let machine = machine();
+
+    let output = offline(&machine, &["notes", "delete", "5"], "");
+    assert_eq!(output.status.code(), Some(1));
+    let message = stderr(&output);
+    assert!(
+        message.contains("unreachable") && message.contains("nothing was changed"),
+        "{message}"
+    );
+    assert!(!message.contains("not found"), "{message}");
+}
+
+/// A team database nobody listens on: enough for what never connects.
+const UNREACHABLE: &str = "postgres://u:hunter2@127.0.0.1:1/m";
+
+#[test]
+fn push_selection_takes_only_stdin_and_does_not_go_with_overwrite() {
+    let machine = machine();
+    let url = Some(UNREACHABLE);
+
+    for args in [
+        &["push", "--selection"][..],
+        &["push", "--selection", "12"],
+        &["push", "--selection=1,2"],
+        &["push", "--selection", "-", "--selection", "-"],
+        &["scripts", "push", "--selection", "none"],
+    ] {
+        let output = run(binary(&machine, args, url));
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(stderr(&output).contains("usage:"), "{args:?}: {}", stderr(&output));
+    }
+
+    for args in [
+        &["push", "--selection", "-", "--overwrite", "none"][..],
+        &["push", "--overwrite", "all", "--selection", "-", "--json"],
+        &["scripts", "push", "--selection", "-", "--overwrite", "1,2"],
+    ] {
+        let output = run(binary(&machine, args, url));
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(
+            stderr(&output).contains("does not go with --overwrite"),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
+}
+
+#[test]
+fn push_selection_refuses_anything_but_an_object_with_both_lists_of_reviewed_entries() {
+    let machine = machine();
+    std::fs::create_dir_all(&machine.memory).expect("data folder");
+    drop(SqliteStore::open(&machine.memory.join("memory.sqlite3")).expect("local file"));
+
+    let many = format!("{{\"only\":[],\"overwrite\":[{}]}}", vec!["5"; 100_001].join(","));
+    let huge = format!(
+        "{{\"only\":[],\"overwrite\":[],\"x\":\"{}\"}}",
+        " ".repeat(2 * 1024 * 1024)
+    );
+
+    for input in [
+        "",
+        "not json",
+        "[1,2]",
+        "{\"only\":[]}",
+        "{\"overwrite\":[]}",
+        "{\"only\":[],\"overwrite\":[],\"extra\":true}",
+        // The bare ids of the older format are not what was reviewed.
+        "{\"only\":[1],\"overwrite\":[]}",
+        "{\"only\":[{\"id\":1,\"name\":\"a\"}],\"overwrite\":[]}",
+        "{\"only\":[{\"id\":1,\"updatedAt\":\"2026-01-01T00:00:00Z\"}],\"overwrite\":[]}",
+        "{\"only\":[{\"name\":\"a\",\"updatedAt\":\"2026-01-01T00:00:00Z\"}],\"overwrite\":[]}",
+        "{\"only\":[{\"id\":1,\"name\":\"a\",\"updatedAt\":\"2026-01-01T00:00:00Z\",\"x\":1}],\"overwrite\":[]}",
+        "{\"only\":[{\"id\":0,\"name\":\"a\",\"updatedAt\":\"2026-01-01T00:00:00Z\"}],\"overwrite\":[]}",
+        "{\"only\":[{\"id\":\"1\",\"name\":\"a\",\"updatedAt\":\"2026-01-01T00:00:00Z\"}],\"overwrite\":[]}",
+        "{\"only\":[{\"id\":1.5,\"name\":\"a\",\"updatedAt\":\"2026-01-01T00:00:00Z\"}],\"overwrite\":[]}",
+        "{\"only\":[{\"id\":1,\"name\":7,\"updatedAt\":\"2026-01-01T00:00:00Z\"}],\"overwrite\":[]}",
+        "{\"only\":[{\"id\":1,\"name\":\"a\",\"updatedAt\":null}],\"overwrite\":[]}",
+        // The same id twice, with two answers about what it was.
+        "{\"only\":[{\"id\":1,\"name\":\"a\",\"updatedAt\":\"2026-01-01T00:00:00Z\"},\
+         {\"id\":1,\"name\":\"b\",\"updatedAt\":\"2026-01-01T00:00:00Z\"}],\"overwrite\":[]}",
+        "{\"only\":[],\"overwrite\":[-4]}",
+        "{\"only\":[],\"overwrite\":[\"1\"]}",
+        many.as_str(),
+        huge.as_str(),
+    ] {
+        for args in [
+            &["push", "--selection", "-"][..],
+            &["scripts", "push", "--selection", "-"],
+        ] {
+            let output = run_with_input(binary(&machine, args, Some(UNREACHABLE)), input);
+            let shown: String = input.chars().take(60).collect();
+
+            assert_eq!(output.status.code(), Some(2), "{args:?} {shown}: {}", stderr(&output));
+            assert!(
+                stderr(&output).contains("--selection - reads"),
+                "{args:?} {shown}: {}",
+                stderr(&output)
+            );
+            assert!(output.stdout.is_empty(), "{args:?} {shown}");
+        }
+    }
+}
+
+/// A reviewed selection listing `ids`, as `--selection -` reads it.
+fn listing(ids: &[i64]) -> String {
+    let only: Vec<serde_json::Value> = ids
+        .iter()
+        .map(|id| json!({ "id": id, "name": "a", "updatedAt": "2026-01-01T00:00:00Z" }))
+        .collect();
+
+    json!({ "only": only, "overwrite": [] }).to_string()
+}
+
+#[test]
+fn push_selection_reports_every_listed_id_when_there_is_nothing_to_push_from() {
+    let machine = machine();
+    let url = Some("postgres://u:hunter2@127.0.0.1:1/m?connect_timeout=1");
+
+    // No local database, or no scope taken: a listed id is never answered as "nothing to push".
+    for (args, routing, scripts, noun) in [
+        (
+            &["push", "--selection", "-", "--json"][..],
+            ("remote", "remote"),
+            "local",
+            "note",
+        ),
+        (
+            &["push", "--selection", "-", "--json"],
+            ("local", "local"),
+            "local",
+            "note",
+        ),
+        (
+            &["scripts", "push", "--selection", "-", "--json"],
+            ("remote", "remote"),
+            "remote",
+            "script",
+        ),
+        (
+            &["scripts", "push", "--selection", "-", "--json"],
+            ("remote", "remote"),
+            "local",
+            "script",
+        ),
+    ] {
+        let command = |input: &str| {
+            let mut command = routed(&machine, args, url, routing);
+            command.env("HARNESS_MEMORY_SCRIPTS", scripts);
+            run_with_input(command, input)
+        };
+
+        let output = command(&listing(&[3, 7]));
+        let object: serde_json::Value = serde_json::from_slice(&output.stdout).expect("one JSON object");
+
+        assert_eq!(output.status.code(), Some(1), "{args:?} {routing:?}: {object}");
+        assert_eq!(object["nothing"], json!(null), "{args:?} {routing:?}: {object}");
+
+        let ids: Vec<i64> = object["failed"]
+            .as_array()
+            .expect("failed")
+            .iter()
+            .map(|failure| failure["localId"].as_i64().expect("id"))
+            .collect();
+        assert_eq!(ids, [3, 7], "{args:?} {routing:?}: {object}");
+        assert!(
+            object["failed"][0]["message"]
+                .as_str()
+                .is_some_and(|said| said.contains(noun)),
+            "{object}"
+        );
+        assert!(!stderr(&output).contains("hunter2"), "{}", stderr(&output));
+        assert!(
+            !machine.memory.join("memory.sqlite3").exists(),
+            "no local database was made"
+        );
+
+        // An empty selection stays "nothing to push".
+        let object = push_object(&command(&listing(&[])));
+        assert!(object["nothing"].is_string(), "{args:?} {routing:?}: {object}");
+        assert_eq!(object["failed"], json!([]), "{args:?} {routing:?}");
+    }
+}
+
+/// A machine whose local file holds notes and scripts, some of them listed as waiting for the team
+/// database [`UNREACHABLE`] (as the offline fallback leaves them), and that team's key.
+struct Waiting {
+    machine: Machine,
+    team: String,
+}
+
+fn waiting_machine() -> Waiting {
+    let machine = machine();
+    std::fs::create_dir_all(&machine.memory).expect("data folder");
+
+    let team = Backend::Postgres {
+        url: UNREACHABLE.to_owned(),
+    }
+    .team_key();
+
+    Waiting { machine, team }
+}
+
+impl Waiting {
+    fn local(&self) -> SqliteStore {
+        SqliteStore::open(&self.machine.memory.join("memory.sqlite3")).expect("local file")
+    }
+
+    fn pending(&self) -> Pending {
+        Pending::beside(&self.machine.memory.join("memory.sqlite3"))
+    }
+
+    fn note(&self, target: &Target, title: &str) -> i64 {
+        let draft = common::draft(title, "Saved here", NoteKind::Note);
+        self.local().remember(target, &draft).expect("note").id
+    }
+
+    fn script(&self, target: &Target, name: &str) -> i64 {
+        let draft = ScriptDraft {
+            name: name.to_owned(),
+            description: String::new(),
+            language: Language::Sh,
+            body: format!("printf {name}"),
+            timeout_secs: 10,
+            provenance: Provenance::default(),
+        };
+
+        self.local()
+            .save_script(target, &draft)
+            .expect("script")
+            .script
+            .summary
+            .id
+    }
+
+    /// The entry the offline fallback lists for the local row `id`.
+    fn entry(&self, team: &str, id: i64, scope: &str, name: &str) -> Entry {
+        Entry {
+            team: team.to_owned(),
+            id,
+            scope: scope.to_owned(),
+            name: name.to_owned(),
+        }
+    }
+
+    fn wait(&self, kind: Kind, id: i64, scope: &str, name: &str) -> Entry {
+        let entry = self.entry(&self.team, id, scope, name);
+        self.pending().add(kind, entry.clone()).expect("listed");
+        entry
+    }
+
+    fn titles(&self) -> Vec<String> {
+        local_titles(&self.machine)
+    }
+
+    fn names(&self) -> Vec<String> {
+        let conn = rusqlite::Connection::open(self.machine.memory.join("memory.sqlite3")).expect("local");
+        let mut statement = conn.prepare("SELECT name FROM scripts ORDER BY name").expect("select");
+        statement
+            .query_map([], |row| row.get(0))
+            .expect("names")
+            .collect::<Result<_, _>>()
+            .expect("names")
+    }
+
+    fn discard(&self, noun: &str, args: &[&str]) -> Output {
+        let mut all = vec![noun, "discard-local"];
+        all.extend_from_slice(args);
+
+        let mut command = binary(&self.machine, &all, Some(UNREACHABLE));
+        command.env("HARNESS_MEMORY_SCRIPTS", "remote");
+        run(command)
+    }
+}
+
+const WIDGET_KEY: &str = "git:github.com/acme/widget";
+
+#[test]
+fn discard_local_leaves_the_notes_that_still_wait_for_the_team_database() {
+    let waiting = waiting_machine();
+    let widget = common::repo(push_support::REPO);
+
+    let waits_global = waiting.note(&Target::Global, "Waits global");
+    let waits_repo = waiting.note(&widget, "Waits repo");
+    waiting.note(&Target::Global, "Free global");
+    waiting.note(&widget, "Free repo");
+    let other_team = waiting.note(&Target::Global, "Waits elsewhere");
+
+    waiting.wait(Kind::Notes, waits_global, "global", "Waits global");
+    waiting.wait(Kind::Notes, waits_repo, WIDGET_KEY, "Waits repo");
+    let elsewhere = waiting.entry("team:other", other_team, "global", "Waits elsewhere");
+    waiting.pending().add(Kind::Notes, elsewhere).expect("listed");
+
+    // A scope's notes that wait stay, and so do they in the scope's `--all`.
+    let scoped = push_object(&waiting.discard("notes", &["--all", "--yes", "--json", "--scope", "repo"]));
+    assert_eq!(scoped, json!({ "deleted": 1, "waiting": 1 }));
+    assert_eq!(
+        waiting.titles(),
+        ["Free global", "Waits elsewhere", "Waits global", "Waits repo"]
+    );
+
+    // Every other note goes, among them the one only another team database waits for.
+    let all = push_object(&waiting.discard("notes", &["--all", "--yes", "--json"]));
+    assert_eq!(all, json!({ "deleted": 2, "waiting": 2 }));
+    assert_eq!(waiting.titles(), ["Waits global", "Waits repo"]);
+
+    // Named, the same: the id that waits is reported, not deleted.
+    let named = waiting.note(&Target::Global, "Named");
+    let ids = format!("{waits_global},{named}");
+    let one = push_object(&waiting.discard("notes", &[&ids, "--yes", "--json"]));
+    assert_eq!(one, json!({ "deleted": 1, "waiting": 1 }));
+    assert_eq!(waiting.titles(), ["Waits global", "Waits repo"]);
+
+    let text = waiting.discard("notes", &[&waits_global.to_string(), "--yes"]);
+    assert_eq!(text.status.code(), Some(0), "{}", stderr(&text));
+    assert_eq!(
+        stdout(&text),
+        "deleted 0 notes from this computer, kept 1 that still wait for the team database\n"
+    );
+    assert_eq!(waiting.titles(), ["Waits global", "Waits repo"]);
+
+    // Once a sync took it off the list, it can be discarded.
+    waiting
+        .pending()
+        .remove(
+            Kind::Notes,
+            &[waiting.entry(&waiting.team, waits_global, "global", "Waits global")],
+        )
+        .expect("copied");
+    let freed = push_object(&waiting.discard("notes", &[&waits_global.to_string(), "--yes", "--json"]));
+    assert_eq!(freed, json!({ "deleted": 1, "waiting": 0 }));
+    assert_eq!(waiting.titles(), ["Waits repo"]);
+}
+
+#[test]
+fn discard_local_leaves_the_scripts_that_still_wait_for_the_team_database() {
+    let waiting = waiting_machine();
+    let widget = common::repo(push_support::REPO);
+
+    let waits_global = waiting.script(&Target::Global, "waits-global");
+    let waits_repo = waiting.script(&widget, "waits-repo");
+    waiting.script(&Target::Global, "free-global");
+    waiting.script(&widget, "free-repo");
+    let other_team = waiting.script(&Target::Global, "waits-elsewhere");
+
+    waiting.wait(Kind::Scripts, waits_global, "global", "waits-global");
+    waiting.wait(Kind::Scripts, waits_repo, WIDGET_KEY, "waits-repo");
+    let elsewhere = waiting.entry("team:other", other_team, "global", "waits-elsewhere");
+    waiting.pending().add(Kind::Scripts, elsewhere).expect("listed");
+
+    // A listed note does not hold a script back: the lists are kept apart.
+    let note = waiting.note(&Target::Global, "A note");
+    waiting.wait(Kind::Notes, waits_global, "global", "A note");
+    waiting.wait(Kind::Notes, note, "global", "A note");
+
+    let scoped = push_object(&waiting.discard("scripts", &["--all", "--yes", "--json", "--scope", "global"]));
+    assert_eq!(scoped, json!({ "deleted": 2, "waiting": 1 }));
+    assert_eq!(waiting.names(), ["free-repo", "waits-global", "waits-repo"]);
+
+    let all = push_object(&waiting.discard("scripts", &["--all", "--yes", "--json"]));
+    assert_eq!(all, json!({ "deleted": 1, "waiting": 2 }));
+    assert_eq!(waiting.names(), ["waits-global", "waits-repo"]);
+
+    let ids = format!("{waits_repo},{waits_global}");
+    let named = push_object(&waiting.discard("scripts", &[&ids, "--yes", "--json"]));
+    assert_eq!(named, json!({ "deleted": 0, "waiting": 2 }));
+
+    let text = waiting.discard("scripts", &[&ids, "--yes"]);
+    assert_eq!(
+        stdout(&text),
+        "deleted 0 scripts from this computer, kept 2 that still wait for the team database\n"
+    );
+
+    waiting
+        .pending()
+        .remove(
+            Kind::Scripts,
+            &[waiting.entry(&waiting.team, waits_repo, WIDGET_KEY, "waits-repo")],
+        )
+        .expect("copied");
+    let freed = push_object(&waiting.discard("scripts", &[&ids, "--yes", "--json"]));
+    assert_eq!(freed, json!({ "deleted": 1, "waiting": 1 }));
+    assert_eq!(waiting.names(), ["waits-global"]);
+}
+
+impl Waiting {
+    /// The list of notes saved offline, as the folder holds it.
+    fn list(&self) -> PathBuf {
+        self.machine.memory.join("pending-sync.json")
+    }
+
+    /// Replaces the list (which held `listed`) with one the program refuses to read, `how`.
+    #[cfg(unix)]
+    fn break_list(&self, how: &str, listed: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _ = std::fs::remove_file(self.list());
+
+        match how {
+            "malformed" => self.plant(b"not json"),
+            "not a list" => self.plant(b"[1, 2]"),
+            "oversized" => self.plant(&vec![b' '; 4 * 1024 * 1024 + 1]),
+            "writable by others" => {
+                std::fs::write(self.list(), listed).expect("list");
+                std::fs::set_permissions(self.list(), std::fs::Permissions::from_mode(0o666)).expect("open");
+            }
+            "a link" => {
+                let target = self.machine.memory.join("elsewhere.json");
+                std::fs::write(&target, listed).expect("target");
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("private");
+                std::os::unix::fs::symlink(&target, self.list()).expect("link");
+            }
+            other => panic!("unknown way to break the list: {other}"),
+        }
+    }
+
+    /// Replaces the list with `bytes`, private to its owner as the program writes it.
+    #[cfg(unix)]
+    fn plant(&self, bytes: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(self.list(), bytes).expect("planted list");
+        std::fs::set_permissions(self.list(), std::fs::Permissions::from_mode(0o600)).expect("private");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn discard_local_deletes_nothing_when_the_list_of_waiting_entries_cannot_be_read() {
+    for noun in ["notes", "scripts"] {
+        let waiting = waiting_machine();
+        let widget = common::repo(push_support::REPO);
+
+        // One row waits for the team database, the other does not: only the list tells them apart.
+        let (waits, free) = if noun == "notes" {
+            (waiting.note(&Target::Global, "Waits"), waiting.note(&widget, "Free"))
+        } else {
+            (
+                waiting.script(&Target::Global, "waits"),
+                waiting.script(&widget, "free"),
+            )
+        };
+        let kind = if noun == "notes" { Kind::Notes } else { Kind::Scripts };
+        waiting.wait(kind, waits, "global", if noun == "notes" { "Waits" } else { "waits" });
+
+        let rows = || {
+            if noun == "notes" {
+                waiting.titles()
+            } else {
+                waiting.names()
+            }
+        };
+        let before = rows();
+        let listed = std::fs::read(waiting.list()).expect("the list");
+
+        for how in ["malformed", "not a list", "oversized", "writable by others", "a link"] {
+            waiting.break_list(how, &listed);
+
+            let free_id = free.to_string();
+            let invocations: [&[&str]; 3] = [
+                &["--all", "--yes", "--json"],
+                &["--all", "--yes", "--scope", "repo"],
+                &[&free_id, "--yes", "--json"],
+            ];
+
+            for args in invocations {
+                let output = waiting.discard(noun, args);
+
+                assert_eq!(
+                    output.status.code(),
+                    Some(1),
+                    "{noun} {how} {args:?}: {}",
+                    stderr(&output)
+                );
+                assert!(output.stdout.is_empty(), "{noun} {how} {args:?}: {}", stdout(&output));
+                assert!(
+                    stderr(&output).contains("nothing was deleted") && stderr(&output).contains("pending-sync.json"),
+                    "{noun} {how} {args:?}: {}",
+                    stderr(&output)
+                );
+                assert_eq!(rows(), before, "{noun} {how} {args:?}: nothing was deleted");
+            }
+        }
+
+        // Once the list is readable again, only what does not wait goes.
+        let _ = std::fs::remove_file(waiting.list());
+        std::fs::remove_file(waiting.machine.memory.join("elsewhere.json")).ok();
+        waiting.wait(kind, waits, "global", if noun == "notes" { "Waits" } else { "waits" });
+        let all = push_object(&waiting.discard(noun, &["--all", "--yes", "--json"]));
+        assert_eq!(all, json!({ "deleted": 1, "waiting": 1 }), "{noun}");
+    }
+}
+
+#[test]
+fn discard_local_without_a_list_deletes_what_is_asked_for() {
+    let waiting = waiting_machine();
+    waiting.note(&Target::Global, "One");
+    waiting.note(&Target::Global, "Two");
+    assert!(!waiting.list().exists());
+
+    let all = push_object(&waiting.discard("notes", &["--all", "--yes", "--json"]));
+    assert_eq!(all, json!({ "deleted": 2, "waiting": 0 }));
+    assert!(waiting.titles().is_empty());
 }

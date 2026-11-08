@@ -357,17 +357,27 @@ impl Stream<'_> {
 
     /// Commits a kept stream's transaction and closes the stream in the same request. When the
     /// request may have reached the server but no answer came back, the commit may have run: the
-    /// error says so, and nothing sends the write again.
+    /// error says so, and nothing sends the write again. A server that could not be reached then is
+    /// [`StoreError::Unreachable`]: with the offline fallback the change is saved on this computer
+    /// and copied later, where the same title or an identical note is found, not added twice.
     pub(super) fn commit(self) -> Result<(), StoreError> {
+        let unconfirmed = |reason: &str| {
+            format!(
+                "the libSQL server did not confirm the commit ({reason}), so the write may have been \
+                 applied: read it back before repeating it"
+            )
+        };
+
         match self.finish("COMMIT") {
             Ok(()) => Ok(()),
             Err(Failed {
-                error: StoreError::Backend(reason) | StoreError::Unreachable(reason),
+                error: StoreError::Unreachable(reason),
                 maybe_ran: true,
-            }) => Err(backend(format!(
-                "the libSQL server did not confirm the commit ({reason}), so the write may have been \
-                 applied: read it back before repeating it"
-            ))),
+            }) => Err(StoreError::Unreachable(unconfirmed(&reason))),
+            Err(Failed {
+                error: StoreError::Backend(reason),
+                maybe_ran: true,
+            }) => Err(backend(unconfirmed(&reason))),
             Err(failed) => Err(failed.error),
         }
     }

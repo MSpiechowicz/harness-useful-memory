@@ -3,13 +3,27 @@
 //! [`SplitStore`] serves the MCP tools and `harness-memory notes` from two stores, the team
 //! database and the local SQLite file, routed per note scope by [`NotesPlace`] (see
 //! [`crate::backend::Routing`]): `remote` reads and writes the team database, `local` the local
-//! file, `remote+local` reads both and writes the local file. A write goes to the store its scope
-//! saves to; a read that covers both stores asks both and merges the results.
+//! file, `remote+local` reads both and writes the place [`SplitStore::saving_to`] names
+//! (`remote_local_saves`, the team database by default). A write goes to the store its scope saves
+//! to; a read that covers both stores asks both and merges the results.
 //!
-//! **Read-only team notes.** In a `remote+local` scope the team notes are read-only:
-//! `note_update`, `note_delete` and `entity_link` with a team note id are refused
-//! ([`read_only_error`]), naming `harness-memory notes hide`. In a `remote` scope they stay
-//! editable.
+//! **Read-only team notes.** In a `remote+local` scope that saves to this computer the team notes are
+//! read-only: `note_update`, `note_delete` and `entity_link` with a team note id are refused
+//! ([`read_only_error`]), naming `harness-memory notes hide`. In a `remote` scope, and in a
+//! `remote+local` scope that saves to the team database, they stay editable.
+//!
+//! **Picking the place.** In a `remote+local` scope [`MemoryStore::remember_to`] saves a note to
+//! the place the user picked (`notes save --place`), whatever `remote_local_saves` says: `local`
+//! straight to this computer, `remote` straight to the team database with the hidden title check and
+//! the store's own rules. Neither falls back, and neither records anything as waiting: a note the
+//! person saved here stays here, and an unreachable team database fails a save to it.
+//!
+//! **Notes kept here.** In a `remote+local` scope that saves to the team database, a save without a
+//! place under a title a note on this computer already has (the person kept it here, or an agent
+//! saved it offline) updates that note where it is, online or not, and lists nothing as waiting: only
+//! a genuinely new title follows `remote_local_saves`, and only the row an offline save created is
+//! listed. A scope set to `remote` lists whatever it saves offline. `--place local` takes the note it
+//! saves off the list if it was on it.
 //!
 //! **Hidden team notes.** With [`HiddenNotes`] (read on every call) the team notes hidden on this
 //! computer are left out of every read, in `remote` and `remote+local` scopes alike: a hidden id is
@@ -45,6 +59,16 @@
 //!
 //! Each store only sees the scopes it is read for: notes of another scope left in it (written
 //! before the routing changed) are not shown.
+//!
+//! **Offline fallback.** With [`SplitStore::with_offline_fallback`], scopes that read the team
+//! database are served from this computer while it is unreachable, whether it could not be opened or
+//! its connection was lost during a call (`SplitStore::attempt`: the call is made once more,
+//! now locally). In a scope that saves to the team database (`remote`, or `remote+local` with
+//! `remote_local_saves` `remote`: [`SplitStore::team_writes`]) what is saved meanwhile waits in
+//! [`crate::store::pending`] to be copied back, and a change to a note the team database holds waits
+//! in [`crate::store::pending_updates`] to be applied (`updates`); deleting or linking such a note is
+//! refused, saying nothing was changed. Only what is listed as waiting is copied: a note a person
+//! kept on this computer (`--place local`, or a scope that saves here) is not listed and stays.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeSet, VecDeque};
@@ -56,12 +80,15 @@ use crate::limits::{GET_IDS_MAX, LIST_PAGE_MAX, NEIGHBOR_NOTES_MAX, NEIGHBORS_LI
 use crate::push::{GLOBAL, Options, push_only, scope_label};
 use crate::store::listing::{compare, directed, page_limit, per_place};
 use crate::store::pending::{Entry, Kind, Pending};
+use crate::store::pending_updates::Queue;
 use crate::store::rank::Terms;
 use crate::store::{
     AuthorFacet, Countable, Edge, Forget, Forgotten, HiddenNotes, Hit, Link, MemoryStore, Neighborhood, Note,
     NoteDraft, NoteListQuery, NoteOrigin, NotePage, NotePatch, NoteRow, NoteSort, Saved, Scope, SearchQuery,
     StoreError, Target, VectorTarget, View, clean,
 };
+
+mod updates;
 
 /// How long a copy of the notes saved offline that failed is not tried again.
 const RETRY_COPY: Duration = Duration::from_secs(60);
@@ -75,6 +102,8 @@ pub struct SplitStore {
     local: Box<dyn MemoryStore>,
     repo: NotesPlace,
     global: NotesPlace,
+    /// Where new notes of a scope routed `remote+local` are saved.
+    saves: Place,
     hidden: Option<HiddenNotes>,
     fallback: Option<Fallback>,
     /// True while the offline fallback serves the scopes that read the team database from this
@@ -86,6 +115,9 @@ pub struct SplitStore {
 struct Fallback {
     /// The notes saved on this computer for a scope set to `remote`.
     pending: Pending,
+    /// The changes to team notes made while the team database was unreachable, waiting to be
+    /// applied to it.
+    updates: Queue,
     /// The local database those notes are copied from.
     database: PathBuf,
     /// The team database the notes are meant for ([`crate::backend::Backend::team_key`]).
@@ -161,21 +193,34 @@ impl SplitStore {
             local,
             repo,
             global,
+            saves: Place::default(),
             hidden,
             fallback: None,
             down: false,
         }
     }
 
+    /// The store saving new notes of a scope routed `remote+local` to `saves` (`remote_local_saves`;
+    /// the team database without this). The team's notes of such a scope are editable only when
+    /// that is the team database.
+    pub fn saving_to(mut self, saves: Place) -> Self {
+        self.saves = saves;
+        self
+    }
+
     /// The store falling back to this computer while the team database cannot be opened: the
     /// scopes that read the team database are then read and saved in the local database `database`
     /// (the team notes are not shown), the notes saved for a scope set to `remote` are listed in
     /// [`Pending`], and they are copied to the team database when it is reachable again (at the
-    /// next call, or when a later server starts). Without it an unreachable team database fails the
-    /// calls that need it.
+    /// next call, or when a later server starts). A change to a team note made meanwhile is kept in
+    /// the [`Queue`] and applied then too. A team database that was reached and is lost
+    /// during a call is told apart as well: the call is made again from this computer
+    /// (`attempt`). Without the fallback an unreachable team database fails the calls that
+    /// need it.
     pub fn with_offline_fallback(mut self, database: &Path, team: String, secrets: Secrets) -> Self {
         self.fallback = Some(Fallback {
             pending: Pending::beside(database),
+            updates: Queue::beside(database),
             database: database.to_owned(),
             team,
             secrets,
@@ -193,6 +238,18 @@ impl SplitStore {
         }
     }
 
+    /// True when new notes of `scope` go to the team database and its notes can be changed from here:
+    /// a scope set to `remote`, or to `remote+local` while the new notes are saved to the team
+    /// database. Only then do notes saved offline wait for the team database.
+    fn team_writes(&self, scope: Scope) -> bool {
+        self.configured(scope).writes_team(self.saves)
+    }
+
+    /// True when the team's notes of `scope` can be read but not changed from here.
+    fn team_read_only(&self, scope: Scope) -> bool {
+        self.configured(scope).team_read_only(self.saves)
+    }
+
     /// Where the notes of `scope` are read and saved now: the local database alone while the
     /// offline fallback is serving.
     fn place(&self, scope: Scope) -> NotesPlace {
@@ -202,55 +259,102 @@ impl SplitStore {
         }
     }
 
-    /// Decides before a call whether the team database is reachable (a failed open is not tried
-    /// again for a while), and copies the notes saved offline when it is back.
-    fn settle(&mut self) {
-        let reads_team = [Scope::Repo, Scope::Global]
-            .into_iter()
-            .any(|scope| self.configured(scope).reads_team());
+    /// True when some scope reads the team database and the offline fallback serves meanwhile.
+    fn falls_back(&self) -> bool {
+        self.fallback.is_some()
+            && [Scope::Repo, Scope::Global]
+                .into_iter()
+                .any(|scope| self.configured(scope).reads_team())
+    }
 
-        if self.fallback.is_none() || !reads_team {
+    /// True when some scope of `view` reads the team database.
+    fn reads_team_in(&self, view: &View) -> bool {
+        narrow_by(view, |scope| self.configured(scope).reads_team()).is_some()
+    }
+
+    /// Serves from this computer from now on: the team database is not reachable.
+    fn go_down(&mut self) {
+        if !self.down {
+            self.down = true;
+            eprintln!(
+                "harness-memory: the team database is unreachable: notes are read and saved on this computer \
+                 until it is back"
+            );
+        }
+
+        if let Some(fallback) = self.fallback.as_mut() {
+            fallback.sync_due = true;
+        }
+    }
+
+    /// Runs `call`; when the team database turns out to be unreachable during it (a connection that
+    /// worked when the call began and dropped since), the connection is dropped, so the calls
+    /// until the cooldown ends fail at once, and with the offline fallback the call is made once
+    /// more, now served from this computer (and recorded for the team database as an offline
+    /// call is). Without the fallback the call fails, with what to change when the store knows,
+    /// and the next call connects again. A failure of the database that answered is not repeated.
+    fn attempt<T>(&mut self, call: impl Fn(&mut Self) -> Result<T, StoreError>) -> Result<T, StoreError> {
+        let reason = match call(self) {
+            // Already serving from this computer: the team database is not what failed.
+            Err(StoreError::Unreachable(reason)) if !self.down => reason,
+            other => return other,
+        };
+
+        let falls_back = self.falls_back();
+        let message = self.team.connection_lost(&reason, falls_back);
+
+        if !falls_back {
+            return Err(StoreError::Unreachable(message));
+        }
+
+        self.go_down();
+        call(self)
+    }
+
+    /// Decides before a call whether the team database is reachable (a failed open is not tried
+    /// again for a while), and copies the notes saved offline, then applies the changes queued
+    /// meanwhile, when it is back.
+    fn settle(&mut self) {
+        if !self.falls_back() {
             return;
         }
 
         let up = self.team.ready();
 
-        let Some(fallback) = self.fallback.as_mut() else {
-            return;
-        };
-
         if !up {
-            if !self.down {
-                self.down = true;
-                eprintln!(
-                    "harness-memory: the team database is unreachable: notes are read and saved on this computer \
-                     until it is back"
-                );
-            }
-
-            fallback.sync_due = true;
+            self.go_down();
             return;
         }
 
         self.down = false;
 
+        let Some(fallback) = self.fallback.as_mut() else {
+            return;
+        };
+
         if fallback.sync_due && Instant::now() >= fallback.retry_at {
             fallback.sync_due = false;
             self.copy_offline_notes();
+            self.replay_offline_updates();
         }
     }
 
     /// Copies the notes saved offline to the team database; the ones that were not copied stay
-    /// listed and are tried again after a while. Nothing is deleted from this computer.
+    /// listed and are tried again after a while. A note the team database now holds as it is here
+    /// is deleted from this computer, while one it holds differently (a teammate's newer text, or a
+    /// text the team kept) stays here for the person to decide, as `harness-memory push` leaves it.
     fn copy_offline_notes(&mut self) {
         let Some(mut fallback) = self.fallback.take() else {
             return;
         };
 
-        // Only what is meant for this team database and for a scope that is still set to `remote`.
-        let waiting: Vec<Entry> = fallback
-            .pending
-            .entries(Kind::Notes, &fallback.team)
+        // An entry whose note is gone from this computer (deleted, discarded, or removed after a
+        // copy that stopped before it was taken off) waits for nothing.
+        let listed = fallback.pending.entries(Kind::Notes, &fallback.team);
+        let listed = self.without_gone_notes(&fallback, listed);
+
+        // Only what is meant for this team database and for a scope that still saves there.
+        let waiting: Vec<Entry> = listed
             .into_iter()
             .filter(|entry| {
                 let scope = if entry.scope == GLOBAL {
@@ -258,7 +362,7 @@ impl SplitStore {
                 } else {
                     Scope::Repo
                 };
-                self.configured(scope) == NotesPlace::Remote
+                self.team_writes(scope)
             })
             .collect();
 
@@ -268,6 +372,32 @@ impl SplitStore {
         }
 
         self.fallback = Some(fallback);
+    }
+
+    /// `entries` without those whose local note is gone, which are taken off the list too. An entry
+    /// whose note is there under another title stays, and so does everything when the notes cannot
+    /// be asked: nothing is dropped unseen. One read of up to [`GET_IDS_MAX`] notes per few entries.
+    fn without_gone_notes(&mut self, fallback: &Fallback, entries: Vec<Entry>) -> Vec<Entry> {
+        let wanted: BTreeSet<i64> = entries.iter().map(|entry| entry.id).collect();
+        let wanted: Vec<i64> = wanted.into_iter().collect();
+        let mut here: BTreeSet<i64> = BTreeSet::new();
+
+        for chunk in wanted.chunks(GET_IDS_MAX) {
+            match self.local.peek(&View::every_repo(), chunk) {
+                Ok(notes) => here.extend(notes.iter().map(|note| note.id)),
+                Err(_) => return entries,
+            }
+        }
+
+        let (kept, gone): (Vec<Entry>, Vec<Entry>) = entries.into_iter().partition(|entry| here.contains(&entry.id));
+
+        if !gone.is_empty()
+            && let Err(error) = fallback.pending.remove(Kind::Notes, &gone)
+        {
+            eprintln!("harness-memory: {}", fallback.secrets.scrub(&error));
+        }
+
+        kept
     }
 
     /// Copies `waiting` to the team database; false when something has to be tried again.
@@ -287,8 +417,9 @@ impl SplitStore {
         };
 
         let options = Options {
-            skip_global: self.global != NotesPlace::Remote,
-            skip_repositories: self.repo != NotesPlace::Remote,
+            skip_global: !self.team_writes(Scope::Global),
+            skip_repositories: !self.team_writes(Scope::Repo),
+            delete_copied: true,
             ..Options::default()
         };
 
@@ -360,11 +491,29 @@ impl SplitStore {
         }
     }
 
-    /// Lists the local note `id` titled `title`, saved in the scope of `target` (set to `remote`)
-    /// while the team database was unreachable, as waiting to be copied.
-    fn record_offline(&self, target: &Target, id: i64, title: &str) {
+    /// Gives the entry of the local note `id` saved in the scope of `target` the title `title`, when the
+    /// note is listed as waiting for the team database.
+    fn rename_listed(&self, target: &Target, id: i64, title: &str) {
         let Some(fallback) = &self.fallback else {
             return;
+        };
+
+        let name = clean::title(title).unwrap_or_else(|_| title.to_owned());
+
+        if let Err(error) = fallback
+            .pending
+            .rename(Kind::Notes, &fallback.team, id, &scope_label(target), &name)
+        {
+            eprintln!("harness-memory: {}", fallback.secrets.scrub(&error));
+        }
+    }
+
+    /// Lists the local note `id` titled `title`, saved in the scope of `target` (which saves to the team database)
+    /// while the team database was unreachable, as waiting to be copied (a note listed already stays
+    /// listed once). False when the list could not be changed: the note stays here, unlisted.
+    fn record_offline(&self, target: &Target, id: i64, title: &str) -> bool {
+        let Some(fallback) = &self.fallback else {
+            return true;
         };
 
         let entry = Entry {
@@ -379,7 +528,11 @@ impl SplitStore {
                 "harness-memory: the note was saved here but could not be listed for copying: {}",
                 fallback.secrets.scrub(&error)
             );
+
+            return false;
         }
+
+        true
     }
 
     /// True when the store `side` is read for the notes of `scope`.
@@ -392,7 +545,7 @@ impl SplitStore {
 
     /// The store new notes of `scope` go to.
     fn write_side(&self, scope: Scope) -> Side {
-        match self.place(scope).writes() {
+        match self.place(scope).writes(self.saves) {
             Place::Remote => Side::Team,
             Place::Local => Side::Local,
         }
@@ -502,8 +655,11 @@ impl SplitStore {
         };
 
         // A team database that cannot be read fails the call itself, so a failed prune waits for
-        // the next turn.
-        let _ = hidden.prune_if_due(self.team.as_mut());
+        // the next turn. A connection that dropped is the call's to handle ([`Self::attempt`]); one
+        // that is down is not read at all.
+        if !self.down {
+            lost_connection(hidden.prune_if_due(self.team.as_mut()))?;
+        }
 
         Ok(hidden.ids())
     }
@@ -515,7 +671,10 @@ impl SplitStore {
             return Ok(Vec::new());
         };
 
-        let _ = hidden.prune_if_due(self.team.as_mut());
+        if !self.down {
+            lost_connection(hidden.prune_if_due(self.team.as_mut()))?;
+        }
+
         hidden.try_ids()
     }
 
@@ -556,16 +715,20 @@ impl SplitStore {
     }
 
     /// Refuses a change to the team note `raw` (shown as `id`) visible in `view` (the team store's
-    /// part) when it is hidden (not found) or its scope is `remote+local` (read-only).
+    /// part) when it is hidden (not found) or its scope keeps the team's notes read-only
+    /// (`remote+local` saving to this computer).
     fn check_team_write(&mut self, view: &View, raw: i64, id: i64) -> Result<(), StoreError> {
         if self.hidden_ids_strict()?.contains(&raw) {
             return Err(note_missing(id));
         }
 
-        let (repo, global) = (self.repo, self.global);
-        let read_only = move |scope: Scope| {
-            let place = if scope == Scope::Repo { repo } else { global };
-            place == NotesPlace::RemoteLocal
+        let (repo_read_only, global_read_only) = (self.team_read_only(Scope::Repo), self.team_read_only(Scope::Global));
+        let read_only = |scope: Scope| {
+            if scope == Scope::Repo {
+                repo_read_only
+            } else {
+                global_read_only
+            }
         };
         let in_view = (view.repo.is_some() && read_only(Scope::Repo)) || (view.global && read_only(Scope::Global));
 
@@ -730,6 +893,15 @@ impl SplitStore {
     }
 }
 
+/// `pruned` as a failed prune of the hidden list leaves it: only a team database that cannot be
+/// reached is an error, which fails the call that asked.
+fn lost_connection(pruned: Result<usize, StoreError>) -> Result<(), StoreError> {
+    match pruned {
+        Err(error @ StoreError::Unreachable(_)) => Err(error),
+        _ => Ok(()),
+    }
+}
+
 /// `ids` (the store `side`'s own) with those of `asked` (shown ids) that are `side`'s, each once.
 fn with_asked(mut ids: Vec<i64>, side: Side, asked: &[i64]) -> Vec<i64> {
     for (of, raw) in asked.iter().map(|id| decode(*id)) {
@@ -834,6 +1006,16 @@ fn reword(error: StoreError, side: Side, ids: Option<(i64, i64)>) -> StoreError 
     }
 }
 
+/// The refusal to change team note `id` (`done`: `deleted`, `linked`, `changed`) while the team
+/// database is unreachable: the note cannot be read, so nothing was changed, and it is not known to
+/// be gone.
+pub(crate) fn offline_refusal(id: i64, done: &str) -> StoreError {
+    StoreError::Unreachable(format!(
+        "the team database is unreachable, so note {id} was not {done} and nothing was changed: this needs the \
+         team database. Try again when it is back"
+    ))
+}
+
 /// The error of a note id no visible scope holds, as the stores word it.
 fn note_missing(id: i64) -> StoreError {
     StoreError::NotFound(format!("note {id} not found in this repository or the global scope"))
@@ -847,7 +1029,7 @@ pub fn hidden_title_error(id: i64) -> StoreError {
     ))
 }
 
-/// The refusal to change team note `id` of a `remote+local` scope.
+/// The refusal to change team note `id` of a `remote+local` scope that saves to this computer.
 pub fn read_only_error(id: i64, scope: Scope) -> StoreError {
     let key = match scope {
         Scope::Repo => "repository_notes",
@@ -855,9 +1037,10 @@ pub fn read_only_error(id: i64, scope: Scope) -> StoreError {
     };
 
     StoreError::Invalid(format!(
-        "note {id} is a team note and read-only here: {key} is \"remote+local\", which reads the team's notes \
-         and saves new notes on this computer only. Save a new note instead, or stop seeing this one with \
-         harness-memory notes hide {id} (Hide on this computer in Harness Desktop)"
+        "note {id} is a team note and read-only here: {key} is \"remote+local\" and remote_local_saves is \
+         \"local\", which reads the team's notes and saves new notes on this computer only. Save a new note \
+         instead, or stop seeing this one with harness-memory notes hide {id} (Hide on this computer in \
+         Harness Desktop)"
     ))
 }
 
@@ -954,11 +1137,16 @@ const NOTHING: View = View {
     global: false,
 };
 
-impl MemoryStore for SplitStore {
-    fn remember(&mut self, target: &Target, draft: &NoteDraft) -> Result<Saved, StoreError> {
+impl SplitStore {
+    fn remember_once(&mut self, target: &Target, draft: &NoteDraft) -> Result<Saved, StoreError> {
         self.settle();
         let scope = target_scope(target);
-        let side = self.write_side(scope);
+        let mut side = self.write_side(scope);
+
+        // A note kept on this computer under this title is updated where it is, online or not.
+        if self.kept_here(scope, side, target, &draft.title)? {
+            side = Side::Local;
+        }
 
         if side == Side::Team {
             self.check_hidden_title(target, &draft.title)?;
@@ -969,21 +1157,113 @@ impl MemoryStore for SplitStore {
             .remember(target, draft)
             .map_err(|error| reword(error, side, None))?;
 
-        // A save that replaced a row already kept here (one a person saved on purpose) is not
-        // listed: that row, and the relations it already has, stay on this computer.
-        if side == Side::Local && saved.created && self.down && self.configured(scope) == NotesPlace::Remote {
-            self.record_offline(target, saved.id, &draft.title);
+        // Listed whether the save made the row or replaced one already here (a leftover of an earlier
+        // offline save, say): what was saved last for a scope that saves to the team database is meant
+        // for it. The list is a set, so a row listed already is not listed twice. A scope routed
+        // `remote+local` lists only the row the save made: one that was here already is a person's own.
+        let mut not_listed = false;
+
+        // A save that replaced a row listed as waiting may have changed its title (the letter case
+        // is not part of the match), so the entry follows it: the push finds a row by its exact name.
+        if side == Side::Local && !saved.created && self.team_writes(scope) {
+            self.rename_listed(target, saved.id, &draft.title);
+        }
+
+        if side == Side::Local && self.down && self.team_writes(scope) && self.lists_save(scope, saved.created) {
+            not_listed = !self.record_offline(target, saved.id, &draft.title);
         }
 
         Ok(Saved {
             id: encode(side, saved.id)?,
+            not_listed,
             ..saved
         })
     }
 
-    fn update(&mut self, view: &View, id: i64, patch: &NotePatch) -> Result<Saved, StoreError> {
+    /// True when a save without a picked place updates the note this computer keeps under `title`
+    /// instead of going to the team database: the scope is routed `remote+local`, the save would
+    /// go to the team database (`side`), and a note of that title is here. The store's own rules
+    /// then apply to it, such as the conflict of a same-title save from another checkout.
+    fn kept_here(&mut self, scope: Scope, side: Side, target: &Target, title: &str) -> Result<bool, StoreError> {
+        if side != Side::Team || self.configured(scope) != NotesPlace::RemoteLocal {
+            return Ok(false);
+        }
+
+        Ok(self.local.find_by_title(target, title)?.is_some())
+    }
+
+    /// True when a save on this computer while the team database was unreachable is listed as waiting:
+    /// in a scope set to `remote` always (what is here is meant for the team database), in one routed
+    /// `remote+local` only when the save created the row.
+    fn lists_save(&self, scope: Scope, created: bool) -> bool {
+        created || self.configured(scope) == NotesPlace::Remote
+    }
+
+    /// Takes the local note `id` saved in the scope of `target` off the list of what waits for the team
+    /// database: the person kept it here.
+    fn unlist_offline(&self, target: &Target, id: i64) -> Result<(), StoreError> {
+        let Some(fallback) = &self.fallback else {
+            return Ok(());
+        };
+
+        fallback
+            .pending
+            .forget(Kind::Notes, &fallback.team, id, &scope_label(target))
+            .map_err(|error| {
+                StoreError::Backend(format!(
+                    "the note was saved on this computer, but could not be taken off the list of what waits for \
+                     the team database, so it may still be copied there: {}",
+                    fallback.secrets.scrub(&error)
+                ))
+            })
+    }
+
+    /// Saves the note to this computer whatever the routing of its scope says: the place a person
+    /// picked. It records nothing as waiting, so the note stays here, also while the team database
+    /// is unreachable, and a note listed as waiting is taken off the list.
+    fn remember_local(&mut self, target: &Target, draft: &NoteDraft) -> Result<Saved, StoreError> {
+        let saved = self
+            .local
+            .remember(target, draft)
+            .map_err(|error| reword(error, Side::Local, None))?;
+
+        // Off the list before anything settles: a settle copies what waits to the team database and
+        // deletes the row here, which would send the old text there and drop the person's own.
+        self.unlist_offline(target, saved.id)?;
+        self.settle();
+
+        Ok(Saved {
+            id: encode(Side::Local, saved.id)?,
+            ..saved
+        })
+    }
+
+    /// Saves the note to the team database whatever the routing of its scope says, with the rules of
+    /// a save there: the hidden title check, then the store's own. It never serves this computer
+    /// and records nothing as waiting, so it takes no part in the offline fallback.
+    fn remember_remote(&mut self, target: &Target, draft: &NoteDraft) -> Result<Saved, StoreError> {
+        self.check_hidden_title(target, &draft.title)?;
+
+        let saved = self
+            .team
+            .remember(target, draft)
+            .map_err(|error| reword(error, Side::Team, None))?;
+
+        Ok(Saved {
+            id: encode(Side::Team, saved.id)?,
+            ..saved
+        })
+    }
+
+    fn update_once(&mut self, view: &View, id: i64, patch: &NotePatch) -> Result<Saved, StoreError> {
         self.settle();
         let (side, raw) = decode(id);
+
+        // The note cannot be read now, so the change waits for the team database.
+        if side == Side::Team && self.down {
+            return self.queue_update(view, id, patch);
+        }
+
         let Some(view) = self.narrow(view, side) else {
             return Err(note_missing(id));
         };
@@ -1007,17 +1287,17 @@ impl MemoryStore for SplitStore {
         Ok(Saved { id, ..saved })
     }
 
-    fn get(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
+    fn get_once(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
         self.settle();
         self.read_notes(view, ids, true)
     }
 
-    fn peek(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
+    fn peek_once(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
         self.settle();
         self.read_notes(view, ids, false)
     }
 
-    fn list_notes(&mut self, query: &NoteListQuery) -> Result<NotePage, StoreError> {
+    fn list_notes_once(&mut self, query: &NoteListQuery) -> Result<NotePage, StoreError> {
         self.settle();
         let mut cursors: Vec<Cursor> = Vec::new();
         let mut places: Vec<(Place, usize)> = Vec::new();
@@ -1107,7 +1387,7 @@ impl MemoryStore for SplitStore {
         Ok(page)
     }
 
-    fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
+    fn search_once(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
         self.settle();
         let limit = query.limit.clamp(1, SEARCH_LIMIT_MAX);
         let readers: Vec<(Side, View)> = self
@@ -1164,29 +1444,9 @@ impl MemoryStore for SplitStore {
         Ok(hits)
     }
 
-    /// One target per store read for the view, the local one with its id offset.
-    fn vector_targets(&mut self, view: &View) -> Vec<VectorTarget> {
-        let mut targets: Vec<VectorTarget> = Vec::new();
-
-        for side in self.order() {
-            let Some(narrowed) = self.narrow(view, side) else {
-                continue;
-            };
-
-            let offset = match side {
-                Side::Team => 0,
-                Side::Local => LOCAL_ID_OFFSET,
-            };
-
-            targets.extend(VectorTarget::of_view(side.place(), &narrowed, offset));
-        }
-
-        targets
-    }
-
     /// The notes among `ids` (shown ids) each store reads for the view of `query`, the hidden
     /// team notes left out.
-    fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
+    fn hits_for_once(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
         self.settle();
         let mut hits: Vec<Hit> = Vec::new();
 
@@ -1216,6 +1476,306 @@ impl MemoryStore for SplitStore {
         }
 
         Ok(hits)
+    }
+
+    fn similar_once(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {
+        self.settle();
+        let (side, raw) = decode(id);
+
+        if side == Side::Team && self.hidden_ids()?.contains(&raw) {
+            return Ok(Vec::new());
+        }
+
+        let Some(own) = self.narrow(view, side) else {
+            return Ok(Vec::new());
+        };
+
+        let mut parts = vec![self.similar_side(side, &own, Source::Own(raw), limit)?];
+
+        // In a `remote+local` scope the other store holds notes of the same scope too.
+        let shared = narrow_by(view, |scope| self.place(scope) == NotesPlace::RemoteLocal);
+
+        if let Some(shared) = shared {
+            let note = self.store(side).peek(&own, &[raw])?.into_iter().next();
+            let note = note.filter(|note| self.place(note.scope) == NotesPlace::RemoteLocal);
+
+            if let Some(note) = note {
+                let source = Source::Text((&note.title, &note.body));
+                parts.push(self.similar_side(other(side), &shared, source, limit)?);
+            }
+        }
+
+        Ok(take_turns(parts, limit))
+    }
+
+    fn link_once(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {
+        self.settle();
+        let scope = target_scope(target);
+        let side = self.write_side(scope);
+
+        let ids = match link.note_id {
+            Some(id) => {
+                let (note_side, raw) = decode(id);
+                let team_note = note_side == Side::Team;
+
+                if team_note && self.down && self.configured(scope).reads_team() {
+                    return Err(offline_refusal(id, "linked"));
+                }
+
+                if note_side != side && team_note && self.reads(scope, Side::Team) {
+                    return Err(read_only_error(id, scope));
+                }
+
+                let reads_both = self.reads(scope, Side::Team) && self.reads(scope, Side::Local);
+
+                if note_side != side && !team_note && reads_both {
+                    return Err(StoreError::NotFound(format!(
+                        "note {id} is kept on this computer, and a link in this scope is saved in the team \
+                         database, so it cannot point at it"
+                    )));
+                }
+
+                if note_side != side || (team_note && self.hidden_ids_strict()?.contains(&raw)) {
+                    return Err(StoreError::NotFound(format!("note {id} not found in this scope")));
+                }
+
+                Some((raw, id))
+            }
+            None => None,
+        };
+
+        let own = Link {
+            note_id: ids.map(|(raw, _)| raw),
+            ..link.clone()
+        };
+        let edge = self
+            .store(side)
+            .link(target, &own)
+            .map_err(|error| reword(error, side, ids))?;
+
+        Ok(Edge {
+            note_id: edge.note_id.map(|raw| encode(side, raw)).transpose()?,
+            ..edge
+        })
+    }
+
+    fn neighbors_once(
+        &mut self,
+        view: &View,
+        entity: &str,
+        depth: u8,
+        limit: usize,
+    ) -> Result<Neighborhood, StoreError> {
+        self.settle();
+        let limit = limit.clamp(1, NEIGHBORS_LIMIT_MAX);
+        let mut parts: Vec<(Side, Neighborhood)> = Vec::new();
+        let mut missing: Option<StoreError> = None;
+
+        for side in self.order() {
+            let Some(view) = self.narrow(view, side) else {
+                continue;
+            };
+
+            match self.store(side).neighbors(&view, entity, depth, limit) {
+                Ok(part) => parts.push((side, part)),
+                Err(error @ StoreError::NotFound(_)) => missing = missing.or(Some(error)),
+                Err(error) => return Err(error),
+            }
+        }
+
+        if parts.is_empty() {
+            if let Some(error) = missing {
+                return Err(error);
+            }
+
+            let first = self.first();
+            return self.store(first).neighbors(&NOTHING, entity, depth, limit);
+        }
+
+        let hidden = self.hidden_ids()?;
+        let shown = |side: Side, raw: i64| !(side == Side::Team && hidden.contains(&raw));
+        let mut merged = Neighborhood::default();
+        let mut total = 0usize;
+
+        for (side, part) in parts {
+            total += part.edges.len() + part.more_edges;
+
+            for edge in part.edges {
+                let note_id = edge.note_id.filter(|raw| shown(side, *raw));
+
+                merged.edges.push(Edge {
+                    note_id: note_id.map(|raw| encode(side, raw)).transpose()?,
+                    ..edge
+                });
+            }
+
+            for (raw, title) in part.notes {
+                if shown(side, raw) {
+                    merged.notes.push((encode(side, raw)?, title));
+                }
+            }
+        }
+
+        merged.edges.truncate(limit);
+        merged.notes.truncate(NEIGHBOR_NOTES_MAX);
+        merged.more_edges = total.saturating_sub(merged.edges.len());
+        Ok(merged)
+    }
+
+    fn forget_once(&mut self, view: &View, target: &Target, what: &Forget) -> Result<usize, StoreError> {
+        self.settle();
+        let Forget::Note(id) = what else {
+            let side = self.write_side(target_scope(target));
+            return self.store(side).forget(view, target, what);
+        };
+
+        let (side, raw) = decode(*id);
+
+        // The note cannot be read now, so it is not known to be gone: nothing is deleted.
+        if side == Side::Team && self.down && self.reads_team_in(view) {
+            return Err(offline_refusal(*id, "deleted"));
+        }
+
+        let Some(view) = self.narrow(view, side) else {
+            return Err(note_missing(*id));
+        };
+
+        if side == Side::Team {
+            self.check_team_write(&view, raw, *id)?;
+        }
+
+        self.store(side)
+            .forget(&view, target, &Forget::Note(raw))
+            .map_err(|error| reword(error, side, Some((raw, *id))))
+    }
+
+    /// Each store deletes the scopes it saves (the team notes of a `remote+local` scope that saves to
+    /// this computer stay, and so do the notes on this computer of one that saves to the team
+    /// database), and the team store leaves the hidden notes too (nothing is deleted there when the
+    /// hidden list cannot be read); a failure in the second leaves the first's deletes.
+    fn forget_notes_once(&mut self, view: &View, exclude: &[i64]) -> Result<Forgotten, StoreError> {
+        self.settle();
+        let mut forgotten = Forgotten::default();
+
+        for side in [Side::Team, Side::Local] {
+            let Some(view) = self.narrow_writes(view, side) else {
+                continue;
+            };
+
+            let hidden = match side {
+                Side::Team => self.hidden_ids_strict()?,
+                Side::Local => Vec::new(),
+            };
+            let left = with_asked(hidden, side, exclude);
+            forgotten = forgotten + self.store(side).forget_notes(&view, &left)?;
+        }
+
+        Ok(forgotten)
+    }
+
+    fn find_by_title_once(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
+        self.settle();
+        let side = self.write_side(target_scope(target));
+
+        match self.store(side).find_by_title(target, title)? {
+            Some(note) => Ok(Some(Note {
+                id: encode(side, note.id)?,
+                ..note
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// The setting of the store new notes go to: the team database when a scope saves there, else
+    /// this computer's file.
+    fn english_notes_once(&mut self) -> Result<bool, StoreError> {
+        self.settle();
+        let side = self.settings_sides().first().copied().unwrap_or(Side::Local);
+        self.store(side).english_notes()
+    }
+
+    /// Stores the setting in every store a scope saves to.
+    fn set_english_notes_once(&mut self, on: bool) -> Result<(), StoreError> {
+        self.settle();
+        for side in self.settings_sides() {
+            self.store(side).set_english_notes(on)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl MemoryStore for SplitStore {
+    fn remember(&mut self, target: &Target, draft: &NoteDraft) -> Result<Saved, StoreError> {
+        self.attempt(|this| this.remember_once(target, draft))
+    }
+
+    fn remember_to(&mut self, place: Place, target: &Target, draft: &NoteDraft) -> Result<Saved, StoreError> {
+        let scope = target_scope(target);
+
+        if self.configured(scope) != NotesPlace::RemoteLocal {
+            return Err(StoreError::Invalid(
+                "a place can be picked only for notes routed \"remote+local\"".to_owned(),
+            ));
+        }
+
+        match place {
+            Place::Local => self.remember_local(target, draft),
+            Place::Remote => match self.remember_remote(target, draft) {
+                Err(StoreError::Unreachable(reason)) => {
+                    let message = self.team.connection_lost(&reason, false);
+
+                    Err(StoreError::Unreachable(format!(
+                        "nothing was saved, not even on this computer: {message}"
+                    )))
+                }
+                other => other,
+            },
+        }
+    }
+
+    fn update(&mut self, view: &View, id: i64, patch: &NotePatch) -> Result<Saved, StoreError> {
+        self.attempt(|this| this.update_once(view, id, patch))
+    }
+
+    fn get(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
+        self.attempt(|this| this.get_once(view, ids))
+    }
+
+    fn peek(&mut self, view: &View, ids: &[i64]) -> Result<Vec<Note>, StoreError> {
+        self.attempt(|this| this.peek_once(view, ids))
+    }
+
+    fn list_notes(&mut self, query: &NoteListQuery) -> Result<NotePage, StoreError> {
+        self.attempt(|this| this.list_notes_once(query))
+    }
+
+    fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
+        self.attempt(|this| this.search_once(query))
+    }
+
+    /// One target per store read for the view, the local one with its id offset.
+    fn vector_targets(&mut self, view: &View) -> Vec<VectorTarget> {
+        let mut targets: Vec<VectorTarget> = Vec::new();
+
+        for side in self.order() {
+            let Some(narrowed) = self.narrow(view, side) else {
+                continue;
+            };
+
+            let offset = match side {
+                Side::Team => 0,
+                Side::Local => LOCAL_ID_OFFSET,
+            };
+
+            targets.extend(VectorTarget::of_view(side.place(), &narrowed, offset));
+        }
+
+        targets
+    }
+
+    fn hits_for(&mut self, query: &SearchQuery, ids: &[i64]) -> Result<Vec<Hit>, StoreError> {
+        self.attempt(|this| this.hits_for_once(query, ids))
     }
 
     fn countable(&mut self, view: &View, ids: &[i64]) -> Countable {
@@ -1289,210 +1849,42 @@ impl MemoryStore for SplitStore {
     }
 
     fn similar(&mut self, view: &View, id: i64, limit: usize) -> Result<Vec<Hit>, StoreError> {
-        self.settle();
-        let (side, raw) = decode(id);
-
-        if side == Side::Team && self.hidden_ids()?.contains(&raw) {
-            return Ok(Vec::new());
-        }
-
-        let Some(own) = self.narrow(view, side) else {
-            return Ok(Vec::new());
-        };
-
-        let mut parts = vec![self.similar_side(side, &own, Source::Own(raw), limit)?];
-
-        // In a `remote+local` scope the other store holds notes of the same scope too.
-        let shared = narrow_by(view, |scope| self.place(scope) == NotesPlace::RemoteLocal);
-
-        if let Some(shared) = shared {
-            let note = self.store(side).peek(&own, &[raw])?.into_iter().next();
-            let note = note.filter(|note| self.place(note.scope) == NotesPlace::RemoteLocal);
-
-            if let Some(note) = note {
-                let source = Source::Text((&note.title, &note.body));
-                parts.push(self.similar_side(other(side), &shared, source, limit)?);
-            }
-        }
-
-        Ok(take_turns(parts, limit))
+        self.attempt(|this| this.similar_once(view, id, limit))
     }
 
     fn link(&mut self, target: &Target, link: &Link) -> Result<Edge, StoreError> {
-        self.settle();
-        let scope = target_scope(target);
-        let side = self.write_side(scope);
-
-        let ids = match link.note_id {
-            Some(id) => {
-                let (note_side, raw) = decode(id);
-                let team_note = note_side == Side::Team;
-
-                if note_side != side && team_note && self.reads(scope, Side::Team) {
-                    return Err(read_only_error(id, scope));
-                }
-
-                if note_side != side || (team_note && self.hidden_ids_strict()?.contains(&raw)) {
-                    return Err(StoreError::NotFound(format!("note {id} not found in this scope")));
-                }
-
-                Some((raw, id))
-            }
-            None => None,
-        };
-
-        let own = Link {
-            note_id: ids.map(|(raw, _)| raw),
-            ..link.clone()
-        };
-        let edge = self
-            .store(side)
-            .link(target, &own)
-            .map_err(|error| reword(error, side, ids))?;
-
-        Ok(Edge {
-            note_id: edge.note_id.map(|raw| encode(side, raw)).transpose()?,
-            ..edge
-        })
+        self.attempt(|this| this.link_once(target, link))
     }
 
     fn neighbors(&mut self, view: &View, entity: &str, depth: u8, limit: usize) -> Result<Neighborhood, StoreError> {
-        self.settle();
-        let limit = limit.clamp(1, NEIGHBORS_LIMIT_MAX);
-        let mut parts: Vec<(Side, Neighborhood)> = Vec::new();
-        let mut missing: Option<StoreError> = None;
-
-        for side in self.order() {
-            let Some(view) = self.narrow(view, side) else {
-                continue;
-            };
-
-            match self.store(side).neighbors(&view, entity, depth, limit) {
-                Ok(part) => parts.push((side, part)),
-                Err(error @ StoreError::NotFound(_)) => missing = missing.or(Some(error)),
-                Err(error) => return Err(error),
-            }
-        }
-
-        if parts.is_empty() {
-            if let Some(error) = missing {
-                return Err(error);
-            }
-
-            let first = self.first();
-            return self.store(first).neighbors(&NOTHING, entity, depth, limit);
-        }
-
-        let hidden = self.hidden_ids()?;
-        let shown = |side: Side, raw: i64| !(side == Side::Team && hidden.contains(&raw));
-        let mut merged = Neighborhood::default();
-        let mut total = 0usize;
-
-        for (side, part) in parts {
-            total += part.edges.len() + part.more_edges;
-
-            for edge in part.edges {
-                let note_id = edge.note_id.filter(|raw| shown(side, *raw));
-
-                merged.edges.push(Edge {
-                    note_id: note_id.map(|raw| encode(side, raw)).transpose()?,
-                    ..edge
-                });
-            }
-
-            for (raw, title) in part.notes {
-                if shown(side, raw) {
-                    merged.notes.push((encode(side, raw)?, title));
-                }
-            }
-        }
-
-        merged.edges.truncate(limit);
-        merged.notes.truncate(NEIGHBOR_NOTES_MAX);
-        merged.more_edges = total.saturating_sub(merged.edges.len());
-        Ok(merged)
+        self.attempt(|this| this.neighbors_once(view, entity, depth, limit))
     }
 
     fn forget(&mut self, view: &View, target: &Target, what: &Forget) -> Result<usize, StoreError> {
-        self.settle();
-        let Forget::Note(id) = what else {
-            let side = self.write_side(target_scope(target));
-            return self.store(side).forget(view, target, what);
-        };
-
-        let (side, raw) = decode(*id);
-        let Some(view) = self.narrow(view, side) else {
-            return Err(note_missing(*id));
-        };
-
-        if side == Side::Team {
-            self.check_team_write(&view, raw, *id)?;
-        }
-
-        self.store(side)
-            .forget(&view, target, &Forget::Note(raw))
-            .map_err(|error| reword(error, side, Some((raw, *id))))
+        self.attempt(|this| this.forget_once(view, target, what))
     }
 
-    /// Each store deletes the scopes it saves (a `remote+local` scope's team notes stay), and the
-    /// team store leaves the hidden notes too (nothing is deleted there when the hidden list cannot
-    /// be read); a failure in the second leaves the first's deletes.
     fn forget_notes(&mut self, view: &View, exclude: &[i64]) -> Result<Forgotten, StoreError> {
-        self.settle();
-        let mut forgotten = Forgotten::default();
-
-        for side in [Side::Team, Side::Local] {
-            let Some(view) = self.narrow_writes(view, side) else {
-                continue;
-            };
-
-            let hidden = match side {
-                Side::Team => self.hidden_ids_strict()?,
-                Side::Local => Vec::new(),
-            };
-            let left = with_asked(hidden, side, exclude);
-            forgotten = forgotten + self.store(side).forget_notes(&view, &left)?;
-        }
-
-        Ok(forgotten)
+        self.attempt(|this| this.forget_notes_once(view, exclude))
     }
 
     fn find_by_title(&mut self, target: &Target, title: &str) -> Result<Option<Note>, StoreError> {
-        self.settle();
-        let side = self.write_side(target_scope(target));
-
-        match self.store(side).find_by_title(target, title)? {
-            Some(note) => Ok(Some(Note {
-                id: encode(side, note.id)?,
-                ..note
-            })),
-            None => Ok(None),
-        }
+        self.attempt(|this| this.find_by_title_once(target, title))
     }
 
-    /// The setting of the store new notes go to: the team database when a scope saves there, else
-    /// this computer's file.
     fn english_notes(&mut self) -> Result<bool, StoreError> {
-        self.settle();
-        let side = self.settings_sides().first().copied().unwrap_or(Side::Local);
-        self.store(side).english_notes()
+        self.attempt(|this| this.english_notes_once())
     }
 
-    /// Stores the setting in every store a scope saves to.
     fn set_english_notes(&mut self, on: bool) -> Result<(), StoreError> {
-        self.settle();
-        for side in self.settings_sides() {
-            self.store(side).set_english_notes(on)?;
-        }
-
-        Ok(())
+        self.attempt(|this| this.set_english_notes_once(on))
     }
 
     fn origin(&self, id: i64, scope: Scope) -> NoteOrigin {
         match decode(id).0 {
             Side::Local => NoteOrigin::Local,
             Side::Team => NoteOrigin::Team {
-                read_only: self.place(scope) == NotesPlace::RemoteLocal,
+                read_only: self.place(scope).team_read_only(self.saves),
             },
         }
     }
