@@ -361,6 +361,72 @@ fn replies_stay_within_their_caps() {
 }
 
 #[test]
+fn an_empty_project_path_means_the_repository_the_server_runs_in() {
+    let dir = TempDir::new().expect("temp");
+    let home = dir.path().join("home");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).expect("work");
+    let mut inside = server(&dir, &home, &work);
+
+    let replies = run(
+        &mut inside,
+        &[
+            call(
+                1,
+                "note_save",
+                json!({ "title": "Deploy order", "body": "The gateway ships before the worker.", "kind": "note", "project_path": {} }),
+            ),
+            call(
+                2,
+                "note_save",
+                json!({ "title": "Cache size", "body": "Thumbnails stay below two gigabytes.", "kind": "note", "project_path": "" }),
+            ),
+            call(
+                3,
+                "note_save",
+                json!({ "title": "Test fixtures", "body": "Fixtures live next to the parser.", "kind": "note", "project_path": "  " }),
+            ),
+            call(
+                4,
+                "note_save",
+                json!({ "title": "Release day", "body": "Tagging happens on Tuesday mornings.", "kind": "note", "project_path": null }),
+            ),
+            call(5, "note_search", json!({ "scope": "repo", "project_path": {} })),
+            call(
+                6,
+                "note_save",
+                json!({ "title": "x", "body": "y", "kind": "note", "project_path": { "path": "/x" } }),
+            ),
+        ],
+    );
+
+    for reply in &replies[..5] {
+        assert!(!is_error(reply), "{reply}");
+    }
+
+    let listed = text(&replies[4]);
+
+    for title in ["Deploy order", "Cache size", "Test fixtures", "Release day"] {
+        assert!(listed.contains(title), "{title}: {listed}");
+    }
+
+    assert!(is_error(&replies[5]), "a path inside an object is no empty value");
+
+    let mut outside = server(&dir, &home, &home);
+    let replies = run(
+        &mut outside,
+        &[call(
+            1,
+            "note_save",
+            json!({ "title": "t", "body": "b", "kind": "note", "project_path": {} }),
+        )],
+    );
+
+    assert!(is_error(&replies[0]));
+    assert!(text(&replies[0]).contains("project_path"));
+}
+
+#[test]
 fn without_a_repository_repo_scope_asks_for_project_path() {
     let dir = TempDir::new().expect("temp");
     let home = dir.path().join("home");

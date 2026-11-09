@@ -373,16 +373,36 @@ impl Server {
         // Missing or null arguments are an empty object. Anything else that is no object is refused
         // here: a derived struct also parses a JSON array as positional fields, which a guard that
         // reads `project_path` by name would not see.
-        let arguments = match params.get("arguments") {
+        let mut arguments = match params.get("arguments") {
             None | Some(Value::Null) => json!({}),
             Some(object @ Value::Object(_)) => object.clone(),
             Some(_) => return protocol::error(id, INVALID_PARAMS, "tools/call arguments must be an object"),
         };
+        drop_empty_project_path(&mut arguments);
 
         match calls::call(self, name, arguments) {
             Some(reply) => protocol::result(id, tool_result(reply)),
             None => protocol::error(id, INVALID_PARAMS, &format!("unknown tool: {}", short(name))),
         }
+    }
+}
+
+/// Removes a `project_path` that is blank text, `{}` or null: agents send those when they mean the repository
+/// they are working in, and the call and its guards then use the root of the folder the server runs in.
+fn drop_empty_project_path(arguments: &mut Value) {
+    let Some(fields) = arguments.as_object_mut() else {
+        return;
+    };
+
+    let empty = match fields.get("project_path") {
+        Some(Value::String(text)) => text.trim().is_empty(),
+        Some(Value::Object(object)) => object.is_empty(),
+        Some(Value::Null) => true,
+        _ => false,
+    };
+
+    if empty {
+        fields.remove("project_path");
     }
 }
 
